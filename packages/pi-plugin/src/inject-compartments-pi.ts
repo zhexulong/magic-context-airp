@@ -1638,7 +1638,7 @@ export function materializeM0Pi(
 	// Phase 1 (no lock): read markers + render. Rendering can be slow, so we do
 	// it OUTSIDE the write lock to keep the BEGIN IMMEDIATE critical section tiny.
 	const docs = passSnapshot?.projectDocs ?? readProjectDocsForPiM0(state);
-	if (passSnapshot && passSnapshot.projectDocs === undefined) {
+	if (passSnapshot && typeof passSnapshot === "object" && passSnapshot.projectDocs === undefined) {
 		passSnapshot.projectDocs = docs;
 	}
 	const foldMaterializedAt = Date.now();
@@ -2666,10 +2666,14 @@ export function injectM0M1Pi(
 	piMessages: PiAgentMessage[],
 	entryIds?: readonly (string | undefined)[],
 	recomputeM1ThisPass = false,
-	passSnapshot?: PiM0M1PassSnapshot,
+	passSnapshot?: PiM0M1PassSnapshot | boolean,
 	/** True only for a real provider invocation; false preserves DEFER maintenance replay. */
 	allowExternalMemoryRefresh = false,
 ): PiM0M1InjectionResult {
+	if (typeof passSnapshot === "boolean") {
+		allowExternalMemoryRefresh = passSnapshot;
+		passSnapshot = undefined;
+	}
 	if (state.preparedPrefix) {
 		const prepared = state.preparedPrefix;
 		const skippedVisibleMessages = prepared.trimBoundaryId

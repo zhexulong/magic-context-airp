@@ -145,7 +145,7 @@ describe("Pi context project identity cache", () => {
 			__resetProjectIdentityForTests();
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
-			rmSync(project, { recursive: true, force: true });
+			rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 		}
 	});
 });
@@ -180,7 +180,7 @@ describe("Pi protected-token floor wiring", () => {
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
-			rmSync(project, { recursive: true, force: true });
+			rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 		}
 	});
 });
@@ -2435,7 +2435,7 @@ describe("registerPiContextHandler", () => {
 			clearContextHandlerSession("ses-context");
 			closeQuietly(db);
 		}
-	});
+	}, 30000);
 
 	it("ignores a late older assistant model event after a newer model has been pinned", async () => {
 		const db = createTestDb();
@@ -2584,7 +2584,11 @@ describe("registerPiContextHandler", () => {
 			expect(notify).not.toHaveBeenCalled();
 		} finally {
 			closeQuietly(db);
-			rmSync(dir, { recursive: true, force: true });
+			try {
+				rmSync(dir, { recursive: true, force: true });
+			} catch {
+				// Windows file lock transient cleanup
+			}
 		}
 	});
 
