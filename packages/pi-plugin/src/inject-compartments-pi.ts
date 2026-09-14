@@ -91,11 +91,11 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-import type {
-	GameBuddyStableContextMaterialization,
-	GameBuddyStableContextSourceRecord,
+import {
+	type GameBuddyStableContextMaterialization,
+	type GameBuddyStableContextSourceRecord,
+	renderGameBuddyVolatileContextBlock,
 } from "./gamebuddy-stable-context-source";
-import { renderGameBuddyVolatileContextBlock } from "./tavern";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";

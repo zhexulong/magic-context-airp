@@ -24,16 +24,16 @@ export function resolveGameBuddyMemoryProjectPath(
 export type GameBuddyPlayerMemoryProfileBinding = Readonly<{
     continuityId: string;
     runtimeCwd: string;
-    profileId?: string;
-    profileRevision?: number;
-    profileCanonicalHash?: string;
+    profileId: string;
+    profileRevision: number;
+    profileCanonicalHash: string;
 }>;
 
 export type GameBuddyPlayerMemoryReadInput = Readonly<{
     continuityId: string;
-    profileId?: string;
-    profileRevision?: number;
-    profileCanonicalHash?: string;
+    profileId: string;
+    profileRevision: number;
+    profileCanonicalHash: string;
 }>;
 
 export type GameBuddyPlayerMemoryReadView = Readonly<{
@@ -54,33 +54,33 @@ export type GameBuddyPlayerMemoryReadProjection = Readonly<{
 }>;
 
 export function validateMemoryProfileBinding(args: GameBuddyPlayerMemoryProfileBinding): void {
-    if (typeof args.continuityId !== "string" || args.continuityId.length === 0)
+    if (!args || typeof args !== "object")
         throw new Error("invalid_memory_profile_binding");
-    if (args.profileId !== undefined) {
-        if (typeof args.profileId !== "string" || args.profileId.length === 0 || args.profileId === "unknown")
-            throw new Error("invalid_memory_profile_binding");
-    }
-    if (args.profileRevision !== undefined) {
-        if (!Number.isSafeInteger(args.profileRevision) || args.profileRevision < 1)
-            throw new Error("invalid_memory_profile_binding");
-    }
-    if (args.profileCanonicalHash !== undefined) {
-        if (typeof args.profileCanonicalHash !== "string" || !/^[a-f0-9]{64}$/.test(args.profileCanonicalHash))
-            throw new Error("invalid_memory_profile_binding");
-    }
+    if (typeof args.continuityId !== "string" || args.continuityId.trim().length === 0)
+        throw new Error("invalid_memory_profile_binding");
+    if (typeof args.runtimeCwd !== "string" || args.runtimeCwd.trim().length === 0)
+        throw new Error("invalid_memory_profile_binding");
+    if (typeof args.profileId !== "string" || args.profileId.trim().length === 0 || args.profileId === "unknown")
+        throw new Error("invalid_memory_profile_binding");
+    if (typeof args.profileRevision !== "number" || !Number.isSafeInteger(args.profileRevision) || args.profileRevision < 1)
+        throw new Error("invalid_memory_profile_binding");
+    if (typeof args.profileCanonicalHash !== "string" || !/^[a-f0-9]{64}$/.test(args.profileCanonicalHash))
+        throw new Error("invalid_memory_profile_binding");
 }
 
 export function assertMemoryProfileMatch(
     bound: GameBuddyPlayerMemoryProfileBinding,
     input: GameBuddyPlayerMemoryReadInput,
 ): void {
+    if (!input || typeof input !== "object")
+        throw new Error("gamebuddy_memory_profile_mismatch");
     if (input.continuityId !== bound.continuityId)
         throw new Error("gamebuddy_memory_continuity_mismatch");
-    if (bound.profileId !== undefined && input.profileId !== undefined && input.profileId !== bound.profileId)
+    if (typeof input.profileId !== "string" || input.profileId !== bound.profileId)
         throw new Error("gamebuddy_memory_profile_mismatch");
-    if (bound.profileRevision !== undefined && input.profileRevision !== undefined && input.profileRevision !== bound.profileRevision)
+    if (typeof input.profileRevision !== "number" || input.profileRevision !== bound.profileRevision)
         throw new Error("gamebuddy_memory_profile_mismatch");
-    if (bound.profileCanonicalHash !== undefined && input.profileCanonicalHash !== undefined && input.profileCanonicalHash !== bound.profileCanonicalHash)
+    if (typeof input.profileCanonicalHash !== "string" || input.profileCanonicalHash !== bound.profileCanonicalHash)
         throw new Error("gamebuddy_memory_profile_mismatch");
 }
 

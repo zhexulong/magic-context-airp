@@ -54,6 +54,49 @@ const text = (v: unknown, field: string) => typeof v === "string" && v.length > 
 const hash = (v: unknown, field: string) => /^[a-f0-9]{64}$/.test(text(v, field)) ? v as string : fail("invalid_catalog", `${field} must be sha256`);
 const freeze = <T>(v: T): T => { if (v && typeof v === "object") { Object.freeze(v); for (const x of Object.values(v as object)) freeze(x); } return v; };
 
+export const MAX_AUTHORED_VOLATILE_SOURCES = 128;
+export const MAX_AUTHORED_VOLATILE_BUDGET_TOKENS = 32768;
+
+const escapeXmlContent = (s: string): string =>
+  s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+const escapeXmlAttr = (s: string): string =>
+  s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+/**
+ * Convenience helper rendering the volatile M1 context block with XML injection defense.
+ */
+export function renderGameBuddyVolatileContextBlock(
+  context:
+    | Readonly<{
+        snapshotCanonicalHash?: string;
+        canonicalHash?: string;
+        volatileSources: readonly GameBuddyAuthoredVolatileSource[];
+      }>
+    | readonly GameBuddyAuthoredVolatileSource[],
+  canonicalHash?: string,
+): string {
+  let sources: readonly GameBuddyAuthoredVolatileSource[];
+  let hash: string;
+
+  if (typeof context === "object" && context !== null && "volatileSources" in context) {
+    sources = context.volatileSources;
+    hash = canonicalHash ?? context.snapshotCanonicalHash ?? context.canonicalHash ?? "";
+  } else {
+    sources = (context as readonly GameBuddyAuthoredVolatileSource[]) ?? [];
+    hash = canonicalHash ?? "";
+  }
+
+  if (!sources || sources.length === 0) return "";
+  const renderedSources = sources
+    .map(
+      (source: GameBuddyAuthoredVolatileSource) =>
+        `<gamebuddy-volatile-source source-id="${escapeXmlAttr(source.sourceId)}" revision="${escapeXmlAttr(source.revision)}" canonical-hash="${escapeXmlAttr(source.canonicalHash)}">\n${escapeXmlContent(source.content)}\n</gamebuddy-volatile-source>`,
+    )
+    .join("\n");
+  return `<gamebuddy-volatile-context canonical-hash="${escapeXmlAttr(hash)}">\n${renderedSources}\n</gamebuddy-volatile-context>`;
+}
+
 export function validateGameBuddyAuthoredStableCatalog(value: unknown, expected: GameBuddyChatContextScope): GameBuddyAuthoredStableCatalog {
   if (!value || typeof value !== "object" || Array.isArray(value)) return fail("invalid_catalog", "catalog must be an object");
   const input = value as Record<string, unknown>;
@@ -82,16 +125,23 @@ export function validateGameBuddyAuthoredStableCatalog(value: unknown, expected:
     orderKeys.add(s.totalOrderKey);
   }
   const rawVolatiles = Array.isArray(input.volatileSources) ? (input.volatileSources as readonly unknown[]) : [];
+  if (rawVolatiles.length > MAX_AUTHORED_VOLATILE_SOURCES)
+    return fail("invalid_catalog", `volatile candidates exceed limit (${MAX_AUTHORED_VOLATILE_SOURCES})`);
   const volatileSources = rawVolatiles.map((raw: unknown) => {
     if (!raw || typeof raw !== "object") return fail("invalid_catalog", "volatile source must be object");
     const r = raw as Record<string, unknown>;
     if (r.kind !== "lorebook_entry") return fail("unknown_source_kind", String(r.kind));
     const content = text(r.content, "volatile.content");
     const contentHash = hash(r.canonicalHash, "volatile.canonicalHash");
-    if (contentHash !== sha(content) || !Number.isSafeInteger(r.budgetTokens) || (r.budgetTokens as number) <= 0) return fail("hash_mismatch", "volatile source hash mismatch");
-     if (!Array.isArray(r.selectionKeys) || r.selectionKeys.some((key) => typeof key !== "string" || key.length === 0)) return fail("invalid_catalog", "volatile selection keys must be non-empty strings");
-     return freeze({ sourceId: text(r.sourceId, "volatile.sourceId"), kind: "lorebook_entry" as const, revision: text(r.revision, "volatile.revision"), canonicalHash: contentHash, content, budgetTokens: r.budgetTokens as number, totalOrderKey: text(r.totalOrderKey, "volatile.totalOrderKey"), provenance: text(r.provenance, "volatile.provenance"), selectionKeys: r.selectionKeys as string[] });
+    if (contentHash !== sha(content)) return fail("hash_mismatch", "volatile source hash mismatch");
+    if (!Number.isSafeInteger(r.budgetTokens) || (r.budgetTokens as number) <= 0) return fail("invalid_catalog", "invalid volatile budget");
+    if (!Array.isArray(r.selectionKeys) || r.selectionKeys.some((key) => typeof key !== "string" || key.trim().length === 0))
+      return fail("invalid_catalog", "volatile selection keys must be non-empty strings");
+    return freeze({ sourceId: text(r.sourceId, "volatile.sourceId"), kind: "lorebook_entry" as const, revision: text(r.revision, "volatile.revision"), canonicalHash: contentHash, content, budgetTokens: r.budgetTokens as number, totalOrderKey: text(r.totalOrderKey, "volatile.totalOrderKey"), provenance: text(r.provenance, "volatile.provenance"), selectionKeys: r.selectionKeys as string[] });
   });
+  const totalVolatileBudget = volatileSources.reduce((n, s) => n + s.budgetTokens, 0);
+  if (!Number.isSafeInteger(totalVolatileBudget) || totalVolatileBudget > MAX_AUTHORED_VOLATILE_BUDGET_TOKENS)
+    return fail("invalid_catalog", "volatile candidates exceed total budgetTokens limit");
   const body = hasVolatileSources
     ? { version: GAMEBUDDY_AUTHORED_CONTEXT_CATALOG_VERSION, scope: expected, stableSources: sources, volatileSources }
     : { version: GAMEBUDDY_AUTHORED_CONTEXT_CATALOG_VERSION, scope: expected, stableSources: sources };

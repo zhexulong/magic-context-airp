@@ -76,4 +76,70 @@ describe("GameBuddy authored stable catalog", () => {
     expect(materialized.budgetTokens).toBe(150);
     expect(Object.isFrozen(materialized)).toBe(true);
   });
+
+  it("rejects volatile candidates with whitespace-only selection keys", () => {
+    const volatileSource = {
+      sourceId: "entry-1",
+      kind: "lorebook_entry" as const,
+      revision: "1",
+      content: "Volatile content",
+      canonicalHash: hash("Volatile content"),
+      budgetTokens: 20,
+      totalOrderKey: "0010",
+      provenance: "test",
+      selectionKeys: ["   ", "valid-key"],
+    };
+    const body = {
+      version: GAMEBUDDY_AUTHORED_CONTEXT_CATALOG_VERSION,
+      scope,
+      stableSources: catalog().stableSources,
+      volatileSources: [volatileSource],
+    };
+    const c = { ...body, canonicalHash: hash(canonical(body)) };
+    expect(() => validateGameBuddyAuthoredStableCatalog(c, scope)).toThrow("volatile selection keys must be non-empty strings");
+  });
+
+  it("rejects volatile candidates exceeding the 128 limit", () => {
+    const candidates = Array.from({ length: 129 }, (_, i) => ({
+      sourceId: `entry-${i}`,
+      kind: "lorebook_entry" as const,
+      revision: "1",
+      content: `Volatile content ${i}`,
+      canonicalHash: hash(`Volatile content ${i}`),
+      budgetTokens: 10,
+      totalOrderKey: String(i).padStart(4, "0"),
+      provenance: "test",
+      selectionKeys: [`key-${i}`],
+    }));
+    const body = {
+      version: GAMEBUDDY_AUTHORED_CONTEXT_CATALOG_VERSION,
+      scope,
+      stableSources: catalog().stableSources,
+      volatileSources: candidates,
+    };
+    const c = { ...body, canonicalHash: hash(canonical(body)) };
+    expect(() => validateGameBuddyAuthoredStableCatalog(c, scope)).toThrow("volatile candidates exceed limit");
+  });
+
+  it("rejects volatile candidates exceeding total budget limit", () => {
+    const volatileSource = {
+      sourceId: "entry-1",
+      kind: "lorebook_entry" as const,
+      revision: "1",
+      content: "Large budget content",
+      canonicalHash: hash("Large budget content"),
+      budgetTokens: 50000,
+      totalOrderKey: "0010",
+      provenance: "test",
+      selectionKeys: ["key"],
+    };
+    const body = {
+      version: GAMEBUDDY_AUTHORED_CONTEXT_CATALOG_VERSION,
+      scope,
+      stableSources: catalog().stableSources,
+      volatileSources: [volatileSource],
+    };
+    const c = { ...body, canonicalHash: hash(canonical(body)) };
+    expect(() => validateGameBuddyAuthoredStableCatalog(c, scope)).toThrow("volatile candidates exceed total budgetTokens limit");
+  });
 });

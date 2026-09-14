@@ -350,7 +350,7 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
   });
 
   test("用例 4：M1 Volatile 渲染 XML 注入防御断言", async () => {
-    const { renderGameBuddyVolatileContextBlock } = await import("./tavern/index");
+    const { renderGameBuddyVolatileContextBlock } = await import("./gamebuddy-stable-context-source");
     const volatileSource = {
       sourceId: "lore-entry-1",
       kind: "lorebook_entry" as const,

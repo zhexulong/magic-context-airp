@@ -39,7 +39,7 @@ export type GameBuddyPlayerMemoryCrudFacade =
         ): Promise<GameBuddyPlayerMemoryReadView>;
         archive(
             input: GameBuddyPlayerMemoryReadInput & Readonly<{ stateToken: string }>,
-        ): Promise<void>;
+        ): Promise<GameBuddyPlayerMemoryReadView>;
     }>;
 
 export function createGameBuddyPlayerMemoryCrudFacade(
@@ -85,7 +85,7 @@ export function createGameBuddyPlayerMemoryCrudFacade(
         },
         async archive(input) {
             assertMemoryProfileMatch(args, input);
-            (await open()).archiveByStateToken(
+            const result = (await open()).archiveByStateToken(
                 {
                     projectPath,
                     stateToken: input.stateToken,
@@ -93,6 +93,11 @@ export function createGameBuddyPlayerMemoryCrudFacade(
                 },
                 "Archived by player management",
             );
+            const reread = await read.getMemory({ ...input, stateToken: result.stateToken });
+            if (reread.status !== "archived") {
+                throw new Error("gamebuddy_memory_archive_readback_failed");
+            }
+            return reread;
         },
     });
 }

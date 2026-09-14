@@ -8,6 +8,11 @@ import { createGameBuddyPlayerMemoryCrudFacade } from "./gamebuddy-player-memory
 import { resolveGameBuddyMemoryProjectPath } from "./gamebuddy-player-memory-read-projection";
 
 const continuityId = "continuity_01";
+const defaultProfile = {
+    profileId: "profile_01",
+    profileRevision: 1,
+    profileCanonicalHash: "a".repeat(64),
+};
 let root: string | undefined;
 
 afterEach(async () => {
@@ -19,9 +24,9 @@ afterEach(async () => {
 describe("GameBuddy player Memory CRUD facade", () => {
     test("is continuity-bound, writes through vendor ownership, and rereads each mutation", async () => {
         root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-"));
-        const facade = createGameBuddyPlayerMemoryCrudFacade({ continuityId, runtimeCwd: root });
+        const facade = createGameBuddyPlayerMemoryCrudFacade({ continuityId, runtimeCwd: root, ...defaultProfile });
 
-        const created = await facade.create({ continuityId, content: "The farmer likes blueberries." });
+        const created = await facade.create({ continuityId, content: "The farmer likes blueberries.", ...defaultProfile });
         expect(created.content).toBe("The farmer likes blueberries.");
         expect(created.category).toBe("semantic");
         expect(created.status).toBe("active");
@@ -30,16 +35,19 @@ describe("GameBuddy player Memory CRUD facade", () => {
             continuityId,
             stateToken: created.stateToken,
             content: "The farmer prefers strawberries.",
+            ...defaultProfile,
         });
         expect(updated.content).toBe("The farmer prefers strawberries.");
         expect(updated.stateToken).not.toBe(created.stateToken);
 
-        await facade.archive({ continuityId, stateToken: updated.stateToken });
-        const entries = await facade.listMemories({ continuityId });
+        const archived = await facade.archive({ continuityId, stateToken: updated.stateToken, ...defaultProfile });
+        expect(archived.status).toBe("archived");
+
+        const entries = await facade.listMemories({ continuityId, ...defaultProfile });
         expect(entries).toHaveLength(1);
         expect(entries[0]?.content).toBe("The farmer prefers strawberries.");
         expect(entries[0]?.status).toBe("archived");
-        await expect(facade.listMemories({ continuityId: "other" })).rejects.toThrow(
+        await expect(facade.listMemories({ continuityId: "other", ...defaultProfile })).rejects.toThrow(
             "gamebuddy_memory_continuity_mismatch",
         );
     });
@@ -58,25 +66,25 @@ describe("GameBuddy player Memory CRUD facade", () => {
             sourceType: "user",
             actor: { principal: "player_direct", delegated: false },
         });
-        const first = createGameBuddyPlayerMemoryCrudFacade({ continuityId, runtimeCwd: root });
-        const second = createGameBuddyPlayerMemoryCrudFacade({ continuityId: "continuity_02", runtimeCwd: root });
+        const first = createGameBuddyPlayerMemoryCrudFacade({ continuityId, runtimeCwd: root, ...defaultProfile });
+        const second = createGameBuddyPlayerMemoryCrudFacade({ continuityId: "continuity_02", runtimeCwd: root, ...defaultProfile });
 
-        await first.create({ continuityId, content: "Only the first continuity may see this." });
-        expect(await first.listMemories({ continuityId })).toMatchObject([
+        await first.create({ continuityId, content: "Only the first continuity may see this.", ...defaultProfile });
+        expect(await first.listMemories({ continuityId, ...defaultProfile })).toMatchObject([
             { content: "Only the first continuity may see this." },
         ]);
-        expect(await second.listMemories({ continuityId: "continuity_02" })).toEqual([]);
+        expect(await second.listMemories({ continuityId: "continuity_02", ...defaultProfile })).toEqual([]);
     });
 
     test("rejects a second write using the stale vendor state token", async () => {
         root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-cas-"));
-        const facade = createGameBuddyPlayerMemoryCrudFacade({ continuityId, runtimeCwd: root });
-        const created = await facade.create({ continuityId, content: "Original" });
-        await facade.update({ continuityId, stateToken: created.stateToken, content: "First update" });
+        const facade = createGameBuddyPlayerMemoryCrudFacade({ continuityId, runtimeCwd: root, ...defaultProfile });
+        const created = await facade.create({ continuityId, content: "Original", ...defaultProfile });
+        await facade.update({ continuityId, stateToken: created.stateToken, content: "First update", ...defaultProfile });
         await expect(
-            facade.update({ continuityId, stateToken: created.stateToken, content: "Stale second update" }),
+            facade.update({ continuityId, stateToken: created.stateToken, content: "Stale second update", ...defaultProfile }),
         ).rejects.toThrow(/stale|not found/i);
-        const rows = await facade.listMemories({ continuityId });
+        const rows = await facade.listMemories({ continuityId, ...defaultProfile });
         expect(rows).toMatchObject([{ content: "First update" }]);
     });
 
@@ -93,12 +101,17 @@ describe("GameBuddy player Memory CRUD facade", () => {
 
         // Mismatched profileId throws
         await expect(
-            facade.create({ continuityId, content: "Test", profileId: "mismatched_profile" }),
+            facade.create({ continuityId, content: "Test", profileId: "mismatched_profile", profileRevision: 2, profileCanonicalHash: "a".repeat(64) }),
         ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
         // Mismatched profileRevision throws
         await expect(
-            facade.create({ continuityId, content: "Test", profileRevision: 99 }),
+            facade.create({ continuityId, content: "Test", profileId: "profile_01", profileRevision: 99, profileCanonicalHash: "a".repeat(64) }),
+        ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
+
+        // Mismatched hash throws
+        await expect(
+            facade.create({ continuityId, content: "Test", profileId: "profile_01", profileRevision: 2, profileCanonicalHash: "b".repeat(64) }),
         ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
         // Matching profile succeeds
@@ -113,15 +126,17 @@ describe("GameBuddy player Memory CRUD facade", () => {
 
         // Mismatched profile read throws
         await expect(
-            facade.listMemories({ continuityId, profileId: "wrong" }),
+            facade.listMemories({ continuityId, profileId: "wrong", profileRevision: 2, profileCanonicalHash: "a".repeat(64) }),
         ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
-        // Invalid profile binding throws at construction
+        // Missing profile fields in binding throws
         expect(() =>
             createGameBuddyPlayerMemoryCrudFacade({
                 continuityId,
                 runtimeCwd: root!,
                 profileId: "",
+                profileRevision: 1,
+                profileCanonicalHash: "a".repeat(64),
             }),
         ).toThrow("invalid_memory_profile_binding");
     });
