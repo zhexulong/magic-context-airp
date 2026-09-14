@@ -1,5 +1,10 @@
+import {
+    MERGED_REASONING_PARTS_PREFIX,
+    readFrozenMergedReasoningParts,
+} from "../../features/magic-context/merged-reasoning-decisions";
 import { isRecord } from "../../shared/record-type-guard";
 import { isSentinel, makeSentinel, makeWholeMessageSentinel } from "./sentinel";
+import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 
 const DROPPED_PLACEHOLDER_PATTERN = /^\[dropped §\d+§\]$/;
@@ -467,6 +472,34 @@ function hasReasoningReplayContent(message: MessageLike): boolean {
  * metadata-only request shell; the adapter drops that shell, so it cannot own the exemption for
  * the completed assistant whose signed reasoning is actually replayed last.
  */
+export function findNewestReasoningBearingAssistantId(messages: MessageLike[]): string | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.info.role !== "assistant") continue;
+        if (
+            !message.parts.some(
+                (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
+            )
+        ) {
+            continue;
+        }
+        const id = message.info.id;
+        if (typeof id === "string" && id.length > 0) return id;
+    }
+    return undefined;
+}
+
+export function assistantHasReasoningPart(messages: MessageLike[], messageId: string): boolean {
+    return messages.some(
+        (message) =>
+            message.info.role === "assistant" &&
+            message.info.id === messageId &&
+            message.parts.some(
+                (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
+            ),
+    );
+}
+
 export function findLatestAssistantReasoningMutationExemptMessage(
     messages: MessageLike[],
 ): MessageLike | undefined {
@@ -485,6 +518,7 @@ interface MergedReasoningStripPlan {
 function planMergedAssistantReasoningStrip(
     messages: MessageLike[],
     mutationExemptMessage?: MessageLike,
+    frozenMessageIds?: ReadonlySet<string>,
 ): MergedReasoningStripPlan[] {
     const plan: MergedReasoningStripPlan[] = [];
     let prevRole: string | undefined;
@@ -502,7 +536,7 @@ function planMergedAssistantReasoningStrip(
         const firstInRun = prevRole !== "assistant";
         if (firstInRun) keptReasoningInRun = false;
 
-        if (message === mutationExemptMessage) {
+        if (message === mutationExemptMessage || frozenMessageIds?.has(message.info.id ?? "")) {
             prevRole = role;
             continue;
         }
@@ -577,7 +611,7 @@ function isSentinelInvisibleTextPart(part: unknown): boolean {
         isRecord(part) &&
         part.type === "text" &&
         typeof part.text === "string" &&
-        part.text.trim() === ""
+        stripWellFormedLeadingTagPrefix(part.text).trim() === ""
     );
 }
 
@@ -640,8 +674,11 @@ export function snapshotTrailingBlankSourceDecisions(
 
 /**
  * Capture the representation served for each assistant before a provider can append
- * a late blank. The newest assistant may be refreshed while it remains live; once a
- * later assistant appears, its last served choice becomes an immutable replay rule.
+ * a late blank. A newest keep may refresh to another keep count or demote to strip,
+ * but an established strip is absorbing. A harness blank that arrives after the first
+ * serve is therefore stripped forever, keeping the suffix monotonic from streaming
+ * through completion and historical replay. Once a later assistant appears, the last
+ * served choice is immutable.
  *
  * Production callers supply sourceDecisions captured from the unmodified harness
  * input. That prevents sentinels, canonical blanks, and synthetic messages added by
@@ -666,7 +703,10 @@ export function findTrailingBlankDecisionCandidates(
     for (const [id, decision] of observedDecisions) {
         if (!visibleIds.has(id)) continue;
         const frozen = frozenDecisions.get(id);
-        if (frozen !== undefined && (id !== options?.refreshMessageId || frozen === decision)) {
+        if (
+            frozen !== undefined &&
+            (id !== options?.refreshMessageId || frozen === decision || frozen === "strip")
+        ) {
             continue;
         }
         decisions.push([id, decision]);
@@ -677,12 +717,12 @@ export function findTrailingBlankDecisionCandidates(
 /**
  * Replay persisted choices after all other message mutations. Keep decisions
  * preserve the canonical blank suffix first served for that message; strip decisions
- * remove a later blank suffix unless that would expose terminal reasoning. Never
- * delete the newest assistant's suffix in either message representation.
+ * remove a blank suffix unless that would expose terminal reasoning. Applying strip
+ * while the assistant is newest keeps its suffix unchanged from streaming, which has
+ * no step-finish sentinel, through completion and later historical replays.
  */
 export function applyFrozenTrailingBlankDecisions(
     messages: MessageLike[],
-    newestAssistantId: string | undefined,
     frozenDecisions: ReadonlyMap<string, TrailingBlankDecision>,
 ): number {
     let mutations = 0;
@@ -742,7 +782,7 @@ export function applyFrozenTrailingBlankDecisions(
             continue;
         }
 
-        if (id === newestAssistantId || trailingCount === 0) continue;
+        if (trailingCount === 0) continue;
         const lastMeaningfulPart = message.parts[lastMeaningfulIndex];
         if (
             isRecord(lastMeaningfulPart) &&
@@ -829,6 +869,55 @@ export function findMergedReasoningStripCandidateIds(
  * convert-to-anthropic-messages-prompt.ts (case 'assistant'). Same class
  * fixed for Bedrock in vercel/ai#13583/#13972.
  */
+export function stripReasoningFromAssistantIds(
+    messages: MessageLike[],
+    providerID: string | undefined,
+    messageIds: ReadonlySet<string>,
+): number {
+    if (providerID !== "anthropic" || messageIds.size === 0) return 0;
+    let stripped = 0;
+    for (const message of messages) {
+        const id = message.info.id;
+        if (typeof id !== "string" || !messageIds.has(id)) continue;
+        for (let index = 0; index < message.parts.length; index += 1) {
+            const part = message.parts[index];
+            if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
+            message.parts[index] = makeSentinel(part);
+            stripped += 1;
+        }
+    }
+    return stripped;
+}
+
+/**
+ * Record which reasoning parts to remove before first application. Also retain
+ * the plain message id for older readers that do not understand part selections.
+ */
+export function findMergedReasoningStripDecisions(
+    messages: MessageLike[],
+    providerID: string | undefined,
+    frozenIds: ReadonlySet<string>,
+    options?: { mutationExemptMessage?: MessageLike },
+): string[] {
+    if (providerID !== "anthropic") return [];
+    const frozenParts = readFrozenMergedReasoningParts(frozenIds);
+    const decisions: string[] = [];
+    for (const entry of planMergedAssistantReasoningStrip(
+        messages,
+        options?.mutationExemptMessage,
+        new Set(frozenParts.keys()),
+    )) {
+        const id = entry.message.info.id;
+        if (typeof id !== "string" || id.length === 0 || frozenParts.has(id)) continue;
+        const parts = entry.stripIndices.map((index) => {
+            const part = entry.message.parts[index];
+            return isRecord(part) && typeof part.id === "string" ? part.id : index;
+        });
+        decisions.push(id, MERGED_REASONING_PARTS_PREFIX + JSON.stringify([id, parts]));
+    }
+    return decisions;
+}
+
 export function stripReasoningFromMergedAssistants(
     messages: MessageLike[],
     providerID?: string,
@@ -846,9 +935,29 @@ export function stripReasoningFromMergedAssistants(
     if (providerID !== "anthropic") return 0;
 
     let stripped = 0;
+    const frozenParts = readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
+    // Replay the exact persisted selection without reconsidering adjacency.
+    // Dropping empty preceding assistants can make a stripped thinking part
+    // look eligible to keep on the next request. Only legacy bare ids still
+    // use that layout-dependent rule, preserving their pre-deployment bytes.
+    for (const message of messages) {
+        if (message === options?.mutationExemptMessage || message.info.role !== "assistant")
+            continue;
+        const parts = frozenParts.get(message.info.id ?? "");
+        if (!parts) continue;
+        for (let index = 0; index < message.parts.length; index += 1) {
+            const part = message.parts[index];
+            if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
+            if (!parts.includes(index) && !(typeof part.id === "string" && parts.includes(part.id)))
+                continue;
+            message.parts[index] = makeSentinel(part);
+            stripped++;
+        }
+    }
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,
+        new Set(frozenParts.keys()),
     )) {
         if (options?.frozenMessageIds) {
             const id = entry.message.info.id;

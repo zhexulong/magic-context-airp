@@ -28,12 +28,11 @@ import {
     denyTaskRoutingToAgents,
     denyTaskRoutingToCallerAgents,
     HISTORIAN_ALLOWED_TOOLS,
-    SIDEKICK_ALLOWED_TOOLS,
     SMART_NOTE_COMPILER_ALLOWED_TOOLS,
 } from "./agents/permissions";
-import { SIDEKICK_AGENT } from "./agents/sidekick";
 import { SMART_NOTE_COMPILER_AGENT } from "./agents/smart-note-compiler";
 import { permissionDisabled } from "./hooks/magic-context/ctx-reduce-availability";
+import { resolveHistorianAgentOverrides } from "./shared/model-resolution";
 
 function taskRules(task: Record<string, string>) {
     return Object.entries(task).map(([pattern, action]) => ({
@@ -61,7 +60,6 @@ describe("hidden-agent registration drift guard", () => {
         historianPrompt: "historian-prompt",
         historianRecompPrompt: "historian-recomp-prompt",
         historianEditorPrompt: "historian-editor-prompt",
-        sidekickPrompt: "sidekick-prompt",
         historianDisallowed: [],
     });
     const byId = (id: string) => regs.find((r) => r.id === id);
@@ -80,9 +78,35 @@ describe("hidden-agent registration drift guard", () => {
                 HISTORIAN_AGENT,
                 HISTORIAN_EDITOR_AGENT,
                 HISTORIAN_RECOMP_AGENT,
-                SIDEKICK_AGENT,
             ].sort(),
         );
+    });
+
+    test("registers opt-in historian temperature on every historian agent", () => {
+        const registrationsFor = (historianConfig: unknown) =>
+            buildHiddenAgentRegistrations({
+                dreamerPrompt: "dreamer-prompt",
+                historianPrompt: "historian-prompt",
+                historianRecompPrompt: "historian-recomp-prompt",
+                historianEditorPrompt: "historian-editor-prompt",
+                historianOverrides: resolveHistorianAgentOverrides(historianConfig),
+                historianDisallowed: [],
+            }).filter((registration) =>
+                [HISTORIAN_AGENT, HISTORIAN_RECOMP_AGENT, HISTORIAN_EDITOR_AGENT].includes(
+                    registration.id,
+                ),
+            );
+
+        for (const registration of registrationsFor(undefined)) {
+            expect(registration.overrides).toEqual({ maxTokens: 32_000 });
+            expect("temperature" in (registration.overrides ?? {})).toBe(false);
+        }
+
+        for (const temperature of [0.1, 0]) {
+            for (const registration of registrationsFor({ temperature })) {
+                expect(registration.overrides).toEqual({ maxTokens: 32_000, temperature });
+            }
+        }
     });
 
     test("all Magic Context worker ids are denied through Task routing", () => {
@@ -175,14 +199,14 @@ describe("hidden-agent registration drift guard", () => {
     });
 
     test("ambient Task wildcard deny stays last so OpenCode hides the tool", () => {
-        const internalAgentIds = [DREAMER_REVIEWER_AGENT, SIDEKICK_AGENT];
+        const internalAgentIds = [DREAMER_REVIEWER_AGENT, HISTORIAN_AGENT];
         // CKDESK's evaluated pre-fix rule order: the ambient whole-tool deny
         // precedes our named routing denies, so Permission.disabled finds the
         // named pattern last and leaves the tool visible.
         const preFixTask = {
             "*": "deny",
             [DREAMER_REVIEWER_AGENT]: "deny",
-            [SIDEKICK_AGENT]: "deny",
+            [HISTORIAN_AGENT]: "deny",
         };
         expect(permissionDisabled("task", taskRules(preFixTask))).toBe(false);
 
@@ -191,14 +215,14 @@ describe("hidden-agent registration drift guard", () => {
         };
         expect(merged.task).toEqual({
             [DREAMER_REVIEWER_AGENT]: "deny",
-            [SIDEKICK_AGENT]: "deny",
+            [HISTORIAN_AGENT]: "deny",
             "*": "deny",
         });
         expect(permissionDisabled("task", taskRules(merged.task))).toBe(true);
     });
 
     test("Task wildcard re-emission is idempotent across repeated registration", () => {
-        const internalAgentIds = [DREAMER_REVIEWER_AGENT, SIDEKICK_AGENT];
+        const internalAgentIds = [DREAMER_REVIEWER_AGENT, HISTORIAN_AGENT];
         const first = denyTaskRoutingToAgents({ task: { "*": "deny" } }, internalAgentIds);
         const second = denyTaskRoutingToAgents(first, internalAgentIds);
 
@@ -235,7 +259,7 @@ describe("hidden-agent registration drift guard", () => {
     });
 
     test("every hidden agent has an internal-only task-routing description", () => {
-        expect(regs).toHaveLength(12);
+        expect(regs).toHaveLength(11);
         for (const registration of regs) {
             expect(registration.mode, registration.id).toBe("primary");
             expect(registration.hidden, registration.id).toBe(true);
@@ -313,10 +337,10 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(SMART_NOTE_COMPILER_AGENT)?.lockPermissions).toBe(true);
     });
 
-    test("every scoped dreamer task agent locks permissions; historian/sidekick do not", () => {
+    test("every scoped dreamer task agent locks permissions; historian agents do not", () => {
         // All dreamer task agents run unsupervised on a per-task tool budget, so a
         // user `dreamer.tools`/`permission` override must not be able to broaden
-        // them. The historian/sidekick/editor are not locked (they take their
+        // them. The historian agents are not locked (they take their
         // allow-list as-is and have no per-task scoping to protect).
         const lockedDreamerAgents = new Set<string>([
             DREAMER_AGENT,
@@ -374,10 +398,6 @@ describe("hidden-agent registration drift guard", () => {
         expect(cfg.tools).toEqual({ aft_search: false });
     });
 
-    test("sidekick inline allow-list matches canonical SIDEKICK_ALLOWED_TOOLS", () => {
-        expect(byId(SIDEKICK_AGENT)?.allowedTools).toEqual([...SIDEKICK_ALLOWED_TOOLS]);
-    });
-
     test("historian + editor inline allow-list matches canonical HISTORIAN_ALLOWED_TOOLS (no disallowed)", () => {
         expect(byId(HISTORIAN_AGENT)?.allowedTools).toEqual([...HISTORIAN_ALLOWED_TOOLS]);
         expect(byId(HISTORIAN_RECOMP_AGENT)?.allowedTools).toEqual([...HISTORIAN_ALLOWED_TOOLS]);
@@ -389,7 +409,6 @@ describe("hidden-agent registration drift guard", () => {
             dreamerPrompt: "d",
             historianPrompt: "h",
             historianEditorPrompt: "he",
-            sidekickPrompt: "s",
             historianDisallowed: ["aft_search"],
         });
         const hist = filtered.find((r) => r.id === HISTORIAN_AGENT);
@@ -401,7 +420,6 @@ describe("hidden-agent registration drift guard", () => {
             dreamerPrompt: "d",
             historianPrompt: "h",
             historianEditorPrompt: "he",
-            sidekickPrompt: "s",
             historianDisallowed: ["*"],
         });
         expect(all.find((r) => r.id === HISTORIAN_AGENT)?.allowedTools).toEqual([]);
@@ -413,7 +431,6 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(SMART_NOTE_COMPILER_AGENT)?.maxSteps).toBe(8);
         expect(byId(HISTORIAN_AGENT)?.maxSteps).toBe(40);
         expect(byId(HISTORIAN_EDITOR_AGENT)?.maxSteps).toBe(40);
-        expect(byId(SIDEKICK_AGENT)?.maxSteps).toBe(40);
     });
 
     test("smart-note compiler uses only its own prompt", () => {
@@ -422,7 +439,6 @@ describe("hidden-agent registration drift guard", () => {
             smartNoteCompilerPrompt: undefined,
             historianPrompt: "historian-prompt",
             historianEditorPrompt: "historian-editor-prompt",
-            sidekickPrompt: "sidekick-prompt",
             historianDisallowed: [],
         });
         expect(regs.find((r) => r.id === SMART_NOTE_COMPILER_AGENT)?.prompt).toBeUndefined();
@@ -436,7 +452,6 @@ describe("hidden-agent registration drift guard", () => {
             dreamerPrompt: undefined,
             historianPrompt: undefined,
             historianEditorPrompt: undefined,
-            sidekickPrompt: undefined,
             historianDisallowed: [],
         });
         expect(noPrompts.every((r) => r.prompt === undefined)).toBe(true);
@@ -455,7 +470,6 @@ describe("hidden-agent registration drift guard", () => {
                 HISTORIAN_AGENT,
                 HISTORIAN_EDITOR_AGENT,
                 HISTORIAN_RECOMP_AGENT,
-                SIDEKICK_AGENT,
             ].sort(),
         );
     });

@@ -6,6 +6,7 @@ import type {
 	EmbeddingProvider,
 	EmbeddingPurpose,
 } from "@magic-context/core/features/magic-context/memory/embedding-provider";
+import { backfillMessageFtsRowidMapBatch } from "@magic-context/core/features/magic-context/message-fts-rowid-map";
 import {
 	_resetProjectEmbeddingRegistryForTests,
 	_setTestProviderFactoryForProject,
@@ -107,6 +108,7 @@ function seedCompartments(
 			"INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
 		).run(sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
 	}
+	backfillMessageFtsRowidMapBatch(db);
 }
 
 function registerEmbedding(
@@ -159,9 +161,7 @@ describe("Pi /ctx-embed progress", () => {
 				retryable: false,
 			} satisfies EmbeddingFailure,
 		},
-	])("surfaces $failure.class in the /ctx-embed summary", async ({
-		failure,
-	}) => {
+	])("maps $failure.class to a stable /ctx-embed code", async ({ failure }) => {
 		_setTestProviderFactoryForProject(
 			() => new FailingEmbeddingProvider(failure),
 		);
@@ -175,16 +175,8 @@ describe("Pi /ctx-embed progress", () => {
 			const terminal = await runEmbedDrain(db, project, sessionId, {
 				batchSize: 1,
 			});
-			expect(terminal.text).toContain(failure.reason);
-			if (failure.retryable) {
-				expect(terminal.text).toContain(
-					"Run /ctx-embed start again to retry them.",
-				);
-			} else {
-				expect(terminal.text).not.toContain(
-					"Run /ctx-embed start again to retry them.",
-				);
-			}
+			expect(terminal.text).toMatch(/\(MC-E\d{2}\)$/);
+			expect(terminal.text).not.toContain(failure.reason);
 		} finally {
 			closeQuietly(db);
 		}
@@ -232,13 +224,10 @@ describe("Pi /ctx-embed progress", () => {
 			await waitUntil(
 				() =>
 					autoEmbedAttemptedBySession.has(sessionId) &&
-					notifications.some((text) =>
-						text.includes(
-							"Embedded 1 compartment of history for semantic search.",
-						),
-					),
+					getEmbeddingCoverageStatus(db, project, sessionId).session
+						.embedded === 1,
 			);
-			const completedNotifications = notifications.length;
+			expect(notifications).toEqual([]);
 
 			maybeAutoEmbedPiSession(
 				{ db, projectDir: "/tmp/pi-embed", projectIdentity: project },
@@ -248,7 +237,7 @@ describe("Pi /ctx-embed progress", () => {
 				(text) => notifications.push(text),
 			);
 			await new Promise((resolve) => setTimeout(resolve, 20));
-			expect(notifications).toHaveLength(completedNotifications);
+			expect(notifications).toEqual([]);
 		} finally {
 			clearPiEmbedSessionState(sessionId);
 			closeQuietly(db);

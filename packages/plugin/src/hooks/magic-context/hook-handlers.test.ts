@@ -1,7 +1,8 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 
+import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
@@ -13,6 +14,7 @@ import {
     getOverflowState,
     recordOverflowDetected,
 } from "../../features/magic-context/storage-meta-persisted";
+import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { Channel1State } from "./ctx-reduce-nudge";
@@ -23,6 +25,8 @@ import {
     createEventHook,
     createToolExecuteAfterHook,
 } from "./hook-handlers";
+import { registerLkgPersistence } from "./lkg-slot";
+import { setRawMessageProvider } from "./read-session-chunk";
 import type { MessageLike } from "./tag-messages";
 import { countRealUserMessages } from "./tail-hygiene-walk";
 
@@ -297,8 +301,78 @@ describe("createToolExecuteAfterHook todo snapshots", () => {
     });
 });
 
+describe("createEventHook incremental indexing", () => {
+    test("coalesces streaming message.updated events into one settled part read", async () => {
+        __resetMessageIndexAsyncForTests();
+        const db = createTestDb();
+        const sessionId = "ses-streaming-index";
+        let partReads = 0;
+        const rawMessage = {
+            id: "msg-streaming",
+            ordinal: 1,
+            role: "assistant",
+            parts: [{ type: "text", text: "settled response" }],
+            version: 1,
+        };
+        const clearProvider = setRawMessageProvider(sessionId, {
+            readMessages: () => [rawMessage],
+        });
+        const hook = createEventHook({
+            eventHandler: async () => {},
+            contextUsageMap: new Map(),
+            db,
+            liveModelBySession: new Map(),
+            variantBySession: new Map(),
+            agentBySession: new Map(),
+            sessionDirectoryBySession: new Map(),
+            historyRefreshSessions: new Set(),
+            deferredHistoryRefreshSessions: new Set(),
+            systemPromptRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            deferredMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            readIncrementalMessage: () => {
+                partReads += 1;
+                return rawMessage;
+            },
+            client: undefined as never,
+        });
+
+        try {
+            for (let index = 0; index < 8; index += 1) {
+                await hook({
+                    event: {
+                        type: "message.updated",
+                        properties: {
+                            info: {
+                                id: rawMessage.id,
+                                role: "assistant",
+                                sessionID: sessionId,
+                                finish: "stop",
+                            },
+                        },
+                    },
+                });
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            await new Promise((resolve) => setTimeout(resolve, 140));
+
+            expect(partReads).toBe(1);
+        } finally {
+            clearProvider();
+            __resetMessageIndexAsyncForTests();
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("createEventHook mid-session model switch clears overflow state", () => {
-    function makeAssistantEvent(sessionID: string, providerID: string, modelID: string) {
+    function makeAssistantEvent(
+        sessionID: string,
+        providerID: string,
+        modelID: string,
+        messageID = `msg-${Math.random().toString(36).slice(2)}`,
+    ) {
         return {
             event: {
                 type: "message.updated",
@@ -306,7 +380,7 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
                     info: {
                         role: "assistant",
                         sessionID,
-                        id: `msg-${Math.random().toString(36).slice(2)}`,
+                        id: messageID,
                         providerID,
                         modelID,
                         finish: "stop",
@@ -337,11 +411,10 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
                 deferredMaterializationSessions: new Set(),
                 lastHeuristicsTurnId: new Map(),
                 client: undefined as never,
-                protectedTags: 5,
             });
 
             // First assistant response on the small-context model.
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small", "msg-000001"));
             // Session overflowed on the small model → records a detected limit + arms recovery.
             recordOverflowDetected(db, sessionId, 120_000);
             let overflow = getOverflowState(db, sessionId);
@@ -351,11 +424,108 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
             // User switches to a 1M-context model mid-session — next assistant event
             // carries the new model. The handler must clear BOTH the stale detected
             // limit and the recovery flag so the new model's pressure math is clean.
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-large"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-large", "msg-000002"));
             overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(0);
             expect(overflow.needsEmergencyRecovery).toBe(false);
         } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("ignores late updates from an older assistant after a model switch", async () => {
+        const db = createTestDb();
+        let dropCount = 0;
+        registerLkgPersistence({
+            load: () => undefined,
+            clear: () => {
+                dropCount++;
+            },
+        });
+        try {
+            const sessionId = "ses-interleaved-model-switch";
+            const liveModelBySession = new Map<string, { providerID: string; modelID: string }>();
+            const latestAssistantMessageIdBySession = new Map<string, string>();
+            const hook = createEventHook({
+                eventHandler: async () => {},
+                contextUsageMap: new Map(),
+                db,
+                liveModelBySession,
+                latestAssistantMessageIdBySession,
+                variantBySession: new Map(),
+                agentBySession: new Map(),
+                sessionDirectoryBySession: new Map(),
+                historyRefreshSessions: new Set(),
+                deferredHistoryRefreshSessions: new Set(),
+                systemPromptRefreshSessions: new Set(),
+                pendingMaterializationSessions: new Set(),
+                deferredMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                client: undefined as never,
+            });
+
+            // The newer assistant shell arrives between two updates for the older row.
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000001"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5-1", "msg-000002"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000001"));
+
+            expect(dropCount).toBe(1);
+            expect(liveModelBySession.get(sessionId)).toEqual({
+                providerID: "fable",
+                modelID: "fable-5-1",
+            });
+            expect(latestAssistantMessageIdBySession.get(sessionId)).toBe("msg-000002");
+        } finally {
+            registerLkgPersistence(undefined);
+            closeQuietly(db);
+        }
+    });
+
+    test("accepts newer assistants for a genuine A-to-B-to-A model sequence", async () => {
+        const db = createTestDb();
+        let dropCount = 0;
+        registerLkgPersistence({
+            load: () => undefined,
+            clear: () => {
+                dropCount++;
+            },
+        });
+        try {
+            const sessionId = "ses-newer-model-switches";
+            const liveModelBySession = new Map([
+                [sessionId, { providerID: "fable", modelID: "fable-4" }],
+            ]);
+            const latestAssistantMessageIdBySession = new Map<string, string>();
+            const hook = createEventHook({
+                eventHandler: async () => {},
+                contextUsageMap: new Map(),
+                db,
+                liveModelBySession,
+                latestAssistantMessageIdBySession,
+                variantBySession: new Map(),
+                agentBySession: new Map(),
+                sessionDirectoryBySession: new Map(),
+                historyRefreshSessions: new Set(),
+                deferredHistoryRefreshSessions: new Set(),
+                systemPromptRefreshSessions: new Set(),
+                pendingMaterializationSessions: new Set(),
+                deferredMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                client: undefined as never,
+            });
+
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000001"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5-1", "msg-000002"));
+            await hook(makeAssistantEvent(sessionId, "fable", "fable-5", "msg-000003"));
+
+            expect(dropCount).toBe(3);
+            expect(liveModelBySession.get(sessionId)).toEqual({
+                providerID: "fable",
+                modelID: "fable-5",
+            });
+            expect(latestAssistantMessageIdBySession.get(sessionId)).toBe("msg-000003");
+        } finally {
+            registerLkgPersistence(undefined);
             closeQuietly(db);
         }
     });
@@ -380,16 +550,48 @@ describe("createEventHook mid-session model switch clears overflow state", () =>
                 deferredMaterializationSessions: new Set(),
                 lastHeuristicsTurnId: new Map(),
                 client: undefined as never,
-                protectedTags: 5,
             });
 
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small", "msg-000001"));
             recordOverflowDetected(db, sessionId, 120_000);
             // Same model again — detected limit must persist (authoritative on this model).
-            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small"));
+            await hook(makeAssistantEvent(sessionId, "anthropic", "claude-small", "msg-000002"));
             const overflow = getOverflowState(db, sessionId);
             expect(overflow.detectedContextLimit).toBe(120_000);
             expect(overflow.needsEmergencyRecovery).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("createChatMessageHook cache TTL seeding", () => {
+    test("seeds config TTL on the first model-bearing user message without marking it synced", async () => {
+        const db = createTestDb();
+        const sessionId = "ses-cache-ttl-seed";
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession: new Map(),
+            variantBySession: new Map(),
+            agentBySession: new Map(),
+            historyRefreshSessions: new Set(),
+            systemPromptRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            cacheTtlConfig: {
+                default: "5m",
+                "anthropic/claude-opus-5": "1h",
+            },
+        });
+        try {
+            await hook({
+                sessionID: sessionId,
+                model: { providerID: "anthropic", modelID: "claude-opus-5" },
+            });
+
+            const meta = getOrCreateSessionMeta(db, sessionId);
+            expect(meta.cacheTtl).toBe("1h");
+            expect(meta.lastObservedModelKey).toBeNull();
         } finally {
             closeQuietly(db);
         }
@@ -570,6 +772,31 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
+    test("Fable 5.1 variant flip signals nothing and leaves pending materialization untouched", async () => {
+        const sets = freshSets();
+        sets.lastHeuristicsTurnId.set("ses", "turn-1");
+        const { hook, db } = makeHook(sets);
+        try {
+            await hook({
+                sessionID: "ses",
+                variant: "high",
+                model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+            });
+            await hook({
+                sessionID: "ses",
+                variant: "medium",
+                model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+            });
+
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
+            expect(sets.lastHeuristicsTurnId.get("ses")).toBe("turn-1");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("bedrock provider: variant flip signals all three sets (thinking config rendered into prompt)", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
@@ -667,18 +894,16 @@ describe("createChatMessageHook variant-change flush is provider-aware", () => {
         }
     });
 
-    // Unknown provider (no model info on the hook input) takes the
-    // conservative TRUE arm = today's behavior.
-    test("unknown provider (no model info): variant flip takes the TRUE arm (all three sets signaled)", async () => {
+    test("unknown model tuple: variant flip defers rather than manufacturing a bust", async () => {
         const sets = freshSets();
         const { hook, db } = makeHook(sets);
         try {
             await hook({ sessionID: "ses", variant: "low" });
             await hook({ sessionID: "ses", variant: "high" });
 
-            expect(sets.historyRefreshSessions.has("ses")).toBe(true);
-            expect(sets.systemPromptRefreshSessions.has("ses")).toBe(true);
-            expect(sets.pendingMaterializationSessions.has("ses")).toBe(true);
+            expect(sets.historyRefreshSessions.size).toBe(0);
+            expect(sets.systemPromptRefreshSessions.size).toBe(0);
+            expect(sets.pendingMaterializationSessions.size).toBe(0);
         } finally {
             closeQuietly(db);
         }
@@ -754,6 +979,7 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             db,
             channel1StateBySession: new Map([[sessionId, state]]),
         });
+        const sessionLog = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
 
         try {
             const first = { output: "first output" };
@@ -789,7 +1015,26 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             await hook({ tool: "bash", sessionID: sessionId }, regrown);
             expect(regrown.output).toContain("Reminder:");
             expect(regrown.output).not.toContain("a ctx_reduce pass is due");
+            const evaluations = sessionLog.mock.calls
+                .filter(
+                    (call) =>
+                        call[0] === sessionId && String(call[1]).startsWith("channel1 evaluation:"),
+                )
+                .map((call) => String(call[1]));
+            expect(evaluations).toHaveLength(4);
+            for (const evaluation of evaluations) {
+                expect(evaluation).toContain(" U=");
+                expect(evaluation).toContain(" T=");
+                expect(evaluation).toContain(" ratio=");
+                expect(evaluation).toContain(" band=");
+                expect(evaluation).toContain(" growth_threshold=");
+                expect(evaluation).toContain(" sticky_floor_turns_remaining=");
+                expect(evaluation).toContain(" dampening=");
+                expect(evaluation).toContain(" verdict=");
+                expect(evaluation).toContain(" reason=");
+            }
         } finally {
+            sessionLog.mockRestore();
             closeQuietly(db);
         }
     });

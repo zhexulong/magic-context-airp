@@ -2,6 +2,7 @@ import { getLastCompartmentEndMessage } from "../../features/magic-context/compa
 import {
     loadProtectedTailMeta,
     markProtectedTailPolicyV3Seeded,
+    type ProtectedTailMeta,
     recordProtectedTailNoEligibleHead,
     resetProtectedTailNoEligibleHead,
 } from "../../features/magic-context/storage-meta-persisted";
@@ -50,6 +51,7 @@ export interface ResolvedBoundaryContext {
     usage: BoundaryUsage | null;
     usageSource: "live" | "persisted" | "provisional-zero" | "manual-none";
     lastCompartmentEndOrdinal: number;
+    lastCompartmentEndMessageId?: string | null;
     priorBoundaryOrdinal: number;
     protectedTailPolicyVersion: number;
     migrationFloorActive: boolean;
@@ -72,6 +74,8 @@ export interface ProtectedTailBoundarySnapshot {
     sessionId: string;
     mode: BoundaryMode;
     offset: number;
+    /** Latest compartment anchor observed with offset; present on production resolutions. */
+    lastCompartmentEndMessageId?: string | null;
     offsetMessageId: string | null;
     protectedTailStart: number;
     protectedTailStartMessageId: string | null;
@@ -96,6 +100,53 @@ export interface ProtectedTailBoundarySnapshot {
     trueRawEligibleTokens: number;
     oversizeAtomicUnit: boolean;
     boundaryReason: string;
+    /** Captured before drain reservation; historian runners log these diagnostics without rereading newer history. */
+    diagnostics?: BoundaryDiagnostics;
+}
+
+export interface BoundaryDiagnostics {
+    tailTarget: ProtectedTailTokenTarget;
+    usable: number;
+    usagePercentage: number;
+    N: number;
+    triggerBudget: number;
+    capTokens: number;
+    capTier: "normal" | "80" | "95";
+    drainBudget: "not-reserved; does-not-size-cap";
+    sizeWalkStart: number;
+    protectedTailStart: number;
+    livePromptFloor: { ordinal: number | null; from: number; to: number };
+    head: HeadCapDiagnostics;
+}
+
+export interface HeadCapDiagnostics {
+    offset: number;
+    capEnd: number;
+    capTokenSum: number;
+    completedFence: {
+        from: number;
+        to: number;
+        arcs: Array<{ assistant: number; result: number }>;
+        tokenMass: number;
+    };
+    oversizeAdmission: { from: number; to: number };
+    openArcClamp: { from: number; to: number };
+    completedRefence: HeadCapDiagnostics["completedFence"];
+    eligibleEnd: number;
+}
+
+export function describeBoundaryDiagnostics(snapshot: ProtectedTailBoundarySnapshot): string {
+    return `boundaryDiagnostics=${JSON.stringify(snapshot.diagnostics ?? { unavailable: true, boundaryReason: snapshot.boundaryReason })}`;
+}
+
+function boundaryDiagnostics(
+    args: Omit<BoundaryDiagnostics, "capTier" | "drainBudget">,
+): BoundaryDiagnostics {
+    return {
+        ...args,
+        capTier: args.usagePercentage >= 95 ? "95" : args.usagePercentage >= 80 ? "80" : "normal",
+        drainBudget: "not-reserved; does-not-size-cap",
+    };
 }
 
 export interface ProtectedTailTokenTarget {
@@ -338,7 +389,7 @@ function fenceWrapupBoundaryForToolArcs(args: {
     return boundary;
 }
 
-function applyHeadCap(args: {
+export function applyHeadCap(args: {
     index: TrueRawTokenIndex;
     protectedTailStart: number;
     offset: number;
@@ -346,6 +397,7 @@ function applyHeadCap(args: {
     lastCompartmentEndOrdinal: number;
     capTokens: number;
     recentOpenArcCutoff: number;
+    observeDiagnostics?: (diagnostics: HeadCapDiagnostics) => void;
 }): { eligibleEndOrdinal: number; oversizeAtomicUnit: boolean } {
     const {
         index,
@@ -356,21 +408,58 @@ function applyHeadCap(args: {
         capTokens,
         recentOpenArcCutoff,
     } = args;
-    if (offset >= protectedTailStart)
+    const diagnostics: HeadCapDiagnostics = {
+        offset,
+        capEnd: offset,
+        capTokenSum: 0,
+        completedFence: { from: offset, to: offset, arcs: [], tokenMass: 0 },
+        oversizeAdmission: { from: offset, to: offset },
+        openArcClamp: { from: offset, to: offset },
+        completedRefence: { from: offset, to: offset, arcs: [], tokenMass: 0 },
+        eligibleEnd: offset,
+    };
+    if (offset >= protectedTailStart) {
+        args.observeDiagnostics?.(diagnostics);
         return { eligibleEndOrdinal: offset, oversizeAtomicUnit: false };
+    }
     let end = index.findHeadEndForCap(offset, protectedTailStart, capTokens);
+    diagnostics.capEnd = end;
+    diagnostics.capTokenSum = index.rangeTokens(offset, end);
     let oversizeAtomicUnit = end === offset + 1 && index.tokenForOrdinal(offset) > capTokens;
-    const completedFence = fenceBoundaryForCompletedToolArcs(
+    let completedFence = fenceBoundaryForCompletedToolArcs(
         end,
         arcs,
         lastCompartmentEndOrdinal + 1,
+        (component) => {
+            // Capture the actual fence component, not a reconstruction from a later session read.
+            diagnostics.completedFence.arcs = component.map((arc) => ({
+                assistant: arc.invocation,
+                result: arc.result,
+            }));
+            diagnostics.completedFence.tokenMass = index.rangeTokens(
+                Math.min(...component.map((arc) => arc.invocation)),
+                Math.max(...component.map((arc) => arc.result)) + 1,
+            );
+        },
     );
+    diagnostics.completedFence.from = end;
+    diagnostics.completedFence.to = completedFence;
+    diagnostics.oversizeAdmission.from = completedFence;
+    // If the cap cuts the leading completed tool-arc component, admit the entire
+    // overlapping component rather than returning an empty head. Never cross the
+    // protected tail; the open-arc clamp and final completed-arc fence below still apply.
+    if (completedFence <= offset && end > offset) {
+        const afterFirstArc = fenceBoundaryForCompletedToolArcs(end, arcs, offset + 1);
+        if (afterFirstArc <= protectedTailStart) completedFence = afterFirstArc;
+    }
+    diagnostics.oversizeAdmission.to = completedFence;
     if (completedFence > end) {
         end = Math.min(protectedTailStart, completedFence);
         if (index.rangeTokens(offset, end) > capTokens) oversizeAtomicUnit = true;
     } else {
         end = completedFence;
     }
+    diagnostics.openArcClamp.from = end;
     for (const arc of arcs) {
         const resOrdinal = arc.resOrdinal;
         if (resOrdinal === null) {
@@ -388,6 +477,28 @@ function applyHeadCap(args: {
             }
         }
     }
+    // An open invocation can sit inside an admitted overlapping component; the
+    // clamp above must not leave the final head boundary through a completed arc.
+    diagnostics.openArcClamp.to = end;
+    diagnostics.completedRefence.from = end;
+    end = fenceBoundaryForCompletedToolArcs(
+        end,
+        arcs,
+        lastCompartmentEndOrdinal + 1,
+        (component) => {
+            diagnostics.completedRefence.arcs = component.map((arc) => ({
+                assistant: arc.invocation,
+                result: arc.result,
+            }));
+            diagnostics.completedRefence.tokenMass = index.rangeTokens(
+                Math.min(...component.map((arc) => arc.invocation)),
+                Math.max(...component.map((arc) => arc.result)) + 1,
+            );
+        },
+    );
+    diagnostics.completedRefence.to = end;
+    diagnostics.eligibleEnd = end <= offset ? offset : Math.min(end, protectedTailStart);
+    args.observeDiagnostics?.(diagnostics);
     if (end <= offset && offset < protectedTailStart) {
         return { eligibleEndOrdinal: offset, oversizeAtomicUnit };
     }
@@ -426,6 +537,7 @@ export function resolveProtectedTailBoundary(
             sessionId: ctx.sessionId,
             mode: ctx.mode,
             offset,
+            lastCompartmentEndMessageId: ctx.lastCompartmentEndMessageId,
             offsetMessageId: null,
             protectedTailStart: 1,
             protectedTailStartMessageId: null,
@@ -483,6 +595,7 @@ export function resolveProtectedTailBoundary(
             sessionId: ctx.sessionId,
             mode: ctx.mode,
             offset,
+            lastCompartmentEndMessageId: ctx.lastCompartmentEndMessageId,
             offsetMessageId: boundaryMessageId(index, offset),
             protectedTailStart,
             protectedTailStartMessageId: null,
@@ -579,6 +692,11 @@ export function resolveProtectedTailBoundary(
     const forceMaterializationPercentage = escalationBands(
         ctx.executeThresholdPercentage,
     ).forceMaterializationPercentage;
+    const livePromptFloor: BoundaryDiagnostics["livePromptFloor"] = {
+        ordinal: null,
+        from: protectedTailStart,
+        to: protectedTailStart,
+    };
     if (!ctx.emergencyTailScale && usagePercentage < forceMaterializationPercentage) {
         let lastMeaningfulUserOrdinal = 0;
         for (let i = messages.length - 1; i >= 0; i--) {
@@ -588,10 +706,12 @@ export function resolveProtectedTailBoundary(
             lastMeaningfulUserOrdinal = message.ordinal;
             break;
         }
+        livePromptFloor.ordinal = lastMeaningfulUserOrdinal || null;
         if (lastMeaningfulUserOrdinal >= offset) {
             protectedTailStart = Math.min(protectedTailStart, lastMeaningfulUserOrdinal);
         }
     }
+    livePromptFloor.to = protectedTailStart;
     // Keep defer-pass cache keys stable when a tiny token fluctuation would move the ideal by one message.
     if (
         protectedTailStart > offset &&
@@ -606,7 +726,11 @@ export function resolveProtectedTailBoundary(
         contextLimit: ctx.contextLimit,
         executeThresholdPercentage: ctx.executeThresholdPercentage,
     });
+    let headDiagnostics!: HeadCapDiagnostics;
     const head = applyHeadCap({
+        observeDiagnostics: (value) => {
+            headDiagnostics = value;
+        },
         index,
         protectedTailStart,
         offset,
@@ -624,6 +748,7 @@ export function resolveProtectedTailBoundary(
         sessionId: ctx.sessionId,
         mode: ctx.mode,
         offset,
+        lastCompartmentEndMessageId: ctx.lastCompartmentEndMessageId,
         offsetMessageId: boundaryMessageId(index, offset),
         protectedTailStart,
         protectedTailStartMessageId: boundaryMessageId(index, protectedTailStart),
@@ -648,6 +773,40 @@ export function resolveProtectedTailBoundary(
         trueRawEligibleTokens: index.rangeTokens(offset, protectedTailStart),
         oversizeAtomicUnit: head.oversizeAtomicUnit,
         boundaryReason,
+        diagnostics: boundaryDiagnostics({
+            tailTarget: target,
+            usable: target.usable,
+            usagePercentage,
+            N: scaledN,
+            triggerBudget: ctx.triggerBudget,
+            capTokens: perRunCap,
+            sizeWalkStart: recentOpenArcCutoff,
+            protectedTailStart,
+            livePromptFloor,
+            head: headDiagnostics,
+        }),
+    };
+}
+
+function readLastCompartmentBoundary(
+    db: Database,
+    sessionId: string,
+): { endOrdinal: number; endMessageId: string | null } {
+    const row = db
+        .prepare(
+            `SELECT COALESCE(MAX(end_message), -1) AS max_end,
+                    (SELECT end_message_id FROM compartments
+                      WHERE session_id = ? ORDER BY sequence DESC LIMIT 1) AS end_message_id
+               FROM compartments WHERE session_id = ?`,
+        )
+        .get(sessionId, sessionId) as
+        | { max_end?: number | null; end_message_id?: string | null }
+        | undefined;
+    const endMessageId = row?.end_message_id;
+    return {
+        endOrdinal: typeof row?.max_end === "number" ? row.max_end : -1,
+        endMessageId:
+            typeof endMessageId === "string" && endMessageId.length > 0 ? endMessageId : null,
     };
 }
 
@@ -672,10 +831,16 @@ export function resolveBoundaryContext(args: {
      * tests) — unchanged.
      */
     taggerFloor?: number;
+    /** Pass-owned session_meta values; refreshed by the caller on the next pass. */
+    protectedTailMeta?: Pick<
+        ProtectedTailMeta,
+        "priorBoundaryOrdinal" | "protectedTailPolicyVersion"
+    >;
 }): ResolvedBoundaryContext {
-    const lastCompartmentEndOrdinal = getLastCompartmentEndMessage(args.db, args.sessionId);
+    const lastCompartmentBoundary = readLastCompartmentBoundary(args.db, args.sessionId);
+    const lastCompartmentEndOrdinal = lastCompartmentBoundary.endOrdinal;
     const triggerBudget = deriveTriggerBudget(args.contextLimit, args.executeThresholdPercentage);
-    let meta = loadProtectedTailMeta(args.db, args.sessionId);
+    let meta = args.protectedTailMeta ?? loadProtectedTailMeta(args.db, args.sessionId);
     let migrationFloorActive = false;
     if (meta.protectedTailPolicyVersion < 3) {
         let legacyBoundary = 1;
@@ -723,6 +888,7 @@ export function resolveBoundaryContext(args: {
         usage: args.usage ?? null,
         usageSource: args.usageSource ?? (args.usage ? "live" : "provisional-zero"),
         lastCompartmentEndOrdinal,
+        lastCompartmentEndMessageId: lastCompartmentBoundary.endMessageId,
         priorBoundaryOrdinal: meta.priorBoundaryOrdinal,
         protectedTailPolicyVersion: meta.protectedTailPolicyVersion,
         migrationFloorActive,
@@ -830,7 +996,11 @@ export function resolveWrapupProtectedTailBoundary(
         contextLimit: ctx.contextLimit,
         executeThresholdPercentage: ctx.executeThresholdPercentage,
     });
+    let headDiagnostics!: HeadCapDiagnostics;
     const head = applyHeadCap({
+        observeDiagnostics: (value) => {
+            headDiagnostics = value;
+        },
         index,
         protectedTailStart: targetProtectedTailStart,
         offset,
@@ -845,6 +1015,7 @@ export function resolveWrapupProtectedTailBoundary(
         sessionId: ctx.sessionId,
         mode: "manual-wrapup",
         offset,
+        lastCompartmentEndMessageId: ctx.lastCompartmentEndMessageId,
         offsetMessageId: boundaryMessageId(index, offset),
         protectedTailStart: targetProtectedTailStart,
         protectedTailStartMessageId: boundaryMessageId(index, targetProtectedTailStart),
@@ -869,6 +1040,22 @@ export function resolveWrapupProtectedTailBoundary(
         trueRawEligibleTokens: index.rangeTokens(offset, targetProtectedTailStart),
         oversizeAtomicUnit: head.oversizeAtomicUnit,
         boundaryReason,
+        diagnostics: boundaryDiagnostics({
+            tailTarget: target,
+            usable: target.usable,
+            usagePercentage,
+            N: target.N,
+            triggerBudget: ctx.triggerBudget,
+            capTokens: perRunCap,
+            sizeWalkStart: Math.max(offset, anchorRawMessageCount - keep + 1),
+            protectedTailStart: targetProtectedTailStart,
+            livePromptFloor: {
+                ordinal: null,
+                from: targetProtectedTailStart,
+                to: targetProtectedTailStart,
+            },
+            head: headDiagnostics,
+        }),
     };
     return {
         snapshot,

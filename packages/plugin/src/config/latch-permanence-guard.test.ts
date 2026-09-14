@@ -27,6 +27,11 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "VERDICT",
         reason: "Correct: a missing or unloadable native binding needs an install repair, which this process cannot observe.",
     },
+    "packages/plugin/src/features/magic-context/memory/embedding-local.ts:localEmbeddingProcessFailure":
+        {
+            classification: "DIAGNOSTIC",
+            reason: "Most-recent local runtime diagnostic: successful initialization and test reset both clear it; the separate runtime-mode slot owns the process verdict.",
+        },
     "packages/plugin/src/features/magic-context/memory/embedding-synapse.ts:sharedClientPromise": {
         classification: "VERDICT",
         reason: "DEFECT: a rejected connection promise remains shared after the daemon recovers.",
@@ -120,6 +125,10 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
     "packages/plugin/src/plugin/embedding-routing.ts:synapseProbeCache": {
         classification: "VERDICT",
         reason: "Saved: the promise has a 60-second TTL, including rejections, and discovery is retried after expiry.",
+    },
+    "packages/plugin/src/shared/opencode-db-path.ts:lastReadFailure": {
+        classification: "DIAGNOSTIC",
+        reason: "Most-recent OpenCode DB read diagnostic: a successful open clears it, and path discovery re-probes after disappearance.",
     },
     "packages/plugin/src/shared/models-dev-cache.ts:authRewarmDone": {
         classification: "VERDICT",

@@ -17,10 +17,32 @@ describe("embedding routing", () => {
         expect(routing.primary).toEqual({
             provider: "local",
             model: "Xenova/all-MiniLM-L6-v2",
+            local_runtime: "auto",
         });
         expect(routing.primary).not.toHaveProperty("fallback_provider");
         expect(config.subc?.connection_file).toBe(`${homedir()}/run/subc.json`);
         expect(routing.warnings.some((warning) => warning.includes("Synapse"))).toBe(true);
+    });
+
+    it("preserves query and document recipes for an OpenAI-compatible fallback", async () => {
+        const config = MagicContextConfigSchema.parse({
+            embedding: {
+                provider: "synapse",
+                fallback_provider: "openai-compatible",
+                endpoint: "https://example.test/v1",
+                model: "qwen/qwen3-embedding-8b",
+                query_instruction: "Instruct: custom\nQuery: ",
+                document_prefix: "document: ",
+            },
+        });
+
+        const routing = await resolveEmbeddingRouting({ config, projectRoot: "/repo" });
+
+        expect(routing.primary).toMatchObject({
+            provider: "openai-compatible",
+            query_instruction: "Instruct: custom\nQuery: ",
+            document_prefix: "document: ",
+        });
     });
 
     it("warns and falls back when Synapse has no transport block", async () => {

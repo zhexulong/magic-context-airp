@@ -9,23 +9,26 @@ import {
 } from "./model-resolution";
 
 describe("model-resolution", () => {
-    test("pins the historian calibration defaults while preserving explicit overrides", () => {
-        expect(resolveHistorianAgentOverrides(undefined)).toEqual({
-            temperature: 0.1,
-            maxTokens: 32_000,
-        });
-        expect(
-            resolveHistorianAgentOverrides({
-                temperature: 0.2,
+    test("keeps historian temperature opt-in while preserving explicit overrides", () => {
+        const fixtures = [
+            { temperature: undefined, expected: undefined },
+            { temperature: 0.1, expected: 0.1 },
+            { temperature: 0, expected: 0 },
+        ] as const;
+        for (const fixture of fixtures) {
+            const resolved = resolveHistorianAgentOverrides({
+                ...(fixture.temperature !== undefined ? { temperature: fixture.temperature } : {}),
                 maxTokens: 16_000,
                 opencode: { model: "google/flash", variant: "low" },
-            }),
-        ).toEqual({
-            temperature: 0.2,
-            maxTokens: 16_000,
-            model: "google/flash",
-            variant: "low",
-        });
+                pi: { model: "pi/must-not-leak", thinking_level: "high" },
+            });
+            expect(resolved).toEqual({
+                maxTokens: 16_000,
+                ...(fixture.expected !== undefined ? { temperature: fixture.expected } : {}),
+                model: "google/flash",
+                variant: "low",
+            });
+        }
     });
 
     test("normalizes string and object entries to the same model identity", () => {
@@ -56,7 +59,7 @@ describe("model-resolution", () => {
         ]);
     });
 
-    test("applies the flash-calibrated historian generation triple while preserving overrides", () => {
+    test("keeps the flash calibration available only as an explicit override", () => {
         expect(
             resolveHistorianAgentOverrides({
                 opencode: { model: { model: "google/flash", variant: "fast" } },
@@ -64,15 +67,14 @@ describe("model-resolution", () => {
                 two_pass: true,
             }),
         ).toEqual({
-            temperature: 0.1,
             maxTokens: 32_000,
             two_pass: true,
             model: "google/flash",
             variant: "fast",
         });
         expect(
-            resolveHistorianAgentOverrides({ temperature: 0.2, maxTokens: 12_000 }),
-        ).toMatchObject({ temperature: 0.2, maxTokens: 12_000 });
+            resolveHistorianAgentOverrides({ temperature: 0.1, maxTokens: 12_000 }),
+        ).toMatchObject({ temperature: 0.1, maxTokens: 12_000 });
     });
 
     test("does not inherit a block qualifier into unqualified fallbacks", () => {
@@ -126,6 +128,67 @@ describe("model-resolution", () => {
             primary: { model: "pi/model", qualifier: "high" },
             fallbacks: [{ model: "pi/fallback", qualifier: "max" }],
         });
+    });
+
+    test("uses OMP blocks first, falls back to Pi blocks, then preserves existing defaults", () => {
+        const configured = {
+            historian: {
+                pi: {
+                    model: { model: "pi/historian", thinking_level: "high" },
+                    fallback_models: ["pi/historian-fallback"],
+                },
+                omp: {
+                    model: { model: "omp/historian", thinking_level: "auto" },
+                    fallback_models: [{ model: "omp/historian-fallback", thinking_level: "max" }],
+                },
+            },
+            dreamer: {
+                tasks: { verify: { schedule: "0 3 * * *" } },
+                pi: {
+                    model: "pi/dreamer",
+                    tasks: { verify: { model: "pi/verify" } },
+                },
+                omp: {
+                    model: "omp/dreamer",
+                    tasks: {
+                        verify: {
+                            model: { model: "omp/verify", thinking_level: "inherit" },
+                        },
+                    },
+                },
+            },
+        };
+
+        expect(resolveHistorianModel(configured, "omp")).toEqual({
+            primary: { model: "omp/historian", qualifier: "auto" },
+            fallbacks: [{ model: "omp/historian-fallback", qualifier: "max" }],
+        });
+        expect(
+            resolveDreamerTaskModel({ config: configured, harness: "omp", task: "verify" }),
+        ).toMatchObject({ primary: { model: "omp/verify", qualifier: "inherit" } });
+
+        const piFallback = {
+            historian: configured.historian,
+            dreamer: { ...configured.dreamer, omp: undefined },
+        };
+        delete (piFallback.historian as { omp?: unknown }).omp;
+        expect(resolveHistorianModel(piFallback, "omp")?.primary).toEqual({
+            model: "pi/historian",
+            qualifier: "high",
+        });
+        expect(
+            resolveDreamerTaskModel({ config: piFallback, harness: "omp", task: "verify" }),
+        ).toMatchObject({ primary: { model: "pi/verify" } });
+
+        expect(resolveHistorianModel({}, "omp")).toEqual({ fallbacks: [] });
+        const existingDefaults = resolveDreamerTaskModel({
+            config: { dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } } },
+            harness: "omp",
+            task: "verify",
+        });
+        expect(existingDefaults.primary).toBeUndefined();
+        expect(existingDefaults.fallbacks).toEqual([]);
+        expect(existingDefaults.schedule).toBe("0 3 * * *");
     });
 
     test("resolves ordinary task model and scheduling without crossing harnesses", () => {

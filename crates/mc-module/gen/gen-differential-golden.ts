@@ -1,5 +1,5 @@
 /**
- * DG-1..6 reference generator.
+ * DG-1..8 reference generator.
  *
  * The reference side intentionally owns only canonical JSON and wire-visible fields. Rust
  * consumes the exact request fixtures in-process; neither side derives expected bytes from the
@@ -8,7 +8,7 @@
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
-const generatorVersion = "dg-reference-v4";
+const generatorVersion = "dg-reference-v7";
 const textMessage = (role: string, text: string, id?: string) => ({
   role,
   content: [{ kind: { type: "text", text } }],
@@ -18,6 +18,21 @@ const syntheticTextMessage = (role: string, text: string, id: string) => ({
   ...textMessage(role, text, id),
   meta: { harness_id: id, synthetic: true },
 });
+const floatToolMessage = {
+  role: "assistant",
+  content: [
+    {
+      kind: {
+        type: "tool_call",
+        id: "call-float-wire",
+        name: "threshold_probe",
+        input: { threshold: 0.1 },
+        provider_executed: false,
+      },
+    },
+  ],
+  meta: { harness_id: "assistant-float-tool" },
+} as const;
 const userTerminatedReference = (messages: readonly ReturnType<typeof textMessage>[]) => {
   const output = [...messages];
   const userIndex = output.findLastIndex((message) => message.role === "user");
@@ -90,6 +105,36 @@ const trailingBlankKeepReference = (messages: typeof incidentMessages) => {
   }
   return output;
 };
+// OpenCode step-start and step-finish parts reach CK wire as these empty-text sentinels.
+const trailingBlankStripMessages = [
+  {
+    role: "assistant",
+    content: [
+      { kind: { type: "text", text: "" } },
+      { kind: { type: "reasoning", text: "signed thinking", signature: "sig" } },
+      { kind: { type: "text", text: "completed answer" } },
+      { kind: { type: "text", text: "" } },
+    ],
+    meta: { harness_id: "assistant-target" },
+  },
+] as const;
+const trailingBlankStripReference = (messages: typeof trailingBlankStripMessages) => {
+  const output = structuredClone(messages);
+  output[0].content.pop();
+  return output;
+};
+const trailingBlankKeepThreeMessages = [
+  {
+    role: "assistant",
+    content: [
+      { kind: { type: "text", text: "completed answer" } },
+      { kind: { type: "text", text: "" } },
+      { kind: { type: "text", text: "" } },
+      { kind: { type: "text", text: "" } },
+    ],
+    meta: { harness_id: "assistant-target" },
+  },
+] as const;
 const scenarios = [
   {
     id: "DG-1-bust-veto",
@@ -148,6 +193,40 @@ const scenarios = [
     },
     output: { status: "ok", action: "passthrough", decision: "keep-no-manufacture" },
     referenceWire: trailingBlankKeepReference(incidentMessages),
+  },
+  {
+    id: "DG-7-trailing-blank-newest-history-stability",
+    family: "trailing-blank-newest-history-stability",
+    input: {
+      session_id: "dg-trailing-blank-transition",
+      markers: ["signed-reasoning", "newest-to-historical", "frozen-strip"],
+      frozen_decision: { message_id: "assistant-target", decision: "strip" },
+      messages: trailingBlankStripMessages,
+    },
+    output: { status: "ok", action: "passthrough", decision: "strip-replay-stable" },
+    referenceWire: trailingBlankStripReference(trailingBlankStripMessages),
+  },
+  {
+    id: "DG-8-trailing-blank-keep-count-position-stability",
+    family: "trailing-blank-keep-count-position-stability",
+    input: {
+      session_id: "dg-trailing-blank-keep-count",
+      markers: ["newest-to-historical", "frozen-keep-count"],
+      frozen_decision: { message_id: "assistant-target", decision: "keep:3" },
+      messages: trailingBlankKeepThreeMessages,
+    },
+    output: { status: "ok", action: "passthrough", decision: "keep-count-replay-stable" },
+    referenceWire: structuredClone(trailingBlankKeepThreeMessages),
+  },
+  {
+    id: "DG-9-float-tool-input-wire",
+    family: "float-tool-input-wire",
+    input: {
+      session_id: "dg-float-tool-input",
+      markers: ["float-tool-input", "number-wire"],
+      messages: [floatToolMessage],
+    },
+    output: { status: "ok", action: "passthrough", decision: "preserve-number-wire" },
   },
 ] as const;
 

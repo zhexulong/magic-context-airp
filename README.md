@@ -96,7 +96,7 @@ irm https://raw.githubusercontent.com/cortexkit/magic-context/master/scripts/ins
 npx @cortexkit/magic-context@latest setup
 ```
 
-The wizard auto-detects which harnesses you have (OpenCode, Pi, OMP, or any combination), adds the plugin, disables built-in compaction, helps you pick models for the historian, dreamer, and sidekick, and resolves conflicts with other context-management plugins. Target one with `--harness opencode`, `--harness pi`, or `--harness omp`.
+The wizard auto-detects which harnesses you have (OpenCode, Pi, OMP, or any combination), adds the plugin, disables built-in compaction, helps you pick models for the historian and dreamer, and resolves conflicts with other context-management plugins. Target one with `--harness opencode`, `--harness pi`, or `--harness omp`.
 
 > **Why disable built-in compaction?** Magic Context manages context itself. The host's compaction would interfere with its cache-aware deferred operations and double-compress.
 
@@ -125,7 +125,7 @@ Then create `magic-context.jsonc` with the OpenCode historian setting:
 ```
 
 - **Required:** `historian.opencode.model` must be a real `provider/model-id`. Without it, the plugin loads but historian runs fail, older history is not summarized, and repeated failures show a `Magic Context — history comparting needs attention` notice.
-- **Optional:** `dreamer` and `sidekick` model/disable blocks. Omit them to leave periodic memory consolidation and `/ctx-aug` off.
+- **Optional:** the `dreamer` model/disable block. Omit it to leave periodic memory consolidation off.
 - **Optional:** `embedding`. Omit it to use the local `Xenova/all-MiniLM-L6-v2`; turning embeddings off removes semantic/embedding-backed search, but keyword search and context management continue.
 
 ### Flat model-config migration (before/after)
@@ -154,10 +154,16 @@ per-harness **after** form for all new configuration.
     "pi": {
       "model": "provider/model-id",
       "thinking_level": "medium"
+    },
+    "omp": {
+      "model": "opencode/provider-model-id",
+      "thinking_level": "auto"
     }
   }
 }
 ```
+
+OMP uses Pi-native `thinking_level` qualifiers. If `historian.omp` or `dreamer.omp` is absent, OMP falls back to the matching `pi` block, so existing Pi-compatible configurations need no migration. An explicit OMP block is authoritative even when it omits a model.
 
 User-level config is `~/.config/cortexkit/magic-context.jsonc` on macOS/Linux and `%USERPROFILE%\.config\cortexkit\magic-context.jsonc` on Windows (or `$XDG_CONFIG_HOME/cortexkit/magic-context.jsonc` when set). OpenCode Desktop users can use the dashboard's config editor or hand-edit that file; Desktop does not include the CLI setup wizard.
 
@@ -296,7 +302,6 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 | `/ctx-recomp` | Rebuild compartments from raw history (accepts a `start-end` range). Use when stored state seems wrong |
 | `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest N messages raw; queued compaction materializes on the next model message |
 | `/ctx-session-upgrade` | Upgrade this session to the latest history format: rebuild compartments and migrate project memories |
-| `/ctx-aug` | Run sidekick augmentation on a prompt: retrieve relevant memories via a separate model |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
 | `/ctx-embed` | Embedding status, or start/pause history compartment embedding (`start` \| `pause`) |
 
@@ -323,9 +328,9 @@ It reads directly from Magic Context's SQLite database. No extra server, no API.
 
 ## Configuration
 
-Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but the active harness's historian model (`historian.opencode.model` or `historian.pi.model`) is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, memory settings, and prompt-surface presets (`full`/`light`) — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
+Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but the active harness's historian model (`historian.opencode.model`, `historian.pi.model`, or `historian.omp.model`) is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, memory settings, and prompt-surface presets (`full`/`light`) — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
 
-> **Note on per-model settings (OpenCode/Pi):** settings that route per model — like `prompt_surface.models` — apply to the injected guidance block. Tool descriptions are registered once per process by the current (v1) plugin API and follow the default preset; per-model tool descriptions arrive with the OpenCode v2 plugin API once the SDK stabilizes ([#260](https://github.com/cortexkit/magic-context/issues/260)).
+> **Note on per-model settings (OpenCode/Pi/OMP):** settings that route per model — like `prompt_surface.models` — apply to the injected guidance block. Tool descriptions are registered once per process by the current (v1) plugin API and follow the default preset; per-model tool descriptions arrive with the OpenCode v2 plugin API once the SDK stabilizes ([#260](https://github.com/cortexkit/magic-context/issues/260)).
 
 **Config locations** (one shared CortexKit location, project overrides user):
 1. `<project-root>/.cortexkit/magic-context.jsonc`
@@ -351,7 +356,7 @@ If your personal repositories use one hidden-agent model set and work repositori
 { "profile": "work" }
 ```
 
-This is the work-repositories-versus-personal-repositories setup requested by kagbodji. Profiles overlay only hidden-agent model selection, preserve base settings that they do not mention, and are defined only in user config. A project can select a known user profile but cannot supply its contents. See [CONFIGURATION.md](./CONFIGURATION.md#per-repository-model-profiles) for the full OpenCode/Pi example, fallback behavior, and trust boundary.
+This is the work-repositories-versus-personal-repositories setup requested by kagbodji. Profiles overlay only hidden-agent model selection, preserve base settings that they do not mention, and are defined only in user config. A project can select a known user profile but cannot supply its contents. See [CONFIGURATION.md](./CONFIGURATION.md#per-repository-model-profiles) for the full OpenCode/Pi/OMP example, fallback behavior, and trust boundary.
 
 ---
 
@@ -400,6 +405,25 @@ Dream execution requires a live OpenCode server (the dreamer creates ephemeral c
 
 ---
 
+### Cache-bust sentinel
+
+`packages/plugin/scripts/cache-bust-sentinel.ts` audits recent OpenCode and Pi/OMP provider requests for cache busts that are not explained by Magic Context's fold, refresh, reduction, flush, force-band, or provider/system-prompt contracts. It joins each provider request to MC's nearest pass record from 30 seconds before through five seconds after the request from `transform_decisions`/`scheduler_history` in `context.db` and the rust-mode `mc_pass_trace`/decision mirror in `store.db`; requests without a matching pass are reported as `no_mc_pass_row`. It opens both databases, OpenCode's database, auth-plugin dumps, Pi/OMP JSONL, and `.pi/pi-llm-debugging`/served-array artifacts read-only. Its only local write is the high-water/dedup state file at `~/.local/share/cortexkit/magic-context/cache-bust-sentinel-state.json` (or the resolved `MAGIC_CONTEXT_STORAGE_DIR`).
+
+Run a single dry pass from the repository root; each new unaccounted bust window is printed as one JSON line:
+
+```sh
+bun packages/plugin/scripts/cache-bust-sentinel.ts --once
+```
+
+Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/launchd every 1–5 minutes. The template at `packages/plugin/scripts/launchd/com.cortexkit.magic-context.cache-bust-sentinel.plist` uses a five-minute cadence, deliberately has `RunAtLoad=false`, and is not installed automatically. Replace its `__BUN_PATH__`, `__REPO_ROOT__`, and `__LOG_DIR__` placeholders before loading it. A cron equivalent is:
+
+```cron
+*/5 * * * * cd /path/to/magic-context && /path/to/bun packages/plugin/scripts/cache-bust-sentinel.ts --once >> /path/to/cache-bust-sentinel.jsonl 2>> /path/to/cache-bust-sentinel.log
+```
+
+`--send` switches from JSON-line dry-run output to the `prefrontal` module's `wake.event_record` subc operation. Do not enable it until that operation is deployed. Known dispositions (`accepted`, `unowned_session`, `dedup`, and `superseded`) are counted and logged; malformed replies fail the run. Use `--connection-file`, `--wake-module-id`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
+
+---
 ## Contributing
 
 Bug reports and pull requests are welcome. For larger changes, open an issue first to discuss the approach. Run `bun run format` before submitting; CI rejects unformatted code.

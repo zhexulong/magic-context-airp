@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	clearSession,
+	getOrCreateSessionMeta,
+	getTagsBySession,
+	insertTag,
+	openDatabase,
+	updateSessionMeta,
+} from "@magic-context/core/features/magic-context/storage";
+import {
+	cleanupTestTempDir,
+	createTestTempDir,
+} from "@magic-context/core/shared/test-temp-dir";
+
 import { awaitInFlightHistorians } from "./context-handler";
 import { __test as dreamerTest } from "./dreamer";
 import magicContextPiExtension, { __test } from "./index";
@@ -25,8 +37,11 @@ function restoreEnv() {
 	}
 }
 
+const tempRoots: string[] = [];
+
 function isolateXdgEnv(): string {
-	const root = mkdtempSync(join(tmpdir(), "magic-context-pi-latch-test-"));
+	const root = createTestTempDir("magic-context-pi-latch-test-").dir;
+	tempRoots.push(root);
 	const configHome = join(root, "config");
 	process.env.XDG_CONFIG_HOME = configHome;
 	// Use the preload's migration-safe test database; isolate only configuration.
@@ -122,6 +137,7 @@ function createCountingPi() {
 
 afterEach(() => {
 	restoreEnv();
+	for (const root of tempRoots.splice(0)) cleanupTestTempDir(root);
 	// The marker context lives on globalThis (process-global by design), so clear it
 	// between tests or one test's child state could suppress the next.
 	__test.clearPiInProcessSubagentInitContext();
@@ -152,14 +168,20 @@ describe("Pi in-process child guard (#247)", () => {
 		expect(first.events.length).toBeGreaterThan(0);
 		expect(first.tools).toContain("ctx_search");
 		expect(first.commands).toContain("ctx-status");
-		expect(first.entryRenderers).toEqual(["ctx-status"]);
+		expect(first.entryRenderers).toEqual([
+			"magic-context-turn-refused",
+			"ctx-status",
+		]);
 
 		const second = createCountingPi();
 		await magicContextPiExtension(second.pi);
 		expect(second.events.length).toBeGreaterThan(0);
 		expect(second.tools).toContain("ctx_search");
 		expect(second.commands).toContain("ctx-status");
-		expect(second.entryRenderers).toEqual(["ctx-status"]);
+		expect(second.entryRenderers).toEqual([
+			"magic-context-turn-refused",
+			"ctx-status",
+		]);
 	}, 15_000);
 
 	it("keeps session B historian and Dreamer live when session A shuts down", async () => {
@@ -314,6 +336,40 @@ describe("Pi in-process child guard (#247)", () => {
 			);
 		}
 	}, 20_000);
+
+	it("Pi lifecycle adjudication: reversible switch and shutdown preserve durable session state", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		const sessionId = "ses-pi-reversible-lifecycle-pin";
+		const db = openDatabase();
+		try {
+			await magicContextPiExtension(runtime.pi);
+			insertTag(db, sessionId, "m-1", "message", 100, 1);
+			updateSessionMeta(db, sessionId, {
+				lastContextPercentage: 61,
+				lastInputTokens: 61_000,
+			});
+			const ctx = {
+				sessionManager: { getSessionId: () => sessionId },
+				ui: { setStatus: () => undefined },
+			};
+
+			await runtime.emitPiEvent("session_before_switch", {}, ctx);
+			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(
+				61_000,
+			);
+
+			await runtime.emitPiEvent("session_shutdown", {}, ctx);
+			expect(getTagsBySession(db, sessionId)).toHaveLength(1);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(
+				61_000,
+			);
+		} finally {
+			clearSession(db, sessionId);
+		}
+	}, 15_000);
 
 	it("unsubscribes child lifecycle listeners on session shutdown", async () => {
 		isolateXdgEnv();
@@ -561,7 +617,10 @@ describe("Pi in-process child guard (#247)", () => {
 		await magicContextPiExtension(independent.pi);
 		expect(independent.tools).toContain("ctx_search");
 		expect(independent.commands).toContain("ctx-status");
-		expect(independent.entryRenderers).toEqual(["ctx-status"]);
+		expect(independent.entryRenderers).toEqual([
+			"magic-context-turn-refused",
+			"ctx-status",
+		]);
 		expect(__test.claimPiStartupMaintenance()).toBe(false);
 	}, 20_000);
 

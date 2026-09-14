@@ -15,6 +15,8 @@ import {
 } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
+import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
+import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
@@ -28,8 +30,10 @@ export interface PiDreamerOptions {
 	registrationOwner: object;
 	/** Resolved runnable DreamerConfig from loadPiConfig(). When disable=true, the caller does not register. */
 	config: DreamerConfig;
+	/** Active Pi-compatible host used to select per-harness model configuration. */
+	harness: Extract<ModelHarness, "pi" | "omp">;
 	/**
-	 * Council finding #7: dreamer needs the real embedding config so it can
+	 * Dreamer needs the real embedding config so it can
 	 * (a) maintain near-duplicate/stale memories using deterministic file gates and
 	 * (b) re-embed memory content when it gets rewritten by `improve`.
 	 * Hardcoded `{provider:"off"}` previously meant dreamer skipped both
@@ -37,7 +41,7 @@ export interface PiDreamerOptions {
 	 */
 	embeddingConfig: EmbeddingConfig;
 	/**
-	 * Council finding #7: dreamer needs the real memory.enabled gate so the
+	 * Dreamer needs the real memory.enabled gate so the
 	 * memory-promotion pipeline (consolidation + improve + archive) can
 	 * actually write to the project memory store. Hardcoded `false`
 	 * previously made dreamer's memory tasks a no-op.
@@ -202,11 +206,13 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	void startDreamScheduleTimerFn({
 		directory: opts.projectDir,
 		projectIdentity: opts.projectIdentity,
-		harness: "pi",
+		harness: opts.harness,
 		client,
 		dreamerConfig: opts.config,
 		language: opts.language,
 		gitCommitIndexing: opts.gitCommitIndexing,
+		memoryEnabled: opts.memoryEnabled,
+		embeddingConfig: opts.embeddingConfig,
 		retinaHandoff: opts.retinaHandoff,
 		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
@@ -264,7 +270,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 			projectIdentity: manualOpts.projectIdentity,
 			tasks: buildDreamTaskRuntimeConfigs(
 				manualOpts.config,
-				"pi",
+				manualOpts.harness,
 				manualOpts.language,
 				manualOpts.mural?.model,
 			),
@@ -418,6 +424,9 @@ function createPiDreamerClient(
 			});
 			return { id: sessionId };
 		},
+		// PiSubagentRunner owns accounting because it sees every message_end usage
+		// payload. Keeping this list empty prevents the shared executor from writing
+		// a second, synthetic invocation row for the same task.
 		list: async () => ({ data: [] as Array<{ id: string }> }),
 		prompt: async (args: SessionPromptArgs) => {
 			const sessionId = args.path.id;
@@ -455,6 +464,9 @@ function createPiDreamerClient(
 				// `variant`; the Pi facade translates that same wire field into
 				// `--thinking` without letting a primary level leak to fallbacks.
 				thinkingLevel: extractBodyVariant(args),
+				accountingSessionId: opts.projectIdentity,
+				accountingSubagent: "dreamer",
+				accountingTask: accountingTaskFromTitle(dreamSession.title),
 			});
 			inFlightDreams.set(runPromise, opts.registrationOwner);
 			try {
@@ -474,9 +486,14 @@ function createPiDreamerClient(
 					makeMessage("assistant", [
 						// Synthetic tool parts first so investigationToolCallCount
 						// (refresh-primers grounding gate) sees the agent's tool use,
-						// then the final answer text.
-						...syntheticToolParts(result.toolCallCount ?? 0),
-						{ type: "text", text: result.assistantText },
+						// then the final answer text when the runner produced one.
+						...syntheticToolParts(
+							result.toolCallCount ?? 0,
+							result.completedToolCalls,
+						),
+						...(result.assistantText
+							? [{ type: "text" as const, text: result.assistantText }]
+							: []),
 					]),
 				];
 				// G5: fire conservatively after every successful dreamer task. Many
@@ -514,6 +531,17 @@ function readDirectory(args: { query?: unknown }): string | undefined {
 	return typeof directory === "string" && directory.length > 0
 		? directory
 		: undefined;
+}
+
+function accountingTaskFromTitle(title: string | undefined): string | null {
+	if (!title) return null;
+	if (title.startsWith("magic-context-smart-note-confirm-")) {
+		return "evaluate-smart-notes";
+	}
+	const task = title.slice("magic-context-dream-".length);
+	if (!title.startsWith("magic-context-dream-") || task.length === 0)
+		return null;
+	return task === "classify" ? "classify-memories" : task;
 }
 
 function readSessionTitle(args: { body?: unknown }): string | undefined {
@@ -592,22 +620,43 @@ function extractBodyAgent(args: { body?: unknown }): string | undefined {
 
 type SyntheticPart =
 	| { type: "text"; text: string }
-	| { type: "tool"; tool: string; state: { input: { description: string } } };
+	| {
+			type: "tool";
+			callID?: string;
+			tool: string;
+			state: {
+				status?: "completed";
+				input: Record<string, unknown>;
+				output?: string;
+			};
+	  };
 
 /**
- * Build `toolCallCount` synthetic tool parts so the shared
- * `investigationToolCallCount` / `extractToolCallSummaries` (which require
- * `{ type: "tool", tool, state }`) sees the agent's investigation on Pi. Pi's
- * facade only carries the final assistant text, so without these the
- * refresh-primers grounding gate (count > 0) would reject every Pi answer.
+ * Rebuild tool parts for the shared executor. Completed calls retain their
+ * tool identity and result status; the remaining count becomes generic parts
+ * for read-only grounding gates that only need to know whether tools were used.
  */
-function syntheticToolParts(count: number): SyntheticPart[] {
-	const safe = Math.max(0, Math.floor(count));
-	return Array.from({ length: safe }, () => ({
+function syntheticToolParts(
+	count: number,
+	completedCalls: readonly CompletedSubagentToolCall[] = [],
+): SyntheticPart[] {
+	const safe = Math.max(completedCalls.length, Math.max(0, Math.floor(count)));
+	const completed = completedCalls.map((call, index) => ({
+		type: "tool" as const,
+		callID: `pi-completed-tool-${index}`,
+		tool: call.name,
+		state: {
+			status: "completed" as const,
+			input: call.arguments,
+			output: "completed",
+		},
+	}));
+	const remaining = Array.from({ length: safe - completed.length }, () => ({
 		type: "tool" as const,
 		tool: "investigation",
 		state: { input: { description: "investigation step" } },
 	}));
+	return [...completed, ...remaining];
 }
 
 function makeMessage(

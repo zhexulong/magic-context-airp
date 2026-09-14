@@ -18,7 +18,7 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
-        expect(validation.files.length).toBe(61);
+        expect(validation.files.length).toBe(79);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -29,12 +29,28 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(41);
-        expect(rust).toHaveLength(32);
+        expect(ts).toHaveLength(44);
+        expect(rust).toHaveLength(37);
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(22);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(19);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(22);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
-        expect(new Set([...ts, ...rust]).size).toBe(validation.files.length);
+        const excluded = validation.manifest.entries
+            .filter((entry) => entry.tier === "excluded")
+            .map((entry) => entry.path);
+        expect([...excluded].sort()).toEqual([
+            "tests/opencode2/adapters-s2-contracts.test.ts",
+            "tests/opencode2/adapters-s3-marker-policy.test.ts",
+            "tests/opencode2/context-s2-lanes.test.ts",
+            "tests/opencode2/entry-s2-context.test.ts",
+            "tests/opencode2/harness-s3-identity.test.ts",
+            "tests/opencode2/hidden-s3-executor.test.ts",
+            "tests/opencode2/pins.test.ts",
+            "tests/opencode2/probes.test.ts",
+            "tests/opencode2/runner.test.ts",
+            "tests/opencode2/store-reader.test.ts",
+            "tests/window-overlay-reload.test.ts",
+        ]);
+        expect(new Set([...ts, ...rust]).size).toBe(validation.files.length - excluded.length);
     });
 
     it("rejects a missing, duplicated, or dead manifest path", () => {

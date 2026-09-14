@@ -4,6 +4,8 @@ import { estimateTokens } from "../../hooks/magic-context/read-session-formattin
 import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { isSynapseEmbeddingTruncated } from "./memory/embedding-synapse";
+import { messageFtsOrdinalRangeIsMapped } from "./message-fts-rowid-map";
 import { recursiveCharacterSplit } from "./recursive-text-splitter";
 
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
@@ -108,15 +110,26 @@ export interface SaveCompartmentChunkEmbeddingInput {
     createdAt?: number;
 }
 
+export const MESSAGE_FTS_CHUNK_LOAD_SQL = `SELECT map.message_ordinal AS messageOrdinal, fts.role, fts.content
+ FROM message_fts_rowid_map AS map
+ CROSS JOIN message_history_fts AS fts
+   ON fts.rowid = map.fts_rowid
+ WHERE map.session_id = ?
+   AND map.message_ordinal BETWEEN ? AND ?
+   AND fts.role IN ('user', 'assistant')
+ ORDER BY map.message_ordinal ASC`;
+
 const loadFtsRowsStatements = new WeakMap<Database, PreparedStatement>();
 const existingHashStatements = new WeakMap<Database, PreparedStatement>();
 const existingHashByProjectStatements = new WeakMap<Database, PreparedStatement>();
 const deleteByCompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const insertEmbeddingStatements = new WeakMap<Database, PreparedStatement>();
+const renumberEmbeddingWindowStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
 const searchPoolProbeStatements = new WeakMap<Database, PreparedStatement>();
 const backfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
+const shadowBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
 const DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const decodedSearchPools = new WeakMap<Database, Map<string, DecodedSearchPoolEntry>>();
@@ -126,15 +139,7 @@ let decodedSearchPoolBytes = 0;
 function getLoadFtsRowsStatement(db: Database): PreparedStatement {
     let stmt = loadFtsRowsStatements.get(db);
     if (!stmt) {
-        stmt = db.prepare(
-            `SELECT message_ordinal AS messageOrdinal, role, content
-             FROM message_history_fts
-             WHERE session_id = ?
-               AND message_ordinal >= ?
-               AND message_ordinal <= ?
-               AND role IN ('user', 'assistant')
-             ORDER BY message_ordinal ASC`,
-        );
+        stmt = db.prepare(MESSAGE_FTS_CHUNK_LOAD_SQL);
         loadFtsRowsStatements.set(db, stmt);
     }
     return stmt;
@@ -178,6 +183,22 @@ function getInsertEmbeddingStatement(db: Database): PreparedStatement {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         );
         insertEmbeddingStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getRenumberEmbeddingWindowStatement(db: Database): PreparedStatement {
+    let stmt = renumberEmbeddingWindowStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `UPDATE compartment_chunk_embeddings
+             SET window_index = ?
+             WHERE compartment_id = ?
+               AND model_id = ?
+               AND project_path = ?
+               AND window_index = ?`,
+        );
+        renumberEmbeddingWindowStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -243,17 +264,39 @@ function getBackfillCandidateStatement(db: Database): PreparedStatement {
               AND sp.project_path = ?
              WHERE c.start_message IS NOT NULL
                AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
-             ORDER BY c.created_at DESC, c.id DESC
-             LIMIT ?`,
+             ORDER BY c.created_at DESC, c.id DESC`,
         );
         backfillCandidateStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getShadowBackfillCandidateStatement(db: Database): PreparedStatement {
+    let stmt = shadowBackfillCandidateStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
+             FROM compartments c
+             JOIN session_projects sp
+               ON sp.session_id = c.session_id
+              AND sp.harness = c.harness
+              AND sp.project_path = ?
+             WHERE c.start_message IS NOT NULL
+               AND c.end_message IS NOT NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM compartment_chunk_embeddings primary_chunks
+                   WHERE primary_chunks.compartment_id = c.id
+                     AND primary_chunks.project_path = ?
+                     AND primary_chunks.model_id = ?
+               )
+             ORDER BY c.created_at DESC, c.id DESC`,
+        );
+        shadowBackfillCandidateStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -393,6 +436,19 @@ function parseCanonicalLineRange(line: string): { start: number; end: number } |
     return { start, end };
 }
 
+function assertOrdinalRangeWithinCompartment(
+    rangeStart: number,
+    rangeEnd: number,
+    compartmentStart: number,
+    compartmentEnd: number,
+): void {
+    if (rangeStart < compartmentStart || rangeEnd > compartmentEnd || rangeEnd < rangeStart) {
+        throw new RangeError(
+            `Canonical chunk range ${rangeStart}-${rangeEnd} lies outside compartment ${compartmentStart}-${compartmentEnd}`,
+        );
+    }
+}
+
 function hashChunkText(text: string): string {
     return createHash("sha256").update(text).digest("hex");
 }
@@ -414,8 +470,9 @@ export function buildCanonicalChunkTextFromFts(
     sessionId: string,
     startOrdinal: number,
     endOrdinal: number,
-): string {
+): string | null {
     if (endOrdinal < startOrdinal) return "";
+    if (!messageFtsOrdinalRangeIsMapped(db, sessionId, startOrdinal, endOrdinal)) return null;
     const rows = getLoadFtsRowsStatement(db)
         .all(sessionId, startOrdinal, endOrdinal)
         .map((row) => row as FtsChunkRow);
@@ -533,6 +590,17 @@ export function canonicalizeInMemoryChunkTextForEmbedding(
             continue;
         }
 
+        const clipsRequestedRange =
+            (startOrdinal != null && lineStart < startOrdinal) ||
+            (endOrdinal != null && lineEnd > endOrdinal);
+        if (clipsRequestedRange) {
+            // Merged historian blocks can include filtered ordinals, while a single
+            // message can itself contain " / ". Without one part per ordinal there
+            // is no faithful way to clip the text. Reject the in-memory chunk so the
+            // publish path reconstructs this compartment's exact span from FTS.
+            return "";
+        }
+
         const parts = rawParts.filter((part) => !part.startsWith("TC:"));
         if (parts.length === 0) continue;
         lines.push(`${match[1]} ${parts.join(" / ")}`);
@@ -551,6 +619,13 @@ export function chunkCanonicalText(
         .map((line) => line.trim())
         .filter((line) => line.length > 0);
     if (lines.length === 0 || endOrdinal < startOrdinal) return [];
+
+    for (const line of lines) {
+        const range = parseCanonicalLineRange(line);
+        if (range) {
+            assertOrdinalRangeWithinCompartment(range.start, range.end, startOrdinal, endOrdinal);
+        }
+    }
 
     const normalizedMax = normalizeCompartmentChunkMaxInputTokens(maxInputTokens);
     // Window against a safety-margined budget, not the raw ceiling, so estimator
@@ -578,8 +653,9 @@ export function chunkCanonicalText(
     const flush = (): void => {
         if (currentLines.length === 0 || currentStart === null || currentEnd === null) return;
         const text = currentLines.join("\n");
+        assertOrdinalRangeWithinCompartment(currentStart, currentEnd, startOrdinal, endOrdinal);
         windows.push({
-            windowIndex: windows.length + 1,
+            windowIndex: windows.length,
             startOrdinal: currentStart,
             endOrdinal: currentEnd,
             text,
@@ -607,8 +683,9 @@ export function chunkCanonicalText(
         if (lineTokens > effectiveMax) {
             flush();
             for (const slice of splitOversizedLine(line, effectiveMax)) {
+                assertOrdinalRangeWithinCompartment(lineStart, lineEnd, startOrdinal, endOrdinal);
                 windows.push({
-                    windowIndex: windows.length + 1,
+                    windowIndex: windows.length,
                     startOrdinal: lineStart,
                     endOrdinal: lineEnd,
                     text: slice,
@@ -630,10 +707,6 @@ export function chunkCanonicalText(
     }
     flush();
 
-    // windowIndex is assigned contiguously as 1-based at push time (both the
-    // flush path and the oversized-line split use `windows.length + 1`), so it is
-    // already gap-free and stable — preserve it (chunk identity = compartmentId +
-    // windowIndex + hash; renumbering would orphan every stored chunk row).
     return windows;
 }
 
@@ -769,7 +842,7 @@ export function replaceCompartmentChunkEmbeddings(
     db: Database,
     rows: readonly SaveCompartmentChunkEmbeddingInput[],
 ): void {
-    if (rows.length === 0) return;
+    if (rows.length === 0 || rows.some((row) => isSynapseEmbeddingTruncated(row.vector))) return;
     const compartmentId = rows[0].compartmentId;
     const modelId = rows[0].modelId;
     const now = Date.now();
@@ -869,14 +942,80 @@ export function loadUnembeddedCompartmentChunkCandidates(
     projectPath: string,
     modelId: string,
     limit: number,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
 ): CompartmentChunkBackfillCandidate[] {
-    const rows = getBackfillCandidateStatement(db).all(
-        projectPath,
+    const rows = getBackfillCandidateStatement(db).all(projectPath) as unknown[];
+    return selectHashIncompleteChunkCandidates(
+        db,
         projectPath,
         modelId,
+        mapBackfillCandidateRows(rows),
         Math.max(1, limit),
+        maxInputTokens,
+    );
+}
+
+/**
+ * Select hash-incomplete rows under the shadow window contract, restricted to
+ * compartments already represented in the primary cohort. Primary and shadow
+ * providers may use different token ceilings, so primary window keys and hashes
+ * cannot be used as the shadow completeness predicate.
+ */
+export function loadUnembeddedShadowChunkCandidates(
+    db: Database,
+    projectPath: string,
+    primaryModelId: string,
+    shadowModelId: string,
+    limit: number,
+    shadowMaxInputTokens: number,
+): CompartmentChunkBackfillCandidate[] {
+    const rows = getShadowBackfillCandidateStatement(db).all(
+        projectPath,
+        projectPath,
+        primaryModelId,
     ) as unknown[];
-    return mapBackfillCandidateRows(rows);
+    return selectHashIncompleteChunkCandidates(
+        db,
+        projectPath,
+        shadowModelId,
+        mapBackfillCandidateRows(rows),
+        Math.max(1, limit),
+        shadowMaxInputTokens,
+    );
+}
+
+/**
+ * Auto-drain selector that gives the host a turn after every mapped span read.
+ * `leaseHeldRenumber` is reserved for callers holding the project's write lease.
+ */
+export async function loadUnembeddedCompartmentChunkCandidatesPolite(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+    limit: number,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+    leaseHeldRenumber = false,
+): Promise<CompartmentChunkBackfillCandidate[]> {
+    const rows = getBackfillCandidateStatement(db).all(projectPath) as unknown[];
+    const candidates = mapBackfillCandidateRows(rows);
+    const missing: CompartmentChunkBackfillCandidate[] = [];
+    const stale: CompartmentChunkBackfillCandidate[] = [];
+    for (const candidate of candidates) {
+        const { defect, windows } = classifyChunkCoverageDefect(
+            db,
+            projectPath,
+            modelId,
+            candidate,
+            maxInputTokens,
+        );
+        if (defect === "missing") missing.push(candidate);
+        else if (defect === "stale") stale.push(candidate);
+        else if (defect === "renumber" && leaseHeldRenumber) {
+            renumberOneBasedChunkWindows(db, candidate, projectPath, modelId, windows);
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    return [...missing, ...stale].slice(0, Math.max(1, limit));
 }
 
 function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCandidate[] {
@@ -901,18 +1040,137 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
         }));
 }
 
+type ChunkCoverageDefect = "missing" | "stale" | "renumber" | "deferred" | null;
+
+interface ChunkCoverageClassification {
+    defect: ChunkCoverageDefect;
+    windows: CompartmentChunkWindow[];
+}
+
+function renumberOneBasedChunkWindows(
+    db: Database,
+    candidate: CompartmentChunkBackfillCandidate,
+    projectPath: string,
+    modelId: string,
+    windows: readonly CompartmentChunkWindow[],
+): void {
+    const update = getRenumberEmbeddingWindowStatement(db);
+    db.transaction(() => {
+        // Move lowest to highest so each old key is vacant before the next row
+        // moves into it, preserving the unique compartment/model/window key.
+        for (const window of windows) {
+            const result = update.run(
+                window.windowIndex,
+                candidate.id,
+                modelId,
+                projectPath,
+                window.windowIndex + 1,
+            );
+            if (result.changes !== 1) {
+                throw new Error(
+                    `Failed to renumber compartment ${candidate.id} window ${window.windowIndex + 1}`,
+                );
+            }
+        }
+    })();
+    invalidateDecodedSearchPools(
+        db,
+        ([sessionId, cachedProjectPath, cachedModelId]) =>
+            sessionId === candidate.sessionId &&
+            cachedProjectPath === projectPath &&
+            cachedModelId === modelId,
+    );
+}
+
+/** Classify one compartment against the transcript bytes the current model would embed. */
+function classifyChunkCoverageDefect(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+    candidate: CompartmentChunkBackfillCandidate,
+    maxInputTokens: number,
+): ChunkCoverageClassification {
+    const mappedText = buildCanonicalChunkTextFromFts(
+        db,
+        candidate.sessionId,
+        candidate.startMessage,
+        candidate.endMessage,
+    );
+    if (mappedText === null) return { defect: "deferred", windows: [] };
+    const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
+    const windows = chunkCanonicalText(
+        canonicalText,
+        candidate.startMessage,
+        candidate.endMessage,
+        maxInputTokens,
+    );
+    const existing = getExistingChunkHashes(db, candidate.id, modelId, projectPath);
+
+    const isMatchingOneBasedSet =
+        windows.length > 0 &&
+        existing.size === windows.length &&
+        windows.every((window) => existing.get(window.windowIndex + 1) === window.chunkHash);
+    if (isMatchingOneBasedSet) return { defect: "renumber", windows };
+
+    const expectedWindowIndexes = new Set(windows.map((window) => window.windowIndex));
+    if ([...existing.keys()].some((windowIndex) => !expectedWindowIndexes.has(windowIndex))) {
+        return { defect: "stale", windows };
+    }
+    if (windows.some((window) => !existing.has(window.windowIndex))) {
+        return { defect: "missing", windows };
+    }
+    if (
+        existing.size !== windows.length ||
+        windows.some((window) => existing.get(window.windowIndex) !== window.chunkHash)
+    ) {
+        return { defect: "stale", windows };
+    }
+    return { defect: null, windows };
+}
+
+/**
+ * Return only key/hash-incomplete compartments. Missing expected window keys are
+ * ordered ahead of stale-hash replacements so a bounded sweep fills holes before
+ * spending provider capacity refreshing rows that remain searchable.
+ */
+function selectHashIncompleteChunkCandidates(
+    db: Database,
+    projectPath: string,
+    modelId: string,
+    candidates: readonly CompartmentChunkBackfillCandidate[],
+    limit: number,
+    maxInputTokens: number,
+    leaseHeldRenumber = false,
+): CompartmentChunkBackfillCandidate[] {
+    const missing: CompartmentChunkBackfillCandidate[] = [];
+    const stale: CompartmentChunkBackfillCandidate[] = [];
+    for (const candidate of candidates) {
+        const { defect, windows } = classifyChunkCoverageDefect(
+            db,
+            projectPath,
+            modelId,
+            candidate,
+            maxInputTokens,
+        );
+        if (defect === "missing") missing.push(candidate);
+        else if (defect === "stale") stale.push(candidate);
+        else if (defect === "renumber" && leaseHeldRenumber) {
+            renumberOneBasedChunkWindows(db, candidate, projectPath, modelId, windows);
+        }
+    }
+    return [...missing, ...stale].slice(0, limit);
+}
+
 const sessionBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
 /** Session-scoped variant of {@link loadUnembeddedCompartmentChunkCandidates}.
  *  Used by the on-demand `/ctx-embed-history` command, which backfills ONE
- *  session at a time (oldest-first so the user watches it fill chronologically),
- *  unlike the project-wide passive drain. A compartment is a candidate when it
- *  has no chunk-embedding row for `modelId` yet.
+ *  session at a time. Missing expected windows precede stale-hash replacements;
+ *  each defect class remains oldest-first so progress is deterministic.
  *
  *  `excludeIds` lets the drain loop advance past compartments that produced no
- *  embeddable work this run (empty canonical text / windows already current) so
- *  one un-embeddable old compartment can't block every newer one — without it
- *  the oldest-first query would re-select the same stuck prefix forever. */
+ *  embeddable work or provider failures this run. `leaseHeldRenumber` is reserved
+ *  for callers holding the project's write lease. */
 export function loadUnembeddedSessionChunkCandidates(
     db: Database,
     projectPath: string,
@@ -920,95 +1178,103 @@ export function loadUnembeddedSessionChunkCandidates(
     modelId: string,
     limit: number,
     excludeIds?: readonly number[],
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+    leaseHeldRenumber = false,
 ): CompartmentChunkBackfillCandidate[] {
-    if (excludeIds && excludeIds.length > 0) {
-        // Exclusion sets are per-run and unbounded in shape, so this statement
-        // is built ad hoc (not cached) with an inline placeholder list.
-        const placeholders = excludeIds.map(() => "?").join(", ");
-        const stmt = db.prepare(
-            `SELECT c.id AS id,
-                    c.session_id AS sessionId,
-                    c.start_message AS startMessage,
-                    c.end_message AS endMessage,
-                    c.title AS title
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND c.id NOT IN (${placeholders})
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
-             ORDER BY c.start_message ASC, c.id ASC
-             LIMIT ?`,
-        );
-        const rows = stmt.all(
-            projectPath,
-            sessionId,
-            ...excludeIds,
-            projectPath,
-            modelId,
-            Math.max(1, limit),
-        ) as unknown[];
-        return mapBackfillCandidateRows(rows);
-    }
-    let stmt = sessionBackfillCandidateStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `SELECT c.id AS id,
-                    c.session_id AS sessionId,
-                    c.start_message AS startMessage,
-                    c.end_message AS endMessage,
-                    c.title AS title
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )
-             ORDER BY c.start_message ASC, c.id ASC
-             LIMIT ?`,
-        );
-        sessionBackfillCandidateStatements.set(db, stmt);
-    }
-    const rows = stmt.all(
-        projectPath,
-        sessionId,
+    const exclusions = excludeIds && excludeIds.length > 0 ? excludeIds : [];
+    const exclusionSql =
+        exclusions.length > 0 ? `AND c.id NOT IN (${exclusions.map(() => "?").join(", ")})` : "";
+    const stmt =
+        exclusions.length > 0
+            ? db.prepare(
+                  `SELECT c.id AS id,
+                          c.session_id AS sessionId,
+                          c.start_message AS startMessage,
+                          c.end_message AS endMessage,
+                          c.title AS title
+                   FROM compartments c
+                   JOIN session_projects sp
+                     ON sp.session_id = c.session_id
+                    AND sp.harness = c.harness
+                    AND sp.project_path = ?
+                   WHERE c.session_id = ?
+                     AND c.start_message IS NOT NULL
+                     AND c.end_message IS NOT NULL
+                     ${exclusionSql}
+                   ORDER BY c.start_message ASC, c.id ASC`,
+              )
+            : (() => {
+                  let cached = sessionBackfillCandidateStatements.get(db);
+                  if (!cached) {
+                      cached = db.prepare(
+                          `SELECT c.id AS id,
+                                  c.session_id AS sessionId,
+                                  c.start_message AS startMessage,
+                                  c.end_message AS endMessage,
+                                  c.title AS title
+                           FROM compartments c
+                           JOIN session_projects sp
+                             ON sp.session_id = c.session_id
+                            AND sp.harness = c.harness
+                            AND sp.project_path = ?
+                           WHERE c.session_id = ?
+                             AND c.start_message IS NOT NULL
+                             AND c.end_message IS NOT NULL
+                           ORDER BY c.start_message ASC, c.id ASC`,
+                      );
+                      sessionBackfillCandidateStatements.set(db, cached);
+                  }
+                  return cached;
+              })();
+    const rows = stmt.all(projectPath, sessionId, ...exclusions) as unknown[];
+    return selectHashIncompleteChunkCandidates(
+        db,
         projectPath,
         modelId,
+        mapBackfillCandidateRows(rows),
         Math.max(1, limit),
-    ) as unknown[];
-    return mapBackfillCandidateRows(rows);
+        maxInputTokens,
+        leaseHeldRenumber,
+    );
 }
 
-/** Count compartments in this session that still lack a chunk embedding for
- *  `modelId` — drives the `/ctx-embed-history` progress total. */
+/** Count session compartments whose current transcript windows are missing or stale. */
 export function countUnembeddedSessionCompartments(
     db: Database,
     projectPath: string,
     sessionId: string,
     modelId: string,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
 ): number {
-    const row = db
+    return loadUnembeddedSessionChunkCandidates(
+        db,
+        projectPath,
+        sessionId,
+        modelId,
+        Number.MAX_SAFE_INTEGER,
+        undefined,
+        maxInputTokens,
+    ).length;
+}
+
+/**
+ * Count total embeddable compartments and key/hash-complete compartments for
+ * `/ctx-embed`. A row's mere existence never contributes to `embedded`.
+ */
+export function countSessionCompartmentEmbedCoverage(
+    db: Database,
+    projectPath: string,
+    sessionId: string,
+    modelId: string,
+    maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+): { embedded: number; total: number } {
+    const rows = db
         .prepare(
-            `SELECT COUNT(*) AS n
+            `SELECT c.id AS id,
+                    c.session_id AS sessionId,
+                    c.start_message AS startMessage,
+                    c.end_message AS endMessage,
+                    c.title AS title
              FROM compartments c
              JOIN session_projects sp
                ON sp.session_id = c.session_id
@@ -1017,52 +1283,20 @@ export function countUnembeddedSessionCompartments(
              WHERE c.session_id = ?
                AND c.start_message IS NOT NULL
                AND c.end_message IS NOT NULL
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM compartment_chunk_embeddings current
-                   WHERE current.compartment_id = c.id
-                     AND current.project_path = ?
-                     AND current.model_id = ?
-               )`,
+             ORDER BY c.start_message ASC, c.id ASC`,
         )
-        .get(projectPath, sessionId, projectPath, modelId) as { n?: number } | undefined;
-    return typeof row?.n === "number" ? row.n : 0;
-}
-
-/** Total embeddable compartments in this session (have a message range), and how
- *  many are currently embedded under `modelId`. Drives the `/ctx-embed` status
- *  line: `embedded / total`. Counts the project's OWN compartments for the
- *  session (same `session_projects` scoping as the unembedded counter). */
-export function countSessionCompartmentEmbedCoverage(
-    db: Database,
-    projectPath: string,
-    sessionId: string,
-    modelId: string,
-): { embedded: number; total: number } {
-    const row = db
-        .prepare(
-            `SELECT
-               COUNT(*) AS total,
-               SUM(CASE WHEN EXISTS (
-                   SELECT 1 FROM compartment_chunk_embeddings e
-                   WHERE e.compartment_id = c.id
-                     AND e.project_path = ?
-                     AND e.model_id = ?
-               ) THEN 1 ELSE 0 END) AS embedded
-             FROM compartments c
-             JOIN session_projects sp
-               ON sp.session_id = c.session_id
-              AND sp.harness = c.harness
-              AND sp.project_path = ?
-             WHERE c.session_id = ?
-               AND c.start_message IS NOT NULL
-               AND c.end_message IS NOT NULL`,
-        )
-        .get(projectPath, modelId, projectPath, sessionId) as
-        | { total?: number; embedded?: number }
-        | undefined;
-    return {
-        total: typeof row?.total === "number" ? row.total : 0,
-        embedded: typeof row?.embedded === "number" ? row.embedded : 0,
-    };
+        .all(projectPath, sessionId) as unknown[];
+    const candidates = mapBackfillCandidateRows(rows);
+    let embedded = 0;
+    for (const candidate of candidates) {
+        const { defect } = classifyChunkCoverageDefect(
+            db,
+            projectPath,
+            modelId,
+            candidate,
+            maxInputTokens,
+        );
+        if (defect === null || defect === "renumber") embedded += 1;
+    }
+    return { embedded, total: candidates.length };
 }

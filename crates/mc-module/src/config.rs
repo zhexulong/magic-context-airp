@@ -14,6 +14,8 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use crate::scheduler::{self, ExecuteThresholdConfig};
+
 /// Default execute threshold percentage (65.0). The Rust module reads config without the
 /// plugin, so this must stay identical to packages/plugin/src/config/schema/magic-context.ts.
 pub const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 65.0;
@@ -23,9 +25,6 @@ pub const DEFAULT_MEMORY_BUDGET_TOKENS: f64 = 4_000.0;
 /// Default token budget for user-profile injection. It must remain 4,000 tokens so the Rust
 /// module and the TypeScript renderer use the same default.
 pub const DEFAULT_USER_PROFILE_BUDGET_TOKENS: f64 = 4_000.0;
-/// Maximum execute threshold percentage (90.0). Output capacity is already reserved
-/// from the usable window, leaving the final 10% for mid-turn input growth.
-const MAX_EXECUTE_THRESHOLD_PERCENTAGE: f64 = 90.0;
 /// Minimum historian producer chunk size. The derived budget is one quarter of the model
 /// context limit, but it is never allowed to fall below 8,000 tokens.
 pub const MIN_HISTORIAN_CHUNK_TOKENS: usize = 8_000;
@@ -82,10 +81,20 @@ impl Default for CavemanConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
     pub model_chain: Vec<String>,
+    /// Optional trusted user-configured sampling temperature for historian requests.
+    pub historian_temperature: Option<f64>,
     /// Trusted user-configured language for hidden-agent prose. Project config is deliberately
     /// excluded because the language directive becomes provider-visible prompt text.
     pub language: Option<String>,
     pub execute_threshold_percentage: f64,
+    /// Retain per-model threshold values until the request supplies its canonical model key.
+    pub execute_threshold_user_config: Option<ExecuteThresholdConfig>,
+    pub execute_threshold_user_configured: bool,
+    /// Project overrides are a per-model floor, never permission to lower the user threshold.
+    pub execute_threshold_project_config: Option<ExecuteThresholdConfig>,
+    /// User and project protected-token overrides remain separate until usable geometry is known.
+    pub protected_tokens_user: Option<u64>,
+    pub protected_tokens_project: Option<u64>,
     /// Whether compaction is enabled, as resolved during host startup. This determines which
     /// component controls context-window compaction for the request.
     pub compaction_enabled: bool,
@@ -101,6 +110,8 @@ pub struct McModuleConfig {
     pub user_memory_collection_enabled: bool,
     /// Historian model context limit; configurable until the module has a model catalog.
     pub historian_context_limit_tokens: usize,
+    /// True only when the user supplied a known historian model window.
+    pub historian_context_limit_known: bool,
     pub memory_budget_tokens: f64,
     pub user_profile_budget_tokens: f64,
     /// Controls whether the frozen m0 baseline includes the canonical project-docs block.
@@ -122,8 +133,14 @@ impl Default for McModuleConfig {
     fn default() -> Self {
         Self {
             model_chain: Vec::new(),
+            historian_temperature: None,
             language: None,
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+            execute_threshold_user_config: None,
+            execute_threshold_user_configured: false,
+            execute_threshold_project_config: None,
+            protected_tokens_user: None,
+            protected_tokens_project: None,
             compaction_enabled: true,
             memory_enabled: true,
             auto_search: AutoSearchConfig::default(),
@@ -131,6 +148,7 @@ impl Default for McModuleConfig {
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
+            historian_context_limit_known: false,
             memory_budget_tokens: DEFAULT_MEMORY_BUDGET_TOKENS,
             user_profile_budget_tokens: DEFAULT_USER_PROFILE_BUDGET_TOKENS,
             inject_docs: true,
@@ -155,7 +173,91 @@ pub struct ResolvedCacheTtl {
     pub provenance: CacheTtlProvenance,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedExecuteThreshold {
+    pub percentage: f64,
+    pub provenance: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProtectedTokens {
+    pub floor: u64,
+    pub provenance: &'static str,
+    pub warning: Option<String>,
+}
+
+fn resolve_threshold_config(
+    config: &ExecuteThresholdConfig,
+    model_key: Option<&str>,
+    configured: bool,
+    fallback: f64,
+) -> ResolvedExecuteThreshold {
+    let provenance = match config {
+        _ if !configured => "builtin",
+        ExecuteThresholdConfig::Percentage(_) => "scalar",
+        ExecuteThresholdConfig::ByModel(values) => {
+            if model_key.is_some_and(|key| {
+                scheduler::model_key_lookup_order(key)
+                    .iter()
+                    .any(|candidate| values.contains_key(candidate))
+            }) {
+                "object.model"
+            } else if values.contains_key("default") {
+                "object.default"
+            } else {
+                "builtin"
+            }
+        }
+    };
+    ResolvedExecuteThreshold {
+        percentage: scheduler::resolve_execute_threshold(config, model_key, fallback, None, None),
+        provenance,
+    }
+}
+
 impl McModuleConfig {
+    pub fn resolve_protected_tokens(&self, usable_soft: u64) -> ResolvedProtectedTokens {
+        let derived = crate::protection_window::derive_default_floor(usable_soft);
+        let (mut floor, mut provenance) = self
+            .protected_tokens_user
+            .map_or((derived, "derived"), |value| (value, "user"));
+        let mut warning = None;
+        if let Some(project) = self.protected_tokens_project {
+            if project >= floor {
+                floor = project;
+                provenance = "project";
+            } else {
+                warning = Some(format!(
+                    "ignoring project protected_tokens={project}; it cannot lower resolved user/default floor {floor}"
+                ));
+            }
+        }
+        ResolvedProtectedTokens {
+            floor,
+            provenance,
+            warning,
+        }
+    }
+
+    pub fn resolve_execute_threshold(&self, model_key: Option<&str>) -> ResolvedExecuteThreshold {
+        let scalar = ExecuteThresholdConfig::Percentage(self.execute_threshold_percentage);
+        let mut resolved = resolve_threshold_config(
+            self.execute_threshold_user_config
+                .as_ref()
+                .unwrap_or(&scalar),
+            model_key,
+            self.execute_threshold_user_configured,
+            DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+        );
+        if let Some(project) = &self.execute_threshold_project_config {
+            let floor = resolve_threshold_config(project, model_key, true, resolved.percentage);
+            if floor.percentage > resolved.percentage {
+                resolved = floor;
+            }
+        }
+        resolved
+    }
+
     /// Resolve the effective cache TTL while preserving whether the model walk matched an entry.
     ///
     /// The configured default remains the effective value for host-side scheduling, but it is not
@@ -431,6 +533,9 @@ fn merge_tiers_with_warnings(
                 );
             }
         }
+        if let Some(temperature) = number_at(user, "/historian/temperature") {
+            cfg.historian_temperature = Some(temperature);
+        }
         if let Some(language) = user
             .pointer("/language")
             .and_then(Value::as_str)
@@ -439,9 +544,10 @@ fn merge_tiers_with_warnings(
         {
             cfg.language = Some(language.to_ascii_lowercase());
         }
-        if let Some(threshold) = number_at(user, "/execute_threshold_percentage") {
-            cfg.execute_threshold_percentage = threshold;
-        }
+        cfg.execute_threshold_user_config = execute_threshold_at(user);
+        cfg.execute_threshold_user_configured = cfg.execute_threshold_user_config.is_some();
+        cfg.protected_tokens_user = protected_tokens_at(user, "user", &mut warnings);
+        warn_deprecated_protected_tags(user, "user", &mut warnings);
         if let Some(enabled) = user.pointer("/compaction/enabled").and_then(Value::as_bool) {
             cfg.compaction_enabled = enabled;
         }
@@ -475,6 +581,7 @@ fn merge_tiers_with_warnings(
         }
         if let Some(limit) = positive_usize_at(user, "/historian/context_limit_tokens") {
             cfg.historian_context_limit_tokens = limit;
+            cfg.historian_context_limit_known = true;
         }
         if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
@@ -524,11 +631,9 @@ fn merge_tiers_with_warnings(
     }
 
     if let Some(project) = project {
-        if let Some(project_threshold) = number_at(project, "/execute_threshold_percentage") {
-            if project_threshold > cfg.execute_threshold_percentage {
-                cfg.execute_threshold_percentage = project_threshold;
-            }
-        }
+        cfg.execute_threshold_project_config = execute_threshold_at(project);
+        cfg.protected_tokens_project = protected_tokens_at(project, "project", &mut warnings);
+        warn_deprecated_protected_tags(project, "project", &mut warnings);
         warn_ignored_project_key(project, "/language", &mut warnings);
         warn_ignored_project_key(project, "/compaction/enabled", &mut warnings);
         if let Some(enabled) = project.pointer("/memory/enabled").and_then(Value::as_bool) {
@@ -578,9 +683,11 @@ fn merge_tiers_with_warnings(
         );
     }
 
-    cfg.execute_threshold_percentage = cfg
-        .execute_threshold_percentage
-        .clamp(1.0, MAX_EXECUTE_THRESHOLD_PERCENTAGE);
+    cfg.execute_threshold_user_config
+        .get_or_insert(ExecuteThresholdConfig::Percentage(
+            DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+        ));
+    cfg.execute_threshold_percentage = cfg.resolve_execute_threshold(None).percentage;
     cfg.model_chain.dedup();
     (cfg, warnings)
 }
@@ -639,6 +746,42 @@ fn positive_usize_at(value: &Value, pointer: &str) -> Option<usize> {
         .and_then(Value::as_u64)
         .and_then(|v| usize::try_from(v).ok())
         .filter(|v| *v > 0)
+}
+
+fn protected_tokens_at(value: &Value, tier: &str, warnings: &mut Vec<String>) -> Option<u64> {
+    let configured = value.get("protected_tokens")?;
+    let valid = configured
+        .as_u64()
+        .filter(|tokens| (4_000..=1_000_000).contains(tokens));
+    if valid.is_none() {
+        warnings.push(format!(
+            "invalid {tier} protected_tokens; expected an integer from 4000 through 1000000; using the derived/default floor"
+        ));
+    }
+    valid
+}
+
+fn warn_deprecated_protected_tags(value: &Value, tier: &str, warnings: &mut Vec<String>) {
+    if value.get("protected_tags").is_some() {
+        warnings.push(format!(
+            "deprecated {tier} protected_tags is ignored; use protected_tokens"
+        ));
+    }
+}
+
+fn execute_threshold_at(value: &Value) -> Option<ExecuteThresholdConfig> {
+    let threshold = value.get("execute_threshold_percentage")?;
+    if let Some(number) = threshold.as_f64() {
+        return Some(ExecuteThresholdConfig::Percentage(number));
+    }
+    threshold.as_object().map(|values| {
+        ExecuteThresholdConfig::ByModel(
+            values
+                .iter()
+                .filter_map(|(key, value)| value.as_f64().map(|value| (key.clone(), value)))
+                .collect(),
+        )
+    })
 }
 
 fn number_at(value: &Value, pointer: &str) -> Option<f64> {
@@ -723,6 +866,43 @@ pub fn strip_jsonc(input: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod protected_tokens_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn scalar_overrides_resolve_raise_only_after_geometry_derivation() {
+        let (cfg, warnings) = merge_tiers_with_warnings(
+            Some(&json!({ "protected_tokens": 20_000 })),
+            Some(&json!({ "protected_tokens": 16_000 })),
+        );
+        assert!(warnings.is_empty());
+        let resolved = cfg.resolve_protected_tokens(200_000);
+        assert_eq!(resolved.floor, 20_000);
+        assert_eq!(resolved.provenance, "user");
+        assert!(resolved.warning.unwrap().contains("cannot lower"));
+
+        let (cfg, _) = merge_tiers_with_warnings(
+            Some(&json!({ "protected_tokens": 20_000 })),
+            Some(&json!({ "protected_tokens": 30_000 })),
+        );
+        assert_eq!(cfg.resolve_protected_tokens(200_000).floor, 30_000);
+    }
+
+    #[test]
+    fn invalid_override_falls_back_and_deprecated_count_is_parsed_inertly() {
+        let (cfg, warnings) = merge_tiers_with_warnings(
+            Some(&json!({ "protected_tokens": 4_000.5, "protected_tags": 101 })),
+            None,
+        );
+        assert_eq!(cfg.resolve_protected_tokens(372_000).floor, 18_600);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("expected an integer"));
+        assert!(warnings[1].contains("protected_tags is ignored"));
+    }
 }
 
 #[cfg(test)]
@@ -862,6 +1042,147 @@ mod tests {
     }
 
     #[test]
+    fn object_execute_threshold_default_is_not_silently_replaced_by_builtin_65() {
+        let object = merge_tiers(
+            Some(&serde_json::json!({
+                "execute_threshold_percentage": {
+                    "default": 75,
+                    "openai/gpt-6-astra": 85
+                }
+            })),
+            None,
+        );
+        assert_eq!(object.execute_threshold_percentage, 75.0);
+        assert!(!scheduler::advance_drain_latch(
+            scheduler::LatchState {
+                active_since_ms: Some(1_000)
+            },
+            63.0,
+            object
+                .resolve_execute_threshold(Some("anthropic/claude-sonnet-5"))
+                .percentage,
+            2_000,
+        )
+        .is_active());
+        assert_eq!(
+            object.resolve_execute_threshold(Some("anthropic/claude-sonnet-5")),
+            ResolvedExecuteThreshold {
+                percentage: 75.0,
+                provenance: "object.default"
+            }
+        );
+        assert_eq!(
+            object.resolve_execute_threshold(Some("openai/gpt-6-astra-fast")),
+            ResolvedExecuteThreshold {
+                percentage: 85.0,
+                provenance: "object.model"
+            }
+        );
+        let scalar = merge_tiers(
+            Some(&serde_json::json!({"execute_threshold_percentage": 65})),
+            None,
+        );
+        assert_eq!(scalar.execute_threshold_percentage, 65.0);
+    }
+
+    #[test]
+    fn execute_threshold_config_matches_typescript_percentage_goldens() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/scheduler-golden.json")).unwrap();
+        let mut checked = 0;
+        for case in golden["threshold_cases"].as_array().unwrap() {
+            if case.get("tokens_config").is_some() {
+                continue;
+            }
+            let cfg = merge_tiers(
+                Some(
+                    &serde_json::json!({"execute_threshold_percentage": case["percentage_config"]}),
+                ),
+                None,
+            );
+            assert_eq!(
+                cfg.resolve_execute_threshold(case["model_key"].as_str())
+                    .percentage,
+                case["expected"].as_f64().unwrap(),
+                "{}",
+                case["label"]
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4);
+    }
+
+    #[test]
+    fn execute_threshold_object_lookup_and_project_floor_preserve_model_identity() {
+        let user = serde_json::json!({"execute_threshold_percentage": {"default": 75, "claude-sonnet": 78, "anthropic/claude-sonnet-5": 82}});
+        let project = serde_json::json!({"execute_threshold_percentage": {"default": 90, "anthropic/claude-sonnet-5": 80}});
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert_eq!(
+            cfg.resolve_execute_threshold(Some("anthropic/claude-sonnet-5"))
+                .percentage,
+            82.0
+        );
+        assert_eq!(
+            cfg.resolve_execute_threshold(Some("openai/gpt-6-astra"))
+                .percentage,
+            90.0
+        );
+        let alias = merge_tiers(
+            Some(
+                &serde_json::json!({"execute_threshold_percentage": {"default": 65, "openai-codex/gpt-5.6-sol": 40}}),
+            ),
+            None,
+        );
+        assert_eq!(
+            alias
+                .resolve_execute_threshold(Some("openai/gpt-5.6-sol"))
+                .percentage,
+            40.0
+        );
+        let canonical = merge_tiers(
+            Some(
+                &serde_json::json!({"execute_threshold_percentage": {"default": 65, "openai-codex/gpt-5.6-sol": 40, "openai/gpt-5.6-sol": 30}}),
+            ),
+            None,
+        );
+        assert_eq!(
+            canonical
+                .resolve_execute_threshold(Some("openai-codex/gpt-5.6-sol"))
+                .percentage,
+            30.0
+        );
+        let user_only = merge_tiers(Some(&user), None);
+        assert_eq!(
+            user_only
+                .resolve_execute_threshold(Some("anthropic/claude-sonnet-4-fast"))
+                .percentage,
+            78.0
+        );
+        for (value, expected) in [(0.0, 0.0), (-1.0, 65.0), (95.0, 90.0)] {
+            let cfg = merge_tiers(
+                Some(&serde_json::json!({"execute_threshold_percentage": value})),
+                None,
+            );
+            assert_eq!(cfg.resolve_execute_threshold(None).percentage, expected);
+        }
+        assert_eq!(
+            merge_tiers(None, None)
+                .resolve_execute_threshold(None)
+                .provenance,
+            "builtin"
+        );
+        assert_eq!(
+            merge_tiers(
+                Some(&serde_json::json!({"execute_threshold_percentage": 65})),
+                None
+            )
+            .resolve_execute_threshold(None)
+            .provenance,
+            "scalar"
+        );
+    }
+
+    #[test]
     fn default_threshold_matches_typescript_schema() {
         let cfg = merge_tiers(None, None);
         assert_eq!(cfg.execute_threshold_percentage, 65.0);
@@ -921,6 +1242,7 @@ mod tests {
         assert_eq!(cfg.memory_budget_tokens, 5_000.0);
         assert_eq!(cfg.user_profile_budget_tokens, 2_500.0);
         assert_eq!(cfg.historian_context_limit_tokens, 64_000);
+        assert!(cfg.historian_context_limit_known);
         for key in [
             "/memory/budget_tokens",
             "/memory/user_profile_budget_tokens",
@@ -1203,6 +1525,27 @@ mod tests {
         });
         let cfg = merge_tiers(Some(&user), Some(&project));
         assert_eq!(cfg.model_chain, vec!["google/gemini-3.5-flash"]);
+    }
+
+    #[test]
+    fn historian_temperature_is_optional_and_user_tier_only() {
+        let project = serde_json::json!({ "historian": { "temperature": 0.9 } });
+        assert_eq!(merge_tiers(None, None).historian_temperature, None);
+        for temperature in [0.1, 0.0] {
+            let user = serde_json::json!({
+                "historian": {
+                    "temperature": temperature,
+                    "module_model": "module/historian"
+                }
+            });
+            let resolved = merge_tiers(Some(&user), Some(&project));
+            assert_eq!(resolved.historian_temperature, Some(temperature));
+            assert_eq!(resolved.model_chain, vec!["module/historian"]);
+        }
+        assert_eq!(
+            merge_tiers(None, Some(&project)).historian_temperature,
+            None
+        );
     }
 
     #[test]

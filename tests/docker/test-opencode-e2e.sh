@@ -44,13 +44,20 @@ section() {
 # ----------------------------------------------------------------------
 # Phase 0: install the Magic Context plugin from the local copy so the
 # rest of the script tests the bits we plan to publish, not whatever
-# happens to be on npm. We use `npm link` so global `bunx` resolves the
-# local copy of @cortexkit/opencode-magic-context.
+# happens to be on npm. Install a tarball as a consumer: npm still resolves
+# root devDependencies with --omit=dev, unlike dependencies of a tarball.
 # ----------------------------------------------------------------------
 section "Phase 0: install Magic Context locally"
 cd /test/mc-opencode
-npm install --silent --no-audit --no-fund --omit=dev 2>&1 | tail -5 || true
-npm link --silent --no-audit --no-fund 2>&1 | tail -3 || true
+# A failed install leaves file: plugins unable to resolve their runtime imports.
+# Preserve npm's resolver error instead of diagnosing a missing DB much later.
+PLUGIN_TARBALL=$(npm pack --ignore-scripts --silent)
+mkdir -p /test/mc-install
+if ! npm install --prefix /test/mc-install --no-audit --no-fund \
+    "/test/mc-opencode/$PLUGIN_TARBALL"; then
+    echo "Magic Context dependency installation failed; the file: plugin cannot load."
+    exit 1
+fi
 cd /test/project
 
 # ----------------------------------------------------------------------
@@ -102,14 +109,14 @@ check "doctor did not leave issues that need manual attention" \
 # ----------------------------------------------------------------------
 # Phase 2: SESSION_SMOKE — run a real opencode session against aimock.
 # Two assertions:
-#   - the plugin loaded (log file exists, contains a session-id line)
+#   - the plugin entered its server hook (boot breadcrumb, not doctor output)
 #   - the plugin tagged ≥1 message in the shared DB with harness='opencode'
 # ----------------------------------------------------------------------
 section "Phase 2: SESSION_SMOKE — single-turn opencode run with aimock"
 
 # Tell OpenCode about an OpenAI-compatible mock provider. Use a
 # file:// plugin specifier so OpenCode loads the locally-built plugin
-# at /test/mc-opencode rather than pulling the published version from
+# from the installed local tarball rather than pulling the published version from
 # npm. Without this, OpenCode's plugin resolver hits its own per-
 # package cache (~/.cache/opencode/packages/) and downloads the
 # @latest npm tarball, which would test the previous release rather
@@ -117,7 +124,7 @@ section "Phase 2: SESSION_SMOKE — single-turn opencode run with aimock"
 cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file:///test/mc-opencode"],
+  "plugin": ["file:///test/mc-install/node_modules/@cortexkit/opencode-magic-context"],
   "compaction": { "auto": false, "prune": false },
   "provider": {
     "mock": {
@@ -138,7 +145,6 @@ cat > "$HOME/.config/opencode/magic-context.jsonc" <<'JSON'
   "enabled": true,
   "historian": { "model": "mock/mock-model" },
   "dreamer": { "enabled": false },
-  "sidekick": { "enabled": false },
   "embedding": { "provider": "off" },
   "auto_update": false
 }
@@ -176,11 +182,18 @@ tail -20 /tmp/opencode.log
 
 check "opencode produced a log file" "test -s /tmp/opencode.log"
 
-# Plugin log should now exist with at least one transform line.
-check "magic-context plugin log exists" "test -s $PLUGIN_LOG"
+# Doctor also writes this log; only the server hook emits the boot breadcrumb.
+check "magic-context plugin entered server hook" \
+    "grep -q '\[magic-context\] boot: entering pid=' $PLUGIN_LOG"
 
 # Shared DB should now exist and have at least one tagged message.
 check "shared SQLite DB created" "test -f $DB_PATH"
+# A missing DB can mean load failure or storage initialization failure.
+# Print the plugin log here and the host's session.error events below.
+if [[ ! -f "$DB_PATH" && -s "$PLUGIN_LOG" ]]; then
+    echo "  ── magic-context log (shared DB missing) ──"
+    tail -60 "$PLUGIN_LOG"
+fi
 
 if [[ -f "$DB_PATH" ]]; then
     SESSION_META_COUNT=$(sqlite3 "$DB_PATH" \
@@ -208,6 +221,113 @@ if [[ -f "$DB_PATH" ]]; then
 fi
 
 # ----------------------------------------------------------------------
+# DUAL_INSTANCE_BOOT keeps one real OpenCode server active for this project
+# while a second OpenCode process boots against the same MC database. A separate
+# SQLite connection holds a representative BEGIN IMMEDIATE write lock so this
+# harness exercises startup diagnostics and lock behavior together.
+# ----------------------------------------------------------------------
+section "Phase 3: DUAL_INSTANCE_BOOT — shared project and contended MC database"
+
+DUAL_STORAGE="$HOME/.local/share/cortexkit/magic-context"
+DUAL_A_MC=/tmp/dual-instance-a-mc.log
+DUAL_B_MC=/tmp/dual-instance-b-mc.log
+DUAL_A_LOG=/tmp/dual-instance-a.log
+DUAL_B_LOG=/tmp/dual-instance-b.log
+rm -f "$DUAL_A_MC" "$DUAL_B_MC" "$DUAL_A_LOG" "$DUAL_B_LOG"
+
+MAGIC_CONTEXT_STORAGE_DIR="$DUAL_STORAGE" MAGIC_CONTEXT_LOG_PATH="$DUAL_A_MC" \
+    opencode serve --hostname 127.0.0.1 --port 4098 >"$DUAL_A_LOG" 2>&1 &
+DUAL_A_PID=$!
+for _ in $(seq 1 150); do
+    if curl -fsS --max-time 0.2 http://127.0.0.1:4098/doc >/dev/null 2>&1; then break; fi
+    sleep 0.1
+done
+# Subscribe globally before /config bootstraps the instance. The project event
+# endpoint bootstraps before subscribing and can miss plugin load failures.
+# Retain the existing 20s config deadline. Keep reading until the server stops:
+# /config can return before asynchronous plugin initialization publishes errors.
+{
+node --input-type=module > /tmp/opencode-events.log 2>&1 <<'JS' || true
+import { writeFileSync } from "node:fs";
+const controller = new AbortController();
+const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]);
+let events;
+try {
+    const response = await fetch("http://127.0.0.1:4098/global/event", { signal });
+    if (!response.ok) throw new Error(`Event subscription: HTTP ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const first = await reader.read();
+    if (first.done) throw new Error("Event subscription closed before bootstrap");
+    process.stdout.write(decoder.decode(first.value, { stream: true }));
+    events = (async () => {
+        while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            process.stdout.write(decoder.decode(next.value, { stream: true }));
+        }
+    })().catch((error) => {
+        if (!signal.aborted) console.error(error);
+    });
+    const config = await fetch("http://127.0.0.1:4098/config?directory=/test/project", { signal });
+    writeFileSync("/tmp/dual-instance-a-config.json", await config.text());
+    if (!config.ok) throw new Error(`Config bootstrap: HTTP ${config.status}`);
+    await events;
+} finally {
+    controller.abort();
+    await events;
+}
+JS
+} &
+EVENTS_PID=$!
+for _ in $(seq 1 150); do
+    [[ -s "$DUAL_A_MC" ]] && break
+    sleep 0.1
+done
+check "instance A loaded Magic Context for the project" "test -s $DUAL_A_MC"
+
+# Keep a write transaction open long enough to overlap instance B's storage
+# initialization. WAL readers remain available; current-schema boot must avoid
+# acquiring a migration write lock merely to discover that no migration exists.
+({ echo "PRAGMA busy_timeout=1000; BEGIN IMMEDIATE;"; sleep 6; echo "COMMIT;"; } | \
+    sqlite3 "$DB_PATH" >/tmp/dual-instance-holder.log 2>&1) &
+DUAL_HOLDER_PID=$!
+sleep 0.2
+DUAL_STARTED_MS=$(date +%s%3N)
+set +e
+MAGIC_CONTEXT_STORAGE_DIR="$DUAL_STORAGE" MAGIC_CONTEXT_LOG_PATH="$DUAL_B_MC" \
+    timeout --signal=KILL 20 opencode debug config >"$DUAL_B_LOG" 2>&1 &
+DUAL_B_PID=$!
+DUAL_FIRST_LOG_MS=-1
+for _ in $(seq 1 300); do
+    if [[ -s "$DUAL_B_MC" ]]; then
+        DUAL_FIRST_LOG_MS=$(( $(date +%s%3N) - DUAL_STARTED_MS ))
+        break
+    fi
+    kill -0 "$DUAL_B_PID" 2>/dev/null || break
+    sleep 0.1
+done
+wait "$DUAL_B_PID"
+DUAL_B_EXIT=$?
+set -e
+wait "$DUAL_HOLDER_PID" 2>/dev/null || true
+DUAL_READY_MS=$(( $(date +%s%3N) - DUAL_STARTED_MS ))
+DUAL_RPC_FILE_COUNT=$(find "$DUAL_STORAGE/rpc" -type f -name 'port-*.json' 2>/dev/null | wc -l || true)
+kill "$DUAL_A_PID" 2>/dev/null || true
+wait "$DUAL_A_PID" 2>/dev/null || true
+kill "$EVENTS_PID" 2>/dev/null || true
+wait "$EVENTS_PID" 2>/dev/null || true
+
+echo "  instance B first Magic Context log: ${DUAL_FIRST_LOG_MS}ms"
+echo "  instance B host config ready: ${DUAL_READY_MS}ms (exit=$DUAL_B_EXIT)"
+check "instance B emits boot: entering before contention" \
+    "test \"$DUAL_FIRST_LOG_MS\" -ge 0 && grep -q '\[magic-context\] boot: entering pid=' $DUAL_B_MC"
+check "instance B completes while instance A remains active" "test \"$DUAL_B_EXIT\" -eq 0"
+check "instance B stays inside the 20s host-start cap" "test \"$DUAL_READY_MS\" -lt 20000"
+check "instance A published project-scoped RPC discovery" \
+    "test \"$DUAL_RPC_FILE_COUNT\" -gt 0"
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 section "Summary"
@@ -218,6 +338,8 @@ if [[ $FAIL -eq 0 ]]; then
     echo -e "${GREEN}All OpenCode E2E checks passed.${NC}"
     exit 0
 else
+    echo "  ── OpenCode bootstrap events (includes session.error load failures) ──"
+    cat /tmp/opencode-events.log 2>/dev/null || true
     echo -e "${RED}OpenCode E2E checks failed.${NC}"
     exit 1
 fi

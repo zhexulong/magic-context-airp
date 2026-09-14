@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
@@ -438,6 +439,7 @@ function installMarkerAndCaptureBounds(args: {
     contextStoreUuid: string;
     domains: readonly AuthorityDomain[];
 }): void {
+    const transactionStartedAt = performance.now();
     args.db.exec("BEGIN IMMEDIATE");
     try {
         withPrivilegedWriter(args.db, () => {
@@ -460,6 +462,7 @@ function installMarkerAndCaptureBounds(args: {
             }
         });
         args.db.exec("COMMIT");
+        logSlowWriteTransaction("authority_marker_capture", transactionStartedAt);
     } catch (error) {
         try {
             args.db.exec("ROLLBACK");
@@ -475,6 +478,7 @@ function capturedBoundsUnchanged(
     projectPath: string,
     domains: readonly AuthorityDomain[],
 ): boolean {
+    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
     try {
         const read = db.prepare(
@@ -491,6 +495,7 @@ function capturedBoundsUnchanged(
             );
         });
         db.exec("COMMIT");
+        logSlowWriteTransaction("authority_capture_check", transactionStartedAt);
         return unchanged;
     } catch (error) {
         try {
@@ -565,6 +570,8 @@ export async function prepareAuthority(args: PrepareAuthorityArgs): Promise<Auth
                                     args.projectPath,
                                     identity.moduleRowId,
                                     identity.sourceRowId,
+                                    undefined,
+                                    true,
                                 );
                             }
                         })
@@ -1524,20 +1531,30 @@ function rememberIdentity(
     moduleRowId: number,
     contextRowId: number,
     statements?: MirrorPageStatements,
+    replaceContextIdentity = domain === "notes",
 ): void {
     const existing = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
-    if (existing) return;
-    // A note can be re-minted with a new module row id when authority is prepared
-    // again. Replace its stale canonical identity so note evaluation joins the live
-    // revision instead of retaining an id that the module no longer recognizes.
-    if (domain === "notes") {
+    if (existing?.context_row_id === contextRowId) return;
+    if (existing) {
+        if (!replaceContextIdentity) return;
+        (
+            statements?.deleteIdentity ??
+            db.prepare(
+                "DELETE FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
+            )
+        ).run(domain, moduleProject, moduleRowId);
+    }
+    // Stable source identity is authoritative when a module row is re-minted. Replace
+    // the stale backlink before inserting the new module id; INSERT OR IGNORE alone
+    // would lose to UNIQUE(domain, context_row_id) and leave the tombstoned id canonical.
+    if (replaceContextIdentity) {
         (
             statements?.deleteIdentityByContext ??
             db.prepare("DELETE FROM mirror_identity WHERE domain = ? AND context_row_id = ?")
         ).run(domain, contextRowId);
     }
-    // A context row has one canonical module identity. A duplicate memory feed row
-    // may still update that row, but it must not claim a second identity for it.
+    // A natural-key-only duplicate memory feed row may update the canonical context row,
+    // but it must not claim a second identity without stable source identity.
     (
         statements?.insertIdentity ??
         db.prepare(
@@ -1553,9 +1570,9 @@ function contextMemoryId(
     row: Record<string, unknown>,
     moduleRowId: number,
     statements?: MirrorPageStatements,
-): number {
+): { contextId: number; inserted: boolean } {
     const mapped = mirrorIdentity(db, domain, moduleProject, moduleRowId, statements);
-    if (mapped) return mapped.context_row_id;
+    if (mapped) return { contextId: mapped.context_row_id, inserted: false };
     const sourceUuid = rowNullableString(row, "context_store_uuid");
     const sourceId = rowNumber(row, "context_row_id", -1);
     const localStoreUuid = statements?.contextStoreUuid ?? getContextStoreUuid(db);
@@ -1567,8 +1584,8 @@ function contextMemoryId(
             db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?")
         ).get(sourceId, moduleProject) as { id?: number } | undefined;
         if (existing?.id !== undefined) {
-            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements);
-            return existing.id;
+            rememberIdentity(db, domain, moduleProject, moduleRowId, existing.id, statements, true);
+            return { contextId: existing.id, inserted: false };
         }
     }
     // A legacy facade row may have no source identity even though this project in the
@@ -1585,7 +1602,7 @@ function contextMemoryId(
         ).all(moduleProject, category, normalizedHash) as Array<{ id?: number }>;
         if (candidates.length === 1 && candidates[0]?.id !== undefined) {
             rememberIdentity(db, domain, moduleProject, moduleRowId, candidates[0].id, statements);
-            return candidates[0].id;
+            return { contextId: candidates[0].id, inserted: false };
         }
     }
     const result = (
@@ -1596,7 +1613,7 @@ function contextMemoryId(
     ).run(moduleProject, rowString(row, "category", "CONSTRAINTS"));
     const contextId = Number(result.lastInsertRowid);
     rememberIdentity(db, domain, moduleProject, moduleRowId, contextId, statements);
-    return contextId;
+    return { contextId, inserted: true };
 }
 
 function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPageStatements): void {
@@ -1674,7 +1691,7 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         (hasSnapshotField(row, "importance") &&
             !(typeof row.importance === "number" && Number.isFinite(row.importance)));
     if (metadataClobberRisk) statements.markRepairPending.run(Date.now());
-    const contextId = contextMemoryId(
+    const { contextId, inserted } = contextMemoryId(
         db,
         feed.domain,
         moduleProject,
@@ -1700,7 +1717,9 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
     const recencyGuard = guardMemorySnapshotByRecency({
         row,
         snapshot: recencySnapshot,
-        existing,
+        // The placeholder was allocated only to obtain a context id. Its zero-valued
+        // immutable fields are not host history and must not override the module snapshot.
+        existing: inserted ? undefined : existing,
     });
     const projectedRow = recencyGuard.effectiveRow;
     const has = (key: string): boolean => hasSnapshotField(row, key);
@@ -2099,6 +2118,46 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                 // tombstone until the module's current live identities have been captured.
                 throw new Error("memory mirror resnapshot must complete before tombstones");
             }
+            if (page.domain === "memories") {
+                // A module transaction can retire one row id and mint its replacement before
+                // this page is consumed. Bind every replacement carrying local source identity
+                // first, so an earlier tombstone cannot delete the durable host row or its
+                // id-keyed satellites before the replacement updates it in place.
+                for (const feed of page.rows) {
+                    if (
+                        feed.domain !== "memories" ||
+                        feed.op === "tombstone" ||
+                        feed.feed_seq <= durableCursor
+                    ) {
+                        continue;
+                    }
+                    const row = feed.full_row_snapshot;
+                    const moduleProject = rowString(row, "project_path");
+                    const sourceUuid = rowNullableString(row, "context_store_uuid");
+                    const sourceId = rowNumber(row, "context_row_id", -1);
+                    if (
+                        !moduleProject ||
+                        !sourceUuid ||
+                        sourceUuid !== statements.contextStoreUuid ||
+                        sourceId < 0
+                    ) {
+                        continue;
+                    }
+                    const existing = statements.memoryIdByStoreId.get(sourceId, moduleProject) as
+                        | { id?: number }
+                        | undefined;
+                    if (existing?.id === undefined) continue;
+                    rememberIdentity(
+                        db,
+                        "memories",
+                        moduleProject,
+                        feed.module_row_id,
+                        existing.id,
+                        statements,
+                        true,
+                    );
+                }
+            }
             const touchedProjects = new Set<string>();
             for (const feed of page.rows) {
                 if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
@@ -2125,9 +2184,11 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     return nextCursor;
 }
 
+type MirrorPullModuleClient = Pick<AuthorityModuleClient, "mirrorPull">;
+
 export async function ensureLiveMemoryResnapshot(args: {
     db: Database;
-    module: AuthorityModuleClient;
+    module: MirrorPullModuleClient;
     limit: number;
 }): Promise<void> {
     let adoptedWinner = false;
@@ -2254,12 +2315,18 @@ export async function ensureLiveMemoryResnapshot(args: {
     });
 }
 
-export async function pullAndApplyMirrorPage(args: {
+interface AppliedMirrorPage {
+    cursor: number;
+    hasMore: boolean;
+    rowsApplied: number;
+}
+
+async function pullAndApplyMirrorPageWithStatus(args: {
     db: Database;
-    module: AuthorityModuleClient;
+    module: MirrorPullModuleClient;
     domain: AuthorityDomain;
     limit?: number;
-}): Promise<number> {
+}): Promise<AppliedMirrorPage> {
     if (!args.module.mirrorPull) {
         throw new Error("memory mirror consumer requires the mirror.pull module route");
     }
@@ -2273,28 +2340,99 @@ export async function pullAndApplyMirrorPage(args: {
         cursor,
         limit,
     });
-    return applyMirrorPage({ db: args.db, page: response.page });
+    const nextCursor = applyMirrorPage({ db: args.db, page: response.page });
+    return {
+        cursor: nextCursor,
+        hasMore: response.page.has_more,
+        rowsApplied: response.page.rows.filter(
+            (row) => row.domain === args.domain && row.feed_seq > cursor,
+        ).length,
+    };
 }
 
-const mirrorFlights = new WeakMap<object, Promise<number>>();
+export async function pullAndApplyMirrorPage(args: {
+    db: Database;
+    module: MirrorPullModuleClient;
+    domain: AuthorityDomain;
+    limit?: number;
+}): Promise<number> {
+    return (await pullAndApplyMirrorPageWithStatus(args)).cursor;
+}
+
+export interface MirrorDrainResult {
+    cursor: number;
+    pagesPulled: number;
+    rowsApplied: number;
+    complete: boolean;
+    budgetExhausted: boolean;
+}
+
+/**
+ * Drain the paged mirror protocol until the producer reports completion. This is
+ * shared by explicit tool synchronization and transform-driven background pulls
+ * so both callers preserve the same cursor-progress rule.
+ */
+export async function drainMirrorPages(args: {
+    db: Database;
+    module: MirrorPullModuleClient;
+    domain: AuthorityDomain;
+    limit?: number;
+    pageBudget?: number;
+}): Promise<MirrorDrainResult> {
+    const pageBudget =
+        args.pageBudget === undefined
+            ? Number.MAX_SAFE_INTEGER
+            : Math.max(1, Math.floor(args.pageBudget));
+    let pagesPulled = 0;
+    let rowsApplied = 0;
+    let cursor = getMirrorCursor(args.db, args.domain);
+    while (pagesPulled < pageBudget) {
+        const priorCursor = cursor;
+        const page = await pullAndApplyMirrorPageWithStatus(args);
+        pagesPulled += 1;
+        rowsApplied += page.rowsApplied;
+        cursor = page.cursor;
+        if (!page.hasMore) {
+            return { cursor, pagesPulled, rowsApplied, complete: true, budgetExhausted: false };
+        }
+        if (cursor === priorCursor) {
+            return { cursor, pagesPulled, rowsApplied, complete: false, budgetExhausted: false };
+        }
+    }
+    return { cursor, pagesPulled, rowsApplied, complete: false, budgetExhausted: true };
+}
+
+export const TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET = 20;
+
+export interface MemoryMirrorDrainResult extends MirrorDrainResult {
+    cuePoolVersion: number;
+}
+
+const mirrorFlights = new WeakMap<object, Promise<MemoryMirrorDrainResult>>();
 
 /**
  * The rust transform pass is the mirror cadence. Coalesce overlapping passes so a
  * slower pull can never race a second cursor application on the same connection.
+ * One flight drains a bounded page batch; an incomplete result remains eligible on
+ * the next transform pass.
  */
 export function pullMemoryMirrorOnce(args: {
     db: Database;
-    module: AuthorityModuleClient;
+    module: MirrorPullModuleClient;
     limit?: number;
-}): Promise<number> {
+    pageBudget?: number;
+}): Promise<MemoryMirrorDrainResult> {
     const existing = mirrorFlights.get(args.module);
     if (existing) return existing;
-    const flight = pullAndApplyMirrorPage({
+    const flight = drainMirrorPages({
         db: args.db,
         module: args.module,
         domain: "memories",
         limit: args.limit,
-    }).finally(() => mirrorFlights.delete(args.module));
+        pageBudget: args.pageBudget ?? TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET,
+    })
+        .then((result) => ({ ...result, cuePoolVersion: result.cursor }))
+        .finally(() => mirrorFlights.delete(args.module));
     mirrorFlights.set(args.module, flight);
     return flight;
 }

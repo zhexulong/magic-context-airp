@@ -12,8 +12,10 @@ import {
     isWrapupInProgress,
 } from "../../features/magic-context/storage-meta-persisted";
 import type { PluginContext } from "../../plugin/types";
+import { sessionLog } from "../../shared/logger";
 import type { ModelInput } from "../../shared/model-resolution";
 import type { Database } from "../../shared/sqlite";
+import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
 import {
     executeContextRecomp,
     executeContextRecompWithResult,
@@ -67,6 +69,8 @@ export interface ManagedRecompContext {
     autoPromote: boolean;
     /** Active OpenCode historian entry, including its outbound request variant. */
     historianModel?: ModelInput;
+    historianContextLimit?: number;
+    historianMaxOutputTokens?: number;
     /** Resolved historian fallback chain (config `fallback_models` → builtin). */
     fallbackModels: readonly ModelInput[];
     language?: string;
@@ -241,6 +245,8 @@ function buildRecompDeps(ctx: ManagedRecompContext, sessionId: string) {
         //  - fallbackModels: configured chain (e.g. anthropic/claude-sonnet-4-6)
         //  - fallbackModelId: the live session model as a last-ditch retry
         model: ctx.historianModel,
+        historianContextLimit: ctx.historianContextLimit,
+        historianMaxOutputTokens: ctx.historianMaxOutputTokens,
         fallbackModels: ctx.fallbackModels,
         language: ctx.language,
         fallbackModelId:
@@ -342,13 +348,14 @@ export async function runManagedRecomp(
         );
         return message;
     } catch (error) {
-        setRecompTerminal(
-            ctx.liveSessionState,
+        const failure = renderUserFacingFailure("recomp_unavailable");
+        sessionLog(
             sessionId,
-            "failed",
-            `Recomp crashed: ${String(error)}`,
+            `recomp failed code=${userFacingFailureCode("recomp_unavailable")}`,
+            error,
         );
-        return `## Magic Recomp — Failed\n\nRecomp crashed: ${String(error)}`;
+        setRecompTerminal(ctx.liveSessionState, sessionId, "failed", failure);
+        return `## Magic Recomp — Failed\n\n${failure}`;
     }
 }
 
@@ -464,13 +471,14 @@ export async function runManagedUpgrade(
             migrationSummary ? `\n${migrationSummary}` : "",
         ].join("\n");
     } catch (error) {
-        setRecompTerminal(
-            ctx.liveSessionState,
+        const failure = renderUserFacingFailure("recomp_unavailable");
+        sessionLog(
             sessionId,
-            "failed",
-            `Upgrade crashed: ${String(error)}`,
+            `session upgrade failed code=${userFacingFailureCode("recomp_unavailable")}`,
+            error,
         );
-        return `## Session Upgrade — Failed\n\nUpgrade crashed: ${String(error)}`;
+        setRecompTerminal(ctx.liveSessionState, sessionId, "failed", failure);
+        return `## Session Upgrade — Failed\n\n${failure}`;
     }
 }
 
@@ -517,6 +525,11 @@ async function runUpgradeMemoryMigration(
         });
         return outcome.summary;
     } catch (error) {
-        return `Memory migration skipped (error): ${String(error)}`;
+        sessionLog(
+            sessionId,
+            `memory migration failed code=${userFacingFailureCode("dream_unknown")}`,
+            error,
+        );
+        return renderUserFacingFailure("dream_unknown");
     }
 }

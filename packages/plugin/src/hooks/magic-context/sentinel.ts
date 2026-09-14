@@ -1,3 +1,5 @@
+import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
+import { canonicalModelIdentity } from "../../shared/harness-provider-map";
 import { isRecord } from "../../shared/record-type-guard";
 
 /**
@@ -37,49 +39,52 @@ export function modelAcceptsEmptyContent(providerID?: string): boolean {
 }
 
 /**
- * Decide whether a reasoning-variant change (effort / budget_tokens / toggle)
- * busts the provider's prompt cache on its own.
- *
- * Two provider cache models govern this:
- *
- *  - Thinking-config-in-prompt (Anthropic family): the reasoning
- *    configuration is rendered into the prompt itself, so changing it
- *    re-serializes the affected message blocks. Anthropic's docs state that
- *    changing the thinking config "always invalidates message blocks"; the
- *    same holds on Bedrock. The bust therefore happens regardless of our
- *    flush, and our queued ops drain on that natural bust.
- *
- *  - Request-param-outside-cache-key (OpenAI-compatible et al.):
- *    reasoning_effort / budget is a request parameter that lives outside the
- *    cache key. A variant flip does NOT re-serialize any cached bytes, so the
- *    provider serves the whole prefix as a cache HIT. Our flush would be the
- *    ONLY bust — manufacturing a gratuitous one that re-runs heuristics and
- *    re-materializes drops for no provider-side reason (reporter's evidence:
- *    104 pending ops drained at 54% usage, 156K uncached tokens, while a
- *    no-op variant flip on the same provider was a full cache HIT).
- *
- * Safety asymmetry: misclassifying toward TRUE keeps today's behavior
- * (wasteful but correct — the ops still drain). Misclassifying toward FALSE
- * only defers queued ops to the next natural bust (fold / threshold / TTL /
- * flush), which is the already-designed steady-state for historian publishes
- * (ARCHITECTURE.md invariant 3: deferred work rides the next bust cycle, it
- * never forces its own). So the conservative default for unknown providers is
- * TRUE (today's behavior).
- *
- * Provider IDs matched (per OpenCode's `provider/transform.ts`):
- *   - `anthropic`                     — canonical @ai-sdk/anthropic
- *   - `bedrock`                        — @ai-sdk/amazon-bedrock (reported as "bedrock")
- *   - `google-vertex-anthropic`       — @ai-sdk/google-vertex/anthropic
- * The `bedrock` check uses `includes` so any future bedrock-derived providerID
- * (e.g. a mantle variant) is also covered, matching how OpenCode's own
- * `useMessageLevelOptions` gate matches bedrock.
+ * Provider-cache facts for model identities whose effort can change without
+ * invalidating cached prompt bytes: Anthropic Fable 5.1 was observed on
+ * 2026-09-02 and OpenAI GPT-6 Astra on 2026-09-05.
  */
-export function variantChangeBustsProviderCache(providerID?: string): boolean {
-    if (providerID === undefined) return true;
-    if (providerID === "anthropic") return true;
-    if (providerID === "google-vertex-anthropic") return true;
-    if (providerID.includes("bedrock")) return true;
-    return false;
+const VARIANT_CACHE_PRESERVING_MODELS: Readonly<Record<string, string>> = {
+    "anthropic/claude-fable-5-1": "2026-09-02",
+    "openai/gpt-6-astra": "2026-09-05",
+};
+
+function canonicalVariantModelIdentity(providerID: string, modelID: string): string {
+    const normalizedProviderID = providerID.toLowerCase();
+    const isAnthropicFamily =
+        normalizedProviderID === "anthropic" ||
+        normalizedProviderID === "google-vertex-anthropic" ||
+        normalizedProviderID.includes("bedrock");
+    if (isAnthropicFamily && isFable51ThinkingBindingModel("anthropic", modelID)) {
+        return "anthropic/claude-fable-5-1";
+    }
+    return canonicalModelIdentity(`${providerID}/${modelID}`).toLowerCase();
+}
+
+/**
+ * Decide whether a reasoning-variant change busts the provider cache naturally.
+ *
+ * Older Anthropic-family models serialize thinking configuration into cached
+ * message blocks, so an effort/budget change already busts that prefix and
+ * pending work can ride the provider's bust. The explicit models above instead
+ * carry effort outside the cached prefix; manufacturing our own flush would
+ * rewrite an otherwise byte-identical suffix.
+ *
+ * Deferring is the safe side of the ambiguity: pending work rides the next
+ * natural bust (ARCHITECTURE.md invariant 3), while a false-positive flush
+ * costs a full suffix rewrite on every effort change. Unknown provider/model
+ * combinations therefore defer rather than opening an unproven bust.
+ */
+export function variantChangeBustsProviderCache(providerID?: string, modelID?: string): boolean {
+    if (!providerID || !modelID) return false;
+    const identity = canonicalVariantModelIdentity(providerID, modelID);
+    if (Object.hasOwn(VARIANT_CACHE_PRESERVING_MODELS, identity)) return false;
+
+    const normalizedProviderID = providerID.toLowerCase();
+    return (
+        normalizedProviderID === "anthropic" ||
+        normalizedProviderID === "google-vertex-anthropic" ||
+        normalizedProviderID.includes("bedrock")
+    );
 }
 
 /**
@@ -157,39 +162,34 @@ export function isSentinel(part: unknown): boolean {
 }
 
 /**
- * Replay a previously-persisted set of message IDs by replacing each
- * matching message's parts with a single whole-message sentinel. Used to
- * keep the wire shape stable across defer passes when OpenCode rebuilds
- * messages from its DB — any message whose ID is in `ids` was
- * neutralized on a prior bust pass and should be neutralized again now.
- *
- * `providerID` controls which sentinel shape is installed (see
- * `makeWholeMessageSentinel`). Pass the live session's provider so the
- * replayed wire shape matches the fresh sentinelization on the current
- * pass — providers that don't filter empties get `[dropped]`, Anthropic
- * gets `""`.
- *
- * Returns the number of messages replayed + the set of IDs that were NOT
- * found in the current message array (caller can prune them from the
- * persisted set so we stop carrying stale IDs forever).
+ * Replay persisted whole-message decisions onto a fresh host projection.
+ * Canonical Anthropic keeps empty sentinels because its adapter filters them.
+ * For non-empty-sentinel providers, hidden seam rows are removed instead: they
+ * were absent on the fold pass, so removal is the only byte-identical replay.
  */
 export function replaySentinelByMessageIds(
     messages: Array<{ info: { id?: string }; parts: unknown[] }>,
     ids: Set<string>,
     providerID?: string,
+    hiddenSeamIds: ReadonlySet<string> = new Set(),
 ): { replayed: number; missingIds: string[] } {
     if (ids.size === 0) return { replayed: 0, missingIds: [] };
     const seen = new Set<string>();
     let replayed = 0;
-    for (const msg of messages) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const msg = messages[index];
         const id = msg.info.id;
         if (!id || !ids.has(id)) continue;
         seen.add(id);
-        // Idempotent skip — already neutralized on an earlier pass in this turn
+        if (!modelAcceptsEmptyContent(providerID) && hiddenSeamIds.has(id)) {
+            messages.splice(index, 1);
+            replayed += 1;
+            continue;
+        }
         if (msg.parts.length === 1 && isSentinel(msg.parts[0])) continue;
         msg.parts.length = 0;
         msg.parts.push(makeWholeMessageSentinel(providerID));
-        replayed++;
+        replayed += 1;
     }
     const missingIds: string[] = [];
     for (const id of ids) if (!seen.has(id)) missingIds.push(id);

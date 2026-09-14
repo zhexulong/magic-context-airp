@@ -107,7 +107,12 @@ function writeHealthyFiles(agentDir: string, cwd: string): void {
     );
 }
 
-function createInstalledPiPlugin(agentDir: string, withNativeBinding: boolean): void {
+function createInstalledPiPlugin(
+    agentDir: string,
+    withNativeBinding: boolean,
+    withWasmFallback = false,
+    withNativePackage = true,
+): void {
     const pluginDir = join(agentDir, "npm", "node_modules", "@cortexkit", "pi-magic-context");
     mkdirSync(pluginDir, { recursive: true });
     writeFileSync(
@@ -115,18 +120,33 @@ function createInstalledPiPlugin(agentDir: string, withNativeBinding: boolean): 
         JSON.stringify({ name: "@cortexkit/pi-magic-context", version: "0.0.0" }),
     );
 
-    const onnxDir = join(pluginDir, "node_modules", "onnxruntime-node");
-    mkdirSync(onnxDir, { recursive: true });
-    writeFileSync(
-        join(onnxDir, "package.json"),
-        JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
-    );
-    writeFileSync(join(onnxDir, "index.js"), "module.exports = {};\n");
+    if (withNativePackage) {
+        const onnxDir = join(pluginDir, "node_modules", "onnxruntime-node");
+        mkdirSync(onnxDir, { recursive: true });
+        writeFileSync(
+            join(onnxDir, "package.json"),
+            JSON.stringify({ name: "onnxruntime-node", main: "index.js" }),
+        );
+        writeFileSync(join(onnxDir, "index.js"), "module.exports = {};\n");
 
-    if (withNativeBinding) {
-        const binDir = join(onnxDir, "bin", "napi-v6", process.platform, process.arch);
-        mkdirSync(binDir, { recursive: true });
-        writeFileSync(join(binDir, "onnxruntime_binding.node"), "mock native binding");
+        if (withNativeBinding) {
+            const binDir = join(onnxDir, "bin", "napi-v6", process.platform, process.arch);
+            mkdirSync(binDir, { recursive: true });
+            writeFileSync(join(binDir, "onnxruntime_binding.node"), "mock native binding");
+        }
+    }
+
+    if (withWasmFallback) {
+        const wasmDir = join(pluginDir, "node_modules", "onnxruntime-web");
+        mkdirSync(wasmDir, { recursive: true });
+        writeFileSync(
+            join(wasmDir, "package.json"),
+            JSON.stringify({ name: "onnxruntime-web", main: "index.js" }),
+        );
+        writeFileSync(join(wasmDir, "index.js"), "module.exports = {};\n");
+        const distDir = join(pluginDir, "dist");
+        mkdirSync(distDir, { recursive: true });
+        writeFileSync(join(distDir, "transformers-node-wasm.js"), "export {};\n");
     }
 }
 
@@ -216,6 +236,34 @@ describe("Pi doctor", () => {
             retryV22Backfill: true,
             rekeyV22DirIdentity: "/tmp/project",
         });
+    });
+
+    it("parses --report as a non-interactive issue flow", () => {
+        expect(parseDoctorArgs(["--report", "diagnostics.md"])).toMatchObject({
+            issue: true,
+            report: "diagnostics.md",
+        });
+    });
+
+    it("fails the runtime JSONC parse check for a recoverable leading backslash", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const configHome = process.env.XDG_CONFIG_HOME ?? join(root, ".config");
+        writeFileSync(
+            join(configHome, "cortexkit", "magic-context.jsonc"),
+            '\\{\n  "cache_ttl": "1h"\n}',
+        );
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(1);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain("FAIL user magic-context.jsonc is invalid JSONC");
+        expect(output).toContain(":1:1: invalid symbol");
+        expect(output).not.toContain("PASS user magic-context.jsonc is valid JSONC");
     });
 
     it("passes Phase 1 with a healthy mocked environment", async () => {
@@ -326,6 +374,25 @@ describe("Pi doctor", () => {
         expect(output).toContain("WARN 2");
     });
 
+    it("reports the WASM fallback when onnxruntime-node is completely absent", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        createInstalledPiPlugin(agentDir, false, true, false);
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor(baseOptions(root, cwd, prompts));
+
+        expect(code).toBe(0);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            "WARN Embedding provider: local — onnxruntime-node native binding failed",
+        );
+        expect(output).toContain("WASM fallback active");
+        expect(output).not.toContain("native runtime and WASM fallback both unavailable");
+    });
+
     it("passes the local embedding check when the onnxruntime native binding is present", async () => {
         const root = makeTempRoot();
         const cwd = makeTempRoot("mc-pi-doctor-cwd-");
@@ -338,7 +405,7 @@ describe("Pi doctor", () => {
 
         expect(code).toBe(0);
         const output = prompts.messages.join("\n");
-        expect(output).toContain("PASS Embedding provider: local (native runtime OK)");
+        expect(output).toContain("PASS Embedding provider: local (native runtime selected and OK)");
     });
 
     it("repairs missing package entry and missing user config in --force mode", async () => {
@@ -377,7 +444,7 @@ describe("Pi doctor", () => {
         const settingsPath = join(agentDir, "settings.json");
         const legacyPath = join(agentDir, "magic-context.jsonc");
         writeFileSync(settingsPath, JSON.stringify({ packages: [] }));
-        writeFileSync(legacyPath, JSON.stringify({ protected_tags: 13 }));
+        writeFileSync(legacyPath, JSON.stringify({ protected_tokens: 13 }));
         writeFileSync(
             join(cwd, ".cortexkit", "magic-context.jsonc"),
             JSON.stringify({ enabled: true }),
@@ -392,9 +459,9 @@ describe("Pi doctor", () => {
         expect(code).toBe(0);
         const targetPath = join(root, ".config", "cortexkit", "magic-context.jsonc");
         const config = parseJsonc(readFileSync(targetPath, "utf-8")) as {
-            protected_tags?: number;
+            protected_tokens?: number;
         };
-        expect(config.protected_tags).toBe(13);
+        expect(config.protected_tokens).toBe(13);
         expect(existsSync(legacyPath)).toBe(false);
         expect(existsSync(`${legacyPath}.MOVED_READPLEASE`)).toBe(true);
         const output = prompts.messages.join("\n");
@@ -419,11 +486,11 @@ describe("Pi doctor", () => {
         mkdirSync(opencodeDir, { recursive: true });
         writeFileSync(
             join(opencodeDir, "magic-context.jsonc"),
-            JSON.stringify({ protected_tags: 7 }),
+            JSON.stringify({ protected_tokens: 7 }),
         );
         writeFileSync(
             join(agentDir, "magic-context.jsonc"),
-            JSON.stringify({ protected_tags: 13 }),
+            JSON.stringify({ protected_tokens: 13 }),
         );
         const prompts = new MockPrompts();
 
@@ -589,6 +656,27 @@ describe("Pi doctor", () => {
         expect(report).not.toContain(root);
         expect(report).not.toContain("abc123");
         expect(report).not.toContain("sk-12345678901234567890");
+
+        const nonInteractivePrompts = new MockPrompts();
+        const explicitReportPath = join(cwd, "explicit-report.md");
+        const nonInteractiveCode = await runDoctor({
+            ...options,
+            issue: true,
+            report: explicitReportPath,
+            prompts: nonInteractivePrompts,
+            deps: {
+                ...options.deps,
+                collectDiagnostics: async () => diagnosticReport,
+            },
+        });
+        expect(nonInteractiveCode).toBe(0);
+        expect(existsSync(explicitReportPath)).toBe(true);
+        expect(nonInteractivePrompts.messages.some((message) => message.startsWith("intro:"))).toBe(
+            false,
+        );
+        expect(
+            nonInteractivePrompts.messages.some((message) => message.startsWith("spinner-start:")),
+        ).toBe(false);
     });
 
     it("clears stale caches under PI_CODING_AGENT_DIR's parent without touching HOME/.pi/cache", async () => {

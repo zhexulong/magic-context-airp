@@ -26,15 +26,18 @@ import {
     parseRpcPortFile,
     readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import { Database, detectSqliteRuntime, registerSlowWriteReporter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
+import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+
 import { ensureContextStoreUuid } from "./context-authority";
 import {
     attachFailClosedBlockingProcessEvidence,
     type FailClosedBlockingProcess,
     type FailClosedProcessKind,
 } from "./fail-closed-block";
+import { startMessageFtsRowidMapBackfill } from "./message-fts-rowid-map";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import {
@@ -43,6 +46,11 @@ import {
     setDatabase as setToolDefinitionDatabase,
 } from "./tool-definition-tokens";
 import { runToolOwnerBackfill } from "./tool-owner-backfill";
+
+// The SQLite chokepoint cannot import the logging chain itself (it is executed
+// directly by Node in the backend smoke); every storage open path runs through
+// this module, so registering here covers privileged writes on both runtimes.
+registerSlowWriteReporter(logSlowWriteTransaction);
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -97,7 +105,14 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 82;
+export const LATEST_SUPPORTED_VERSION = 84;
+
+/**
+ * Every runtime backend receives the same finite wait before the first schema
+ * read. Five seconds preserves the established contention tolerance while
+ * remaining well inside the server-wide 15 second boot budget.
+ */
+export const BOOT_SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -159,9 +174,39 @@ function restrictDatabaseFilePermissions(dbPath: string): void {
     }
 }
 
+export interface DatabaseBootTimings {
+    openMs: number;
+    guardMs: number;
+    migrateMs: number;
+}
+
 export interface OpenDatabaseOptions {
     dbPath?: string;
     latestSupportedVersion?: number;
+    /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
+    busyTimeoutMs?: number;
+    /** Boot-only timing sink; omitted by ordinary storage callers. */
+    onBootTimings?: (timings: DatabaseBootTimings) => void;
+    /** Receives the exact busy-timeout diagnostic emitted during a fresh database open. */
+    onBootBusyTimeout?: (message: string) => void;
+}
+
+function resolveBootBusyTimeoutMs(value: number | undefined): number {
+    if (value === undefined) return BOOT_SQLITE_BUSY_TIMEOUT_MS;
+    if (!Number.isFinite(value)) return BOOT_SQLITE_BUSY_TIMEOUT_MS;
+    return Math.max(0, Math.min(BOOT_SQLITE_BUSY_TIMEOUT_MS, Math.floor(value)));
+}
+
+function installBootBusyTimeout(
+    db: Database,
+    dbPath: string,
+    timeoutMs: number,
+    report: (message: string) => void = log,
+): void {
+    db.exec(`PRAGMA busy_timeout=${timeoutMs}`);
+    report(
+        `[magic-context] SQLite boot busy timeout: backend=${detectSqliteRuntime()} timeout=${timeoutMs}ms path=${dbPath}`,
+    );
 }
 
 // Exported for the test-isolation guard test. Returns a PATH only — opens no DB —
@@ -621,19 +666,31 @@ export function formatInconclusiveOpenCodeMigrationWarning(
     return `[magic-context] storage warning: continuing migration for ${dbPath}; OpenCode server PID ${pids.join(", ")} was not confirmed because its liveness or identity check could not run. This commonly means an OS sandbox denied kill(0) or ps. No live OpenCode server was confirmed.`;
 }
 
+export function formatInconclusivePiMigrationWarning(
+    dbPath: string,
+    pids: readonly number[],
+): string {
+    return `[magic-context] storage warning: continuing migration for ${dbPath}; Pi/OMP PID ${pids.join(", ")} was not confirmed as a live harness because the process image or command line was ambiguous. No live Pi harness was confirmed.`;
+}
+
 function logInconclusiveMigrationProbes(
     dbPath: string,
     discovery: RpcServerDiscovery,
-    piProbeState: "known" | "unreadable",
+    piDiscovery: {
+        state: "known" | "unreadable" | "inconclusive";
+        inconclusivePids?: readonly number[];
+    },
 ): void {
     const uncertainPids = discovery.inconclusivePids ?? [];
     if (uncertainPids.length > 0) {
         log(formatInconclusiveOpenCodeMigrationWarning(dbPath, uncertainPids));
     }
-    if (piProbeState === "unreadable") {
+    if (piDiscovery.state === "unreadable") {
         log(
             `[magic-context] storage warning: continuing migration for ${dbPath}; the Pi/OMP process-list probe could not run, which commonly means an OS sandbox denied ps. No live Pi harness was confirmed.`,
         );
+    } else if ((piDiscovery.inconclusivePids?.length ?? 0) > 0) {
+        log(formatInconclusivePiMigrationWarning(dbPath, piDiscovery.inconclusivePids ?? []));
     }
 }
 
@@ -704,7 +761,7 @@ function enforceMigrationOnOpenGuard(
         piPids.length === 0
     ) {
         lastMigrationOnOpenRefusal = null;
-        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery.state);
+        logInconclusiveMigrationProbes(dbPath, discovery, piDiscovery);
         return true;
     }
     const blockingPids = [...new Set([...discovery.serverPids, ...piPids])].sort(
@@ -809,7 +866,7 @@ function finishDatabaseOpen(
     // never fail-close the plugin. Lazy adoption covers rows the backfill could
     // not reach.
     if (!explicitDbPath) {
-        const runBackfill = () => {
+        const runBackfills = () => {
             try {
                 runToolOwnerBackfill(db);
             } catch (error) {
@@ -817,9 +874,14 @@ function finishDatabaseOpen(
                     `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
                 );
             }
+            void startMessageFtsRowidMapBackfill(db).catch((error) => {
+                log(
+                    `[magic-context] message FTS rowid-map backfill failed (will resume next startup): ${getErrorMessage(error)}`,
+                );
+            });
         };
-        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfill);
-        else runBackfill();
+        if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfills);
+        else runBackfills();
     }
     // Wire the persistence-backed tool-definition measurement store and
     // rehydrate the in-memory map from any prior writes. Doing this here
@@ -841,12 +903,14 @@ function finishDatabaseOpen(
     return db;
 }
 
-export function initializeDatabase(db: Database): void {
-    // Install the busy timeout BEFORE any file-level PRAGMAs like WAL. Two
-    // processes can cold-open the same DB at once (real OpenCode/Pi startup, or
-    // the subprocess lease tests); without the timeout this connection can throw
-    // SQLITE_BUSY immediately while the sibling is switching journal mode.
-    db.exec("PRAGMA busy_timeout=5000");
+export function initializeDatabase(
+    db: Database,
+    busyTimeoutMs = BOOT_SQLITE_BUSY_TIMEOUT_MS,
+): void {
+    // Keep the same finite timeout through schema creation and migrations. The
+    // open paths install it before their first read; direct initializer callers
+    // receive it here before any file-level PRAGMA such as WAL.
+    db.exec(`PRAGMA busy_timeout=${resolveBootBusyTimeoutMs(busyTimeoutMs)}`);
     // SQLite per-connection PRAGMAs. foreign_keys MUST run before any reads
     // or writes: it defaults to OFF, which silently breaks every ON DELETE
     // CASCADE / SET NULL declared in the schema below and in migrations.
@@ -1381,6 +1445,23 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       tokenize='porter unicode61'
     );
 
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+      session_id TEXT NOT NULL,
+      message_ordinal INTEGER NOT NULL,
+      fts_rowid INTEGER NOT NULL,
+      PRIMARY KEY(session_id, message_ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      watermark_rowid INTEGER NOT NULL DEFAULT 0,
+      completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+      (id, watermark_rowid, completed, updated_at)
+    VALUES (1, 0, 0, 0);
+
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
       last_indexed_ordinal INTEGER NOT NULL DEFAULT 0,
@@ -1490,10 +1571,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       pending_pi_compaction_marker_state TEXT,
       new_work_tokens INTEGER NOT NULL DEFAULT 0,
       total_input_tokens INTEGER NOT NULL DEFAULT 0,
-      -- deferred_execute_state: intentionally NULLABLE without a default.
-      -- Absence is SQL NULL; presence is a JSON blob written via
-      -- setDeferredExecutePendingIfAbsent. Excluded from the
-      -- healAllNullColumns fallback list.
+      -- Retired columns remain in place so existing databases keep the same schema:
+      -- deferred_execute_state was used by the removed turn-boundary execute hold.
       deferred_execute_state TEXT,
       cached_m0_bytes BLOB,
       cached_m0_project_memory_epoch INTEGER,
@@ -1510,6 +1589,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
+      protected_tokens_effective INTEGER,
+      protected_tokens_pre_snapshot TEXT,
       protected_tail_policy_version INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_window_started_at INTEGER NOT NULL DEFAULT 0,
       protected_tail_drain_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1526,8 +1607,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       cached_m0_system_hash TEXT,
       cached_m0_tool_set_hash TEXT,
       cached_m0_model_key TEXT,
-      cached_m0_project_identity TEXT,
-      cached_m0_last_baseline_end_message_id TEXT,
+       cached_m0_project_identity TEXT,
+       cached_m0_last_baseline_end_message_id TEXT,
+       thinking_binding_recovery_target TEXT NOT NULL DEFAULT '',
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
     );
@@ -1761,6 +1843,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
+    ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
@@ -1923,6 +2006,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
     ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+    ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
     ensureColumn(db, "session_meta", "protected_tail_policy_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(
         db,
@@ -2197,6 +2282,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
     const explicitDbPath = options?.dbPath !== undefined;
     const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
     const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    const busyTimeoutMs = resolveBootBusyTimeoutMs(options?.busyTimeoutMs);
     lastSchemaFenceRejection = null;
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
@@ -2222,6 +2308,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         ensureSecureStorageDir(dbDir);
 
         const db = new Database(dbPath);
+        installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
@@ -2230,7 +2317,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             closeQuietly(db);
             return null;
         }
-        initializeDatabase(db);
+        initializeDatabase(db, busyTimeoutMs);
         runMigrations(db);
         ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
@@ -2258,14 +2345,23 @@ export async function openDatabaseAsync(
     const explicitDbPath = options?.dbPath !== undefined;
     const { dbDir, dbPath } = resolveDatabasePath(options?.dbPath);
     const latestSupportedVersion = getRuntimeLatestSupportedVersion(options);
+    const busyTimeoutMs = resolveBootBusyTimeoutMs(options?.busyTimeoutMs);
     lastSchemaFenceRejection = null;
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
     if (existing) {
-        if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) return null;
-        if (!persistenceByDatabase.has(existing)) persistenceByDatabase.set(existing, true);
-        healWedgedChannel2Claims(existing);
-        return existing;
+        const startedAt = performance.now();
+        const accepted = enforceSchemaFence(existing, dbPath, latestSupportedVersion);
+        if (accepted) {
+            if (!persistenceByDatabase.has(existing)) persistenceByDatabase.set(existing, true);
+            healWedgedChannel2Claims(existing);
+        }
+        options?.onBootTimings?.({
+            openMs: performance.now() - startedAt,
+            guardMs: 0,
+            migrateMs: 0,
+        });
+        return accepted ? existing : null;
     }
 
     const pending = pendingAsyncOpens.get(dbPath);
@@ -2273,23 +2369,38 @@ export async function openDatabaseAsync(
 
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
+        const openStartedAt = performance.now();
+        let openMs = 0;
+        let guardMs = 0;
+        let migrateMs = 0;
+        let guardStartedAt: number | null = null;
+        let migrateStartedAt: number | null = null;
         try {
             if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
             ensureSecureStorageDir(dbDir);
 
             db = new Database(dbPath);
+            installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
+            openMs = performance.now() - openStartedAt;
+            guardStartedAt = performance.now();
             if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+                guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;
             }
             if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+                guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;
             }
-            initializeDatabase(db);
+            guardMs = performance.now() - guardStartedAt;
+            migrateStartedAt = performance.now();
+            initializeDatabase(db, busyTimeoutMs);
             await runMigrationsWithRetry(db);
             ensureContextStoreUuid(db);
-            return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+            const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
+            migrateMs = performance.now() - migrateStartedAt;
+            return opened;
         } catch (error) {
             if (db) closeQuietly(db);
             const detail = getErrorMessage(error);
@@ -2297,6 +2408,15 @@ export async function openDatabaseAsync(
             throw new Error(
                 `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
             );
+        } finally {
+            if (openMs === 0) openMs = performance.now() - openStartedAt;
+            if (guardStartedAt !== null && guardMs === 0) {
+                guardMs = performance.now() - guardStartedAt;
+            }
+            if (migrateStartedAt !== null && migrateMs === 0) {
+                migrateMs = performance.now() - migrateStartedAt;
+            }
+            options?.onBootTimings?.({ openMs, guardMs, migrateMs });
         }
     })();
     pendingAsyncOpens.set(dbPath, opening);

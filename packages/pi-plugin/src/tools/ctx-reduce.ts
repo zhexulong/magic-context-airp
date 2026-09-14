@@ -14,6 +14,10 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	getProtectionWindowForSession,
+	readEpochFloorSnapshot,
+} from "@magic-context/core/features/magic-context/protection-window";
 import { parseRangeString } from "@magic-context/core/features/magic-context/range-parser";
 import {
 	type ContextDatabase,
@@ -23,6 +27,7 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { getInertWhitespaceAssistantTags } from "@magic-context/core/features/magic-context/storage-tags";
 import { getErrorMessage } from "@magic-context/core/shared/error-message";
 import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
@@ -59,14 +64,11 @@ function formatIds(ids: number[]): string {
 
 export interface CtxReduceToolDeps {
 	db: ContextDatabase;
-	protectedTags: number;
-	/** Resolve the protected-tail size from the current cwd at tool-call time.
-	 *  Pi keeps the tool registered across `/cd`, so the threshold must follow
-	 *  the active project rather than the launch project. */
+	protectedTags?: number;
+	floor?: number;
+	protectedTokens?: number;
+	resolveFloor?: (ctx: { cwd: string }) => number | undefined;
 	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
-	/** Optional callback to read live session input tokens; falls back to
-	 *  `getOrCreateSessionMeta(...).lastInputTokens`. Mirrors OpenCode's
-	 *  `getSessionTokens` deps field. */
 	getSessionTokens?: (sessionId: string) => number;
 }
 
@@ -87,10 +89,6 @@ export function createCtxReduceTool(
 		) {
 			params = unwrapImitatedReducedArgs(params, ["drop"], { drop: "string" });
 			const sessionId = ctx.sessionManager.getSessionId();
-			const protectedTags = Math.max(
-				0,
-				Math.floor(deps.resolveProtectedTags?.(ctx) ?? deps.protectedTags),
-			);
 
 			if (!params.drop) {
 				return err("Error: 'drop' must be provided.");
@@ -115,15 +113,49 @@ export function createCtxReduceTool(
 			}
 
 			const activeTags = allTags.filter((tag) => tag.status === "active");
-			const protectedTagIds = activeTags
-				.map((tag) => tag.tagNumber)
-				.sort((left, right) => right - left)
-				.slice(0, protectedTags);
-			const protectedSet = new Set(protectedTagIds);
+
+			// Resolve the effective token floor threshold used to compute the protection window
+			const effectiveFloor =
+				readEpochFloorSnapshot(deps.db, sessionId) ??
+				deps.resolveFloor?.(ctx) ??
+				deps.floor ??
+				deps.protectedTokens ??
+				16_000;
+			// Protection window membership in tag-number coordinate space (empty-window behaviour: empty set)
+			const windowResult = getProtectionWindowForSession(
+				deps.db,
+				sessionId,
+				effectiveFloor,
+			);
+			const hasToolTags = allTags.some((t) => t.type === "tool");
+			const protectedSet = hasToolTags
+				? windowResult.tagNumberSet.tagNumbers
+				: typeof deps.protectedTags === "number" && deps.protectedTags > 0
+					? new Set(
+							activeTags
+								.map((tag) => tag.tagNumber)
+								.sort((left, right) => right - left)
+								.slice(0, deps.protectedTags),
+						)
+					: new Set<number>();
 
 			const tagStatusMap = new Map(
 				allTags.map((tag) => [tag.tagNumber, tag.status]),
 			);
+			const inertWhitespaceTagNumbers = new Set(
+				getInertWhitespaceAssistantTags(deps.db, sessionId).map(
+					(tag) => tag.tagNumber,
+				),
+			);
+			const inertDropIds = [
+				...new Set(dropIds.filter((id) => inertWhitespaceTagNumbers.has(id))),
+			];
+			const inertNote =
+				inertDropIds.length > 0
+					? `Skipped: ${inertDropIds
+							.map((id) => `§${id}§ is provider framing, nothing to reclaim`)
+							.join("; ")}.`
+					: "";
 
 			const pendingOps = getPendingOps(deps.db, sessionId);
 			const pendingMap = new Map(
@@ -136,7 +168,10 @@ export function createCtxReduceTool(
 			// can't be dropped without confusing downstream readers.
 			const conflicts: string[] = [];
 			for (const id of dropIds) {
-				if (tagStatusMap.get(id) === "compacted") {
+				if (
+					tagStatusMap.get(id) === "compacted" &&
+					!inertWhitespaceTagNumbers.has(id)
+				) {
 					conflicts.push(`§${id}§ is from before compaction`);
 				}
 			}
@@ -144,16 +179,40 @@ export function createCtxReduceTool(
 				return err(`Error: Conflicting operations — ${conflicts.join("; ")}.`);
 			}
 
-			const preFilterDropCount = dropIds.length;
+			const alreadyDropped = [
+				...new Set(dropIds.filter((id) => tagStatusMap.get(id) === "dropped")),
+			];
+			const alreadyQueued = [
+				...new Set(
+					dropIds.filter(
+						(id) =>
+							tagStatusMap.get(id) !== "dropped" &&
+							pendingMap.get(id) === "drop",
+					),
+				),
+			];
+			const skippedNote = [
+				alreadyDropped.length
+					? `Already dropped: ${formatIds(alreadyDropped)}.`
+					: "",
+				alreadyQueued.length
+					? `Already queued: ${formatIds(alreadyQueued)}.`
+					: "",
+			]
+				.filter(Boolean)
+				.join(" ");
 			dropIds = dropIds.filter(
 				(id) =>
-					tagStatusMap.get(id) !== "dropped" && pendingMap.get(id) !== "drop",
+					!inertWhitespaceTagNumbers.has(id) &&
+					tagStatusMap.get(id) !== "dropped" &&
+					pendingMap.get(id) !== "drop",
 			);
-			const skippedCount = preFilterDropCount - dropIds.length;
 
 			if (dropIds.length === 0) {
 				return ok(
-					"All requested tags were already queued or processed. No new action is needed.",
+					[inertNote, skippedNote, "No new action is needed."]
+						.filter(Boolean)
+						.join(" "),
 				);
 			}
 
@@ -181,16 +240,15 @@ export function createCtxReduceTool(
 			const deferredDropIds = [
 				...new Set(dropIds.filter((id) => protectedSet.has(id))),
 			];
-			const skippedNote =
-				skippedCount > 0
-					? ` ${skippedCount} requested tag${skippedCount === 1 ? " was" : "s were"} already queued and need no action.`
-					: "";
+
 			const parts: string[] = [];
 			if (immediateDropIds.length > 0)
 				parts.push(`drop ${formatIds(immediateDropIds)}`);
 			if (deferredDropIds.length > 0)
 				parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
-			return ok(`Queued: ${parts.join(", ")}.${skippedNote}`);
+			return ok(
+				`Queued: ${parts.join(", ")}.${skippedNote ? ` ${skippedNote}` : ""}${inertNote ? ` ${inertNote}` : ""}`,
+			);
 		},
 	};
 }

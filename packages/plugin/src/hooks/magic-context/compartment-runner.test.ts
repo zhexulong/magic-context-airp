@@ -1,6 +1,10 @@
+import {
+    __resetNotificationStateForTests,
+    drainNotifications,
+} from "../../shared/rpc-notifications";
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -26,6 +30,7 @@ import {
     incrementHistorianFailure,
     loadProtectedTailMeta,
     openDatabase,
+    recordOverflowDetected,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
@@ -45,10 +50,17 @@ import {
     hasRunnableCompartmentWindow,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
+import { __ignoredNotificationTest } from "./send-session-notification";
 import { tagMessages } from "./tag-messages";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+beforeEach(() => {
+    // These fixtures end on real user rows, so the notice hold would queue.
+    // This file tests recomp behavior, not that gate.
+    __ignoredNotificationTest.setHoldDetector(() => false);
+});
 
 async function runCompartmentAgentWithLease(
     deps: Parameters<typeof runCompartmentAgent>[0],
@@ -63,8 +75,11 @@ async function runCompartmentAgentWithLease(
 }
 
 afterEach(() => {
+    __ignoredNotificationTest.reset();
+    __resetNotificationStateForTests();
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
     for (const dir of tempDirs) {
         try {
@@ -159,9 +174,9 @@ describe("executeContextRecomp", () => {
 
         expect(result).toContain("Rebuilt 1 compartment across 1 historian pass");
         expect(result).toContain("Covered raw history 1-4");
-        expect(
-            getIgnoredNotificationTexts(client.session.prompt as ReturnType<typeof mock>),
-        ).toContain("## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-4.");
+        expect(getRpcNotificationTexts(client.session.prompt as ReturnType<typeof mock>)).toContain(
+            "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-4.",
+        );
         expect(getCompartments(db, "ses-recomp")).toEqual([
             expect.objectContaining({
                 startMessage: 1,
@@ -239,7 +254,9 @@ describe("executeContextRecomp", () => {
         ).toBeNull();
     });
 
-    it("keeps published state unchanged when a later recomp pass fails", async () => {
+    it.each([
+        1, 2,
+    ])("keeps old state before progress and promotes validated progress when historian pass %i fails", async (failingPass) => {
         useTempDataHome("magic-recomp-fail-closed-");
         createOpenCodeDb("ses-recomp-fail", [
             { id: "m-1", role: "user", text: "eligible one" },
@@ -306,8 +323,8 @@ describe("executeContextRecomp", () => {
         });
         const prompt = mock(async () => {
             const callIndex = prompt.mock.calls.length;
-            if (callIndex >= 2) {
-                throw new Error("historian failed on second pass");
+            if (callIndex >= failingPass) {
+                throw new Error("historian pass failed");
             }
             return {};
         });
@@ -330,18 +347,27 @@ describe("executeContextRecomp", () => {
             directory: "/tmp",
         });
 
-        expect(result).toContain("historian failed on second pass");
+        // Only historian requests use prompt now; progress no longer consumes mock calls.
+        expect(result).toContain("(MC-R01)");
         expect(getCompartments(db, "ses-recomp-fail")).toEqual([
             expect.objectContaining({
                 startMessage: 1,
                 endMessage: 2,
-                title: "published",
-                content: "published summary",
+                title: failingPass === 1 ? "published" : "Chunk one",
+                content: failingPass === 1 ? "published summary" : "Chunk one summary",
             }),
         ]);
-        expect(getSessionFacts(db, "ses-recomp-fail")).toEqual([
-            expect.objectContaining({ category: "WORKFLOW_RULES", content: "Published fact." }),
-        ]);
+        // Recomp publishes structure only; a published replacement has no legacy session facts.
+        expect(getSessionFacts(db, "ses-recomp-fail")).toEqual(
+            failingPass === 1
+                ? [
+                      expect.objectContaining({
+                          category: "WORKFLOW_RULES",
+                          content: "Published fact.",
+                      }),
+                  ]
+                : [],
+        );
     });
 
     it("retries once when historian skips a visible message and then publishes the repaired recomp result", async () => {
@@ -425,11 +451,11 @@ describe("executeContextRecomp", () => {
         expect(result).toContain("Rebuilt 1 compartment across 1 historian pass");
         expect(historianFetches).toBe(2);
         expect(getHistorianPromptCount(prompt)).toBe(2);
-        expect(getIgnoredNotificationTexts(prompt)).toEqual(
+        expect(getRpcNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
                 "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-4.",
                 expect.stringContaining(
-                    "Historian pass 1, attempt 1 is continuing with a repair retry for messages 1-4.",
+                    "History compression is retrying this pass. History compression could not be rebuilt. Run /ctx-recomp again. (MC-R01)",
                 ),
             ]),
         );
@@ -542,7 +568,7 @@ describe("executeContextRecomp", () => {
             directory: "/tmp",
         });
 
-        expect(result).toContain("missing the tiered paraphrase structure");
+        expect(result).toContain("(MC-R01)");
         expect(getCompartments(db, sessionId)).toHaveLength(0);
         expect(
             db
@@ -702,8 +728,8 @@ describe("executeContextRecomp", () => {
             promptSyncSpy.mockRestore();
         }
 
-        expect(result).toContain("prompt timed out after 300000ms");
-        expect(getIgnoredNotificationTexts(prompt)).toContain(
+        expect(result).toContain("(MC-R01)");
+        expect(getRpcNotificationTexts(prompt)).toContain(
             "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-4.",
         );
         expect(getCompartments(db, "ses-recomp-timeout")).toHaveLength(0);
@@ -798,7 +824,7 @@ describe("executeContextRecomp", () => {
         // the chunk rather than absorbing the gap.
         expect(result).toContain("## Magic Recomp");
         expect(result).toContain("Covered raw history 1-6");
-        expect(getIgnoredNotificationTexts(prompt)).toEqual(
+        expect(getRpcNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
                 "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-6.",
             ]),
@@ -876,17 +902,17 @@ describe("executeContextRecomp", () => {
         });
 
         // Overlapping compartments are NOT healed by gap healing, so retry/shrink triggers.
-        expect(result).toContain("Recomp failed while rebuilding messages 1-6");
-        expect(getIgnoredNotificationTexts(prompt)).toEqual(
+        expect(result).toContain("(MC-R01)");
+        expect(getRpcNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
                 "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-6.",
                 expect.stringContaining(
-                    "Historian pass 1, attempt 1 is continuing with a repair retry for messages 1-6.",
+                    "History compression is retrying this pass. History compression could not be rebuilt. Run /ctx-recomp again. (MC-R01)",
                 ),
             ]),
         );
         expect(
-            getIgnoredNotificationTexts(prompt).some((text) =>
+            getRpcNotificationTexts(prompt).some((text) =>
                 text.includes("Retrying with a smaller chunk ending at"),
             ),
         ).toBe(false);
@@ -987,7 +1013,7 @@ describe("executeContextRecomp", () => {
         // Invalid full-size attempts force a smaller chunk; a successful smaller
         // pass must not permanently reduce the budget for the following pass.
         expect(result).toContain("Covered raw history 1-7");
-        expect(getIgnoredNotificationTexts(prompt)).toEqual(
+        expect(getRpcNotificationTexts(prompt)).toEqual(
             expect.arrayContaining([
                 "## Magic Recomp\n\nHistorian pass 1, attempt 1 started for messages 1-6.",
                 "## Magic Recomp\n\nHistorian pass 2, attempt 1 started for messages 5-7.",
@@ -1086,13 +1112,14 @@ function createOpenCodeDb(
     }
 }
 
-function getIgnoredNotificationTexts(promptMock: ReturnType<typeof mock>): string[] {
-    return promptMock.mock.calls
-        .map(
-            (call) => call[0] as { body?: { noReply?: boolean; parts?: Array<{ text?: string }> } },
-        )
-        .filter((input) => input.body?.noReply === true)
-        .map((input) => input.body?.parts?.[0]?.text ?? "");
+function getRpcNotificationTexts(promptMock: ReturnType<typeof mock>): string[] {
+    const ignored = promptMock.mock.calls
+        .map((call) => call[0] as { body?: { noReply?: boolean } })
+        .filter((input) => input.body?.noReply === true);
+    expect(ignored).toEqual([]);
+    return drainNotifications()
+        .filter((notice) => notice.type === "toast")
+        .map((notice) => String(notice.payload.message));
 }
 
 function getHistorianPromptCount(promptMock: ReturnType<typeof mock>): number {
@@ -1256,6 +1283,30 @@ describe("runCompartmentAgent", () => {
         expect(prompt).toHaveBeenCalled();
     });
 
+    it("records opencode_db_missing as a historian no-fire instead of silently returning", async () => {
+        useTempDataHome("compartment-runner-missing-opencode-db-");
+        const db = openDatabase();
+
+        await runCompartmentAgentWithLease({
+            client: {} as PluginContext["client"],
+            db,
+            sessionId: "ses-missing-opencode-db",
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(getOrCreateSessionMeta(db, "ses-missing-opencode-db").compartmentInProgress).toBe(
+            false,
+        );
+        expect(
+            db
+                .prepare(
+                    "SELECT status, failure_reason FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get("ses-missing-opencode-db"),
+        ).toEqual({ status: "noop", failure_reason: "opencode_db_missing" });
+    });
+
     it("clears compartment-in-progress after successful compartment generation", async () => {
         useTempDataHome("compartment-runner-reset-");
         createOpenCodeDb("ses-1", [
@@ -1327,6 +1378,68 @@ describe("runCompartmentAgent", () => {
             query: { directory: "/tmp/parent" },
         });
         expect(promptSession.mock.calls[0]?.[0]?.body.agent).toBe("historian");
+        expect(
+            db.prepare("SELECT harness FROM historian_runs WHERE session_id = ?").all("ses-1"),
+        ).toEqual([{ harness: "opencode" }]);
+    });
+
+    it("keeps both chunk-edge compartments when emergency recovery is armed", async () => {
+        useTempDataHome("compartment-runner-emergency-discard-last-");
+        const sessionId = "ses-emergency-discard-last";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "First eligible message" },
+            { id: "m-2", role: "assistant", text: "Second eligible message" },
+            { id: "m-3", role: "user", text: "Third eligible message" },
+            { id: "m-4", role: "assistant", text: "Fourth eligible message" },
+            { id: "m-5", role: "user", text: "protected 1" },
+            { id: "m-6", role: "user", text: "protected 2" },
+            { id: "m-7", role: "user", text: "protected 3" },
+            { id: "m-8", role: "user", text: "protected 4" },
+            { id: "m-9", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        recordOverflowDetected(db, sessionId, 4_096, "anthropic/test");
+
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/emergency-discard-last" } })),
+                create: mock(async () => ({ data: { id: "ses-agent-emergency-discard-last" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<compartment start="1" end="2" title="First"><p1>First summary</p1></compartment>\n<compartment start="3" end="4" title="Second"><p1>Second summary</p1></compartment>`,
+                                },
+                            ],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(getCompartments(db, sessionId).map((compartment) => compartment.endMessage)).toEqual(
+            [2, 4],
+        );
+        expect(
+            db
+                .prepare(
+                    "SELECT discarded_last FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get(sessionId),
+        ).toEqual({ discarded_last: 0 });
     });
 
     it("keeps a committed publish succeeded and signaled when post-commit project registration throws", async () => {
@@ -1532,6 +1645,77 @@ describe("runCompartmentAgent", () => {
         expect(getCompartments(db, "ses-retry")).toEqual([
             expect.objectContaining({ title: "Recovered", startMessage: 1, endMessage: 2 }),
         ]);
+    });
+
+    it("refuses a producer source far beyond the known window but admits one within the margin", async () => {
+        useTempDataHome("compartment-runner-producer-window-");
+        const source = "producer source token ".repeat(2_000);
+        const makeMessages = (prefix: string) => [
+            { id: `${prefix}-1`, role: "user", text: source },
+            { id: `${prefix}-2`, role: "assistant", text: "Second eligible message" },
+            { id: `${prefix}-3`, role: "user", text: "protected 1" },
+            { id: `${prefix}-4`, role: "user", text: "protected 2" },
+            { id: `${prefix}-5`, role: "user", text: "protected 3" },
+            { id: `${prefix}-6`, role: "user", text: "protected 4" },
+            { id: `${prefix}-7`, role: "user", text: "protected 5" },
+        ];
+        createOpenCodeDb("ses-window-refuse", makeMessages("refuse"));
+        createOpenCodeDb("ses-window-admit", makeMessages("admit"));
+        const db = openDatabase();
+        const createSession = mock(async () => ({ data: { id: "ses-agent-window" } }));
+        const promptSession = mock(async () => ({}));
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/producer-window" } })),
+                create: createSession,
+                prompt: promptSession,
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: '<compartment start="1" end="2" title="Window edge"><p1>Summary</p1></compartment>',
+                                },
+                            ],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId: "ses-window-refuse",
+            historianChunkTokens: 100_000,
+            historianContextLimit: 32_001,
+            historianMaxOutputTokens: 32_000,
+            model: "test/model",
+            directory: "/tmp",
+        });
+
+        expect(createSession).toHaveBeenCalledTimes(0);
+        expect(promptSession).toHaveBeenCalledTimes(0);
+        expect(getHistorianFailureState(db, "ses-window-refuse").lastError).toContain(
+            "producer_source_exceeds_window",
+        );
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId: "ses-window-admit",
+            historianChunkTokens: 100_000,
+            historianContextLimit: 1_000_000,
+            historianMaxOutputTokens: 32_000,
+            model: "test/model",
+            directory: "/tmp",
+        });
+
+        expect(createSession).toHaveBeenCalledTimes(1);
+        expect(promptSession).toHaveBeenCalledTimes(1);
     });
 
     it("records length-capped reasoning-only output with the actionable error and drain backoff", async () => {
@@ -2241,7 +2425,12 @@ describe("runCompartmentAgent", () => {
         // First failure on a fresh session → transient/reassuring framing (the
         // escalated "needs attention" + error detail only appears once failures
         // persist past HISTORIAN_PERSISTENT_FAILURE_THRESHOLD).
-        expect(getIgnoredNotificationTexts(promptSession)[0].toLowerCase()).toContain("transient");
+        expect(
+            String(
+                drainNotifications(0, "ses-invalid-existing").find((n) => n.type === "toast")
+                    ?.payload.message,
+            ).toLowerCase(),
+        ).toContain("(mc-h01)");
     });
 
     it("rejects invalid historian output without replacing compartments or facts", async () => {
@@ -2299,7 +2488,12 @@ describe("runCompartmentAgent", () => {
             expect.objectContaining({ category: "CONSTRAINTS", content: "Existing fact stays." }),
         ]);
         // First failure → transient framing (no raw error / no action ask yet).
-        expect(getIgnoredNotificationTexts(promptSession)[0].toLowerCase()).toContain("transient");
+        expect(
+            String(
+                drainNotifications(0, "ses-invalid-output").find((n) => n.type === "toast")?.payload
+                    .message,
+            ).toLowerCase(),
+        ).toContain("(mc-h01)");
     });
 
     it("alerts when historian model execution fails", async () => {
@@ -2344,7 +2538,12 @@ describe("runCompartmentAgent", () => {
         // unavailable") is still recorded in historian_failure_state for the
         // escalated notice + doctor diagnostics; it just isn't surfaced to the
         // user on a single transient blip.
-        expect(getIgnoredNotificationTexts(promptSession)[0].toLowerCase()).toContain("transient");
+        expect(
+            String(
+                drainNotifications(0, "ses-model-failure").find((n) => n.type === "toast")?.payload
+                    .message,
+            ).toLowerCase(),
+        ).toContain("(mc-h01)");
     });
 
     it("escalates the historian alert to an actionable notice after persistent failures", async () => {
@@ -2385,11 +2584,13 @@ describe("runCompartmentAgent", () => {
             directory: "/tmp",
         });
 
-        const notice = getIgnoredNotificationTexts(promptSession)[0];
-        expect(notice).toContain("needs attention");
-        expect(notice).toContain("magic-context.jsonc");
-        // The escalated notice surfaces the real error for diagnosis.
-        expect(notice).toContain("historian model unavailable");
+        const notice = String(
+            drainNotifications(0, "ses-persistent-failure").find((n) => n.type === "toast")?.payload
+                .message,
+        );
+        expect(notice).toContain("(MC-H01)");
+        expect(notice).not.toContain("magic-context.jsonc");
+        expect(notice).not.toContain("historian model unavailable");
     });
 
     it("re-reads narrative-gap ordinals after validation rejection", async () => {

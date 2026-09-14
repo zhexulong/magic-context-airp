@@ -2,6 +2,7 @@ import {
     acquireCompartmentLease,
     COMPARTMENT_LEASE_RENEWAL_MS,
     releaseCompartmentLease,
+    releaseCompartmentLeaseBestEffort,
     renewCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
 import { isWrapupInProgress, updateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -12,7 +13,10 @@ import {
     type PartialRecompRange,
 } from "./compartment-runner-partial-recomp";
 import { executeContextRecompInternal } from "./compartment-runner-recomp";
-import type { CompartmentRunnerDeps } from "./compartment-runner-types";
+import type {
+    CompartmentRunnerDeps,
+    HiddenCompartmentRunnerDeps,
+} from "./compartment-runner-types";
 
 export interface ActiveCompartmentRun {
     promise: Promise<void>;
@@ -76,7 +80,7 @@ export function registerActiveCompartmentRun(
     return activeRun;
 }
 
-function withPublishedCallback(deps: CompartmentRunnerDeps): CompartmentRunnerDeps {
+function withPublishedCallback<T extends HiddenCompartmentRunnerDeps>(deps: T): T {
     return {
         ...deps,
         onCompartmentStatePublished: (sid) => {
@@ -87,7 +91,7 @@ function withPublishedCallback(deps: CompartmentRunnerDeps): CompartmentRunnerDe
 }
 
 function startLeaseRenewal(
-    deps: CompartmentRunnerDeps,
+    deps: HiddenCompartmentRunnerDeps,
     holderId: string,
 ): ReturnType<typeof setInterval> {
     return setInterval(() => {
@@ -108,7 +112,10 @@ function startLeaseRenewal(
     }, COMPARTMENT_LEASE_RENEWAL_MS);
 }
 
-export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
+export function startCompartmentAgent(
+    deps: HiddenCompartmentRunnerDeps,
+    runAgent: typeof runCompartmentAgent = runCompartmentAgent,
+): void {
     // Intentional: this check-then-set is safe in Bun's single-threaded event loop.
     // The synchronous code between activeRuns.get() and activeRuns.set() cannot interleave,
     // so another start for the same session cannot sneak in here.
@@ -161,7 +168,7 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
             realRunStarted = true;
         },
     });
-    const promise = runCompartmentAgent(runnerDeps)
+    const promise = runAgent(runnerDeps)
         .catch((err) => {
             sessionLog(deps.sessionId, "compartment agent: unhandled rejection:", err);
             // Ensure compartmentInProgress is cleared on any failure
@@ -172,10 +179,17 @@ export function startCompartmentAgent(deps: CompartmentRunnerDeps): void {
             }
         })
         .finally(() => {
-            clearInterval(renewal);
-            releaseCompartmentLease(deps.db, deps.sessionId, holderId);
-            if (activeRuns.get(deps.sessionId)?.promise === promise) {
-                activeRuns.delete(deps.sessionId);
+            // The `.catch` above has already run by the time this finalizer executes,
+            // so anything thrown here would reject a promise nobody awaits. Contain
+            // every step: cleanup must never become an unhandled rejection.
+            try {
+                clearInterval(renewal);
+                releaseCompartmentLeaseBestEffort(deps.db, deps.sessionId, holderId, sessionLog);
+                if (activeRuns.get(deps.sessionId)?.promise === promise) {
+                    activeRuns.delete(deps.sessionId);
+                }
+            } catch (err) {
+                sessionLog(deps.sessionId, "compartment agent: finalizer failed:", err);
             }
         });
     activeRuns.set(deps.sessionId, { promise, published: false, kind: "incremental" });

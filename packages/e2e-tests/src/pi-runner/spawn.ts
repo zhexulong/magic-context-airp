@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readdirSync, realpathSync, symlinkSync, writeFil
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { assertMockEndpoint, pinMockAgents } from "../mock-routing";
 
 export const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 export const PI_PLUGIN_ROOT = join(REPO_ROOT, "packages/pi-plugin");
@@ -46,6 +47,7 @@ function resolvePiPackageJson(): string {
 
 export const PI_PACKAGE_JSON = resolvePiPackageJson();
 export const PI_CLI = join(dirname(PI_PACKAGE_JSON), "dist/cli.js");
+export const PI_RELOAD_EXTENSION = join(import.meta.dir, "reload-extension.mjs");
 
 export interface PiIsolatedEnv {
   baseDir: string;
@@ -72,6 +74,7 @@ export interface PiRunnerOptions {
   magicContextConfig?: Record<string, unknown>;
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
+  extensionsBeforeMagicContext?: string[];
   /** Compatibility option from the old spawn-per-turn runner. RPC sessions persist naturally. */
   continueSession?: boolean;
 }
@@ -146,6 +149,7 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
       },
     },
   };
+  assertMockEndpoint(models.providers.anthropic.baseUrl, opts.mockProviderURL);
   writeFileSync(join(env.agentDir, "models.json"), JSON.stringify(models, null, 2));
 
   const magicContext = {
@@ -162,10 +166,9 @@ export function writeConfigs(env: PiIsolatedEnv, opts: PiRunnerOptions): void {
       git_commit_indexing: { enabled: false },
     },
     embedding: { provider: "off" },
-    historian: { model: "" },
+    historian: { model: "anthropic/claude-haiku-4-5" },
     dreamer: { disable: true },
-    sidekick: { disable: true },
-    ...(opts.magicContextConfig ?? {}),
+    ...pinMockAgents(opts.magicContextConfig, "anthropic/claude-haiku-4-5", "pi"),
   };
   writeFileSync(join(env.agentDir, "magic-context.jsonc"), JSON.stringify(magicContext, null, 2));
 }

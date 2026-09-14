@@ -34,6 +34,7 @@ import type {
   SessionFilter,
   SessionMessageRow,
   SessionRow,
+  SessionScanCondition,
 } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import FilterSelect from "../shared/FilterSelect";
@@ -179,7 +180,7 @@ function loadStoredValue(key: string): string {
 
 function loadHarnessFilter(): HarnessFilter {
   const stored = loadStoredValue(HARNESS_FILTER_KEY);
-  return stored === "opencode" || stored === "pi" ? stored : "all";
+  return stored === "opencode" || stored === "pi" || stored === "omp" ? stored : "all";
 }
 
 interface SessionViewerProps {
@@ -267,6 +268,9 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
   const [hasMore, setHasMore] = createSignal(false);
   const [totalSessions, setTotalSessions] = createSignal(0);
   const [loadingMore, setLoadingMore] = createSignal(false);
+  const [sessionScanConditions, setSessionScanConditions] = createSignal<SessionScanCondition[]>(
+    [],
+  );
   let sessionRequestId = 0;
   let loadMoreSentinel: HTMLDivElement | undefined;
   let loadMoreObserver: IntersectionObserver | undefined;
@@ -278,6 +282,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
     const requestId = ++sessionRequestId;
 
     setSessionPage(1);
+    setSessionScanConditions([]);
 
     if (cached) {
       setSessions(cached);
@@ -297,6 +302,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
         sessionsTotalCache.set(key, fresh.total);
         if (requestId === sessionRequestId) {
           setSessions(fresh.rows);
+          setSessionScanConditions(fresh.conditions);
           setTotalSessions(fresh.total);
           setHasMore(fresh.has_more);
           setSessionPage(1);
@@ -319,6 +325,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
         if (requestId !== sessionRequestId) return;
         const nextRows = [...sessions(), ...fresh.rows];
         setSessions(nextRows);
+        setSessionScanConditions(fresh.conditions);
         setTotalSessions(fresh.total);
         setHasMore(fresh.has_more);
         setSessionPage((page) => page + 1);
@@ -744,6 +751,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
               { value: "all", label: "Harness: All" },
               { value: "opencode", label: "OpenCode" },
               { value: "pi", label: "Pi" },
+              { value: "omp", label: "OMP" },
             ]}
           />
           <label
@@ -776,6 +784,13 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
             fallback={<div class="empty-state">Loading sessions...</div>}
           >
             <div class="list-gap">
+              <For each={sessionScanConditions()}>
+                {(condition) => (
+                  <div class="empty-state" data-condition={condition.code}>
+                    {condition.message}
+                  </div>
+                )}
+              </For>
               <For each={filteredSessions()}>
                 {(session) => {
                   return (
@@ -1765,7 +1780,9 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                       <td>Execute hits</td>
                       <td>{metaData().times_execute_threshold_reached}</td>
                     </tr>
-                    <Show when={sessionDetail()?.harness !== "pi"}>
+                    <Show
+                      when={sessionDetail()?.harness !== "pi" && sessionDetail()?.harness !== "omp"}
+                    >
                       <tr>
                         <td>Subagent</td>
                         <td>{metaData().is_subagent ? "Yes" : "No"}</td>

@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	cleanupTestTempDir,
+	createTestTempDir,
+} from "@magic-context/core/shared/test-temp-dir";
+
 import magicContextPiExtension, { __test } from "./index";
 import { MAGIC_CONTEXT_PI_SUBAGENT_ENV } from "./subagent-runner";
 
@@ -19,8 +22,11 @@ function restoreEnv() {
 	}
 }
 
+const tempRoots: string[] = [];
+
 function isolateXdgEnv() {
-	const root = mkdtempSync(join(tmpdir(), "magic-context-pi-index-test-"));
+	const root = createTestTempDir("magic-context-pi-index-test-").dir;
+	tempRoots.push(root);
 	process.env.XDG_CONFIG_HOME = join(root, "config");
 	process.env.XDG_DATA_HOME = join(root, "data");
 }
@@ -57,6 +63,7 @@ function createCountingPi() {
 
 afterEach(() => {
 	restoreEnv();
+	for (const root of tempRoots.splice(0)) cleanupTestTempDir(root);
 	// Clear the process-global marker context so one test's full init does not
 	// leak into the next (the holder lives on globalThis, not module state).
 	__test.clearPiInProcessSubagentInitContext();
@@ -87,7 +94,10 @@ describe("Pi full extension subagent env guard", () => {
 		expect(registrations.events.length).toBeGreaterThan(0);
 		expect(registrations.tools.length).toBeGreaterThan(0);
 		expect(registrations.commands.length).toBeGreaterThan(0);
-		expect(registrations.entryRenderers).toEqual(["ctx-status"]);
+		expect(registrations.entryRenderers).toEqual([
+			"magic-context-turn-refused",
+			"ctx-status",
+		]);
 		expect(registrations.events).toContain("before_agent_start");
 		expect(registrations.tools).toContain("ctx_search");
 		expect(registrations.commands).toContain("ctx-status");

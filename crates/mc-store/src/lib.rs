@@ -110,6 +110,21 @@ struct CkWireMessageData {
     pub meta: HarnessMeta,
 }
 
+#[derive(Serialize)]
+struct CkWireMessageRef<'a> {
+    role: &'a str,
+    content: &'a [CkWireBlock],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a MessageOrigin>,
+    #[serde(skip_serializing_if = "provider_extras_ref_is_empty")]
+    provider_extras: &'a ProviderExtras,
+    meta: &'a HarnessMeta,
+}
+
+fn provider_extras_ref_is_empty(value: &&ProviderExtras) -> bool {
+    value.is_empty()
+}
+
 impl<'de> Deserialize<'de> for CkWireMessage {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -137,12 +152,12 @@ impl Serialize for CkWireMessage {
         if let Some(original) = &self.original {
             return original.serialize(serializer);
         }
-        CkWireMessageData {
-            role: self.role.clone(),
-            content: self.content.clone(),
-            origin: self.origin.clone(),
-            provider_extras: self.provider_extras.clone(),
-            meta: self.meta.clone(),
+        CkWireMessageRef {
+            role: &self.role,
+            content: &self.content,
+            origin: self.origin.as_ref(),
+            provider_extras: &self.provider_extras,
+            meta: &self.meta,
         }
         .serialize(serializer)
     }
@@ -183,6 +198,23 @@ impl CkWireMessage {
         self.original = None;
     }
 
+    /// Serialize canonical JSON without rebuilding retained ingress messages as a second JSON tree.
+    /// Typed messages continue through the sorted-key value form that defines the existing wire
+    /// format; an unchanged retained value already has that canonical representation.
+    pub fn to_canonical_json_vec(&self) -> Result<Vec<u8>, serde_json::Error> {
+        if let Some(original) = &self.original {
+            serde_json::to_vec(original)
+        } else {
+            let canonical = serde_json::to_value(self)?;
+            serde_json::to_vec(&canonical)
+        }
+    }
+
+    /// The parsed object retained for lossless pass-through, when this message is unchanged.
+    pub fn retained_original_json(&self) -> Option<&Value> {
+        self.original.as_ref()
+    }
+
     fn mark_fully_typed(&mut self) {
         self.original = None;
         for block in &mut self.content {
@@ -205,6 +237,13 @@ struct CkWireBlockData {
     pub kind: CkKind,
     #[serde(default, skip_serializing_if = "ProviderExtras::is_empty")]
     pub provider_extras: ProviderExtras,
+}
+
+#[derive(Serialize)]
+struct CkWireBlockRef<'a> {
+    kind: &'a CkKind,
+    #[serde(skip_serializing_if = "provider_extras_ref_is_empty")]
+    provider_extras: &'a ProviderExtras,
 }
 
 impl<'de> Deserialize<'de> for CkWireBlock {
@@ -231,9 +270,9 @@ impl Serialize for CkWireBlock {
         if let Some(original) = &self.original {
             return original.serialize(serializer);
         }
-        CkWireBlockData {
-            kind: self.kind.clone(),
-            provider_extras: self.provider_extras.clone(),
+        CkWireBlockRef {
+            kind: &self.kind,
+            provider_extras: &self.provider_extras,
         }
         .serialize(serializer)
     }
@@ -263,6 +302,11 @@ impl CkWireBlock {
     /// bytes and the edit never reaches the wire.
     pub fn mark_modified(&mut self) {
         self.original = None;
+    }
+
+    /// The parsed object retained for lossless pass-through, when this block is unchanged.
+    pub fn retained_original_json(&self) -> Option<&Value> {
+        self.original.as_ref()
     }
 }
 
@@ -416,8 +460,8 @@ const PASS_SCHEDULER_INTERESTING_HISTORY_CAP: usize = 256;
 const MAX_FULL_ARRAY_FINGERPRINT_BYTES: usize = 256;
 /// The recency entry is at most 99 bytes. An interesting entry is at most 1,906 bytes with
 /// sender identity and arc counters; JSON's worst case expands fingerprint bytes to `\u00xx`.
-const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 99;
-const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_906;
+const MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 157;
+const MAX_INTERESTING_PASS_SCHEDULER_OBSERVATION_JSON_BYTES: usize = 1_964;
 /// Maximum combined UTF-8 bytes for both scheduler JSON arrays on one session row.
 pub const PASS_SCHEDULER_TELEMETRY_MAX_BYTES: usize = 1
     + PASS_SCHEDULER_HISTORY_CAP * (MAX_PASS_SCHEDULER_OBSERVATION_JSON_BYTES + 1)
@@ -2510,6 +2554,183 @@ const MIGRATIONS: &[Migration] = &[
         END;
         "#,
     },
+    Migration {
+        version: 53,
+        // SQLite persists trigger SQL in the database and evaluates it on every connection.
+        // Connection-local UDFs therefore made CLI, dashboard, and repair writes fail before
+        // the guard could apply its plain-writer semantics. Keep the scope in a singleton row
+        // changed only inside the writer transaction: SQLite permits one writer at a time, and
+        // uncommitted scope values are invisible to every other connection.
+        //
+        // McStore::open intentionally logs and accepts a store-ahead outcome for rollback
+        // binaries. This migration removes no table or column needed by rollback binaries and
+        // keeps legacy UDF registration in McStore::open; an older binary does not replay
+        // v24/v33 over these rebuilt, same-named triggers.
+        statements: r#"
+        CREATE TABLE IF NOT EXISTS mc_privilege_state (
+            id                      INTEGER PRIMARY KEY CHECK (id = 1),
+            facade_authority_domain TEXT NOT NULL DEFAULT ''
+                CHECK (facade_authority_domain IN ('', 'memories', 'notes')),
+            facade_authority_route  TEXT NOT NULL DEFAULT '',
+            note_caller_project     TEXT NOT NULL DEFAULT ''
+        );
+        INSERT OR IGNORE INTO mc_privilege_state(id) VALUES (1);
+
+        DROP TRIGGER IF EXISTS mc_notes_ownership_insert;
+        DROP TRIGGER IF EXISTS mc_notes_ownership_update;
+        DROP TRIGGER IF EXISTS mc_notes_ownership_delete;
+        CREATE TRIGGER mc_notes_ownership_insert
+        BEFORE INSERT ON mc_notes
+        WHEN NEW.project_path = ''
+          OR COALESCE((
+                 SELECT note_caller_project FROM mc_privilege_state WHERE id = 1
+             ), '') IS NOT NEW.project_path
+        BEGIN
+            SELECT RAISE(ABORT, 'note ownership insert is outside the caller project');
+        END;
+        CREATE TRIGGER mc_notes_ownership_update
+        BEFORE UPDATE ON mc_notes
+        WHEN (NEW.id IS NOT OLD.id OR NEW.type IS NOT OLD.type
+              OR NEW.session_id IS NOT OLD.session_id OR NEW.project_path IS NOT OLD.project_path
+              OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+              OR NEW.context_row_id IS NOT OLD.context_row_id)
+          AND NOT (
+              COALESCE((
+                  SELECT note_caller_project FROM mc_privilege_state WHERE id = 1
+              ), '') IS OLD.project_path
+              OR COALESCE((
+                  SELECT note_caller_project FROM mc_privilege_state WHERE id = 1
+              ), '') IS NEW.project_path
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'note ownership update is outside the old or new project');
+        END;
+        CREATE TRIGGER mc_notes_ownership_delete
+        BEFORE DELETE ON mc_notes
+        WHEN COALESCE((
+                 SELECT note_caller_project FROM mc_privilege_state WHERE id = 1
+             ), '') IS NOT OLD.project_path
+        BEGIN
+            SELECT RAISE(ABORT, 'note ownership delete is outside the row project');
+        END;
+
+        DROP TRIGGER IF EXISTS mc_memories_facade_authority_insert;
+        DROP TRIGGER IF EXISTS mc_memories_facade_authority_update;
+        DROP TRIGGER IF EXISTS mc_memories_facade_authority_delete;
+        CREATE TRIGGER mc_memories_facade_authority_insert
+        BEFORE INSERT ON mc_memories
+        WHEN COALESCE((
+                 SELECT facade_authority_domain FROM mc_privilege_state WHERE id = 1
+             ), '') = 'memories'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = COALESCE((
+                       SELECT facade_authority_route FROM mc_privilege_state WHERE id = 1
+                   ), '')
+               AND authority.domain = 'memories'
+               AND authority.project = NEW.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_memories_facade_authority_update
+        BEFORE UPDATE ON mc_memories
+        WHEN COALESCE((
+                 SELECT facade_authority_domain FROM mc_privilege_state WHERE id = 1
+             ), '') = 'memories'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = COALESCE((
+                       SELECT facade_authority_route FROM mc_privilege_state WHERE id = 1
+                   ), '')
+               AND authority.domain = 'memories'
+               AND authority.project IN (OLD.project_path, NEW.project_path)
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_memories_facade_authority_delete
+        BEFORE DELETE ON mc_memories
+        WHEN COALESCE((
+                 SELECT facade_authority_domain FROM mc_privilege_state WHERE id = 1
+             ), '') = 'memories'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = COALESCE((
+                       SELECT facade_authority_route FROM mc_privilege_state WHERE id = 1
+                   ), '')
+               AND authority.domain = 'memories'
+               AND authority.project = OLD.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+
+        DROP TRIGGER IF EXISTS mc_notes_facade_authority_insert;
+        DROP TRIGGER IF EXISTS mc_notes_facade_authority_update;
+        DROP TRIGGER IF EXISTS mc_notes_facade_authority_delete;
+        CREATE TRIGGER mc_notes_facade_authority_insert
+        BEFORE INSERT ON mc_notes
+        WHEN COALESCE((
+                 SELECT facade_authority_domain FROM mc_privilege_state WHERE id = 1
+             ), '') = 'notes'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = COALESCE((
+                       SELECT facade_authority_route FROM mc_privilege_state WHERE id = 1
+                   ), '')
+               AND authority.domain = 'notes'
+               AND authority.project = NEW.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_notes_facade_authority_update
+        BEFORE UPDATE ON mc_notes
+        WHEN COALESCE((
+                 SELECT facade_authority_domain FROM mc_privilege_state WHERE id = 1
+             ), '') = 'notes'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = COALESCE((
+                       SELECT facade_authority_route FROM mc_privilege_state WHERE id = 1
+                   ), '')
+               AND authority.domain = 'notes'
+               AND authority.project IN (OLD.project_path, NEW.project_path)
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        CREATE TRIGGER mc_notes_facade_authority_delete
+        BEFORE DELETE ON mc_notes
+        WHEN COALESCE((
+                 SELECT facade_authority_domain FROM mc_privilege_state WHERE id = 1
+             ), '') = 'notes'
+          AND EXISTS (
+              SELECT 1 FROM mc_authority_route_bindings binding
+              JOIN mc_authority authority
+                ON authority.context_store_uuid = binding.context_store_uuid
+               AND authority.project = binding.project
+             WHERE binding.route_project_root = COALESCE((
+                       SELECT facade_authority_route FROM mc_privilege_state WHERE id = 1
+                   ), '')
+               AND authority.domain = 'notes'
+               AND authority.project = OLD.project_path
+               AND authority.state != 'MODULE'
+          )
+        BEGIN SELECT RAISE(ABORT, 'authority_draining'); END;
+        "#,
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -2735,6 +2956,46 @@ pub struct HistorianChunkRange {
     pub to_ordinal: u64,
 }
 
+/// Outcome of one historian trigger evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorianDecision {
+    Fired,
+    NoFire,
+}
+
+/// Bounded, durable evidence for one historian trigger decision. Measurement fields are
+/// quantized before construction so repeated equivalent no-fire observations stay write-free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorianRecentDecision {
+    pub at_ms: i64,
+    pub request_observed_at_ms: i64,
+    pub decision: HistorianDecision,
+    pub cause: String,
+    pub eligible_tokens: u64,
+    pub bar_tokens: u64,
+    pub pressure_pct: u16,
+    pub drain_latch: bool,
+    pub chunk_range: Option<HistorianChunkRange>,
+    pub producer_model: Option<String>,
+    pub completed_at_ms: Option<i64>,
+    pub apply_row_version: Option<u64>,
+}
+
+impl HistorianRecentDecision {
+    fn same_observation(&self, other: &Self) -> bool {
+        self.decision == other.decision
+            && self.cause == other.cause
+            && self.eligible_tokens == other.eligible_tokens
+            && self.bar_tokens == other.bar_tokens
+            && self.pressure_pct == other.pressure_pct
+            && self.drain_latch == other.drain_latch
+            && self.chunk_range == other.chunk_range
+    }
+}
+
+pub const HISTORIAN_RECENT_DECISION_LIMIT: usize = 16;
+
 /// Content-sensitive identity for one message selected into a historian firing.
 /// The outer firing vector preserves message order; each block vector preserves
 /// the canonical block order already tracked by [`ModuleMeta::block_identity_by_mid`].
@@ -2786,12 +3047,17 @@ pub struct HistorianDurableState {
     /// later firing establishes its producer run.
     #[serde(default)]
     pub last_failure: Option<String>,
-    /// Why the most recent pass declined to fire (reason discriminant only, no numbers,
-    /// so steady-state passes rewrite nothing). The twin of `last_failure` for the
-    /// pre-fire half: a supervised rig cannot read the transform response's diagnostics
-    /// block, so the skip branch must be readable from the state dump. Cleared on fire.
+    /// Why the most recent pass declined to fire. The structured text retains the raw Rust
+    /// cause, a TypeScript-aligned canonical cause, and quantized measurements when available.
+    /// Its change gate prevents steady-state passes from rewriting the row. The twin of
+    /// `last_failure` for the pre-fire half: a supervised rig cannot read the transform response's
+    /// diagnostics block, so the skip branch must be readable from the state dump. Cleared on fire.
     #[serde(default)]
     pub last_no_fire: Option<String>,
+    /// Newest-last trigger decisions retained for incident diagnosis. Fire decisions are always
+    /// appended; identical quantized no-fire observations are change-gated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_decisions: Vec<HistorianRecentDecision>,
     /// Consecutive failures on the historian publication path. This is diagnostic-only
     /// state: it makes repeated fence/outbox failures visible without affecting bytes.
     #[serde(default)]
@@ -2814,7 +3080,54 @@ impl Default for HistorianDurableState {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            recent_decisions: Vec::new(),
             consecutive_publish_failures: 0,
+        }
+    }
+}
+
+impl HistorianDurableState {
+    /// Append one decision while suppressing only equivalent no-fire observations.
+    pub fn record_recent_decision(&mut self, decision: HistorianRecentDecision) -> bool {
+        if decision.decision == HistorianDecision::NoFire
+            && self
+                .recent_decisions
+                .last()
+                .is_some_and(|previous| previous.same_observation(&decision))
+        {
+            return false;
+        }
+        if self.recent_decisions.len() >= HISTORIAN_RECENT_DECISION_LIMIT {
+            let remove_through = self.recent_decisions.len() - HISTORIAN_RECENT_DECISION_LIMIT;
+            self.recent_decisions.drain(..=remove_through);
+        }
+        self.recent_decisions.push(decision);
+        true
+    }
+
+    /// Fill the model on a fire decision already persisted by trigger preparation. If the
+    /// preparation write lost its CAS race, append the decision here with the model attached.
+    pub fn start_recent_fire(&mut self, decision: HistorianRecentDecision) {
+        if let Some(previous) = self.recent_decisions.last_mut().filter(|previous| {
+            previous.decision == HistorianDecision::Fired
+                && previous.completed_at_ms.is_none()
+                && previous.at_ms == decision.at_ms
+                && previous.request_observed_at_ms == decision.request_observed_at_ms
+                && previous.same_observation(&decision)
+        }) {
+            previous.producer_model = decision.producer_model;
+            return;
+        }
+        self.record_recent_decision(decision);
+    }
+
+    /// Attach the atomic publication outcome to the newest unresolved fire record.
+    fn complete_latest_fire(&mut self, completed_at_ms: i64, apply_row_version: u64) {
+        if let Some(decision) = self.recent_decisions.iter_mut().rev().find(|decision| {
+            decision.decision == HistorianDecision::Fired && decision.completed_at_ms.is_none()
+        }) {
+            decision.completed_at_ms = Some(completed_at_ms);
+            decision.apply_row_version = Some(apply_row_version);
         }
     }
 }
@@ -2823,7 +3136,14 @@ impl Default for HistorianDurableState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassSchedulerObservation {
     pub timestamp_ms: i64,
+    /// Detailed Rust pass band retained for existing incident tooling.
     pub scheduler_decision: String,
+    /// Execute/defer class shared with TypeScript `transform_decisions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_decision: Option<String>,
+    /// Canonical TypeScript refusal reason when the final class is defer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_reason: Option<String>,
     pub drain_latch_active: bool,
 }
 
@@ -2832,6 +3152,10 @@ pub struct PassSchedulerObservation {
 pub struct InterestingPassSchedulerObservation {
     pub timestamp_ms: i64,
     pub scheduler_decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_reason: Option<String>,
     pub drain_latch_active: bool,
     /// Sender-stamped request instant. Missing remains missing; it is never backfilled from the
     /// module clock because the two clocks are not interchangeable correlation keys.
@@ -2869,6 +3193,8 @@ impl InterestingPassSchedulerObservation {
         Self {
             timestamp_ms: observation.timestamp_ms,
             scheduler_decision: observation.scheduler_decision.clone(),
+            canonical_decision: observation.canonical_decision.clone(),
+            defer_reason: observation.defer_reason.clone(),
             drain_latch_active: observation.drain_latch_active,
             request_observed_at_ms,
             full_array_fingerprint: full_array_fingerprint
@@ -2893,6 +3219,29 @@ fn serialize_scheduler_observation(
             "unknown scheduler decision {:?}",
             observation.scheduler_decision
         )));
+    }
+    if let Some(canonical_decision) = observation.canonical_decision.as_deref() {
+        let expected = if observation.scheduler_decision == "Defer" {
+            "defer"
+        } else {
+            "execute"
+        };
+        if canonical_decision != expected {
+            return Err(McStoreError::Serde(format!(
+                "scheduler pass {} requires canonical decision {expected}, got {canonical_decision}",
+                observation.scheduler_decision
+            )));
+        }
+    }
+    if let Some(defer_reason) = observation.defer_reason.as_deref() {
+        if observation.scheduler_decision != "Defer"
+            || !matches!(defer_reason, "scheduler_defer" | "mid_turn_boundary")
+        {
+            return Err(McStoreError::Serde(format!(
+                "invalid scheduler defer reason {defer_reason} for pass {}",
+                observation.scheduler_decision
+            )));
+        }
     }
     serde_json::to_string(observation).map_err(|error| McStoreError::Serde(error.to_string()))
 }
@@ -3530,6 +3879,43 @@ pub struct TailHygieneBaseline {
     pub channel1_post_reduce_grace_pre_level: String,
 }
 
+/// Compartment coverage composed into one frozen prefix unit. Empty fields mean the unit
+/// contained no compartments; an absent proof on ModuleMeta means the old bytes are unproven.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedCompartmentCoverage {
+    pub max_sequence: Option<i64>,
+    pub boundary_ordinal: Option<u64>,
+}
+
+impl RenderedCompartmentCoverage {
+    pub fn from_coverage(sequence: i64, boundary_ordinal: Option<u64>) -> Self {
+        Self {
+            max_sequence: boundary_ordinal.map(|_| sequence),
+            boundary_ordinal,
+        }
+    }
+}
+
+/// Narrow structural projection used to validate an applied prefix without loading summaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompartmentBoundary {
+    pub sequence: i64,
+    pub start_message: i64,
+    pub end_message: i64,
+    pub end_message_id: String,
+}
+
+/// Estimated tiered-drop budget, not a provider-measured post-drop usage sample.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EmergencyDropAssessment {
+    pub fixed_floor_tokens: f64,
+    pub target_tokens: f64,
+    pub required_reclaim_tokens: f64,
+    pub selected_reclaim_tokens: f64,
+    pub candidate_tokens: f64,
+    pub target_unreachable: bool,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
@@ -3624,6 +4010,16 @@ pub struct ModuleMeta {
     /// resetting it; legacy or damaged rows resume escalation after those bounded windows close.
     #[serde(default, skip_serializing_if = "u8_is_zero")]
     pub boundary_divergence_pending_count: u8,
+    /// Compartment revision counted for divergence repair. A new publication restarts the
+    /// observation bound without acknowledging that its summaries have been rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_divergence_observed_compartment_seq: Option<i64>,
+    /// Minted from the m0 composition and committed with its bytes, never reconstructed on replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_m0_coverage: Option<RenderedCompartmentCoverage>,
+    /// Minted from the m1 composition. A legacy m0 stays unproven until it is actually rebuilt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_m1_coverage: Option<RenderedCompartmentCoverage>,
     /// The last materializing pass had cross-session memory disabled. The negative form keeps
     /// pre-field metadata and fresh default state compatible with the historical enabled mode.
     #[serde(default)]
@@ -3757,6 +4153,11 @@ pub struct ModuleMeta {
     /// render, so a transition pass can coordinate one cache-breaking HARD first.
     #[serde(default)]
     pub tagging_surface_active: bool,
+    /// Effective protected-token floor in the existing durable metadata blob. Hostless sessions
+    /// resolve it on cache-busting passes; hosted sessions mirror the host's epoch snapshot so
+    /// asynchronous reduction acknowledgements use the same floor as transforms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_tokens_effective: Option<u64>,
     /// Reclaimable-token amount at the last Channel-1 append or suppression reset.
     #[serde(default)]
     pub channel1_last_nudge_undropped: i64,
@@ -3791,6 +4192,9 @@ pub struct ModuleMeta {
     /// Whether the emergency idempotence sample is valid.
     #[serde(default)]
     pub has_prior_emergency_drop: bool,
+    /// Last evaluated emergency target and candidate exhaustion, retained through sub-margin dips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emergency_drop_assessment: Option<EmergencyDropAssessment>,
     /// Execute intent recorded when mid-turn tool-use defers a scheduler execute.
     #[serde(default)]
     pub deferred_execute_state: Option<DeferredExecuteState>,
@@ -3857,6 +4261,15 @@ pub struct ModuleMeta {
     /// the served block set for that pass, so it stays bounded by the output size.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub served_output_fingerprint: Vec<ServedBlockFingerprint>,
+    /// Revert and shadow-hydration generations that produced the served CK fingerprints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_output_generation: Option<(u64, u64, u64)>,
+    /// After a priced native pass, numeric-cutoff legacy replay is permanently retired.
+    #[serde(default)]
+    pub reasoning_clear_initialized: bool,
+    /// Native replay proof for the short legacy-adoption interval; no schema change is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay_evidence: Option<ReasoningReplayEvidence>,
 
     /// Tracks which shadow reset generation this record belongs to. Operations created
     /// before the most recent reset are rejected so they cannot write rows from an older
@@ -3906,6 +4319,16 @@ pub struct TagMintInput {
     pub kind: String,
     pub token_count: i64,
     pub source_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReasoningReplayEvidence {
+    pub row_version: u64,
+    pub generation: (u64, u64, u64),
+    pub source_hash: String,
+    pub ck_fingerprints: Vec<ServedBlockFingerprint>,
+    pub native: BTreeMap<String, serde_json::Value>,
+    pub unit_native: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5459,6 +5882,15 @@ pub enum FacadeMutationOutcome {
     Duplicate(Vec<u8>),
 }
 
+/// Per-id result for a transaction-scoped note dismissal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteDismissOutcome {
+    Dismissed,
+    NotFound,
+    NotOwned,
+    AlreadyDismissed,
+}
+
 /// Transaction-scoped ports used by the module facade. Every method operates on the transaction
 /// owned by `with_facade_command`, so the mutation and its response ledger row commit together.
 pub struct FacadeMutationTxn<'a> {
@@ -5522,6 +5954,7 @@ impl<'a> FacadeMutationTxn<'a> {
         project_path: &str,
         id: i64,
         content: &str,
+        category: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, String> {
         let Some(memory) = load_memory_full_tx(self.tx, id).map_err(|error| error.to_string())?
@@ -5534,6 +5967,7 @@ impl<'a> FacadeMutationTxn<'a> {
         {
             return Ok(None);
         }
+        let target_category = category.unwrap_or(&memory.category);
         let normalized_hash = compute_normalized_memory_hash(content);
         let duplicate_id = self
             .tx
@@ -5541,7 +5975,7 @@ impl<'a> FacadeMutationTxn<'a> {
                 "SELECT id FROM mc_memories
                   WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                   LIMIT 1",
-                params![project_path, memory.category, normalized_hash],
+                params![project_path, target_category, normalized_hash],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -5555,16 +5989,17 @@ impl<'a> FacadeMutationTxn<'a> {
             .execute(
                 "UPDATE mc_memories
                     SET content = ?1,
-                        normalized_hash = ?2,
-                        updated_at = ?3,
+                        category = ?2,
+                        normalized_hash = ?3,
+                        updated_at = ?4,
                         shareable = 0,
                         classified_at = NULL,
                         mural_cue = NULL,
                         mural_cue_hash = NULL,
                         mural_cue_at = NULL,
                         mural_cue_rejection_count = 0
-                  WHERE id = ?4",
-                params![content, normalized_hash, now_ms, id],
+                  WHERE id = ?5",
+                params![content, target_category, normalized_hash, now_ms, id],
             )
             .map_err(|error| error.to_string())?;
         append_memory_mutation_tx(
@@ -5574,7 +6009,7 @@ impl<'a> FacadeMutationTxn<'a> {
                 mutation_type: "update",
                 target_memory_id: id,
                 superseded_by_id: None,
-                category: Some(&memory.category),
+                category: Some(target_category),
                 new_content: Some(content),
                 queued_at: now_ms,
             },
@@ -6066,6 +6501,10 @@ impl<'a> FacadeMutationTxn<'a> {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        compiled_provider: Option<&str>,
+        compiled_config: Option<&str>,
+        compiled_at: Option<i64>,
+        compile_status: Option<&str>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
         let current = load_note_tx(self.tx, note_id)
@@ -6098,19 +6537,36 @@ impl<'a> FacadeMutationTxn<'a> {
             .tx
             .execute(
                 "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
+                    compiled_provider = CASE WHEN ?2 THEN ?4 ELSE compiled_provider END,
+                    compiled_config = CASE WHEN ?2 THEN ?5 ELSE compiled_config END,
+                    compiled_at = CASE WHEN ?2 THEN ?6 ELSE compiled_at END,
+                    compile_status = CASE WHEN ?2 THEN ?7 ELSE compile_status END,
+                    status = ?8, status_version = status_version + 1, updated_at_ms = ?9,
                     last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
                     ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
                     ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
                     compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
                     manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
                     check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                    check_cron = CASE WHEN ?2 THEN NULL ELSE check_cron END,
+                    check_version = CASE WHEN ?2 THEN 0 ELSE check_version END,
+                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END,
+                    check_failure_count = CASE WHEN ?2 THEN 0 ELSE check_failure_count END,
+                    check_network_failure_count = CASE WHEN ?2 THEN 0 ELSE check_network_failure_count END,
+                    check_quarantined_until = CASE WHEN ?2 THEN NULL ELSE check_quarantined_until END,
+                    check_next_due_at = CASE WHEN ?2 THEN NULL ELSE check_next_due_at END,
+                    check_compiled_at = CASE WHEN ?2 THEN NULL ELSE check_compiled_at END,
+                    check_false_since_at = CASE WHEN ?2 THEN NULL ELSE check_false_since_at END,
+                    check_last_liveness_at = CASE WHEN ?2 THEN NULL ELSE check_last_liveness_at END
+                  WHERE id = ?10 AND project_path = ?11 AND status = ?12 AND status_version = ?13",
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
+                    compiled_provider,
+                    compiled_config,
+                    compiled_at,
+                    compile_status,
                     next_status,
                     now_ms,
                     note_id,
@@ -6132,28 +6588,31 @@ impl<'a> FacadeMutationTxn<'a> {
         ))
     }
 
-    pub fn dismiss_note(
+    fn dismiss_note_with_outcome(
         &self,
         project_path: &str,
         session_id: &str,
         note_id: i64,
         resolution: Option<&str>,
         now_ms: i64,
-    ) -> Result<Option<StoredNote>, String> {
+    ) -> Result<(NoteDismissOutcome, Option<StoredNote>), String> {
         let Some(current) = load_note_tx(self.tx, note_id)
             .optional()
             .map_err(|error| error.to_string())?
         else {
-            return Ok(None);
+            return Ok((NoteDismissOutcome::NotFound, None));
         };
-        if current.project_path != project_path
-            || current.session_id != session_id
-            || !matches!(
-                current.status.as_str(),
-                "active" | "pending" | "ready" | "surfacing" | "surfaced"
-            )
-        {
-            return Ok(None);
+        if current.project_path != project_path || current.session_id != session_id {
+            return Ok((NoteDismissOutcome::NotOwned, None));
+        }
+        if current.status == "dismissed" {
+            return Ok((NoteDismissOutcome::AlreadyDismissed, Some(current)));
+        }
+        if !matches!(
+            current.status.as_str(),
+            "active" | "pending" | "ready" | "surfacing" | "surfaced"
+        ) {
+            return Ok((NoteDismissOutcome::AlreadyDismissed, Some(current)));
         }
         let resolution = resolution.map(str::trim).filter(|value| !value.is_empty());
         let content = resolution
@@ -6180,25 +6639,128 @@ impl<'a> FacadeMutationTxn<'a> {
             )
             .map_err(|error| error.to_string())?;
         if changed == 0 {
-            return Ok(None);
+            return Ok((NoteDismissOutcome::AlreadyDismissed, None));
         }
-        Ok(Some(
-            load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
+        Ok((
+            NoteDismissOutcome::Dismissed,
+            Some(load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?),
         ))
+    }
+
+    pub fn dismiss_notes(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_ids: &[i64],
+        resolution: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Vec<(i64, NoteDismissOutcome)>, String> {
+        note_ids
+            .iter()
+            .map(|&note_id| {
+                self.dismiss_note_with_outcome(
+                    project_path,
+                    session_id,
+                    note_id,
+                    resolution,
+                    now_ms,
+                )
+                .map(|(outcome, _)| (note_id, outcome))
+            })
+            .collect()
+    }
+
+    pub fn dismiss_note(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        note_id: i64,
+        resolution: Option<&str>,
+        now_ms: i64,
+    ) -> Result<Option<StoredNote>, String> {
+        let (outcome, note) =
+            self.dismiss_note_with_outcome(project_path, session_id, note_id, resolution, now_ms)?;
+        Ok((outcome == NoteDismissOutcome::Dismissed)
+            .then_some(note)
+            .flatten())
+    }
+}
+
+/// SQLite handle that copies process-local facade identity into a durable transaction row.
+///
+/// The singleton row is safe because SQLite allows only one writer, and its elevated values are
+/// cleared before commit. A second connection therefore sees only the committed empty state.
+struct ScopedSqliteStore {
+    inner: SqliteStore,
+    note_caller_project: Arc<Mutex<Option<String>>>,
+    facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
+}
+
+impl std::ops::Deref for ScopedSqliteStore {
+    type Target = SqliteStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl ScopedSqliteStore {
+    fn with_conn_fenced<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<T, StoreError> {
+        let authority = self
+            .facade_authority_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|scope| scope.owner == std::thread::current().id())
+            .map(|scope| (scope.domain.clone(), scope.route_project_root.clone()));
+        let note_caller = self
+            .note_caller_project
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if authority.is_none() && note_caller.is_none() {
+            return self.inner.with_conn_fenced(operation);
+        }
+        let (authority_domain, authority_route) = authority.unwrap_or_default();
+        let note_caller = note_caller.unwrap_or_default();
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute(
+                "INSERT INTO mc_privilege_state(
+                     id, facade_authority_domain, facade_authority_route, note_caller_project
+                 ) VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                     facade_authority_domain = excluded.facade_authority_domain,
+                     facade_authority_route = excluded.facade_authority_route,
+                     note_caller_project = excluded.note_caller_project",
+                params![authority_domain, authority_route, note_caller],
+            )?;
+            let result = operation(tx)?;
+            tx.execute(
+                "UPDATE mc_privilege_state
+                    SET facade_authority_domain = '',
+                        facade_authority_route = '',
+                        note_caller_project = ''
+                  WHERE id = 1",
+                [],
+            )?;
+            Ok(result)
+        })
     }
 }
 
 pub struct McStore {
-    inner: SqliteStore,
+    inner: ScopedSqliteStore,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: u64,
-    /// The connection-local caller identity used by note ownership triggers. It is
-    /// installed only while a fenced note mutation is executing, so an unwrapped SQL
-    /// writer fails closed instead of inheriting a previous operation's project.
+    /// The process-local note caller copied into `mc_privilege_state` for each fenced write.
+    /// The legacy UDF reads the same scope while an old-shape store is migrating.
     note_caller_project: Arc<Mutex<Option<String>>>,
-    /// Facade scope is visible to SQLite triggers for the duration of a mutation. A separate
-    /// lock serializes scopes so one request cannot lend its authority identity to another.
+    /// Facade scope is copied into the durable privilege row for each write transaction. A
+    /// separate lock serializes scopes so one request cannot lend its authority to another.
     facade_authority_scope: Arc<Mutex<Option<FacadeAuthorityScope>>>,
     facade_mutation_lock: Mutex<()>,
     #[cfg(any(test, feature = "test-support"))]
@@ -6211,6 +6773,10 @@ pub struct McStore {
     authority_project_resolution_fail_once: std::sync::atomic::AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     tag_number_query_count: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    tag_payload_query_count: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    state_load_query_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     authority_seed_transaction_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
@@ -6318,11 +6884,23 @@ fn materialize_drop_seed_units(
         }
     }
 
+    if candidates.is_empty() {
+        return skipped;
+    }
+    // Candidate keys are unique. Index the retained units once rather than scanning
+    // the growing vector for every tag in a large cold seed. Reverse collection keeps
+    // the first retained unit authoritative if legacy data contains duplicate keys.
+    let existing_by_key: std::collections::HashMap<_, _> = core
+        .frozen_units
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, unit)| (unit.key.clone(), index))
+        .collect();
     for (key, unit) in candidates {
-        if let Some(existing) = core
-            .frozen_units
-            .iter()
-            .find(|existing| existing.key == key)
+        if let Some(existing) = existing_by_key
+            .get(&key)
+            .map(|index| &core.frozen_units[*index])
         {
             if existing != &unit {
                 eprintln!(
@@ -6375,11 +6953,23 @@ fn materialize_strip_seed_units(
             reset_rule: String::new(),
         });
     }
+    if candidates.is_empty() {
+        return skipped;
+    }
+    // Candidate keys are unique. Index the retained units once rather than scanning
+    // the growing vector for every tag in a large cold seed. Reverse collection keeps
+    // the first retained unit authoritative if legacy data contains duplicate keys.
+    let existing_by_key: std::collections::HashMap<_, _> = core
+        .frozen_units
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, unit)| (unit.key.clone(), index))
+        .collect();
     for (key, unit) in candidates {
-        if let Some(existing) = core
-            .frozen_units
-            .iter()
-            .find(|existing| existing.key == key)
+        if let Some(existing) = existing_by_key
+            .get(&key)
+            .map(|index| &core.frozen_units[*index])
         {
             if existing != &unit {
                 eprintln!(
@@ -6406,8 +6996,9 @@ impl McStore {
         let note_udf_scope = Arc::clone(&note_caller_project);
         let facade_domain_scope = Arc::clone(&facade_authority_scope);
         let facade_route_scope = Arc::clone(&facade_authority_scope);
-        // Register before migrations: migrations create triggers that call these functions,
-        // and the same connection must expose them before the first guarded write is possible.
+        // Register before migrations: stores below v53 still install the historical UDF-backed
+        // triggers before v53 replaces them. Keeping the functions registered also lets a new
+        // binary open an old-shape/store-ahead database without a bootstrap-only failure.
         inner.with_conn(move |conn| {
             conn.create_scalar_function(
                 "mc_note_caller_project",
@@ -6450,9 +7041,24 @@ impl McStore {
                 },
             )
         })?;
-        inner.migrate(NS, MIGRATIONS)?;
+        let migration = inner.migrate(NS, MIGRATIONS)?;
+        if migration.store_ahead() {
+            // A store written by a longer chain than this binary carries is the
+            // rollback shape (#7804 keeps an older ck-mc placeable on purpose), so
+            // startup continues; the line exists so a rolled-back module that later
+            // fails a query on a column it does not know is attributable to the
+            // version skew rather than to data corruption.
+            eprintln!(
+                "mc-store: store schema v{} is ahead of this binary's chain v{} (older binary on a newer store); continuing without migrating",
+                migration.recorded, migration.chain_max
+            );
+        }
         let store = McStore {
-            inner,
+            inner: ScopedSqliteStore {
+                inner,
+                note_caller_project: Arc::clone(&note_caller_project),
+                facade_authority_scope: Arc::clone(&facade_authority_scope),
+            },
             tag_cache_namespace: NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             note_caller_project,
             facade_authority_scope,
@@ -6467,6 +7073,10 @@ impl McStore {
             authority_project_resolution_fail_once: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             tag_number_query_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            tag_payload_query_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            state_load_query_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             authority_seed_transaction_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -6975,21 +7585,16 @@ impl McStore {
         caller_project: &str,
         operation: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
     ) -> Result<T, McStoreError> {
-        let caller_project = caller_project.to_string();
-        let caller_scope = Arc::clone(&self.note_caller_project);
-        self.inner
-            .with_conn_fenced(|tx| {
-                let previous = caller_scope
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .replace(caller_project);
-                let result = operation(tx);
-                *caller_scope
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous;
-                result
-            })
-            .map_err(Into::into)
+        let previous = self
+            .note_caller_project
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(caller_project.to_string());
+        let _scope_guard = FacadeNoteScopeGuard {
+            scope: &self.note_caller_project,
+            previous,
+        };
+        self.inner.with_conn_fenced(operation).map_err(Into::into)
     }
 
     /// The applied schema version of this store's `mc_cache` migration chain:
@@ -7128,6 +7733,9 @@ impl McStore {
     /// Load a session's persisted state. Returns defaults (uninitialized, no row)
     /// when the session has never been seen — the classifier then bootstraps.
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.state_load_query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let row = self.inner.with_conn(|conn| {
             Ok(conn
                 .query_row(
@@ -7157,6 +7765,32 @@ impl McStore {
                     .map_err(|e| McStoreError::Serde(e.to_string()))?,
                 row_version: Some(rv),
             }),
+        }
+    }
+
+    /// Read bootstrap cursors without hydrating frozen units or compartment summary bodies.
+    pub fn load_state_sync_inventory(
+        &self,
+        session_id: &str,
+        include_boundary: bool,
+    ) -> Result<(ModuleMeta, String, i64), McStoreError> {
+        let row = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT meta, CASE WHEN ?2 THEN COALESCE(json_extract(core_state, '$.boundary_id'), '') ELSE '' END,
+                        (SELECT COALESCE(MAX(sequence), -1) FROM mc_compartments WHERE session_id = ?1)
+                 FROM mc_cache_state WHERE session_id = ?1",
+                params![session_id, include_boundary],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+            ).optional()
+        })?;
+        match row {
+            Some((meta, boundary, sequence)) => Ok((
+                serde_json::from_str(&meta)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?,
+                boundary,
+                sequence,
+            )),
+            None => Ok((ModuleMeta::default(), String::new(), -1)),
         }
     }
 
@@ -7922,7 +8556,7 @@ impl McStore {
                 if block_id.is_empty() {
                     continue;
                 }
-                if let Some(row) = tx
+                if let Some(mut row) = tx
                     .query_row(
                         "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                          FROM mc_tags
@@ -7932,6 +8566,15 @@ impl McStore {
                     )
                     .optional()?
                 {
+                    let candidate = input.token_count.max(0);
+                    tx.execute(
+                        "UPDATE mc_tags
+                            SET token_count = MAX(COALESCE(token_count, 0), ?3)
+                          WHERE session_id = ?1 AND block_id = ?2
+                            AND COALESCE(token_count, 0) < ?3",
+                        params![session_id, block_id, candidate],
+                    )?;
+                    row.token_count = row.token_count.max(candidate);
                     out.push(row);
                     continue;
                 }
@@ -7967,8 +8610,32 @@ impl McStore {
         })?)
     }
 
+    /// Raise a persisted tag's output-token mass without permitting a later observation to lower
+    /// it. The SQL guard also backfills a legacy NULL if one is encountered in a migrated store.
+    pub fn update_tag_token_count_max(
+        &self,
+        session_id: &str,
+        block_id: &str,
+        token_count: i64,
+    ) -> Result<bool, McStoreError> {
+        let candidate = token_count.max(0);
+        Ok(self.inner.with_conn_fenced(|conn| {
+            let changed = conn.execute(
+                "UPDATE mc_tags
+                    SET token_count = MAX(COALESCE(token_count, 0), ?3)
+                  WHERE session_id = ?1 AND block_id = ?2
+                    AND COALESCE(token_count, 0) < ?3",
+                params![session_id, block_id, candidate],
+            )?;
+            Ok(changed > 0)
+        })?)
+    }
+
     /// Load all minted tags for a session in tag-number order. This is the cold baseline fill.
     pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.tag_payload_query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
@@ -7991,6 +8658,9 @@ impl McStore {
         session_id: &str,
         after_tag_number: i64,
     ) -> Result<Vec<McTagRow>, McStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.tag_payload_query_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.inner.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
@@ -8079,6 +8749,31 @@ impl McStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn tag_number_query_count_for_test(&self) -> usize {
         self.tag_number_query_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count full and append-delta payload reads. Summary-only cache validation is excluded.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tag_payload_query_count_for_test(&self) -> usize {
+        self.tag_payload_query_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_tag_payload_query_count_for_test(&self) {
+        self.tag_payload_query_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_state_load_query_count_for_test(&self) {
+        self.state_load_query_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn state_load_query_count_for_test(&self) -> usize {
+        self.state_load_query_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -9584,6 +10279,9 @@ impl McStore {
         &self,
         request: ModuleStateSyncRequest<'_>,
     ) -> Result<ModuleStateSyncResult, ModuleStateSyncError> {
+        let timing_started = std::time::Instant::now();
+        let mut drop_seed_units_ms = 0.0;
+        let mut import_ms = 0.0;
         let default_core_json = serde_json::to_string(&CoreState::default())
             .map_err(|e| ModuleStateSyncError::Serde(e.to_string()))?;
         let outcome = self.inner.with_conn_fenced(|tx| {
@@ -9673,12 +10371,14 @@ impl McStore {
                 }
             }
 
+            let drop_started = std::time::Instant::now();
             let drop_seeds_skipped = materialize_drop_seed_units(
                 &mut core,
                 request.session_id,
                 request.drop_seeds,
                 request.drop_seed_skipped,
             );
+            drop_seed_units_ms = drop_started.elapsed().as_secs_f64() * 1000.0;
             let mut pending_agent_drops_seeded = 0usize;
             let mut pending_agent_drops_skipped = request.pending_agent_drops_skipped;
             for seed in request.pending_agent_drops {
@@ -9865,6 +10565,7 @@ impl McStore {
                 params![request.session_id, next as i64, core_json, meta_json, current_time_ms()],
             )?;
 
+            import_ms = timing_started.elapsed().as_secs_f64() * 1000.0;
             Ok(ModuleStateSyncTxnOutcome::Committed(ModuleStateSyncResult {
                 shadow_generation: meta.shadow_generation,
                 shadow_seq: meta.shadow_seq,
@@ -9882,6 +10583,8 @@ impl McStore {
             }))
         })?;
 
+        let commit_ms = (timing_started.elapsed().as_secs_f64() * 1000.0 - import_ms).max(0.0);
+        eprintln!("mc-state-sync-timing side=store session={} import_ms={:.3} drop_seed_units_ms={:.3} commit_ms={:.3} compartments={} tags={}", request.session_id, import_ms, drop_seed_units_ms, commit_ms, request.compartments.len(), request.drop_seeds.len());
         match outcome {
             ModuleStateSyncTxnOutcome::Committed(result) => Ok(result),
             ModuleStateSyncTxnOutcome::NonRetryableStoreConstraint { detail } => {
@@ -9948,6 +10651,31 @@ impl McStore {
                 .query_map(params![session_id], Self::stored_compartment_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(mapped)
+        })?;
+        Ok(rows)
+    }
+
+    /// Read only structural boundaries from one SQLite snapshot, without summary bodies.
+    pub fn load_compartment_boundaries(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CompartmentBoundary>, McStoreError> {
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT sequence, start_message, end_message, end_message_id
+                 FROM mc_compartments WHERE session_id = ?1 ORDER BY sequence ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok(CompartmentBoundary {
+                        sequence: row.get(0)?,
+                        start_message: row.get(1)?,
+                        end_message: row.get(2)?,
+                        end_message_id: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
         })?;
         Ok(rows)
     }
@@ -10581,6 +11309,12 @@ impl McStore {
             };
 
             target_core = source_core;
+            // A descent changes the live message set. Tail reasoning decisions cannot
+            // authorize changes in the new lineage, even if a harness reuses an id.
+            target_core.frozen_units.retain(|unit| {
+                !unit.key.starts_with("strip:reasoning_clear:")
+                    && !unit.key.starts_with("strip:native_reasoning_keep:")
+            });
             target_core.boundary_id = anchor.block_id.clone();
             target_core.reconcile_pending = false;
             target_meta = source_meta;
@@ -10593,6 +11327,9 @@ impl McStore {
             target_meta.pending_rewrite_ambiguous = false;
             target_meta.pending_rewrite_last_failure = None;
             target_meta.served_output_fingerprint.clear();
+            target_meta.served_output_generation = None;
+            target_meta.reasoning_replay_evidence = None;
+            target_meta.reasoning_clear_initialized = false;
             target_meta.anchor_block_id = Some(anchor.block_id.clone());
             target_meta.anchor_content_hash = Some(anchor.content_hash.clone());
             target_meta.ordinal_continuation_base = Some(prior_last);
@@ -10643,6 +11380,10 @@ impl McStore {
                 projects
             };
             for note_project in note_projects {
+                tx.execute(
+                    "UPDATE mc_privilege_state SET note_caller_project = ?1 WHERE id = 1",
+                    params![note_project],
+                )?;
                 let previous_project = note_caller_project
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -10655,9 +11396,10 @@ impl McStore {
                     )?;
                     tx.execute(
                         &format!(
-                            "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
-                             SELECT type, project_path, ?1, content, status, surface_condition,
-                                    ready_at, ready_reason, manifest_json, compiled_check, check_hash,
+                             "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS})
+                              SELECT type, project_path, ?1, content, status, surface_condition,
+                                     compiled_provider, compiled_config, compiled_at, compile_status,
+                                     ready_at, ready_reason, manifest_json, compiled_check, check_hash,
                                     check_cron, check_failure_count, check_network_failure_count,
                                     check_quarantined_until, check_next_due_at, check_compiled_at,
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
@@ -10675,6 +11417,10 @@ impl McStore {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = previous_project;
                 copy_result?;
+                tx.execute(
+                    "UPDATE mc_privilege_state SET note_caller_project = '' WHERE id = 1",
+                    [],
+                )?;
             }
             tx.execute(
                 "INSERT INTO mc_compartments (
@@ -11225,6 +11971,31 @@ impl McStore {
         }
     }
 
+    /// Append a boundary-only historian marker only if its assembly snapshot is still current.
+    /// Reverts and concurrent publications must not turn a scan of old noise into new coverage.
+    pub fn append_filtered_noise_marker(
+        &self,
+        session_id: &str,
+        marker: &StoredCompartment,
+        expected_revert_epoch: u64,
+        expected_generation: CompartmentSetGeneration,
+    ) -> Result<bool, McStoreError> {
+        Ok(self.inner.with_conn_fenced(|tx| {
+            let epoch: i64 = tx.query_row(
+                "SELECT COALESCE((SELECT json_extract(meta, '$.revert_epoch') FROM mc_cache_state WHERE session_id = ?1), 0)",
+                params![session_id], |row| row.get(0),
+            )?;
+            let (max_sequence, count): (i64, i64) = tx.query_row(
+                "SELECT COALESCE(MAX(sequence), 0), COUNT(*) FROM mc_compartments WHERE session_id = ?1",
+                params![session_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if epoch as u64 != expected_revert_epoch || max_sequence != expected_generation.max_sequence || count != expected_generation.count {
+                return Ok(false);
+            }
+            Ok(matches!(append_compartments_tx(tx, session_id, std::slice::from_ref(marker))?, AppendCompartmentsTxnOutcome::Appended))
+        })?)
+    }
+
     /// Promote validated historian facts into project memories using exact-content
     /// de-duplication against the active render set. This path is additive only: it
     /// inserts new `mc_memories` rows and never writes mutation-log rows, so the next
@@ -11237,7 +12008,7 @@ impl McStore {
     ) -> Result<Vec<PromotedRef>, McStoreError> {
         let promoted = self
             .inner
-            .with_conn_fenced(|tx| promote_facts_tx(tx, project_path, facts))?;
+            .with_conn_fenced(|tx| promote_facts_tx(tx, project_path, facts, current_time_ms()))?;
         Ok(promoted)
     }
 
@@ -11375,14 +12146,16 @@ impl McStore {
         Ok(memory_id)
     }
 
-    /// Replace an owned primary memory's content and append its cache-visible mutation in
-    /// the same fenced transaction. Shared workspace visibility is read-only for primary
-    /// agents, so project ownership and lifecycle are rechecked after the transaction begins.
+    /// Replace an owned primary memory's content/category and append its cache-visible mutation
+    /// in the same fenced transaction. Shared workspace visibility is read-only for primary
+    /// agents, so project ownership, lifecycle, and target-category duplication are rechecked
+    /// after the transaction begins.
     pub fn update_memory_content(
         &self,
         project_path: &str,
         id: i64,
         content: &str,
+        category: Option<&str>,
         now_ms: i64,
     ) -> Result<Option<StoredMemoryFull>, McStoreError> {
         let outcome = self.inner.with_conn_fenced(|tx| {
@@ -11395,13 +12168,14 @@ impl McStore {
             {
                 return Ok(MemoryMutationOutcome::NotFound);
             }
+            let target_category = category.unwrap_or(&memory.category);
             let normalized_hash = compute_normalized_memory_hash(content);
             let duplicate_id = tx
                 .query_row(
                     "SELECT id FROM mc_memories
                       WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                       LIMIT 1",
-                    params![project_path, memory.category, normalized_hash],
+                    params![project_path, target_category, normalized_hash],
                     |row| row.get::<_, i64>(0),
                 )
                 .optional()?;
@@ -11411,16 +12185,17 @@ impl McStore {
             tx.execute(
                 "UPDATE mc_memories
                     SET content = ?1,
-                        normalized_hash = ?2,
-                        updated_at = ?3,
+                        category = ?2,
+                        normalized_hash = ?3,
+                        updated_at = ?4,
                         shareable = 0,
                         classified_at = NULL,
                         mural_cue = NULL,
                         mural_cue_hash = NULL,
                         mural_cue_at = NULL,
                         mural_cue_rejection_count = 0
-                  WHERE id = ?4",
-                params![content, normalized_hash, now_ms, id],
+                  WHERE id = ?5",
+                params![content, target_category, normalized_hash, now_ms, id],
             )?;
             append_memory_mutation_tx(
                 tx,
@@ -11429,7 +12204,7 @@ impl McStore {
                     mutation_type: "update",
                     target_memory_id: id,
                     superseded_by_id: None,
-                    category: Some(&memory.category),
+                    category: Some(target_category),
                     new_content: Some(content),
                     queued_at: now_ms,
                 },
@@ -11503,9 +12278,9 @@ impl McStore {
                         )?;
                     } else {
                         tx.execute(
-                            "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
-                            params![now_ms, memory.id],
-                        )?;
+                        "UPDATE mc_memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+                        params![now_ms, memory.id],
+                    )?;
                     }
                     append_memory_mutation_tx(
                         tx,
@@ -11751,6 +12526,7 @@ impl McStore {
                 firing_seq: historian.firing_seq,
                 failure_backoff_at_ms,
                 last_failure,
+                recent_decisions: historian.recent_decisions.clone(),
                 consecutive_publish_failures: if count_publish_failure {
                     historian.consecutive_publish_failures.saturating_add(1)
                 } else {
@@ -11968,7 +12744,14 @@ impl McStore {
                 )?;
             }
             let promoted_refs = if request.promote_facts {
-                promote_facts_tx(tx, request.project_path, request.facts)?
+                // Compartments and facts belong to one historian publication. Reuse the
+                // compartment stamp when available so every row shares that event time.
+                let published_at_ms = request
+                    .compartments
+                    .iter()
+                    .find_map(|compartment| (compartment.created_at > 0).then_some(compartment.created_at))
+                    .unwrap_or_else(current_time_ms);
+                promote_facts_tx(tx, request.project_path, request.facts, published_at_ms)?
             } else {
                 Vec::new()
             };
@@ -12003,9 +12786,9 @@ impl McStore {
                     .unwrap_or(1)
                     .max(request.publication_floor_ordinal.max(1)),
             );
-            meta.historian = idle_historian_after_success(meta.historian.firing_seq);
-
             let next = current as u64 + 1;
+            meta.historian = idle_historian_after_success(&meta.historian);
+            meta.historian.complete_latest_fire(current_time_ms(), next);
             let meta_json = match serde_json::to_string(&meta) {
                 Ok(json) => json,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
@@ -13182,8 +13965,9 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
+                  compiled_provider, compiled_config, compiled_at, compile_status,
                   anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'module', ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -13193,6 +13977,10 @@ impl McStore {
                         .surface_condition
                         .map(str::trim)
                         .filter(|value| !value.is_empty()),
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.anchor_block_id,
                     input.anchor_ordinal,
                     input.now_ms,
@@ -13881,24 +14669,46 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
-        if query.trim().is_empty() {
+        let terms = keyword_search_terms(query);
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let pattern = sql_like_pattern(query);
-        let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, content, status, surface_condition, session_id, anchor_ordinal,
+        let predicates = terms
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let parameter = index + 3;
+                format!(
+                    "(LOWER(content) LIKE ?{parameter} ESCAPE '\\' \
+                          OR LOWER(COALESCE(surface_condition, '')) LIKE ?{parameter} ESCAPE '\\')"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT id, content, status, surface_condition, session_id, anchor_ordinal,
                         created_at_ms, updated_at_ms
-                    FROM mc_notes
+                   FROM mc_notes
                   WHERE project_path = ?1
-                    AND (type = 'smart' OR session_id = ?3)
-                    AND (LOWER(content) LIKE ?2 ESCAPE '\\'
-                      OR LOWER(COALESCE(surface_condition, '')) LIKE ?2 ESCAPE '\\')
+                    AND (type = 'smart' OR session_id = ?2)
+                    AND status IN ('active', 'pending', 'ready')
+                    AND ({predicates})
                   ORDER BY updated_at_ms DESC, id DESC
-                  LIMIT 100",
-            )?;
+                  LIMIT 100"
+        );
+        let mut parameters = vec![
+            SqlValue::Text(project_path.to_string()),
+            SqlValue::Text(session_id.to_string()),
+        ];
+        parameters.extend(
+            terms
+                .iter()
+                .map(|term| SqlValue::Text(sql_like_pattern(term))),
+        );
+        let rows = self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
-                .query_map(params![project_path, pattern, session_id], |r| {
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |r| {
                     Ok(StoredNoteSearchRow {
                         id: r.get(0)?,
                         content: r.get(1)?,
@@ -14011,14 +14821,15 @@ impl McStore {
                 "INSERT INTO mc_memories (id, project_path, category, content, normalized_hash,
                                           importance, status, first_seen_at, created_at,
                                           updated_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, 0, 0, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7, ?7, ?7)",
                 params![
                     id,
                     project_path,
                     category,
                     content,
                     format!("h{id}"),
-                    importance
+                    importance,
+                    current_time_ms(),
                 ],
             )?;
             Ok(())
@@ -14062,7 +14873,7 @@ impl McStore {
                 "INSERT INTO mc_memories (id, project_path, category, content, normalized_hash,
                                           importance, status, expires_at, first_seen_at,
                                           created_at, updated_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, 0, 0, 0, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?8, ?8, ?8)",
                 params![
                     id,
                     project_path,
@@ -14070,7 +14881,8 @@ impl McStore {
                     content,
                     format!("h{id}"),
                     importance,
-                    expires_at
+                    expires_at,
+                    current_time_ms(),
                 ],
             )?;
             Ok(())
@@ -15363,11 +16175,14 @@ impl McStore {
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37)
                  ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
                     type=excluded.type, project_path=excluded.project_path,
                     session_id=excluded.session_id, content=excluded.content,
                     status=excluded.status, surface_condition=excluded.surface_condition,
+                    compiled_provider=excluded.compiled_provider,
+                    compiled_config=excluded.compiled_config, compiled_at=excluded.compiled_at,
+                    compile_status=excluded.compile_status,
                     ready_at=excluded.ready_at, ready_reason=excluded.ready_reason,
                     manifest_json=excluded.manifest_json, compiled_check=excluded.compiled_check,
                     check_hash=excluded.check_hash, check_cron=excluded.check_cron,
@@ -15409,6 +16224,10 @@ impl McStore {
                     text("content").unwrap_or(""),
                     text("status").unwrap_or("active"),
                     text("surface_condition"),
+                    text("compiled_provider"),
+                    text("compiled_config"),
+                    integer("compiled_at"),
+                    text("compile_status"),
                     integer("ready_at"),
                     text("ready_reason"),
                     text("manifest_json"),
@@ -16313,14 +17132,14 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
         tag_number: r.get(0)?,
         block_id: r.get(1)?,
         kind: r.get(2)?,
-        token_count: r.get(3)?,
+        token_count: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
         created_at_ms: r.get(4)?,
         source_bytes: r.get(5)?,
     })
 }
 
 const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, compiled_provider, compiled_config, compiled_at, compile_status, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
@@ -16377,6 +17196,7 @@ fn promote_facts_tx(
     tx: &rusqlite::Transaction<'_>,
     project_path: &str,
     facts: &[FactCandidate],
+    now_ms: i64,
 ) -> rusqlite::Result<Vec<PromotedRef>> {
     let mut active_content = HashSet::new();
     {
@@ -16415,7 +17235,7 @@ fn promote_facts_tx(
                 source_session_id, source_type, seen_count, retrieval_count,
                 first_seen_at, created_at, updated_at, last_seen_at, status,
                 expires_at, verification_status)
-             VALUES (?1,?2,?3,?4,?5,?6,'historian',1,0,0,0,0,0,'active',?7,'unverified')",
+             VALUES (?1,?2,?3,?4,?5,?6,'historian',1,0,?7,?7,?7,?7,'active',?8,'unverified')",
             params![
                 project_path,
                 &fact.category,
@@ -16423,6 +17243,7 @@ fn promote_facts_tx(
                 normalized_hash,
                 fact.importance.map(i64::from),
                 fact.source_session_id.as_deref(),
+                now_ms,
                 fact.expires_at,
             ],
         )?;
@@ -17149,6 +17970,38 @@ fn memory_render_pool_filter_for_column(
     )
 }
 
+fn keyword_search_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let push_current = |terms: &mut Vec<String>, current: &mut String| {
+        if current.len() > 1
+            && current.chars().any(|ch| ch.is_ascii_alphanumeric())
+            && !terms.contains(current)
+        {
+            terms.push(std::mem::take(current));
+        } else {
+            current.clear();
+        }
+    };
+    for ch in query.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | ':' | '-') {
+            current.push(ch);
+        } else if !current.is_empty() {
+            push_current(&mut terms, &mut current);
+        }
+    }
+    if !current.is_empty() {
+        push_current(&mut terms, &mut current);
+    }
+    if terms.is_empty() {
+        let query = query.trim().to_lowercase();
+        if !query.is_empty() {
+            terms.push(query);
+        }
+    }
+    terms
+}
+
 fn sql_like_pattern(query: &str) -> String {
     let mut escaped = String::new();
     for ch in query.trim().to_lowercase().chars() {
@@ -17217,9 +18070,10 @@ fn stable_content_hash(content: &str) -> u64 {
     hash
 }
 
-fn idle_historian_after_success(firing_seq: u64) -> HistorianDurableState {
+fn idle_historian_after_success(current: &HistorianDurableState) -> HistorianDurableState {
     HistorianDurableState {
-        firing_seq,
+        firing_seq: current.firing_seq,
+        recent_decisions: current.recent_decisions.clone(),
         ..HistorianDurableState::default()
     }
 }
@@ -17563,8 +18417,10 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let session = "counter-cas";
         let core = CoreState::default();
-        let mut initial_meta = ModuleMeta::default();
-        initial_meta.boundary_divergence_pending_count = 0;
+        let initial_meta = ModuleMeta {
+            boundary_divergence_pending_count: 0,
+            ..ModuleMeta::default()
+        };
         store.commit(session, None, &core, &initial_meta).unwrap();
 
         let left = store.load(session).unwrap();
@@ -17574,12 +18430,19 @@ mod tests {
 
         let mut left_meta = left.meta.clone();
         left_meta.boundary_divergence_pending_count = 1;
+        left_meta.boundary_divergence_observed_compartment_seq = Some(47);
+        left_meta.rendered_m0_coverage =
+            Some(RenderedCompartmentCoverage::from_coverage(47, Some(2_400)));
+        left_meta.rendered_m1_coverage = Some(RenderedCompartmentCoverage::default());
         store
             .commit(session, left.row_version, &left.core, &left_meta)
             .unwrap();
 
         let mut right_meta = right.meta.clone();
         right_meta.boundary_divergence_pending_count = 1;
+        right_meta.boundary_divergence_observed_compartment_seq = Some(48);
+        right_meta.rendered_m0_coverage =
+            Some(RenderedCompartmentCoverage::from_coverage(48, Some(2_401)));
         let loser = store.commit(session, right.row_version, &right.core, &right_meta);
         assert!(matches!(
             loser,
@@ -17597,8 +18460,36 @@ mod tests {
             1
         );
 
+        assert_eq!(
+            store
+                .load(session)
+                .unwrap()
+                .meta
+                .boundary_divergence_observed_compartment_seq,
+            Some(47)
+        );
+        assert_eq!(
+            store.load(session).unwrap().meta.rendered_m0_coverage,
+            left_meta.rendered_m0_coverage
+        );
         drop(store);
         let reopened = McStore::open(&descriptor(dir.path())).unwrap();
+        assert_eq!(
+            reopened.load(session).unwrap().meta.rendered_m0_coverage,
+            left_meta.rendered_m0_coverage
+        );
+        assert_eq!(
+            reopened.load(session).unwrap().meta.rendered_m1_coverage,
+            left_meta.rendered_m1_coverage
+        );
+        assert_eq!(
+            reopened
+                .load(session)
+                .unwrap()
+                .meta
+                .boundary_divergence_observed_compartment_seq,
+            Some(47)
+        );
         assert_eq!(
             reopened
                 .load(session)
@@ -18811,10 +19702,11 @@ mod tests {
         assert_eq!(
             store.tag_cache_summary("ses").unwrap(),
             TagCacheSummary {
-                generation: 3,
+                generation: 5,
                 count: 3,
                 max_tag_number: 3,
-            }
+            },
+            "the MAX-guarded raise and the new insert both invalidate the tag baseline"
         );
         store
             .execute_tag_sql_for_test(
@@ -18824,15 +19716,15 @@ mod tests {
         assert_eq!(
             store.tag_cache_summary("ses").unwrap(),
             TagCacheSummary {
-                generation: 5,
+                generation: 7,
                 count: 3,
                 max_tag_number: 3,
             },
             "an update fires both OLD and NEW generation writes"
         );
         assert_eq!(
-            all[0].token_count, 11,
-            "token count is computed once at mint"
+            all[0].token_count, 999,
+            "a later larger observation raises the durable token count"
         );
         assert_eq!(
             all[0].source_bytes, b"message source",
@@ -18845,7 +19737,15 @@ mod tests {
             store
                 .sum_tag_token_counts_for_blocks("ses", &token_sum_ids)
                 .unwrap(),
-            44
+            1_032
+        );
+        assert!(
+            !store.update_tag_token_count_max("ses", "m1#0", 10).unwrap(),
+            "a downward write is rejected by the SQL MAX guard"
+        );
+        assert_eq!(
+            store.load_tags_for_session("ses").unwrap()[0].token_count,
+            999
         );
         store
             .execute_tag_sql_for_test(
@@ -18855,7 +19755,7 @@ mod tests {
         assert_eq!(
             store.tag_cache_summary("ses").unwrap(),
             TagCacheSummary {
-                generation: 6,
+                generation: 8,
                 count: 2,
                 max_tag_number: 2,
             },
@@ -18912,6 +19812,52 @@ mod tests {
             .apply_active_overlay_decisions("ses", 4, &[], None, 800)
             .unwrap();
         assert_eq!(store.overlay_watermark("ses").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn legacy_null_tag_mass_decodes_as_zero() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT 7, 'legacy#0', 'tool', NULL, 0, X''",
+                [],
+                tag_row_from_sql,
+            )
+            .unwrap();
+        assert_eq!(row.token_count, 0);
+    }
+
+    #[test]
+    fn hostless_protected_tokens_floor_round_trips_in_module_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        {
+            let store = McStore::open(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                protected_tokens_effective: Some(32_000),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("protected-floor", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+
+        let restarted = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .load("protected-floor")
+                .unwrap()
+                .meta
+                .protected_tokens_effective,
+            Some(32_000)
+        );
+        let mut legacy = serde_json::to_value(ModuleMeta::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("protected_tokens_effective");
+        let legacy: ModuleMeta = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.protected_tokens_effective, None);
     }
 
     #[test]
@@ -19238,11 +20184,15 @@ mod tests {
         let defer = PassSchedulerObservation {
             timestamp_ms: 32,
             scheduler_decision: "Defer".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
         let force = PassSchedulerObservation {
             timestamp_ms: 33,
             scheduler_decision: "Force85".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
         store
@@ -19270,6 +20220,8 @@ mod tests {
                     &PassSchedulerObservation {
                         timestamp_ms,
                         scheduler_decision: "Execute".to_string(),
+                        canonical_decision: None,
+                        defer_reason: None,
                         drain_latch_active: false,
                     },
                     None,
@@ -19303,6 +20255,8 @@ mod tests {
         let interesting = PassSchedulerObservation {
             timestamp_ms: 1,
             scheduler_decision: "Force85".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
 
@@ -19322,6 +20276,8 @@ mod tests {
                     &PassSchedulerObservation {
                         timestamp_ms,
                         scheduler_decision: "Execute".to_string(),
+                        canonical_decision: None,
+                        defer_reason: None,
                         drain_latch_active: true,
                     },
                     Some(10_000 + timestamp_ms as u64),
@@ -19388,6 +20344,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: scheduler_decision.to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active,
                 },
                 (
@@ -19435,11 +20393,15 @@ mod tests {
         let reduction = PassSchedulerObservation {
             timestamp_ms: 700,
             scheduler_decision: "Execute".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: true,
         };
         let divergence = PassSchedulerObservation {
             timestamp_ms: 701,
             scheduler_decision: "Emergency95".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
 
@@ -19515,7 +20477,9 @@ mod tests {
     fn scheduler_interesting_history_is_oldest_first_bounded_and_byte_bounded() {
         let worst_observation = PassSchedulerObservation {
             timestamp_ms: i64::MIN,
-            scheduler_decision: "Emergency95".to_string(),
+            scheduler_decision: "Defer".to_string(),
+            canonical_decision: Some("defer".to_string()),
+            defer_reason: Some("mid_turn_boundary".to_string()),
             drain_latch_active: false,
         };
         assert_eq!(
@@ -19551,6 +20515,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: "Emergency95".to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active: true,
                 },
                 (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19598,6 +20564,8 @@ mod tests {
                 &PassSchedulerObservation {
                     timestamp_ms,
                     scheduler_decision: decision.to_string(),
+                    canonical_decision: None,
+                    defer_reason: None,
                     drain_latch_active: decision == "Execute",
                 },
                 (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19648,6 +20616,8 @@ mod tests {
             &PassSchedulerObservation {
                 timestamp_ms: 400,
                 scheduler_decision: "Force85".to_string(),
+                canonical_decision: None,
+                defer_reason: None,
                 drain_latch_active: false,
             },
             (false, Some(3), Some(0), Some(0), Some(3), 1),
@@ -19673,6 +20643,8 @@ mod tests {
         let observation = PassSchedulerObservation {
             timestamp_ms: 500,
             scheduler_decision: "Defer".to_string(),
+            canonical_decision: None,
+            defer_reason: None,
             drain_latch_active: false,
         };
 
@@ -20526,6 +21498,526 @@ mod tests {
     }
 
     #[test]
+    fn migration_51_defaults_legacy_mappings_and_seed_upserts_mapping_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_context| Ok(String::new()),
+            )
+            .unwrap();
+        for function in ["mc_facade_authority_domain", "mc_facade_authority_route"] {
+            connection
+                .create_scalar_function(function, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                    Ok(String::new())
+                })
+                .unwrap();
+        }
+        connection
+            .execute(
+                "CREATE TABLE cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 )",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 50)
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version(namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO mc_memories(
+                     id, project_path, category, content, normalized_hash, status,
+                     first_seen_at, created_at, updated_at, last_seen_at
+                 ) VALUES (1, 'legacy-project', 'CONSTRAINTS', 'legacy', 'legacy-hash',
+                           'active', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
+                 VALUES (1, 'legacy-project', '[\"src/legacy.rs\"]', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let legacy_origin = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mapping_origin FROM mc_memory_mappings WHERE memory_id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(legacy_origin, "mapper");
+
+        let snapshot = |origin: &str, mapping: Value, updated_at: i64| AuthoritySeedRow {
+            source_row_id: 51,
+            snapshot: serde_json::json!({
+                "id": 51,
+                "project_path": "seed-project",
+                "category": "CONSTRAINTS",
+                "content": "seeded mapping",
+                "normalized_hash": "seed-hash",
+                "status": "active",
+                "mapping": mapping,
+                "mapping_origin": origin,
+                "updated_at": updated_at,
+            }),
+        };
+        store
+            .seed_authority_rows(
+                "context-seed",
+                "seed-project",
+                "memories",
+                &[snapshot("host_rejected_fallback", serde_json::json!([]), 2)],
+            )
+            .unwrap();
+        store
+            .seed_authority_rows(
+                "context-seed",
+                "seed-project",
+                "memories",
+                &[snapshot("mapper", serde_json::json!(["src/lib.rs"]), 3)],
+            )
+            .unwrap();
+        let seeded_mapping = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT mapping.mapped_files_json, mapping.mapping_origin
+                       FROM mc_memory_mappings mapping
+                       JOIN mc_memories memory ON memory.id = mapping.memory_id
+                      WHERE memory.context_store_uuid = 'context-seed'
+                        AND memory.context_row_id = 51",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            seeded_mapping,
+            ("[\"src/lib.rs\"]".to_string(), "mapper".to_string())
+        );
+    }
+
+    #[test]
+    fn migration_52_preserves_legacy_notes_and_durably_stores_compilation_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .create_scalar_function(
+                "mc_note_caller_project",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                |_context| Ok("/repo".to_string()),
+            )
+            .unwrap();
+        for function in ["mc_facade_authority_domain", "mc_facade_authority_route"] {
+            connection
+                .create_scalar_function(function, 0, FunctionFlags::SQLITE_UTF8, |_context| {
+                    Ok(String::new())
+                })
+                .unwrap();
+        }
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS cortexkit_schema_version (
+                     namespace TEXT NOT NULL,
+                     version INTEGER NOT NULL,
+                     applied_at_unix INTEGER NOT NULL,
+                     PRIMARY KEY (namespace, version)
+                 )",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 25)
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS mc_notes_ownership_insert;
+                 DROP TRIGGER IF EXISTS mc_notes_ownership_update;
+                 DROP TRIGGER IF EXISTS mc_notes_ownership_delete;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO mc_notes
+                     (project_path, session_id, content, status, surface_condition,
+                      created_at_ms, updated_at_ms)
+                 VALUES ('/repo', 'session', 'legacy note', 'active',
+                         'legacy condition', 1, 2)",
+                [],
+            )
+            .unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| (26..=51).contains(&migration.version))
+        {
+            connection.execute_batch(migration.statements).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cortexkit_schema_version (namespace, version, applied_at_unix)
+                     VALUES (?1, ?2, 0)",
+                    params![NS, migration.version],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let legacy = store
+            .get_note_by_id("/repo", "session", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.compiled_provider, None);
+        assert_eq!(legacy.compiled_config, None);
+        assert_eq!(legacy.compiled_at, None);
+        assert_eq!(legacy.compile_status, None);
+
+        let compiled = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "/repo",
+                route_project_root: None,
+                session_id: Some("session"),
+                content: "compiled note",
+                surface_condition: Some("compiled condition"),
+                compiled_provider: Some("retina-local-fs"),
+                compiled_config: Some("{\"kind\":\"path_exists\"}"),
+                compiled_at: Some(123),
+                compile_status: Some("compiled"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            compiled.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            compiled.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\"}")
+        );
+        assert_eq!(compiled.compiled_at, Some(123));
+        assert_eq!(compiled.compile_status.as_deref(), Some("compiled"));
+        let compiled_id = compiled.id;
+        drop(store);
+
+        let reopened = McStore::open(&descriptor(dir.path())).unwrap();
+        let durable = reopened
+            .get_note_by_id("/repo", "session", compiled_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(durable.compiled_at, Some(123));
+        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
+    }
+
+    #[test]
+    fn unregistered_second_connection_uses_durable_privilege_state_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let memory_id = store
+            .insert_memory(InsertMemoryInput {
+                project_path: "authority-project",
+                route_project_root: None,
+                category: "CONSTRAINTS",
+                content: "guarded memory",
+                source_session_id: None,
+                source_type: Some("test"),
+                importance: Some(50),
+                expires_at: None,
+                metadata_json: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        store
+            .with_facade_mutation("/unbound-route", "memories", || {
+                store.insert_memory(InsertMemoryInput {
+                    project_path: "/unbound-route",
+                    route_project_root: Some("/unbound-route"),
+                    category: "CONSTRAINTS",
+                    content: "successful facade write",
+                    source_session_id: None,
+                    source_type: Some("test"),
+                    importance: Some(50),
+                    expires_at: None,
+                    metadata_json: None,
+                    now_ms: 1,
+                })
+            })
+            .unwrap();
+        let cleared_scope = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT facade_authority_domain, facade_authority_route, note_caller_project
+                       FROM mc_privilege_state WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(cleared_scope, (String::new(), String::new(), String::new()));
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', 'authority-project', 'memories', 'DRAINING')",
+                    [],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_authority_route_bindings(
+                         route_project_root, context_store_uuid, project
+                     ) VALUES ('/route', 'context', 'authority-project')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let note_id = store
+            .insert_note(NoteInput {
+                project_path: "authority-project",
+                route_project_root: None,
+                session_id: "session",
+                content: "guarded note",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap()
+            .id;
+
+        let second = rusqlite::Connection::open(path).unwrap();
+        second
+            .execute(
+                "UPDATE mc_memories SET created_at = 2 WHERE id = ?1",
+                params![memory_id],
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .query_row(
+                    "SELECT created_at FROM mc_memories WHERE id = ?1",
+                    params![memory_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        second
+            .execute(
+                "UPDATE mc_notes SET created_at_ms = 2 WHERE id = ?1",
+                params![note_id],
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .query_row(
+                    "SELECT created_at_ms FROM mc_notes WHERE id = ?1",
+                    params![note_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+
+        let ownership_error = second
+            .execute(
+                "INSERT INTO mc_notes(type, project_path, content, status)
+                 VALUES ('smart', 'authority-project', 'plain writer', 'active')",
+                [],
+            )
+            .unwrap_err();
+        assert!(ownership_error
+            .to_string()
+            .contains("note ownership insert is outside the caller project"));
+
+        second.execute_batch("BEGIN IMMEDIATE").unwrap();
+        second
+            .execute(
+                "UPDATE mc_privilege_state
+                    SET facade_authority_domain = 'memories',
+                        facade_authority_route = '/route'
+                  WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        let authority_error = second
+            .execute(
+                "UPDATE mc_memories SET content = 'facade write' WHERE id = ?1",
+                params![memory_id],
+            )
+            .unwrap_err();
+        assert!(authority_error.to_string().contains("authority_draining"));
+        second.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn migration_53_replaces_legacy_udf_guards_and_store_ahead_does_not_recreate_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let legacy = open_sqlite(&descriptor).unwrap();
+        legacy
+            .with_conn(|conn| {
+                conn.create_scalar_function(
+                    "mc_note_caller_project",
+                    0,
+                    FunctionFlags::SQLITE_UTF8,
+                    |_context| Ok("authority-project".to_string()),
+                )?;
+                conn.create_scalar_function(
+                    "mc_facade_authority_domain",
+                    0,
+                    FunctionFlags::SQLITE_UTF8,
+                    |_context| Ok(String::new()),
+                )?;
+                conn.create_scalar_function(
+                    "mc_facade_authority_route",
+                    0,
+                    FunctionFlags::SQLITE_UTF8,
+                    |_context| Ok(String::new()),
+                )
+            })
+            .unwrap();
+        let old_chain = &MIGRATIONS[..MIGRATIONS.len() - 1];
+        let old_outcome = legacy.migrate(NS, old_chain).unwrap();
+        assert!(!old_outcome.store_ahead());
+        drop(legacy);
+
+        let migrated = McStore::open(&descriptor).unwrap();
+        assert_eq!(
+            migrated.module_store_schema_version().unwrap(),
+            LATEST_MIGRATION_VERSION
+        );
+        let trigger_sql = migrated
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT sql FROM sqlite_master
+                       WHERE type = 'trigger'
+                         AND (name LIKE 'mc_%_facade_authority_%'
+                              OR name LIKE 'mc_notes_ownership_%')
+                       ORDER BY name",
+                )?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(trigger_sql.len(), 9);
+        for sql in &trigger_sql {
+            assert!(sql.contains("mc_privilege_state"));
+            assert!(!sql.contains("mc_facade_authority_domain()"));
+            assert!(!sql.contains("mc_facade_authority_route()"));
+            assert!(!sql.contains("mc_note_caller_project()"));
+        }
+        drop(migrated);
+
+        let rollback = open_sqlite(&descriptor).unwrap();
+        rollback
+            .with_conn(|conn| {
+                conn.create_scalar_function(
+                    "mc_note_caller_project",
+                    0,
+                    FunctionFlags::SQLITE_UTF8,
+                    |_context| Ok("authority-project".to_string()),
+                )?;
+                conn.create_scalar_function(
+                    "mc_facade_authority_domain",
+                    0,
+                    FunctionFlags::SQLITE_UTF8,
+                    |_context| Ok(String::new()),
+                )?;
+                conn.create_scalar_function(
+                    "mc_facade_authority_route",
+                    0,
+                    FunctionFlags::SQLITE_UTF8,
+                    |_context| Ok(String::new()),
+                )
+            })
+            .unwrap();
+        let rollback_outcome = rollback.migrate(NS, old_chain).unwrap();
+        assert!(rollback_outcome.store_ahead());
+        let rollback_trigger_sql = rollback
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT sql FROM sqlite_master
+                       WHERE type = 'trigger' AND name = 'mc_notes_ownership_insert'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert!(rollback_trigger_sql.contains("mc_privilege_state"));
+        assert!(!rollback_trigger_sql.contains("mc_note_caller_project()"));
+
+        // The store-ahead policy leaves v53's durable triggers intact instead of replaying the
+        // old definitions. An older writer still opens and registers its UDFs, but because it
+        // cannot populate mc_privilege_state, ownership-sensitive note writes fail closed. This
+        // known rollback limitation is why v53 requires a coordinated module bounce.
+        let rollback_error = rollback
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO mc_notes(type, project_path, content, status)
+                     VALUES ('smart', 'authority-project', 'rollback note', 'active')",
+                    [],
+                )
+            })
+            .unwrap_err();
+        assert!(rollback_error
+            .to_string()
+            .contains("note ownership insert is outside the caller project"));
+    }
+
+    #[test]
     fn schema_version_probe_reads_the_live_store_and_matches_the_shipped_ceiling() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -20789,6 +22281,38 @@ mod tests {
     }
 
     #[test]
+    fn compartment_boundary_projection_keeps_structural_fields_and_session_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        store
+            .replace_compartments(
+                "prefix",
+                &[StoredCompartment {
+                    sequence: 7,
+                    start_message: 11,
+                    end_message: 20,
+                    end_message_id: "end#1".to_string(),
+                    content: "summary body is not part of the projection".to_string(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_compartment_boundaries("prefix").unwrap(),
+            vec![CompartmentBoundary {
+                sequence: 7,
+                start_message: 11,
+                end_message: 20,
+                end_message_id: "end#1".to_string()
+            }]
+        );
+        assert!(store
+            .load_compartment_boundaries("other")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn max_compartment_end_ordinal_matches_full_compartment_load() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -20852,6 +22376,160 @@ mod tests {
             }),
             "compartment max must use the covering end-ordinal index: {details:?}"
         );
+    }
+
+    #[test]
+    fn retained_transform_hot_path_queries_are_index_or_rowid_lookups() {
+        fn plan_details(store: &McStore, sql: &str) -> Vec<String> {
+            store
+                .inner
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = statement
+                        .query_map([], |row| row.get::<_, String>(3))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(rows)
+                })
+                .unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let queries = [
+            (
+                "handler/cache state",
+                "SELECT row_version, core_state, meta FROM mc_cache_state \
+                 WHERE session_id = 'plan-session'",
+            ),
+            (
+                "tag generation",
+                "SELECT generation, tag_count, max_tag_number FROM mc_tag_cache_generations \
+                 WHERE session_id = 'plan-session'",
+            ),
+            (
+                "tag baseline",
+                "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes \
+                 FROM mc_tags WHERE session_id = 'plan-session' ORDER BY tag_number ASC",
+            ),
+            (
+                "tag append delta",
+                "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes \
+                 FROM mc_tags WHERE session_id = 'plan-session' AND tag_number > 7 \
+                 ORDER BY tag_number ASC",
+            ),
+            (
+                "temporal overlays",
+                "SELECT block_id, marker_text, created_at FROM mc_temporal_marks \
+                 WHERE session_id = 'plan-session' ORDER BY created_at ASC, block_id ASC",
+            ),
+            (
+                "user hints",
+                "SELECT block_id, hint_text, created_at FROM mc_user_hints \
+                 WHERE session_id = 'plan-session' ORDER BY created_at ASC, block_id ASC",
+            ),
+            (
+                "channel-1 appends",
+                "SELECT block_id, reminder_text, fired_at_ms FROM mc_channel1_appends \
+                 WHERE session_id = 'plan-session' ORDER BY fired_at_ms ASC, block_id ASC",
+            ),
+            (
+                "overlay frontier",
+                "SELECT max_seen_ordinal FROM mc_overlay_frontiers \
+                 WHERE session_id = 'plan-session'",
+            ),
+            (
+                "pending drops",
+                "SELECT p.id, p.target_id, p.queued_at, p.command_id, l.first_applied_at_ms \
+                 FROM pending_agent_drops p LEFT JOIN mc_reduce_command_ledger l \
+                   ON l.session_id = p.session_id AND l.command_id = p.command_id \
+                 WHERE p.session_id = 'plan-session' ORDER BY p.queued_at ASC, p.id ASC",
+            ),
+            (
+                "latest compartment end",
+                "SELECT COALESCE(MAX(end_message), 0) FROM mc_compartments \
+                 WHERE session_id = 'plan-session'",
+            ),
+            (
+                "compartment boundaries",
+                "SELECT sequence, start_message, end_message, end_message_id \
+                 FROM mc_compartments WHERE session_id = 'plan-session' ORDER BY sequence ASC",
+            ),
+            (
+                "workspace owner",
+                "SELECT w.id, w.share_categories FROM mc_workspace_members m \
+                 JOIN mc_workspaces w ON w.id = m.workspace_id \
+                 WHERE m.project_path = 'git:plan'",
+            ),
+            (
+                "workspace members",
+                "SELECT project_path, display_name FROM mc_workspace_members \
+                 WHERE workspace_id = 1 ORDER BY project_path ASC",
+            ),
+            (
+                "m1 memory watermark",
+                "SELECT COALESCE(MAX(id), 0) FROM mc_memories \
+                 WHERE project_path = 'git:plan' AND status IN ('active', 'permanent') \
+                   AND (expires_at IS NULL OR expires_at > 0)",
+            ),
+            (
+                "m1 memory-mutation watermark",
+                "SELECT COALESCE(MAX(id), 0) FROM mc_memory_mutation_log \
+                 WHERE project_path IN ('git:plan')",
+            ),
+            (
+                "m1 compartment watermark",
+                "SELECT COALESCE(MAX(sequence), 0) FROM mc_compartments \
+                 WHERE session_id = 'plan-session'",
+            ),
+            (
+                "m1 note watermark",
+                "SELECT COALESCE(MAX(status_version), 0) FROM mc_notes \
+                 WHERE project_path = 'git:plan'",
+            ),
+            (
+                "authority route",
+                "SELECT authority.project FROM mc_authority_route_bindings binding \
+                 JOIN mc_authority authority \
+                   ON authority.context_store_uuid = binding.context_store_uuid \
+                  AND authority.project = binding.project \
+                 WHERE binding.route_project_root = '/tmp/plan' \
+                   AND authority.domain = 'memories' \
+                   AND authority.state IN ('MODULE', 'DRAINING')",
+            ),
+            (
+                "project mural",
+                "SELECT data_url, content_hash FROM mc_project_mural_artifacts \
+                 WHERE project_path = 'git:plan'",
+            ),
+        ];
+
+        for (name, sql) in queries {
+            let details = plan_details(&store, sql);
+            assert!(
+                details.iter().all(|detail| {
+                    let upper = detail.to_ascii_uppercase();
+                    !upper.starts_with("SCAN ")
+                        || upper.contains("USING INDEX")
+                        || upper.contains("USING COVERING INDEX")
+                }),
+                "{name} must not perform an unindexed table scan: {details:?}"
+            );
+            assert!(
+                details.iter().any(|detail| {
+                    let upper = detail.to_ascii_uppercase();
+                    upper.starts_with("SEARCH ")
+                        || upper.contains("USING INDEX")
+                        || upper.contains("USING COVERING INDEX")
+                }),
+                "{name} must use an index or rowid lookup: {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.contains("USE TEMP B-TREE")),
+                "{name} must not create a temporary sort index: {details:?}"
+            );
+        }
     }
 
     #[test]
@@ -21618,7 +23296,7 @@ mod tests {
     }
 
     #[test]
-    fn update_memory_content_advances_mutation_log_with_row() {
+    fn update_memory_content_recategorizes_row_and_mutation_log_together() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let project = "git:proj";
@@ -21630,9 +23308,10 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_memory_content(project, id, "new", 2)
+            .update_memory_content(project, id, "new", Some("CONSTRAINTS"), 2)
             .unwrap()
             .unwrap();
+        assert_eq!(updated.category, "CONSTRAINTS");
         assert_eq!(updated.content, "new");
         let after = store
             .max_memory_mutation_id(&[project.to_string()])
@@ -21644,7 +23323,51 @@ mod tests {
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].target_memory_id, id);
         assert_eq!(mutations[0].mutation_type, "update");
+        assert_eq!(mutations[0].category.as_deref(), Some("CONSTRAINTS"));
         assert_eq!(mutations[0].new_content.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn update_memory_content_omitted_category_preserves_current_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let id = store
+            .insert_memory(insert_input(project, "ARCHITECTURE", "old", 1))
+            .unwrap();
+
+        let updated = store
+            .update_memory_content(project, id, "new", None, 2)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(updated.category, "ARCHITECTURE");
+        assert_eq!(updated.content, "new");
+    }
+
+    #[test]
+    fn update_memory_content_detects_duplicate_in_target_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let duplicate = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "same", 1))
+            .unwrap();
+        let target = store
+            .insert_memory(insert_input(project, "ARCHITECTURE", "different", 1))
+            .unwrap();
+
+        let error = store
+            .update_memory_content(project, target, "same", Some("CONSTRAINTS"), 2)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            McStoreError::MemoryDuplicateContent { id } if id == duplicate
+        ));
+        let target = store.get_memory_full(target).unwrap().unwrap();
+        assert_eq!(target.category, "ARCHITECTURE");
+        assert_eq!(target.content, "different");
     }
 
     #[test]
@@ -21962,6 +23685,109 @@ mod tests {
     }
 
     #[test]
+    fn promote_facts_stamps_all_lifecycle_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let now_ms = 1_725_000_123_456;
+        let facts = [FactCandidate {
+            category: "CONSTRAINTS".into(),
+            content: "timestamped historian fact".into(),
+            source_session_id: Some("session-with-fact".into()),
+            ..Default::default()
+        }];
+
+        let promoted = store
+            .inner
+            .with_conn_fenced(|tx| promote_facts_tx(tx, "git:proj", &facts, now_ms))
+            .unwrap();
+        let memory = store
+            .get_memory_full(promoted[0].memory_id)
+            .unwrap()
+            .unwrap();
+
+        assert!(now_ms > 0);
+        assert_eq!(memory.first_seen_at, now_ms);
+        assert_eq!(memory.created_at, now_ms);
+        assert_eq!(memory.updated_at, now_ms);
+        assert_eq!(memory.last_seen_at, now_ms);
+    }
+
+    #[test]
+    fn module_authored_memory_insert_paths_never_create_epoch_zero_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let assert_positive_timestamps = |memory_id: i64| {
+            let memory = store.get_memory_full(memory_id).unwrap().unwrap();
+            assert!(memory.first_seen_at > 0, "first_seen_at for {memory_id}");
+            assert!(memory.created_at > 0, "created_at for {memory_id}");
+            assert!(memory.updated_at > 0, "updated_at for {memory_id}");
+            assert!(memory.last_seen_at > 0, "last_seen_at for {memory_id}");
+        };
+
+        store
+            .seed_memory(900, "git:seed", "CONSTRAINTS", "seeded", 50)
+            .unwrap();
+        assert_positive_timestamps(900);
+        store
+            .seed_expiring_memory(
+                901,
+                "git:seed",
+                "CONSTRAINTS",
+                "expiring",
+                50,
+                9_999_999_999_999,
+            )
+            .unwrap();
+        assert_positive_timestamps(901);
+
+        let direct_id = store
+            .insert_memory(insert_input(
+                "git:direct",
+                "CONSTRAINTS",
+                "direct insert",
+                1_725_000_000_001,
+            ))
+            .unwrap();
+        assert_positive_timestamps(direct_id);
+
+        let facade_id = std::cell::Cell::new(None);
+        store
+            .with_facade_command(
+                "/route/facade",
+                "git:facade",
+                "memories",
+                "timestamp-invariant",
+                "ctx_memory",
+                "write",
+                None,
+                |tx| {
+                    let id = tx.insert_memory(insert_input(
+                        "git:facade",
+                        "CONSTRAINTS",
+                        "facade insert",
+                        1_725_000_000_002,
+                    ))?;
+                    facade_id.set(Some(id));
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        assert_positive_timestamps(facade_id.get().unwrap());
+
+        let promoted = store
+            .promote_facts(
+                "git:promoted",
+                &[FactCandidate {
+                    category: "CONSTRAINTS".into(),
+                    content: "public promotion".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        assert_positive_timestamps(promoted[0].memory_id);
+    }
+
+    #[test]
     fn promote_facts_exact_dedup_skips_duplicates_and_advances_watermark() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -22039,10 +23865,81 @@ mod tests {
                 failure_backoff_at_ms: Some(456),
                 last_failure: None,
                 last_no_fire: None,
+                recent_decisions: vec![HistorianRecentDecision {
+                    at_ms: 123,
+                    request_observed_at_ms: 120,
+                    decision: HistorianDecision::Fired,
+                    cause: "trigger_true:pressure".to_string(),
+                    eligible_tokens: 12_000,
+                    bar_tokens: 19_500,
+                    pressure_pct: 60,
+                    drain_latch: false,
+                    chunk_range: Some(HistorianChunkRange {
+                        from_ordinal: 10,
+                        to_ordinal: 20,
+                    }),
+                    producer_model: Some("test/model".to_string()),
+                    completed_at_ms: None,
+                    apply_row_version: None,
+                }],
                 consecutive_publish_failures: 0,
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn historian_recent_decisions_are_change_gated_and_bounded() {
+        let mut historian = HistorianDurableState::default();
+        let decision = |at_ms, eligible_tokens| HistorianRecentDecision {
+            at_ms,
+            request_observed_at_ms: at_ms - 1,
+            decision: HistorianDecision::NoFire,
+            cause: "below_proactive_floor".to_string(),
+            eligible_tokens,
+            bar_tokens: 19_500,
+            pressure_pct: 40,
+            drain_latch: false,
+            chunk_range: Some(HistorianChunkRange {
+                from_ordinal: 1,
+                to_ordinal: 10,
+            }),
+            producer_model: None,
+            completed_at_ms: None,
+            apply_row_version: None,
+        };
+
+        assert!(historian.record_recent_decision(decision(10, 100)));
+        assert!(!historian.record_recent_decision(decision(20, 100)));
+        assert_eq!(historian.recent_decisions.len(), 1);
+
+        for index in 1..=HISTORIAN_RECENT_DECISION_LIMIT {
+            assert!(
+                historian.record_recent_decision(decision(20 + index as i64, 100 + index as u64,))
+            );
+        }
+        assert_eq!(
+            historian.recent_decisions.len(),
+            HISTORIAN_RECENT_DECISION_LIMIT
+        );
+        assert_eq!(
+            historian.recent_decisions.first().unwrap().eligible_tokens,
+            101
+        );
+        assert_eq!(
+            historian.recent_decisions.last().unwrap().eligible_tokens,
+            116
+        );
+
+        let mut fired = decision(50, 116);
+        fired.decision = HistorianDecision::Fired;
+        fired.cause = "trigger_true:tail_size".to_string();
+        assert!(historian.record_recent_decision(fired.clone()));
+        assert!(historian.record_recent_decision(fired));
+        assert_eq!(
+            historian.recent_decisions.len(),
+            HISTORIAN_RECENT_DECISION_LIMIT
+        );
     }
 
     #[test]
@@ -22083,7 +23980,7 @@ mod tests {
             );
         }
 
-        let successful = idle_historian_after_success(predicate.firing_seq);
+        let successful = idle_historian_after_success(&meta.historian);
         assert_eq!(successful.consecutive_publish_failures, 0);
     }
 
@@ -22234,6 +24131,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first.row_version, 2);
+        let promoted_memory = store
+            .get_memory_full(first.promoted_refs[0].memory_id)
+            .unwrap()
+            .unwrap();
+        assert!(promoted_memory.created_at > 0);
+        assert_eq!(promoted_memory.first_seen_at, promoted_memory.created_at);
+        assert_eq!(promoted_memory.updated_at, promoted_memory.created_at);
+        assert_eq!(promoted_memory.last_seen_at, promoted_memory.created_at);
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
@@ -22261,6 +24166,10 @@ mod tests {
         let loaded = store.load("ses").unwrap();
         assert_eq!(loaded.meta.historian.state, HistorianPhase::Idle);
         assert_eq!(loaded.meta.historian.firing_seq, 7);
+        let decision = loaded.meta.historian.recent_decisions.last().unwrap();
+        assert_eq!(decision.producer_model.as_deref(), Some("test/model"));
+        assert!(decision.completed_at_ms.is_some());
+        assert_eq!(decision.apply_row_version, Some(first.row_version));
         assert_eq!(loaded.meta.publication_floor_ordinal, Some(21));
         assert_eq!(store.max_memory_id(&["git:proj".to_string()]).unwrap(), 1);
     }
@@ -26096,7 +28005,7 @@ mod shadow_tests {
             .unwrap();
 
         store
-            .update_memory_content(project, memory_id, "new content", 10)
+            .update_memory_content(project, memory_id, "new content", None, 10)
             .unwrap()
             .unwrap();
         let cues = store
@@ -26186,6 +28095,10 @@ mod shadow_tests {
                         initial.status_version,
                         Some("  keep surrounding whitespace  "),
                         Some(Some("same condition")),
+                        None,
+                        None,
+                        None,
+                        None,
                         2,
                     )?;
                     Ok(Vec::new())
@@ -26216,6 +28129,10 @@ mod shadow_tests {
                         &updated.status,
                         updated.status_version,
                         Some(""),
+                        None,
+                        None,
+                        None,
+                        None,
                         None,
                         3,
                     )?;
@@ -26395,6 +28312,102 @@ mod lineage_descent_tests {
     /// stored summary). A fresh-origin anchor at 0 must descend exactly like
     /// the 1-based form; the placeholder still lands at prior_last+1.
     #[test]
+    fn reasoning_clear_units_and_proofs_do_not_cross_direct_or_composed_descent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 10);
+        let seed_decisions = |key: &str| {
+            let mut state = store.load(key).unwrap();
+            for prefix in ["reasoning_clear", "native_reasoning_keep"] {
+                state
+                    .core
+                    .frozen_units
+                    .push(cortexkit_cache_core::FrozenUnit {
+                        key: format!("strip:{prefix}:summary"),
+                        kind: format!("strip_{prefix}"),
+                        frozen_payload: String::new(),
+                        durability_class: cortexkit_cache_core::DurabilityClass::Lineage,
+                        reset_rule: String::new(),
+                    });
+            }
+            state.meta.newest_live_ordinal = state
+                .meta
+                .newest_live_ordinal
+                .max(state.meta.coverage_ordinal.unwrap_or(0) + 1);
+            state.meta.reasoning_clear_initialized = true;
+            state.meta.served_output_generation = Some((0, 0, 0));
+            state.meta.reasoning_replay_evidence = Some(ReasoningReplayEvidence {
+                row_version: state.row_version.unwrap() + 1,
+                generation: (0, 0, 0),
+                source_hash: "old-source".to_string(),
+                ck_fingerprints: Vec::new(),
+                native: BTreeMap::new(),
+                unit_native: BTreeMap::new(),
+            });
+            store
+                .commit(key, state.row_version, &state.core, &state.meta)
+                .unwrap();
+        };
+        seed_decisions("A");
+        let anchor = anchor();
+        let direct = direct_hop("A", "B", 2);
+        store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 90,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &direct,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 10,
+            })
+            .unwrap();
+        let assert_clean = |key: &str| {
+            let state = store.load(key).unwrap();
+            assert!(!state
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.starts_with("strip:reasoning_clear:")
+                    || unit.key.starts_with("strip:native_reasoning_keep:")));
+            assert!(state.meta.reasoning_replay_evidence.is_none());
+            assert!(state.meta.served_output_fingerprint.is_empty());
+            assert!(state.meta.served_output_generation.is_none());
+            assert!(!state.meta.reasoning_clear_initialized);
+            assert_eq!(state.core.boundary_id, "summary#1");
+        };
+        assert_clean("B");
+        seed_decisions("B");
+        let composed = [direct[0].clone(), direct_hop("B", "C", 3)[0].clone()];
+        let outcome = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "C",
+                expected_target_row_version: None,
+                edge_id: 91,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 3,
+                constituents: &composed,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 11,
+            })
+            .unwrap();
+        assert_eq!(outcome.source_key.as_deref(), Some("B"));
+        assert_clean("C");
+        assert!(store
+            .load("A")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:reasoning_clear:summary"));
+    }
+
+    #[test]
     fn descent_accepts_a_zero_based_fresh_anchor() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -26425,6 +28438,45 @@ mod lineage_descent_tests {
         let target = store.load("B").unwrap();
         assert_eq!(target.meta.coverage_ordinal, Some(11));
         assert_eq!(target.core.boundary_id, "ccm-0#1");
+    }
+
+    #[test]
+    fn descent_preserves_initialized_boundary_and_active_drain_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_lineage(&store, "A", 43);
+        let mut source = store.load("A").unwrap();
+        source.meta.emergency_drain_active = true;
+        source.meta.emergency_drain_entered_at_ms = 1_000;
+        store
+            .commit("A", source.row_version, &source.core, &source.meta)
+            .unwrap();
+        let hops = direct_hop("A", "B", 2);
+        let anchor = anchor();
+        let outcome = store
+            .descend_lineage(LineageDescentRequest {
+                target_key: "B",
+                expected_target_row_version: None,
+                edge_id: 44,
+                prior_key: "A",
+                prior_epoch: 1,
+                new_epoch: 2,
+                constituents: &hops,
+                compaction_observed: true,
+                anchor: Some(&anchor),
+                now_ms: 61_000,
+            })
+            .unwrap();
+        assert_eq!(outcome.disposition, LineageDescentDisposition::Descended);
+        let target = store.load("B").unwrap();
+        assert!(target.meta.initialized);
+        assert_eq!(target.core.boundary_id, "summary#1");
+        assert!(!target.core.reconcile_pending);
+        assert_eq!(target.meta.coverage_ordinal, Some(44));
+        assert_eq!(target.meta.ordinal_continuation_base, Some(43));
+        assert!(target.meta.emergency_drain_active);
+        assert_eq!(target.meta.emergency_drain_entered_at_ms, 1_000);
+        assert!(outcome.materialization_required);
     }
 
     /// A mid-space anchor (neither a fresh origin nor the placeholder) must

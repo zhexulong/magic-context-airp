@@ -1,7 +1,9 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
-import { createMemo } from "solid-js"
+import { createMemo, createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
+import { renderUserStatusSummary, statusSummaryFromDetail } from "../shared/status-summary"
+import { renderUserFacingFailure, userFacingFailureCode } from '../shared/user-facing-codes';
 import {
     createSidebarContentSlot,
     kickRecompProgressRefresh,
@@ -10,6 +12,8 @@ import {
 import packageJson from "../../package.json"
 import { closeRpc, dismissUpgradeReminder, getAnnouncement, getCompartmentCount, getRpcGeneration, initRpcClient, loadEmbedDetail, loadStatusDetail, loadToastDurationMs, markAnnounced, requestRecomp, requestUpgrade, type EmbedDetail, type StatusDetail } from "./data/context-db"
 import { startNotificationSocket, stopNotificationSocket, type SocketNotification } from "./data/notification-socket"
+import { formatCacheTtlDisplay } from "../shared/cache-ttl-display"
+import { formatConfigParseStatusLine } from "../shared/config-diagnostics"
 import { formatThresholdPercent } from "../shared/format-threshold"
 import { formatTailHygiene } from "../shared/tail-hygiene-status"
 import { RUST_MODE_HOST_PATHS_LINE } from "../shared/rust-mode-status"
@@ -136,10 +140,13 @@ const R = (props: { t: TuiThemeCurrent; l: string; v: string; fg?: string }) => 
     </box>
 )
 
-const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
+const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail; diagnostics?: boolean }) => {
     const theme = createMemo(() => (props.api as any).theme.current)
+    const [diagnostics, setDiagnostics] = createSignal(props.diagnostics === true)
     const t = () => theme()
     const s = () => props.s
+    const summaryLines = () =>
+        renderUserStatusSummary(statusSummaryFromDetail(s()), "plain").split("\n").slice(1)
     const compactionOff = () => s().compaction_enabled === false
 
     // Prefer the RPC-provided model context limit (what the sidebar shows) so the
@@ -204,7 +211,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
             segs.push({ label: "User Profile", tokens: d.profileTokens, color: COLORS.profile })
 
         if (d.conversationTokens > 0)
-            segs.push({ label: "Conversation*", tokens: d.conversationTokens, color: COLORS.conversation })
+            segs.push({ label: "Conversation", tokens: d.conversationTokens, color: COLORS.conversation })
         if (d.toolCallTokens > 0)
             segs.push({ label: "Tool Calls", tokens: d.toolCallTokens, color: COLORS.toolCalls })
         if (d.toolDefinitionTokens > 0)
@@ -227,6 +234,25 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 <text fg={t().accent}><b>⚡ Magic Context Status</b></text>
                 <text fg={t().textMuted}>v{packageJson.version}</text>
             </box>
+
+            <box
+                width="100%"
+                justifyContent="flex-end"
+                onMouseDown={() => setDiagnostics(!diagnostics())}
+            >
+                <text fg={diagnostics() ? t().accent : t().textMuted}>
+                    {diagnostics() ? "[x]" : "[ ]"} Diagnostics
+                </text>
+            </box>
+
+            {!diagnostics() ? (
+                <box flexDirection="column" width="100%">
+                    {summaryLines().map((line) => <text>{line}</text>)}
+                </box>
+            ) : (<>
+            {s().configParseFailures.map((failure) => (
+                <text fg={t().error}>{formatConfigParseStatusLine(failure)}</text>
+            ))}
 
             <box flexDirection="row" justifyContent="space-between" width="100%">
                 {compactionOff() ? (
@@ -273,7 +299,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                         </box>
                     )
                 })}
-                <text fg={t().textMuted}>* Conversation includes Reasoning; hygiene excludes it</text>
+                <text fg={t().textMuted}>Conversation includes reasoning; hygiene excludes it</text>
                 {s().tailHygiene !== undefined && (
                     <R
                         t={t()}
@@ -378,7 +404,15 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                             <box marginTop={1}>
                                 <text fg={t().text}><b>Cache TTL</b></text>
                             </box>
-                            <R t={t()} l="Configured" v={s().cacheTtl} />
+                            <R
+                                t={t()}
+                                l="Configured"
+                                v={formatCacheTtlDisplay({
+                                    value: s().cacheTtl,
+                                    source: s().cacheTtlSource,
+                                    modelKey: s().cacheTtlModelKey,
+                                }).replace(/^Cache TTL: /, "")}
+                            />
                             <R t={t()} l="Last response" v={s().lastResponseTime > 0 ? `${Math.round(elapsed() / 1000)}s ago` : "never"} />
                             <R t={t()} l="Remaining" v={s().cacheExpired ? "expired" : s().cacheNeverExpires ? "never (MC never assumes expiry — external cache-keep)" : `${Math.round(s().cacheRemainingMs / 1000)}s`} fg={s().cacheExpired ? t().warning : t().textMuted} />
                             <R t={t()} l="Auto-execute" v={s().cacheExpired ? "yes (expired)" : s().cacheNeverExpires ? `at ≥${formatThresholdPercent(s().executeThreshold)}%` : `at TTL or ≥${formatThresholdPercent(s().executeThreshold)}%`} fg={t().textMuted} />
@@ -424,7 +458,7 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
             {/* Error (full width, conditional) */}
             {s().lastTransformError && (
                 <box marginTop={1} width="100%">
-                    <text fg={t().error}>⚠ {s().lastTransformError}</text>
+                    <text fg={t().error}>{renderUserFacingFailure("transform_update_failed")}</text>
                 </box>
             )}
 
@@ -437,12 +471,13 @@ const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                     fg={(s().loggerDiagnostics?.swallowedWriteCount ?? 0) > 0 ? t().error : t().textMuted}
                 />
                 {s().loggerDiagnostics?.lastErrorMessage && (
-                    <R t={t()} l="Last error" v={s().loggerDiagnostics.lastErrorMessage} fg={t().error} />
+                    <R t={t()} l="Warning" v={renderUserFacingFailure("status_unavailable")} fg={t().error} />
                 )}
                 {s().loggerDiagnostics?.lastErrorTime && (
                     <R t={t()} l="Last error time" v={s().loggerDiagnostics.lastErrorTime} fg={t().textMuted} />
                 )}
             </box>
+            </>)}
 
             {/* Footer */}
             <box marginTop={1} justifyContent="flex-end" width="100%">
@@ -501,7 +536,7 @@ async function showRecompDialog(api: TuiPluginApi, targetSessionId = getSessionI
                     ? "This session has no compartments yet — recomp will build them from raw history."
                     : `You have ${count} compartments.`,
                 "",
-                "Recomp will regenerate all compartments and facts from raw history.",
+                "Recomp will rebuild the compressed history from raw history. Saved memories are not changed.",
                 "This may take a long time and consume significant tokens.",
                 "",
                 "Proceed?",
@@ -603,7 +638,11 @@ function showUpgradeDialog(
     return true
 }
 
-async function showStatusDialog(api: TuiPluginApi, targetSessionId = getSessionId(api)): Promise<boolean> {
+async function showStatusDialog(
+    api: TuiPluginApi,
+    targetSessionId = getSessionId(api),
+    initialDiagnostics = false,
+): Promise<boolean> {
     const sessionId = targetSessionId
     if (!sessionId) {
         showToast(api, { message: "No active session", variant: "warning" })
@@ -615,14 +654,19 @@ async function showStatusDialog(api: TuiPluginApi, targetSessionId = getSessionI
     const result = await loadStatusDetail(sessionId, directory, modelKey)
     if (getSessionId(api) !== sessionId) return false
     if (!result.ok) {
+        console.error(
+            `[magic-context] status unavailable code=${userFacingFailureCode("status_unavailable")}: ${result.error}`,
+        )
         showToast(api, {
-            message: `Status unavailable: ${result.error}`,
+            message: renderUserFacingFailure("status_unavailable"),
             variant: "warning",
         })
         return false
     }
 
-    api.ui.dialog.replace(() => <StatusDialog api={api} s={result.detail} />)
+    api.ui.dialog.replace(() => (
+        <StatusDialog api={api} s={result.detail} diagnostics={initialDiagnostics} />
+    ))
     return true
 }
 
@@ -1111,7 +1155,10 @@ const tui: TuiPlugin = async (api, _options, meta) => {
         const stillActive = () =>
             getRpcGeneration() === generation && getSessionId(api) === requestedSessionId
         if (action === "show-status-dialog") {
-            return stillActive() && (await showStatusDialog(api, requestedSessionId))
+            return (
+                stillActive() &&
+                (await showStatusDialog(api, requestedSessionId, n.payload?.diagnostics === true))
+            )
         }
         if (action === "show-recomp-dialog") {
             return stillActive() && (await showRecompDialog(api, requestedSessionId))

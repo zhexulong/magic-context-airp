@@ -2,8 +2,8 @@
  * Pi-side heuristic cleanup — mirrors OpenCode's `applyHeuristicCleanup`
  * (packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts).
  *
- * Same four passes, in the same order, with the same DB persistence
- * semantics. The only Pi-specific pieces are:
+ * Applies emergency reclaim before routine stale-call removal, injection stripping,
+ * deduplication, and caveman compression. The Pi-specific pieces are:
  *
  *   - Tool fingerprinting walks Pi `AgentMessage[]` instead of
  *     OpenCode `MessageLike[]`. Pi assistant messages carry tool calls
@@ -15,7 +15,7 @@
  *     `tags.status='dropped'` and lets `applyFlushedStatuses` replay existing
  *     drops on every provider, which is the cache-stable mechanism Pi already uses.
  *
- *   - Everything else (drop aged tools, strip system injections from
+ *   - Everything else (tiered emergency reclaim, strip system injections from
  *     message tags, age-tier caveman compression) is tag-driven and
  *     uses the shared `TagTarget` interface produced by `tagTranscript`,
  *     so the OpenCode helpers `applyCavemanCleanup` and
@@ -26,25 +26,21 @@
  * force-materialization gating as OpenCode (gating is the caller's
  * responsibility — this function unconditionally executes when called).
  *
- * Cache safety: every mutation persists to the DB (`tags.status`,
- * `tags.drop_mode`, `source_contents`, `tags.caveman_depth`). Subsequent
- * defer passes read these durable signals via `applyFlushedStatuses` +
- * `replayCavemanCompression` so the visible message bytes stay stable
- * across passes.
+ * Cache safety: mutations persist as tag drop/compression state or namespaced
+ * Pi content decisions in session_meta. The context handler replays reminder
+ * strips after caveman restores its source, including on defer passes. Original
+ * source_contents remain intact for expansion.
  */
 
+import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	type ContextDatabase,
 	getActiveTagsBySession,
 	getMaxTagNumberBySession,
-	replaceSourceContent,
 	updateTagDropMode,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
-import {
-	getEmergencyInputSample,
-	setEmergencyDropSample,
-} from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import {
 	applyCavemanCleanup,
@@ -82,6 +78,10 @@ const DEDUP_SAFE_TOOLS = new Set([
 
 export interface PiHeuristicCleanupConfig {
 	protectedTags: number;
+	/** Token-window cutoff; null means no tool-backed protection window exists. */
+	protectedCutoff?: number | null;
+	/** Run age-sensitive cleanup; emergency selection remains independent. */
+	routine?: boolean;
 	/**
 	 * Whether this pass may discover NEW stale ctx_reduce strips. Existing dropped
 	 * tags still replay through applyFlushedStatuses on every provider.
@@ -96,6 +96,7 @@ export interface PiHeuristicCleanupConfig {
 	emergency?: {
 		currentTotalInputTokens: number;
 		ceilingTokens: number;
+		usagePercentage?: number;
 	};
 	/**
 	 * Age-tier caveman text compression settings. Caller is responsible
@@ -279,10 +280,10 @@ function collectStaleReduceCallIds(
  * goes through `TagTarget` and shared helpers).
  *
  * Run order matches OpenCode:
- *   1. Drop aged tools (or all tools when `dropAllTools=true`).
- *   2. Strip system injections from message tags.
- *   3. Tool dedup (drop older identical calls of read-only tools).
- *   4. Age-tier caveman text compression (when enabled).
+ *   1. Apply the emergency batch when supplied.
+ *   2. Strip stale ctx_reduce calls and system injections when routine cleanup is enabled.
+ *   3. Deduplicate tools when routine cleanup is enabled.
+ *   4. Apply age-tier caveman compression when routine cleanup is enabled.
  *
  * Each pass commits within its own `db.transaction` so partial
  * progress survives mid-pass failures.
@@ -320,7 +321,11 @@ export function applyPiHeuristicCleanup(
 	// regardless of status. `getMaxTagNumberBySession` resolves with a
 	// single backward index seek (O(log N)).
 	const maxTag = getMaxTagNumberBySession(db, sessionId);
-	const protectedCutoff = maxTag - config.protectedTags;
+	const protectedCutoff =
+		config.protectedCutoff === null
+			? maxTag + 1
+			: (config.protectedCutoff ?? maxTag - config.protectedTags);
+	const routine = config.routine !== false;
 	// Stale ctx_reduce removal uses the protected-tail window after first retaining
 	// the newest housekeeping exemplars; only older calls can become stale.
 	const toolAgeCutoff = protectedCutoff;
@@ -334,8 +339,8 @@ export function applyPiHeuristicCleanup(
 	// ── Pass 1: tiered target-headroom emergency drop ─────────────────
 	// Replaces the old need-blind aged-drop + dropAllTools nuke. Runs only when
 	// the caller supplies `emergency` (derived force-band cache-busting pass). Selection is
-	// pure (`planEmergencyDrop`); we apply it and advance the persisted watermark
-	// so each tag drops once. Mirrors OpenCode `applyHeuristicCleanup`.
+	// pure (`planEmergencyDrop`); we persist the tag mutations and return their count.
+	// The context handler consumes the shared episode after all reclaim lanes finish.
 	if (config.emergency) {
 		const emergency = config.emergency;
 		const priorInputSample = getEmergencyInputSample(db, sessionId);
@@ -352,13 +357,18 @@ export function applyPiHeuristicCleanup(
 		// narrowing it to the droppable subset folds real conversation/
 		// reasoning tail into the "irreducible prefix" and under-evicts.
 		const activeTags = tags.filter((t) => t.status === "active");
+		sessionLog(
+			sessionId,
+			`emergency candidates: loaded=${tags.length} active=${activeTags.length} activeTools=${activeTags.filter((tag) => tag.type === "tool").length} visibleCompleteTools=${droppableTags.length} windowYields=${(emergency.usagePercentage ?? 0) >= 95} cutoff=${protectedCutoff}`,
+		);
 		const plan = planEmergencyDrop({
 			tags: droppableTags as readonly EmergencyDropTag[],
 			floorTags: activeTags as readonly EmergencyDropTag[],
 			maxTag,
-			protectedTags: config.protectedTags,
+			protectedCutoff,
 			currentTotalInputTokens: emergency.currentTotalInputTokens,
 			ceilingTokens: emergency.ceilingTokens,
+			usagePercentage: emergency.usagePercentage,
 			priorInputSample,
 			hasPriorDrop: priorInputSample > 0,
 		});
@@ -376,44 +386,51 @@ export function applyPiHeuristicCleanup(
 					if (!toDrop.has(tag.tagNumber)) continue;
 					if (tag.status !== "active" || tag.type !== "tool") continue;
 					const target = targets.get(tag.tagNumber);
-					const recent = newestEmergencyTags.has(tag.tagNumber);
-					const result = recent
-						? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
-						: (target?.drop?.() ?? "absent");
+					const recent =
+						(emergency.usagePercentage ?? 0) < 95 &&
+						newestEmergencyTags.has(tag.tagNumber);
+					// Removing the result separator beside native reasoning lets Anthropic
+					// merge signed assistant turns, so this safety case always keeps the pair.
+					const reasoningSafeSkeleton =
+						target?.requiresToolArcSkeleton === true;
+					const skeleton = recent || reasoningSafeSkeleton;
+					const result = reasoningSafeSkeleton
+						? (target?.truncate?.() ?? "absent")
+						: recent
+							? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
+							: (target?.drop?.() ?? "absent");
 					if (result === "removed" || result === "truncated") {
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 						updateTagDropMode(
 							db,
 							sessionId,
 							tag.tagNumber,
-							recent ? "truncated" : "full",
+							skeleton ? "truncated" : "full",
 						);
 						droppedTools++;
 						emergencyDroppedTools++;
 					}
 				}
-				// The sample is latched after the transaction below for every acting
-				// emergency pass, including zero removals.
-			})();
+			}).immediate();
 			sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
 		} else {
 			sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
 		}
-		// Record every acting emergency sample, including when no target was eligible.
-		setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
 	}
 
 	// ── Pass 1b: stale ctx_reduce calls (Pi persisted-drop replay) ──────
-	const staleReduce = config.staleReduceStripEnabled
-		? collectStaleReduceCallIds(
-				piMessages,
-				buildMessageIdToMaxTagFromTargets(targets),
-				buildCtxReduceTagNumbers(tags),
-				toolAgeCutoff,
-				resolveStableId,
-			)
-		: { composite: new Set<string>(), bareCallIds: new Set<string>() };
+	const staleReduce =
+		routine && config.staleReduceStripEnabled
+			? collectStaleReduceCallIds(
+					piMessages,
+					buildMessageIdToMaxTagFromTargets(targets),
+					buildCtxReduceTagNumbers(tags),
+					toolAgeCutoff,
+					resolveStableId,
+				)
+			: { composite: new Set<string>(), bareCallIds: new Set<string>() };
 	if (
+		routine &&
 		config.staleReduceStripEnabled &&
 		(staleReduce.composite.size > 0 || staleReduce.bareCallIds.size > 0)
 	) {
@@ -441,51 +458,59 @@ export function applyPiHeuristicCleanup(
 					droppedStaleReduceCalls++;
 				}
 			}
-		})();
+		}).immediate();
 	}
 
 	// ── Pass 2: strip system injections from message tags ─────────────
-	db.transaction(() => {
-		for (const tag of tags) {
-			if (tag.status !== "active") continue;
-			if (tag.tagNumber > protectedCutoff) continue;
-			if (tag.type !== "message") continue;
+	if (routine) {
+		db.transaction(() => {
+			for (const tag of tags) {
+				if (tag.status !== "active") continue;
+				if (tag.tagNumber > protectedCutoff) continue;
+				if (tag.type !== "message") continue;
 
-			const target = targets.get(tag.tagNumber);
-			if (!target) continue;
+				const target = targets.get(tag.tagNumber);
+				if (!target) continue;
 
-			const content = target.getContent?.();
-			if (!content) continue;
+				const content = target.getContent?.();
+				if (!content) continue;
 
-			const stripped = stripSystemInjection(content);
-			if (stripped === null) continue;
-			const strippedSource = stripTagPrefix(stripped);
+				const stripped = stripSystemInjection(content);
+				if (stripped === null) continue;
+				const strippedSource = stripTagPrefix(stripped);
 
-			if (strippedSource.trim().length === 0) {
-				const dropResult = target.drop?.() ?? "absent";
-				const didReplace =
-					dropResult === "absent"
-						? target.setContent(`[dropped §${tag.tagNumber}§]`)
-						: false;
-				if (dropResult === "removed" || dropResult === "absent") {
-					replaceSourceContent(db, sessionId, tag.tagNumber, "");
-					updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-					if (dropResult === "removed" || didReplace) {
-						droppedInjections++;
+				if (strippedSource.trim().length === 0) {
+					const dropResult = target.drop?.() ?? "absent";
+					const didReplace =
+						dropResult === "absent"
+							? target.setContent(`[dropped §${tag.tagNumber}§]`)
+							: false;
+					if (dropResult === "removed" || dropResult === "absent") {
+						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
+						if (dropResult === "removed" || didReplace) {
+							droppedInjections++;
+						}
+					}
+				} else {
+					if (
+						freezePiContentDecision(
+							db,
+							sessionId,
+							"reminder-strip",
+							tag.messageId,
+						)
+					) {
+						if (target.setContent(stripped)) droppedInjections++;
 					}
 				}
-			} else {
-				const didSet = target.setContent(stripped);
-				if (didSet) {
-					replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
-					droppedInjections++;
-				}
 			}
-		}
-	})();
+		}).immediate();
+	}
 
 	// ── Pass 3: tool dedup (Pi-shape fingerprinter) ───────────────────
-	const toolFingerprints = buildPiToolFingerprints(piMessages, resolveStableId);
+	const toolFingerprints = routine
+		? buildPiToolFingerprints(piMessages, resolveStableId)
+		: new Map<string, string>();
 	if (toolFingerprints.size > 0) {
 		const tagsByCompositeKey = new Map<string, TagEntry>();
 		for (const tag of tags) {
@@ -524,7 +549,7 @@ export function applyPiHeuristicCleanup(
 					}
 				}
 			}
-		})();
+		}).immediate();
 	}
 
 	if (
@@ -542,11 +567,11 @@ export function applyPiHeuristicCleanup(
 	// ── Pass 4: age-tier caveman text compression ─────────────────────
 	let compressedTextTags = 0;
 	let mutatedTextTags = 0;
-	if (config.caveman?.enabled) {
+	if (routine && config.caveman?.enabled) {
 		const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
 			enabled: true,
 			minChars: config.caveman.minChars,
-			protectedTags: config.protectedTags,
+			protectedCutoff,
 		});
 		compressedTextTags =
 			cavemanResult.compressedToLite +

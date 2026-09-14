@@ -27,6 +27,9 @@ RUST_SESSIONS = {
     "ses_08df2045bffeBcWcqw60elghER",  # ASTROCYTE Rust transform session
 }
 SESSION_PATTERN = re.compile(r"-(ses_[^-]+)-")
+CAPTURE_TIMESTAMP_PATTERN = re.compile(
+    r"^(?P<stamp>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)"
+)
 TAG_PATTERN = re.compile(r"^§(\d+)§(?P<separator> |$)")
 ANY_TAG_PATTERN = re.compile(r"§(\d+)§")
 TEMPORAL_PATTERN = re.compile(r"^<!-- \+[^>]+ -->\n")
@@ -108,6 +111,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--date", default=dt.datetime.now(dt.timezone.utc).date().isoformat())
     parser.add_argument("--per-session", type=int, default=6)
+    parser.add_argument(
+        "--min-provider-bodies",
+        type=int,
+        default=1,
+        help="widen the live lower bound until at least this many provider bodies are admitted",
+    )
     parser.add_argument(
         "--engine-after",
         help="UTC/offset ISO lower bound for hunt-6 engine evidence in --live mode",
@@ -218,6 +227,78 @@ def choose_paths(
         for session in sorted(grouped)
         for path in sorted(grouped[session])[-per_session:]
     ]
+
+
+def choose_live_paths(
+    directories: Iterable[Path],
+    date: str,
+    per_session: int,
+    after: str | None,
+    before: str | None,
+    minimum_provider_bodies: int,
+) -> tuple[list[Path], dict[str, Any]]:
+    if minimum_provider_bodies < 1:
+        raise SystemExit("--min-provider-bodies must be at least 1")
+
+    candidates = sorted(
+        {
+            path
+            for directory in directories
+            for path in directory.glob("*.body.json")
+            if path.is_file()
+        }
+    )
+    requested_lower_bound = after or date
+    upper_bound = before or f"{date}\uffff"
+
+    def select(lower_bound: str) -> list[Path]:
+        grouped: dict[str, list[Path]] = collections.defaultdict(list)
+        for path in candidates:
+            if path.name < lower_bound or path.name > upper_bound:
+                continue
+            session = session_from_name(path)
+            if session is not None:
+                grouped[session].append(path)
+        return [
+            path
+            for session in sorted(grouped)
+            for path in sorted(grouped[session])[-per_session:]
+        ]
+
+    effective_lower_bound = requested_lower_bound
+    paths = select(effective_lower_bound)
+    if len(paths) < minimum_provider_bodies:
+        older_bounds = sorted(
+            {
+                match.group("stamp")
+                for path in candidates
+                if path.name <= upper_bound
+                and (match := CAPTURE_TIMESTAMP_PATTERN.match(path.name)) is not None
+                and match.group("stamp") < requested_lower_bound
+            },
+            reverse=True,
+        )
+        for candidate_bound in older_bounds:
+            widened = select(candidate_bound)
+            effective_lower_bound = candidate_bound
+            paths = widened
+            if len(paths) >= minimum_provider_bodies:
+                break
+
+    if len(paths) < minimum_provider_bodies:
+        raise SystemExit(
+            "live provider denominator minimum unavailable: "
+            f"required {minimum_provider_bodies}, admitted {len(paths)} bodies at or before "
+            f"{before or date}"
+        )
+
+    return paths, {
+        "minimum_provider_bodies": minimum_provider_bodies,
+        "body_count": len(paths),
+        "requested_lower_bound": requested_lower_bound,
+        "effective_lower_bound": effective_lower_bound,
+        "lower_bound_widened": effective_lower_bound != requested_lower_bound,
+    }
 
 
 def load_dumps(paths: Iterable[Path], rust_sessions: set[str]) -> list[Dump]:
@@ -1721,7 +1802,9 @@ def observed_authority_lanes(
         }
     return {
         session: (
-            "ts"
+            "ambiguous"
+            if operand_rows[session] > 0 and session in module_active
+            else "ts"
             if operand_rows[session] > 0
             else "rust"
             if session in module_active
@@ -1737,13 +1820,12 @@ def apply_observed_lanes(
     observed: dict[str, str],
 ) -> list[Dump]:
     effective: list[Dump] = []
+    durable_resolved_dumps = 0
     for dump in dumps:
         observed_lane = observed.get(dump.session, "unknown")
-        lane = (
-            observed_lane
-            if dump.lane in ("rust", "ts") and observed_lane in ("rust", "ts")
-            else dump.lane
-        )
+        lane = observed_lane if observed_lane in ("rust", "ts") else dump.lane
+        if dump.lane == "unverified" and lane in ("rust", "ts"):
+            durable_resolved_dumps += 1
         effective.append(
             Dump(
                 path=dump.path,
@@ -1758,8 +1840,7 @@ def apply_observed_lanes(
         row["observed_lane"] = observed_lane
         row["effective_lane"] = (
             observed_lane
-            if row["configured_lane"] in ("rust", "ts")
-            and observed_lane in ("rust", "ts")
+            if observed_lane in ("rust", "ts")
             else row["configured_lane"]
         )
         if (
@@ -1768,13 +1849,38 @@ def apply_observed_lanes(
             and observed_lane != row["configured_lane"]
         ):
             row["status"] = "config_and_durable_authority_disagree"
+        elif row["configured_lane"] == "unverified" and observed_lane in ("rust", "ts"):
+            row["status"] = "resolved_from_durable_authority"
+        elif row["configured_lane"] == "unverified" and observed_lane == "ambiguous":
+            row["status"] = "durable_authority_ambiguous"
     verification["denominator_dump_counts"] = dict(
         sorted(collections.Counter(dump.lane for dump in effective).items())
     )
+    verification["durable_authority_resolution"] = {
+        "resolved_dumps": durable_resolved_dumps,
+        "remaining_unverified_dumps": sum(
+            dump.lane == "unverified" for dump in effective
+        ),
+    }
     verification["rule"] = (
-        "read live project config first; decisive in-window durable authority then selects the effective denominator"
+        "read served project config first; otherwise decisive in-window transform-decision/module activity selects the denominator; durable authority also wins a config conflict"
     )
     return effective
+
+
+def require_non_empty_provider_denominator(dumps: list[Dump]) -> None:
+    admitted = sum(dump.lane in ("rust", "ts") for dump in dumps)
+    if admitted > 0:
+        return
+    detail = (
+        f"{len(dumps)} served captures were all excluded"
+        if dumps
+        else "no served captures matched the selected window"
+    )
+    raise SystemExit(
+        "non-live provider differ refused: "
+        f"{detail}; provide readable project configs or in-window --context-db/--store-db lane evidence"
+    )
 
 
 def summarize_engine_adjacent_state(
@@ -3343,10 +3449,27 @@ def historian_producer_invariants(contract: dict[str, Any]) -> list[str]:
     ):
         result.append("historian_system_prompt_bytes_diverge")
     calibration = contract.get("calibration", {})
-    expected = {"temperature": 0.1, "max_output_tokens": 32_000, "await_timeout_ms": 600_000}
+    expected = {"temperature": None, "max_output_tokens": 32_000, "await_timeout_ms": 600_000}
     for lane in ("ts", "pi", "rust"):
         if calibration.get(lane) != expected:
             result.append(f"historian_{lane}_calibration_triple_diverges")
+    temperature_shapes = contract.get("temperature_request_shapes", {})
+    if temperature_shapes.get("ts") != {
+        "absent": None,
+        "explicit_0_1": 0.1,
+        "explicit_0": 0,
+    }:
+        result.append("historian_ts_temperature_request_shapes_diverge")
+    if temperature_shapes.get("pi") != {
+        "absence_uses_undefined_check": True,
+        "resolved_from_shared_metadata": True,
+    }:
+        result.append("historian_pi_temperature_request_shapes_diverge")
+    if temperature_shapes.get("rust") != {
+        "option_serialization": True,
+        "zero_fixture": True,
+    }:
+        result.append("historian_rust_temperature_request_shapes_diverge")
     shape = contract.get("request_shape", {})
     for lane in ("ts", "pi", "rust"):
         if shape.get(lane) != ["system", "user"]:
@@ -3454,10 +3577,15 @@ import { createHash } from 'node:crypto';
 import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from './packages/plugin/src/hooks/magic-context/historian-prompt.generated.ts';
 import { resolveHistorianAgentOverrides } from './packages/plugin/src/shared/model-resolution.ts';
 const bytes = Buffer.from(COMPARTMENT_AGENT_SYSTEM_PROMPT);
+const configs = {
+  absent: { opencode: { model: 'open/model' }, pi: { model: 'pi/model' } },
+  explicit_0_1: { temperature: 0.1, opencode: { model: 'open/model' }, pi: { model: 'pi/model' } },
+  explicit_0: { temperature: 0, opencode: { model: 'open/model' }, pi: { model: 'pi/model' } },
+};
 console.log(JSON.stringify({
   sha256: createHash('sha256').update(bytes).digest('hex'),
   bytes: bytes.byteLength,
-  generation: resolveHistorianAgentOverrides({}),
+  generation: Object.fromEntries(Object.entries(configs).map(([key, value]) => [key, resolveHistorianAgentOverrides(value)])),
 }));
 """
     completed = subprocess.run(
@@ -3505,9 +3633,12 @@ console.log(JSON.stringify({
     rust_handler_source = rust_handler_path.read_text() if rust_handler_path.exists() else ""
 
     generation = ts.get("generation", {}) if isinstance(ts.get("generation"), dict) else {}
+    absent_generation = generation.get("absent", {})
+    if not isinstance(absent_generation, dict):
+        absent_generation = {}
     ts_calibration = {
-        "temperature": generation.get("temperature"),
-        "max_output_tokens": generation.get("maxTokens"),
+        "temperature": absent_generation.get("temperature"),
+        "max_output_tokens": absent_generation.get("maxTokens"),
         "await_timeout_ms": 600_000 if "DEFAULT_HISTORIAN_TIMEOUT_MS" in ts_producer else None,
     }
     rust_calibration = {
@@ -3537,16 +3668,25 @@ console.log(JSON.stringify({
             "rust_sha256": hashlib.sha256(rust_prompt).hexdigest() if rust_prompt else None,
             "rust_bytes": len(rust_prompt),
         },
+        "temperature_request_shapes": {
+            "ts": {
+                key: value.get("temperature")
+                for key, value in generation.items()
+                if isinstance(value, dict)
+            },
+            "pi": {
+                "absence_uses_undefined_check": "options.temperature !== undefined" in pi_subagent_source,
+                "resolved_from_shared_metadata": "temperature: historian?.temperature" in pi_index_source,
+            },
+            "rust": {
+                "option_serialization": 'skip_serializing_if = "Option::is_none"' in rust_producer,
+                "zero_fixture": "for temperature in [0.1, 0.0]" in rust_producer,
+            },
+        },
         "calibration": {
             "ts": ts_calibration,
             "pi": {
-                "temperature": (
-                    0.1
-                    if "temperature = 0.1" in pi_runner_source
-                    and "HISTORIAN_CALIBRATION_ENTRY_PATH" in pi_subagent_source
-                    and "MAGIC_CONTEXT_HISTORIAN_TEMPERATURE" in pi_subagent_source
-                    else None
-                ),
+                "temperature": None,
                 "max_output_tokens": (
                     32_000
                     if "maxOutputTokens = 32_000" in pi_runner_source
@@ -3685,7 +3825,6 @@ def summarize_hunt12_source_contract(root: Path) -> dict[str, Any]:
         source(path)
         for path in (
             "packages/plugin/src/index.ts",
-            "packages/plugin/src/features/magic-context/sidekick/agent.ts",
             "packages/plugin/src/features/magic-context/user-memory/review-user-memories.ts",
             "packages/plugin/src/features/magic-context/dreamer/refresh-primers.ts",
             "packages/plugin/src/features/magic-context/dreamer/verify.ts",
@@ -3786,8 +3925,7 @@ def summarize_hunt12_source_contract(root: Path) -> dict[str, Any]:
                 "mapping_origin = excluded.mapping_origin" in store_rs
                 and "prepared_row.mapping_origin.as_deref().unwrap_or(\"mapper\")"
                 in store_rs
-                and "row.mapping_origin === \"host_rejected_fallback\""
-                in context_authority
+                and 'mapping_origin === "host_rejected_fallback"' in context_authority
             ),
             "both_sentinels_are_mapped_and_not_verifiable": (
                 "SELECT DISTINCT memory_id FROM memory_verifications" in storage_verifications
@@ -3811,8 +3949,7 @@ def summarize_hunt12_source_contract(root: Path) -> dict[str, Any]:
                 in data_path_test
             ),
             "pi_preload_regression_present": (
-                "Pi preload isolation outranks the shared storage override"
-                in pi_preload_test
+                "Pi preload isolates storage and user config" in pi_preload_test
                 and "MAGIC_CONTEXT_TEST_DATA_DIR" in pi_preload
             ),
             "doctor_origins_match": doctors.count("storage.source") >= 3,
@@ -4212,12 +4349,15 @@ def live_leg_verdicts(
 
 def run_live(args: argparse.Namespace) -> None:
     expected_rust_sessions = set(args.rust_sessions or RUST_SESSIONS)
-    paths: list[Path] = []
     directories = live_dump_directories(args.dump_dir)
-    for directory in directories:
-        paths.extend(
-            choose_paths(directory, args.date, args.per_session, args.after, args.before)
-        )
+    paths, capture_window = choose_live_paths(
+        directories,
+        args.date,
+        args.per_session,
+        args.after,
+        args.before,
+        args.min_provider_bodies,
+    )
     dumps = load_dumps(paths, expected_rust_sessions)
     try:
         config_overrides = project_config_overrides(args.project_config)
@@ -4231,8 +4371,10 @@ def run_live(args: argparse.Namespace) -> None:
     mural_contract = summarize_mural_compose_contract(source_root)
     wrapup_contract = summarize_wrapup_contract(source_root)
     hunt12_contract = summarize_hunt12_source_contract(source_root)
-    after_ms = parse_bound(args.after, args.date)
-    engine_after_ms = parse_bound(args.engine_after or args.after, args.date)
+    effective_after = str(capture_window["effective_lower_bound"])
+    effective_after_arg = effective_after if "T" in effective_after else None
+    after_ms = parse_bound(effective_after_arg, args.date)
+    engine_after_ms = parse_bound(args.engine_after or effective_after_arg, args.date)
     probe = invoke_live_probe(
         args, after_ms, engine_after_ms, {dump.session for dump in dumps}
     )
@@ -4258,6 +4400,7 @@ def run_live(args: argparse.Namespace) -> None:
             "per_session": args.per_session,
             "capture_directories": len(directories),
             "capture_files": len(dumps),
+            "capture_window": capture_window,
             "expected_rust_session_prefixes": sorted(
                 session[:8] for session in expected_rust_sessions
             ),
@@ -4316,6 +4459,7 @@ def main() -> None:
             args.context_db, args.store_db, sessions, start_ms, end_ms
         ),
     )
+    require_non_empty_provider_denominator(dumps)
     lane_by_session: dict[str, str] = {}
     for session in sessions:
         observed = {dump.lane for dump in dumps if dump.session == session}

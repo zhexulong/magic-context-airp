@@ -2,8 +2,16 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { getProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
+import { REMOVED_AGENT_CONFIG_WARNING } from "@magic-context/core/config/removed-agent-config";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
+import { resolveEpochFloorForPass } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { Database } from "@magic-context/core/shared/sqlite";
+import {
+	getWindowOverlay,
+	reloadWindowOverlay,
+	setWindowOverlayPath,
+} from "@magic-context/core/shared/window-geometry";
 import { loadPiConfig, loadPiConfigDetailed } from "./index";
 
 const tempRoots: string[] = [];
@@ -61,6 +69,7 @@ function writeUserConfig(
 }
 
 afterEach(() => {
+	setWindowOverlayPath(undefined);
 	if (originalHome === undefined) {
 		delete process.env.HOME;
 	} else {
@@ -83,6 +92,66 @@ afterEach(() => {
 });
 
 describe("loadPiConfig", () => {
+	it("recovers a leading invalid symbol and returns a located file-parse warning", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(home, '\\{\n  "cache_ttl": "1h"\n}');
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.cache_ttl).toBe("1h");
+		expect(result.configParseFailures).toHaveLength(1);
+		expect(result.configParseFailures[0]).toMatchObject({
+			warningClass: "file-parse",
+			line: 1,
+			column: 1,
+			recovered: true,
+			message: "invalid symbol",
+		});
+	});
+
+	it("does not invalidate a same-path overlay during routine config reads", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		const overlayRoot = makeTempRoot("mc-pi-overlay-");
+		const overlayPath = join(overlayRoot, "window-overlay.json");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({ models: { window_overlay_path: overlayPath } }),
+		);
+		const writeOverlay = (modelId: string) =>
+			writeFileSync(
+				overlayPath,
+				JSON.stringify({
+					schema: "fusiform-window-overlay/v1",
+					generated_at: "2026-09-01T00:00:00Z",
+					minted_provider_ids: [],
+					cells: [
+						{
+							provider_id: "hunt-provider",
+							model_id: modelId,
+							facts: {},
+						},
+					],
+				}),
+			);
+
+		writeOverlay("before-rewrite");
+		loadPiConfig({ cwd });
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+		writeOverlay("after-rewrite");
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+		loadPiConfig({ cwd });
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+
+		reloadWindowOverlay(overlayPath);
+		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("after-rewrite");
+	});
+
 	it("marks an unmigrated legacy project config as an untrusted load", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
@@ -227,7 +296,7 @@ describe("loadPiConfig", () => {
 		expect(result.loadedFromPaths).toEqual([projectPath, userPath]);
 	});
 
-	it("warns and falls back to defaults for invalid JSONC", () => {
+	it("warns and applies values recovered from invalid JSONC", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
 		withHome(home);
@@ -235,10 +304,15 @@ describe("loadPiConfig", () => {
 
 		const result = loadPiConfig({ cwd });
 
-		expect(result.config).toEqual(MagicContextConfigSchema.parse({}));
+		expect(result.config.enabled).toBe(false);
 		expect(result.loadedFromPaths).toEqual([projectPath]);
-		expect(result.warnings.join("\n")).toContain("failed to load config");
-		expect(result.warnings.join("\n")).toContain("using defaults");
+		expect(result.configParseFailures[0]).toMatchObject({
+			warningClass: "file-parse",
+			recovered: true,
+		});
+		expect(result.warnings.join("\n")).toContain(
+			"recovered values were applied",
+		);
 	});
 
 	it("warns and falls back to defaults for invalid Zod fields", () => {
@@ -311,8 +385,7 @@ describe("loadPiConfig", () => {
 		writeUserConfig(
 			home,
 			JSON.stringify({
-				sidekick: {
-					model: "test-model",
+				dreamer: {
 					prompt: "home={env:HOME}",
 				},
 			}),
@@ -320,7 +393,7 @@ describe("loadPiConfig", () => {
 
 		const result = loadPiConfig({ cwd });
 
-		expect(result.config.sidekick?.prompt).toBe(`home=${home}`);
+		expect(result.config.dreamer?.prompt).toBe(`home=${home}`);
 		expect(result.warnings).toEqual([]);
 	});
 
@@ -330,18 +403,18 @@ describe("loadPiConfig", () => {
 		withHome(home);
 		// A repo-supplied project config must not read env/files. The token is
 		// left literal and a warning is emitted (parity with OpenCode). Use a
-		// benign field (sidekick.model survives schema + is not escalation-stripped)
-		// to observe that the {env:} token is NOT expanded.
+		// benign Dreamer model field survives schema + security stripping, letting
+		// the test observe that the {env:} token is NOT expanded.
 		writeProjectConfig(
 			cwd,
 			JSON.stringify({
-				sidekick: { model: "{env:HOME}" },
+				dreamer: { pi: { model: "{env:HOME}" } },
 			}),
 		);
 
 		const result = loadPiConfig({ cwd });
 
-		expect(result.config.sidekick?.model).toBe("{env:HOME}");
+		expect(result.config.dreamer?.pi?.model).toBe("{env:HOME}");
 		expect(result.warnings.join("\n")).toContain("no longer supports");
 	});
 
@@ -562,6 +635,24 @@ describe("loadPiConfig", () => {
 		});
 	});
 
+	it("ignores the removed agent block with one warning", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		const removedKey = ["side", "kick"].join("");
+		writeUserConfig(
+			home,
+			JSON.stringify({ [removedKey]: { model: "example/model" } }),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(removedKey in result.config).toBe(false);
+		expect(
+			result.warnings.filter((warning) => warning.includes(removedKey)),
+		).toEqual([`[config] ${REMOVED_AGENT_CONFIG_WARNING}`]);
+	});
+
 	it("migrates legacy agent enabled keys before schema parsing", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
@@ -570,7 +661,6 @@ describe("loadPiConfig", () => {
 			cwd,
 			JSON.stringify({
 				dreamer: { enabled: false, disable: false },
-				sidekick: { enabled: true, disable: true },
 				historian: { enabled: true },
 			}),
 		);
@@ -578,7 +668,6 @@ describe("loadPiConfig", () => {
 		const result = loadPiConfig({ cwd });
 
 		expect(result.config.dreamer?.disable).toBe(true);
-		expect(result.config.sidekick?.disable).toBe(true);
 		expect(result.config.historian).toEqual({
 			two_pass: false,
 			disallowed_tools: [],
@@ -589,5 +678,177 @@ describe("loadPiConfig", () => {
 		expect(result.warnings.join("\n")).toContain(
 			'Removed invalid "historian.enabled" in-memory (run doctor to persist).',
 		);
+	});
+
+	describe("protected_tokens tier parity", () => {
+		it("keeps scalar-only semantics at both tiers and preserves the user scalar on an invalid project leaf", () => {
+			const cwd = makeTempRoot("mc-pi-protected-cwd-");
+			const home = makeTempRoot("mc-pi-protected-home-");
+			withHome(home);
+			const vectors = [
+				{
+					name: "user scalar",
+					user: { protected_tokens: 20_000 },
+					project: {},
+					expected: 20_000,
+					warns: false,
+				},
+				{
+					name: "user object",
+					user: { protected_tokens: { default: 20_000 } },
+					project: {},
+					expected: undefined,
+					warns: true,
+				},
+				{
+					name: "project scalar",
+					user: {},
+					project: { protected_tokens: 20_000 },
+					expected: 20_000,
+					warns: false,
+				},
+				{
+					name: "project object",
+					user: {},
+					project: { protected_tokens: { default: 20_000 } },
+					expected: undefined,
+					warns: true,
+				},
+				{
+					name: "invalid project object over user scalar",
+					user: { protected_tokens: 25_000 },
+					project: { protected_tokens: { default: 30_000 } },
+					expected: 25_000,
+					warns: true,
+				},
+			] as const;
+
+			for (const [index, vector] of vectors.entries()) {
+				const vectorCwd = join(cwd, String(index));
+				mkdirSync(vectorCwd, { recursive: true });
+				writeUserConfig(home, JSON.stringify(vector.user));
+				writeProjectConfig(vectorCwd, JSON.stringify(vector.project));
+				const result = loadPiConfig({ cwd: vectorCwd });
+				expect(result.config.protected_tokens, vector.name).toBe(
+					vector.expected,
+				);
+				const warned = result.warnings.some((warning) =>
+					warning.includes("protected_tokens"),
+				);
+				expect(warned, vector.name).toBe(vector.warns);
+			}
+		});
+
+		it("rejects a project protected_tokens floor below the derived floor once geometry is known", () => {
+			const cwd = makeTempRoot("mc-pi-derived-floor-cwd-");
+			const home = makeTempRoot("mc-pi-derived-floor-home-");
+			withHome(home);
+			writeUserConfig(home, JSON.stringify({}));
+			writeProjectConfig(cwd, JSON.stringify({ protected_tokens: 4_000 }));
+			const loaded = loadPiConfig({ cwd });
+			const db = new Database(":memory:");
+			db.exec(`
+				CREATE TABLE session_meta (
+					session_id TEXT PRIMARY KEY,
+					harness TEXT NOT NULL DEFAULT 'pi',
+					last_response_time INTEGER NOT NULL DEFAULT 0,
+					cache_ttl TEXT NOT NULL DEFAULT '5m',
+					counter INTEGER NOT NULL DEFAULT 0,
+					last_nudge_tokens INTEGER NOT NULL DEFAULT 0,
+					last_nudge_band TEXT NOT NULL DEFAULT '',
+					last_transform_error TEXT NOT NULL DEFAULT '',
+					is_subagent INTEGER NOT NULL DEFAULT 0,
+					last_context_percentage REAL NOT NULL DEFAULT 0,
+					last_input_tokens INTEGER NOT NULL DEFAULT 0,
+					observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
+					cache_alert_sent INTEGER NOT NULL DEFAULT 0,
+					times_execute_threshold_reached INTEGER NOT NULL DEFAULT 0,
+					compartment_in_progress INTEGER NOT NULL DEFAULT 0,
+					system_prompt_hash TEXT NOT NULL DEFAULT '',
+					cleared_reasoning_through_tag INTEGER NOT NULL DEFAULT 0,
+					protected_tokens_effective INTEGER,
+					protected_tokens_pre_snapshot TEXT
+				)
+			`);
+			const warnings: string[] = [];
+			const tierOverrides = getProtectedTokensTierOverrides(loaded.config);
+
+			const resolved = resolveEpochFloorForPass(db, "pi-loader-derived-floor", {
+				tierOverrides,
+				usableSoft: 200_000,
+				isCacheBustingPass: true,
+				onRejectedProjectOverride: (warning) => warnings.push(warning),
+			});
+			resolveEpochFloorForPass(db, "pi-loader-derived-floor-next", {
+				tierOverrides,
+				usableSoft: 200_000,
+				isCacheBustingPass: true,
+				onRejectedProjectOverride: (warning) => warnings.push(warning),
+			});
+
+			expect(resolved.floor).toBe(16_000);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toContain("protected_tokens=4000");
+			db.close();
+		});
+	});
+
+	describe("protected_tags deprecation", () => {
+		it("accepts protected_tags: 20 with loud deprecation warning and behavior identical to absent", () => {
+			const cwd = makeTempRoot("mc-pi-dep-cwd-");
+			const home = makeTempRoot("mc-pi-dep-home-");
+			withHome(home);
+			writeProjectConfig(cwd, JSON.stringify({ protected_tags: 20 }));
+
+			const result = loadPiConfig({ cwd });
+			const baselineAbsent = loadPiConfig({
+				cwd: makeTempRoot("mc-pi-absent-"),
+			});
+
+			// Behavior identical to absent
+			expect(result.config.execute_threshold_percentage).toBe(
+				baselineAbsent.config.execute_threshold_percentage,
+			);
+			// Deprecation warning names replacement protected_tokens
+			const warnings = result.warnings.join("\n");
+			expect(warnings).toContain("protected_tags");
+			expect(warnings).toContain("deprecated");
+			expect(warnings).toContain("protected_tokens");
+			expect(result.hasDeprecatedProtectedTags).toBe(true);
+		});
+
+		it("accepts protected_tags: 0 without bounds rejection and identical warning", () => {
+			const cwd = makeTempRoot("mc-pi-dep0-cwd-");
+			const home = makeTempRoot("mc-pi-dep0-home-");
+			withHome(home);
+			writeProjectConfig(cwd, JSON.stringify({ protected_tags: 0 }));
+
+			// Config parse must SUCCEED (no bounds error / no schema failure on deprecated key)
+			const result = loadPiConfig({ cwd });
+			expect(result.configParseFailures).toHaveLength(0);
+
+			const warnings = result.warnings.join("\n");
+			expect(warnings).toContain("protected_tags");
+			expect(warnings).toContain("deprecated");
+			expect(warnings).toContain("protected_tokens");
+			expect(result.hasDeprecatedProtectedTags).toBe(true);
+		});
+
+		it("accepts protected_tags: 101 without bounds rejection and identical warning", () => {
+			const cwd = makeTempRoot("mc-pi-dep101-cwd-");
+			const home = makeTempRoot("mc-pi-dep101-home-");
+			withHome(home);
+			writeProjectConfig(cwd, JSON.stringify({ protected_tags: 101 }));
+
+			// Config parse must SUCCEED (no bounds error / no schema failure on deprecated key)
+			const result = loadPiConfig({ cwd });
+			expect(result.configParseFailures).toHaveLength(0);
+
+			const warnings = result.warnings.join("\n");
+			expect(warnings).toContain("protected_tags");
+			expect(warnings).toContain("deprecated");
+			expect(warnings).toContain("protected_tokens");
+			expect(result.hasDeprecatedProtectedTags).toBe(true);
+		});
 	});
 });

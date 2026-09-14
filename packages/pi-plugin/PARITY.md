@@ -24,7 +24,7 @@ historian / m[0]m[1] injection / nudges / auto-search behind `fullFeatureMode`
 (i.e. `!isSubagent`), and detects subagents via OpenCode's `session.parent_id`.
 
 **Pi:** Pi has **no native subagent concept**. The subagents Magic Context itself
-spawns (historian, dreamer, sidekick) each run as a **separate `pi --print` process**
+spawns (historian and dreamer) each run as a **separate `pi --print` process**
 loading only the lean `subagent-entry.js`, whose recursion guard **never wires
 `pi.on("context")`** (see `subagent-entry.ts` header). A Magic Context subagent
 therefore *cannot* reach the context-handler pipeline at all.
@@ -238,27 +238,49 @@ the harness I/O differs:
 
 - **Channel 2 (hidden ceiling nudge).** OpenCode MUST use a live-server
   `createOpencodeClient(serverUrl)` + `/session` probe to dodge the plugin
-  runner-split bug (anomalyco/opencode#28202); Pi just calls the native
-  `pi.sendMessage({ customType, content, display:false, details }, { deliverAs })`.
-  **Pi has no #28202 workaround, no live-server client, and no probe** — it is
-  single-process, so the message coalesces natively and lands at the tail after
-  the current turn. **Hidden-render divergence (same intent, different mechanism):**
-  OpenCode marks its promptAsync part `synthetic: true` (skips OC core's
-  queued-message wrapper + the #129 flip-bust, drops from the user-message render,
-  still model-visible); Pi has no such wrapper, so it achieves the same
-  "model-visible but not a literal user turn" via a `sendMessage` custom message
-  with `display:false` (Pi converts `role:"custom"`→user message for the model
-  via convertToLlm, renders only when `display:true`). Neither presents the nudge
-  as a user turn. The shared `channel2_nudge_state` lease
-  (pending→claimed→delivered, TTL-scoped stale-claim heal, revert only on send
-  failure) is used identically for the one-ceiling-per-lifetime cap; only the
-  delivery call differs. Delivery timing follows each host's safe queue surface:
-  OpenCode emits from `message.updated` (finish=tool-calls OR stop), and its
-  synthetic queued message drains at the next run-loop step. Pi calls the same
-  token-bound delivery helper from `tool_result`, with clean-stop `agent_end` as
-  the fallback, but always uses `deliverAs: "nextTurn"`. That queue joins the next
-  real user turn instead of steering the active turn or starting an autonomous
-  follow-up that could race an external prompt.
+  runner-split bug (anomalyco/opencode#28202); Pi calls native
+  `pi.sendMessage({ customType, content, display:false, details },
+  { deliverAs:"steer", triggerTurn:true })`. **Pi has no #28202 workaround,
+  live-server client, or probe** — it is single-process. **Hidden-render
+  divergence (same intent, different mechanism):** OpenCode marks its promptAsync
+  part `synthetic: true` (skips OC core's queued-message wrapper + the #129
+  flip-bust, drops from the user-message render, still model-visible); Pi has no
+  such wrapper, so `display:false` keeps the custom row out of the TUI while
+  `convertToLlm` presents it to the model. Neither presents the nudge as a literal
+  user turn.
+
+  `steer` is the shared Pi/oh-my-pi (OMP) boundary contract. During a busy Pi 0.83.0 run it
+  queues the custom row; the [parallel executor finishes every scheduled
+  tool](https://github.com/earendil-works/pi/blob/845d6ff1f6643aba440341cce877ce1c43ebbc39/packages/agent/src/agent-loop.ts#L489-L554),
+  then the [loop injects steering before the next model
+  call](https://github.com/earendil-works/pi/blob/845d6ff1f6643aba440341cce877ce1c43ebbc39/packages/agent/src/agent-loop.ts#L181-L193).
+  OMP 18.1.7 likewise awaits the current batch before its next model boundary
+  ([interrupt classification](https://github.com/can1357/oh-my-pi/blob/c4da0d08e8275659f3e09cf381c7df7018a19025/packages/agent/src/agent-loop.ts#L2478-L2517),
+  [result pairing and skip rules](https://github.com/can1357/oh-my-pi/blob/c4da0d08e8275659f3e09cf381c7df7018a19025/packages/agent/src/agent-loop.ts#L2560-L2579),
+  [await and injection boundary](https://github.com/can1357/oh-my-pi/blob/c4da0d08e8275659f3e09cf381c7df7018a19025/packages/agent/src/agent-loop.ts#L2781-L2889)).
+  Ordinary tools are never skipped. OMP may cancel only tools that explicitly opt
+  into interruption (currently pure waits such as `hub wait`/`vibe`), and emits
+  synthetic skipped results so every tool call remains paired. When idle,
+  `triggerTurn:true` starts a model turn with the nudge on both [Pi](https://github.com/earendil-works/pi/blob/845d6ff1f6643aba440341cce877ce1c43ebbc39/packages/coding-agent/src/core/agent-session.ts#L1450-L1462)
+  and [OMP](https://github.com/can1357/oh-my-pi/blob/c4da0d08e8275659f3e09cf381c7df7018a19025/packages/coding-agent/src/session/agent-session.ts#L7126-L7142),
+  matching OpenCode's idle `promptAsync` behavior.
+
+  Do not restore `nextTurn`: Pi stores it until the next explicit user prompt, so
+  a marathon turn never sees Channel 2. OMP's [public hook
+  type](https://github.com/can1357/oh-my-pi/blob/c4da0d08e8275659f3e09cf381c7df7018a19025/packages/coding-agent/src/extensibility/hooks/types.ts#L512-L532)
+  exposes only `steer | followUp`, even though the [session runtime has hidden
+  `nextTurn`/`aside` branches](https://github.com/can1357/oh-my-pi/blob/c4da0d08e8275659f3e09cf381c7df7018a19025/packages/coding-agent/src/session/agent-session.ts#L7019-L7073).
+  Hook forwarding performs no runtime validation: an unknown busy-run value falls
+  through to steer, while an idle one appends without starting a turn. That
+  coercion and the hidden modes are not a supported integration surface.
+
+  The shared `channel2_nudge_state` lease keeps its three-state
+  pending→claimed→delivered path, token-bound confirm/revert, ten-minute stale
+  claim reap, and one-ceiling-per-tail-cycle cap. Coverage-advancing HARD folds
+  and measured U collapse still re-arm the cycle; delivery mode does not alter
+  compliance grace. OpenCode emits at `message.updated` (finish=tool-calls OR
+  stop). Pi calls the token-bound helper from `tool_result`, with clean-stop
+  `agent_end` as fallback.
 
 - **Removed in this redesign (both harnesses):** the rolling/iteration nudge
   (`nudger`/`injectPiNudge`/`nudge-injector.ts`) and the tool-heavy sticky reminder
@@ -414,8 +436,8 @@ post-publish signals are the DEFERRED variants (`signalPiDeferredHistoryRefresh`
 / `signalPiDeferredMaterialization`) and the compaction marker is STAGED (pending
 blob + deferred drain), never applied eagerly — exactly like the background
 historian's `onPublished`. Eager signals / eager marker apply would force a
-materialization (or mutate `getBranch()`) on whatever transform pass is running,
-possibly mid-turn, busting the cache.
+materialization (or mutate `getBranch()`) on a cache-stable transform pass,
+causing an otherwise avoidable cache bust.
 
 ## 11. Work-metrics: Pi folds the in-memory wire array; OpenCode computes lazily in RPC
 
@@ -567,7 +589,7 @@ Both also clear the flag on a successful `/ctx-recomp` (OpenCode runManagedRecom
 ## 17. Runaway hidden-agent loop: OpenCode needs an in-config step cap; Pi relies on subprocess-kill
 
 A weak local model (e.g. llama.cpp with poor instruction-following) can get a
-hidden agent (historian/dreamer/sidekick) stuck in an infinite tool-call loop
+hidden agent (historian/dreamer) stuck in an infinite tool-call loop
 (issue #154). The protection differs because the spawn model differs:
 
 - **OpenCode** spawns hidden agents as a child SESSION whose run loop is an
@@ -638,21 +660,6 @@ data, mimeType }` user and tool-result parts with the same empty-text sentinel.
 Both persist the frozen id before changing bytes, and clone inheritance copies
 `processed_image_stripped_ids`.
 
----
-
-## 19a. `/ctx-aug` skips empty sidekick augmentation blocks
-
-When sidekick returns the empty-result sentinel (for example, "No relevant
-memories found"), **Pi sends the original prompt without a
-`<sidekick-augmentation>` block**. This is intentional: a no-op augmentation
-block consumes tokens and adds noise while giving the main agent no useful
-context.
-
-OpenCode currently injects a `<sidekick-augmentation>` block containing the
-empty sentinel text. Pi's behavior is the desired target; OpenCode should
-eventually adopt the same skip-empty behavior.
-
----
 
 ## 20. Pi subagents discover extensions, then fail closed with per-agent tools
 
@@ -763,31 +770,28 @@ firmly outside this edge. If it ever surfaces, the clean Pi fix is
 
 ---
 
-## 24. `ctx_memory` registration: OpenCode gates on launch config; Pi always registers + relies on the per-call guard
+## 24. `ctx_memory` visibility: OpenCode omits registration; Pi enables it per session
 
 When `memory.enabled` is false, the `<project-memory>` block is never injected,
-so an agent's `ctx_memory` writes can never resurface. Both harnesses drop the
-ctx_memory PROMPT guidance for a memory-off project, but they register the TOOL
-differently:
+so an agent's `ctx_memory` writes can never resurface. Both harnesses remove
+`ctx_memory` guidance from the system prompt and keep the call-time memory gate,
+but they control model visibility through their host-specific tool lifecycle:
 
-- **OpenCode** gates tool registration on `memory.enabled` in
-  `tool-registry.ts`. This is consistent because the registry and the system
-  prompt both read the SAME launch-resolved config for a given session, so the
-  tool's presence always matches the prompt's guidance.
-- **Pi** must ALWAYS register `ctx_memory` in the main extension entry
-  (`index.ts`, `memoryToolEnabled: true`). Pi is a single long-lived REPL that
-  can `/cd` between projects: tool registration happens once at boot, but the
-  system prompt re-resolves `memory.enabled` per project every pass. Gating
-  registration on the boot project would mismatch after a switch (tool absent
-  while prompt advertises it, or vice-versa). Instead Pi leans on the tool's own
-  per-call guard (`ctx-memory.ts` → `getProjectEmbeddingSnapshot(projectIdentity)`),
-  which refuses with "Cross-session memory is disabled for this project" when the
-  CURRENT project has memory off. OpenCode's handler carries the identical guard,
-  so behavior matches; only the registration strategy differs.
+- **OpenCode** omits `ctx_memory` from registration in `tool-registry.ts` when
+  the launch-resolved project config disables memory. The registry and prompt
+  read the same session config, so the tool is absent with its guidance.
+- **Pi** registers the `ctx_memory` definition once, then calls Pi's
+  `getActiveTools()` / `setActiveTools()` at every `session_start` using that
+  session's resolved project config. A memory-off session removes it from the
+  enabled set; a memory-on session restores it. `session_start` also covers Pi
+  reloads, and its config cache is invalidated first, so a config flip applies
+  to the next session without restarting Pi. A `/cd` change inside an already
+  active session waits for the next session/reload; the existing call-time guard
+  still refuses a stale enabled tool in the meantime.
 
-Note: Pi's `memoryToolEnabled` flag still exists and is still used by the
-SUBAGENT entry (`subagent-entry.ts`) to keep `ctx_memory` off the retrieval-only
-sidekick, a separate security concern, unaffected by this divergence.
+Pi's `memoryToolEnabled` registration flag remains for the lean subagent entry
+(`subagent-entry.ts`) to keep `ctx_memory` off read-only Dreamer tasks, a separate
+security boundary unaffected by the main-session activation behavior.
 
 ---
 
@@ -798,6 +802,25 @@ copy compartments, tags, reductions, and deferred Pi marker state while filterin
 them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
 entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
 a separate future design based on a stable cross-fork identity.
+
+---
+
+## 26. Last-known-good replay is shared across harnesses
+
+Both harnesses capture every successfully applied transform representation and
+persist it in the shared schema-v81 `lkg_slots` table. A transient
+`SQLITE_BUSY`/`SQLITE_LOCKED` failure replays that representation plus the raw
+new tail; schema-fence, migration-guard, and storage-open failures remain loud
+fail-closed startup refusals and never enter the replay lane.
+
+OpenCode keys the validated prefix with native message ids. Pi uses the stable
+`SessionEntry.id` values from its JSONL branch projection, requiring exact id
+sequence and content equality through the prior pass's anchor before appending
+the pristine native `AgentMessage[]` tail. Pi captures the served JSON bytes
+synchronously but defers SHA-256 digests and durable persistence with
+`setImmediate`, with the same synchronous next-pass re-arm after an async
+capture failure. Successful SOFT+ passes refresh the slot even when they did not
+perform a HARD cache bust, preventing a long-lived stale recovery prefix.
 
 ---
 

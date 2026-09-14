@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     sweepOrphanedOpenCodeMessageIndexes,
@@ -40,11 +41,16 @@ function seedIndexedSession(db: Database, sessionId: string, updatedAt: number):
             (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
          VALUES (?, 1, 0, ?, 'opencode')`,
     ).run(sessionId, updatedAt);
-    db.prepare(
-        `INSERT INTO message_history_fts
-            (session_id, message_ordinal, message_id, role, content)
-         VALUES (?, 1, ?, 'user', ?)`,
-    ).run(sessionId, `${sessionId}-message`, `searchable ${sessionId}`);
+    const result = db
+        .prepare(
+            `INSERT INTO message_history_fts
+                (session_id, message_ordinal, message_id, role, content)
+             VALUES (?, 1, ?, 'user', ?)`,
+        )
+        .run(sessionId, `${sessionId}-message`, `searchable ${sessionId}`) as {
+        lastInsertRowid: number | bigint;
+    };
+    recordMessageFtsRowid(db, sessionId, 1, result.lastInsertRowid);
 }
 
 function seedSessionScopedRows(db: Database, sessionId: string, updatedAt: number): void {
@@ -120,6 +126,75 @@ describe("message history orphan maintenance", () => {
             ).toEqual([{ harness: "pi" }]);
             expect(countRows(db, "tags", "ses-live")).toBe(1);
             expect(countRows(db, "tags", "ses-young")).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("preserves every host row and coordinate for an orphan with pending Rust cleanup", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+        const sessionId = "ses-rust-cleanup-orphan";
+        seedSessionScopedRows(db, sessionId, old);
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', 'git:rust-cleanup-orphan', ?)",
+        ).run(sessionId, old);
+        db.prepare(
+            "INSERT INTO pending_session_cleanup (session_id, harness, requested_at) VALUES (?, 'opencode:rust', ?)",
+        ).run(sessionId, old);
+        const openCodePath = createOpenCodeDb([]);
+
+        try {
+            const result = sweepOrphanedOpenCodeMessageIndexes(
+                db,
+                () => new Database(openCodePath, { readonly: true }),
+                { now },
+            );
+
+            expect(result).toMatchObject({ status: "swept", scanned: 1, deleted: 0 });
+            for (const table of [
+                "message_history_fts",
+                "message_history_index",
+                "session_meta",
+                "session_projects",
+                "pending_session_cleanup",
+                "tags",
+                "session_facts",
+                "tool_owner_backfill_state",
+            ]) {
+                expect(countRows(db, table, sessionId), `${table} lost Rust cleanup state`).toBe(1);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("discovers an orphan whose index rows were already purged", () => {
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        const orphanSessionId = "ses-indexless-orphan";
+        const liveSessionId = "ses-indexless-live";
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')",
+        ).run(orphanSessionId);
+        db.prepare(
+            "INSERT INTO tags (session_id, tag_number, harness) VALUES (?, 1, 'opencode')",
+        ).run(liveSessionId);
+        const openCodePath = createOpenCodeDb([liveSessionId]);
+
+        try {
+            expect(countRows(db, "message_history_index", orphanSessionId)).toBe(0);
+
+            const result = sweepOrphanedOpenCodeMessageIndexes(
+                db,
+                () => new Database(openCodePath, { readonly: true }),
+                { now },
+            );
+
+            expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
+            expect(countRows(db, "tags", orphanSessionId)).toBe(0);
+            expect(countRows(db, "tags", liveSessionId)).toBe(1);
         } finally {
             closeQuietly(db);
         }

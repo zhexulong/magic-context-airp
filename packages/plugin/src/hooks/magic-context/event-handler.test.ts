@@ -1,16 +1,21 @@
+import { drainNotifications } from "../../shared/rpc-notifications";
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { recordMessageFtsRowid } from "../../features/magic-context/message-fts-rowid-map";
 import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
+    applyStrippedPlaceholderDelta,
     closeDatabase,
+    getHiddenSeamPlaceholderIds,
     getHistorianFailureState,
     getMaxCompressionDepth,
     getOrCreateSessionMeta,
@@ -19,7 +24,9 @@ import {
     incrementCompressionDepth,
     incrementHistorianFailure,
     insertTag,
+    markSessionCleanupPending,
     openDatabase,
+    retryPendingRustSessionCleanupsForProject,
     retryPendingSessionCleanups,
     setStrippedPlaceholderIds,
     updateSessionMeta,
@@ -29,7 +36,10 @@ import {
     appendNoteNudgeAnchor,
     getAutoSearchHintDecisions,
     getNoteNudgeAnchors,
+    getOverflowState,
     getPersistedNoteNudge,
+    getThinkingBindingRecoveryTarget,
+    recordDetectedContextLimit,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
     normalizeMaterializeReason,
@@ -40,8 +50,14 @@ import {
 } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
+import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import { createEventHandler } from "./event-handler";
+import { __ignoredNotificationTest } from "./send-session-notification";
+
+// These alert-content units supply idle authorization independently of the harness event hook.
+beforeEach(() => __ignoredNotificationTest.setHoldDetector(() => false));
 
 type ContextUsageCacheEntry = {
     usage: ContextUsage;
@@ -54,11 +70,15 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
+    __ignoredNotificationTest.reset();
     __resetMessageIndexAsyncForTests();
     transformDecisionLogTest.reset();
     closeDatabase();
     clearModelsDevCache();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    setWindowOverlayPath(undefined);
+    clearWindowOverlayCacheForTest();
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
     for (const dir of tempDirs) {
         try {
@@ -116,12 +136,25 @@ function waitForTimers(): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function deferred<T = void>(): {
+    promise: Promise<T>;
+    resolve: (value?: T | PromiseLike<T>) => void;
+    reject: (reason?: unknown) => void;
+} {
+    let resolve!: (value?: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = (value) => res(value as T | PromiseLike<T>);
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
 function createDeps(contextUsageMap: Map<string, ContextUsageCacheEntry>) {
     return {
         contextUsageMap,
         compactionHandler: { onCompacted: mock(() => {}) },
         config: {
-            protected_tags: 5,
             cache_ttl: "5m" as string | Record<string, string>,
         },
         tagger: {
@@ -160,6 +193,56 @@ function providersClient(limit: number, prompt?: ReturnType<typeof mock>) {
 }
 
 describe("createEventHandler", () => {
+    it("arms documented Fable 5.1 binding mismatch recovery and ignores other models", async () => {
+        useTempDataHome("context-event-thinking-binding-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        const error = {
+            status: 400,
+            error: {
+                type: "invalid_request_error",
+                message:
+                    'messages.4.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block".',
+            },
+        };
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-fable-51",
+                        providerID: "anthropic",
+                        modelID: "fable-5-1-20260831",
+                        error,
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-fable-51")).toBe(
+            "newest_reasoning_bearing_assistant",
+        );
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "other-failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-other-model",
+                        providerID: "anthropic",
+                        modelID: "fable-5-0",
+                        error,
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-other-model")).toBeNull();
+    });
+
     it("normalizes transform decision reasons across harnesses", () => {
         expect(normalizeMaterializeReason("opencode", "system_hash", true)).toBe("system_hash");
         expect(normalizeMaterializeReason("opencode", null, true)).toBe("pressure_refold");
@@ -442,7 +525,7 @@ describe("createEventHandler", () => {
             internalChildSessions,
         });
 
-        // A magic-context child (historian/dreamer/sidekick/migration title).
+        // A Magic Context child (historian, Dreamer, or migration title).
         await handler({
             event: {
                 type: "session.created",
@@ -517,6 +600,132 @@ describe("createEventHandler", () => {
         expect(getOrCreateSessionMeta(openDatabase(), "ses-usage").observedSafeInputTokens).toBe(
             135_000,
         );
+    });
+
+    it("refuses an impossible success reading above an overlay-backed wall", async () => {
+        useTempDataHome("context-event-impossible-usage-");
+        const overlayPath = join(makeTempDir("context-event-overlay-"), "window-overlay.json");
+        writeFileSync(
+            overlayPath,
+            JSON.stringify({
+                schema: "fusiform-window-overlay/v1",
+                generated_at: "2026-09-11T00:00:00Z",
+                minted_provider_ids: [],
+                cells: [
+                    {
+                        provider_id: "test-provider",
+                        model_id: "test-model",
+                        facts: {
+                            "window.enforced": {
+                                value: { kind: "stated", value: 272_000 },
+                                grade: "measured",
+                                units: "provider",
+                                boundary: "Observed",
+                                source_ref: "session regression fixture",
+                                observed_at: "2026-09-11T00:00:00Z",
+                            },
+                        },
+                    },
+                ],
+            }),
+        );
+        setWindowOverlayPath(overlayPath);
+        await refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "test-provider",
+                                models: {
+                                    "test-model": {
+                                        limit: { context: 272_000, output: 128_000 },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID: "ses-impossible-usage",
+                        providerID: "test-provider",
+                        modelID: "test-model",
+                        tokens: { input: 585_397, cache: { read: 8_320, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        const meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
+        expect(meta.observedSafeInputTokens).toBe(0);
+        expect(meta.lastInputTokens).toBe(0);
+        expect(meta.lastUsageContextLimit).toBe(240_000);
+        expect(contextUsageMap.get("ses-impossible-usage")?.usage.inputTokens).toBe(0);
+    });
+
+    it("clears a stale unkeyed detected limit on the first successful event after restart", async () => {
+        useTempDataHome("context-event-stale-detected-restart-");
+        const sessionId = "ses-stale-detected-restart";
+        recordDetectedContextLimit(openDatabase(), sessionId, 131_232);
+        closeDatabase();
+
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const prompt = mock(async () => ({}));
+        const deps = createDeps(contextUsageMap);
+        deps.client = {
+            config: { providers: async () => ({ data: { providers: [] } }) },
+            session: { prompt },
+        };
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID: sessionId,
+                        providerID: "ninfer",
+                        modelID: "qwen3.8-27b-nvfp4",
+                        tokens: { input: 148_241, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        expect(getOverflowState(deps.db, sessionId).detectedContextLimit).toBe(0);
+        const meta = getOrCreateSessionMeta(deps.db, sessionId);
+        expect(meta.lastUsageContextLimit).toBe(200_000);
+        expect(meta.lastContextPercentage).toBeCloseTo((148_241 / 200_000) * 100, 10);
+        expect(prompt).not.toHaveBeenCalled();
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: {
+                    sessionID: sessionId,
+                    error: "This model's maximum context length is 131232 tokens.",
+                },
+            },
+        });
+
+        expect(getOverflowState(deps.db, sessionId, "ninfer/qwen3.8-27b-nvfp4")).toMatchObject({
+            detectedContextLimit: 131_232,
+            detectedContextLimitModelKey: "ninfer/qwen3.8-27b-nvfp4",
+        });
     });
 
     it("recovers silently when a cache-regressed context limit is fixed by refresh", async () => {
@@ -620,14 +829,20 @@ describe("createEventHandler", () => {
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-regression-alert");
         expect(meta.cacheAlertSent).toBe(true);
-        expect(meta.lastContextPercentage).toBe(400);
-        expect(prompt).toHaveBeenCalledTimes(1);
-        const call = prompt.mock.calls[0]?.[0] as { body?: { parts?: Array<{ text?: string }> } };
-        expect(call.body?.parts?.[0]?.text).toContain("context limit of 30,000 tokens");
-        expect(call.body?.parts?.[0]?.text).toContain("successfully sent 90,000 tokens");
+        expect(meta.lastContextPercentage).toBe(100);
+        expect(meta.lastUsageContextLimit).toBe(120_000);
+        expect(prompt).not.toHaveBeenCalled();
+        const notices = drainNotifications(0, "ses-regression-alert");
+        expect(notices).toHaveLength(1);
+        const text = String(notices[0].payload.message);
+        expect(text).toContain("OpenCode's catalog reports a context limit of 30,000 tokens");
+        expect(text).toContain("this session has sent 90,000 tokens successfully");
+        expect(text).toContain("larger proven value for its pressure math");
+        expect(text).toContain("provider.<provider-id>.models.<model-id>.limit.context");
+        expect(text).not.toContain("Restart OpenCode");
     });
 
-    it("does not mark the cache alert sent when notification delivery fails", async () => {
+    it("delivers the cache alert over RPC even when the prompt transport is unavailable", async () => {
         useTempDataHome("context-event-cache-regression-alert-failed-");
         const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
         await refreshModelLimitsFromApi(providersClient(100_000));
@@ -672,8 +887,9 @@ describe("createEventHandler", () => {
         });
 
         const meta = getOrCreateSessionMeta(openDatabase(), "ses-regression-alert-failed");
-        expect(prompt).toHaveBeenCalledTimes(1);
-        expect(meta.cacheAlertSent).toBe(false);
+        expect(prompt).not.toHaveBeenCalled();
+        expect(meta.cacheAlertSent).toBe(true);
+        expect(drainNotifications(0, "ses-regression-alert-failed")).toHaveLength(1);
     });
 
     it("refreshes ttl for tokenless assistant updates when prior usage exists", async () => {
@@ -897,11 +1113,12 @@ describe("createEventHandler", () => {
         const deps = createDeps(new Map());
         const handler = createEventHandler(deps);
         insertTag(deps.db, "ses-delete-retry", "m-1", "message", 100, 1);
-        deps.db
+        const privateRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'm-1', 'user', 'private bytes')",
             )
-            .run("ses-delete-retry");
+            .run("ses-delete-retry") as { lastInsertRowid: number | bigint };
+        recordMessageFtsRowid(deps.db, "ses-delete-retry", 1, privateRow.lastInsertRowid);
         deps.db
             .prepare(
                 "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, 1, ?)",
@@ -951,6 +1168,259 @@ describe("createEventHandler", () => {
         ).toEqual({ count: 0 });
     });
 
+    it("keeps a failed Rust deletion durable until a project-scoped retry succeeds", async () => {
+        useTempDataHome("context-event-rust-delete-retry-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-retry";
+        const projectPath = "git:rust-delete-retry";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        const onSessionDeleted = mock(async () => {
+            throw new Error("module unavailable");
+        });
+        const handler = createEventHandler({
+            ...deps,
+            onSessionDeleted,
+            rustSessionCleanup: true,
+        });
+
+        await handler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: sessionId } },
+            },
+        });
+
+        expect(onSessionDeleted).toHaveBeenCalledWith(sessionId);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(retryPendingSessionCleanups(deps.db)).toEqual({
+            attempted: 0,
+            cleared: 0,
+            failedSessionIds: [],
+        });
+
+        // A replay after cleanup switches to TypeScript must preserve the pending
+        // Rust marker and host rows until module-owned state is deleted.
+        const flippedHandler = createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        });
+        await flippedHandler({
+            event: {
+                type: "session.deleted",
+                properties: { info: { id: sessionId } },
+            },
+        });
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+
+        const deleteSession = mock(async () => {});
+        await expect(
+            retryPendingRustSessionCleanupsForProject(deps.db, projectPath, deleteSession),
+        ).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+        expect(deleteSession).toHaveBeenCalledWith(sessionId);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("preserves a failed Rust cleanup across TS → Rust → TS double flips", async () => {
+        useTempDataHome("context-event-rust-delete-double-flip-ts-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-double-flip-ts";
+        const projectPath = "git:rust-double-flip-ts";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        markSessionCleanupPending(deps.db, sessionId, true);
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(async () => {
+                throw new Error("module unavailable");
+            }),
+            rustSessionCleanup: true,
+        })(event);
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        await retryPendingRustSessionCleanupsForProject(deps.db, projectPath, async () => {});
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
+    it("preserves a failed Rust cleanup across Rust → TS → Rust double flips", async () => {
+        useTempDataHome("context-event-rust-delete-double-flip-rust-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-double-flip-rust";
+        const projectPath = "git:rust-double-flip-rust";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+        const failRustDelete = () =>
+            createEventHandler({
+                ...deps,
+                onSessionDeleted: mock(async () => {
+                    throw new Error("module unavailable");
+                }),
+                rustSessionCleanup: true,
+            })(event);
+
+        await failRustDelete();
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })(event);
+        await failRustDelete();
+
+        expect(
+            deps.db
+                .prepare("SELECT harness FROM pending_session_cleanup WHERE session_id = ?")
+                .get(sessionId),
+        ).toEqual({ harness: "opencode:rust" });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        await retryPendingRustSessionCleanupsForProject(deps.db, projectPath, async () => {});
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
+    it("serializes the durable outcome of two concurrent session.deleted deliveries", async () => {
+        useTempDataHome("context-event-rust-delete-concurrent-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-concurrent";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        const first = deferred<void>();
+        const second = deferred<void>();
+        let calls = 0;
+        const handler = createEventHandler({
+            ...deps,
+            rustSessionCleanup: true,
+            onSessionDeleted: mock(() => (calls++ === 0 ? first.promise : second.promise)),
+        });
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        const firstDelivery = handler(event);
+        const secondDelivery = handler(event);
+        await Promise.resolve();
+        expect(calls).toBe(2);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        first.reject(new Error("first module delete failed"));
+        second.resolve();
+        await Promise.all([firstDelivery, secondDelivery]);
+
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("serializes two same-tick session.deleted events through the plugin event bus", async () => {
+        useTempDataHome("context-event-bus-rust-delete-concurrent-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-event-bus-concurrent";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        const first = deferred<void>();
+        const second = deferred<void>();
+        let calls = 0;
+        const magicEvent = createEventHandler({
+            ...deps,
+            rustSessionCleanup: true,
+            onSessionDeleted: mock(() => (calls++ === 0 ? first.promise : second.promise)),
+        });
+        const eventBus = createPluginEventHandler({
+            magicContext: { event: magicEvent as never },
+        });
+        const event = {
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        } as const;
+
+        const firstDelivery = eventBus(event as never);
+        const secondDelivery = eventBus(event as never);
+        await Promise.resolve();
+        expect(calls).toBe(2);
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+        first.reject(new Error("first module delete failed"));
+        second.resolve();
+        await Promise.all([firstDelivery, secondDelivery]);
+
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+        expect(
+            deps.db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                )
+                .get(sessionId),
+        ).toEqual({ count: 0 });
+    });
+
+    it("keeps host rows while a delete races the project-scoped Rust retry", async () => {
+        useTempDataHome("context-event-rust-delete-timer-race-");
+        const deps = createDeps(new Map());
+        const sessionId = "ses-rust-delete-timer-race";
+        const projectPath = "git:rust-delete-timer-race";
+        insertTag(deps.db, sessionId, "m-1", "message", 100, 1);
+        recordSessionProjectIdentity(deps.db, sessionId, projectPath);
+        markSessionCleanupPending(deps.db, sessionId, true);
+        const retryDelete = deferred<void>();
+        const retry = retryPendingRustSessionCleanupsForProject(
+            deps.db,
+            projectPath,
+            () => retryDelete.promise,
+        );
+        await Promise.resolve();
+
+        await createEventHandler({
+            ...deps,
+            onSessionDeleted: mock(() => {}),
+            rustSessionCleanup: false,
+        })({
+            event: { type: "session.deleted", properties: { info: { id: sessionId } } },
+        });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(1);
+
+        retryDelete.resolve();
+        await expect(retry).resolves.toEqual({ attempted: 1, cleared: 1, failedSessionIds: [] });
+        expect(getTagsBySession(deps.db, sessionId)).toHaveLength(0);
+    });
+
     it("cleans up removed-message tags and indexed content", async () => {
         useTempDataHome("context-event-message-removed-tags-");
         const deps = createDeps(new Map());
@@ -959,16 +1429,22 @@ describe("createEventHandler", () => {
         insertTag(deps.db, "ses-removed", "msg-removed:p0", "message", 32, 1);
         insertTag(deps.db, "ses-removed", "msg-removed:file1", "file", 48, 2);
         insertTag(deps.db, "ses-removed", "msg-keep:p0", "message", 64, 3);
-        deps.db
+        const removedRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             )
-            .run("ses-removed", 1, "msg-removed", "assistant", "removed");
-        deps.db
+            .run("ses-removed", 1, "msg-removed", "assistant", "removed") as {
+            lastInsertRowid: number | bigint;
+        };
+        recordMessageFtsRowid(deps.db, "ses-removed", 1, removedRow.lastInsertRowid);
+        const keptRow = deps.db
             .prepare(
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             )
-            .run("ses-removed", 2, "msg-keep", "assistant", "keep");
+            .run("ses-removed", 2, "msg-keep", "assistant", "keep") as {
+            lastInsertRowid: number | bigint;
+        };
+        recordMessageFtsRowid(deps.db, "ses-removed", 2, keptRow.lastInsertRowid);
         deps.db
             .prepare(
                 "INSERT INTO message_history_index (session_id, last_indexed_ordinal, updated_at) VALUES (?, ?, ?)",
@@ -984,6 +1460,7 @@ describe("createEventHandler", () => {
 
         expect(getTagsBySession(openDatabase(), "ses-removed")).toEqual([
             {
+                id: 3,
                 tagNumber: 3,
                 messageId: "msg-keep:p0",
                 type: "message",
@@ -996,6 +1473,7 @@ describe("createEventHandler", () => {
                 sessionId: "ses-removed",
                 cavemanDepth: 0,
                 toolOwnerMessageId: null,
+                tokenCount: null,
             },
         ]);
         // The removal path clears synchronously. Async reconciliation is scheduled
@@ -1097,7 +1575,10 @@ describe("createEventHandler", () => {
         const deps = createDeps(new Map());
         const handler = createEventHandler(deps);
 
-        setStrippedPlaceholderIds(deps.db, "ses-stripped", new Set(["msg-keep", "msg-removed"]));
+        setStrippedPlaceholderIds(deps.db, "ses-stripped", new Set(["msg-keep"]));
+        applyStrippedPlaceholderDelta(deps.db, "ses-stripped", {
+            hiddenSeamAdd: ["msg-removed"],
+        });
 
         await handler({
             event: {
@@ -1109,6 +1590,7 @@ describe("createEventHandler", () => {
         expect(getStrippedPlaceholderIds(openDatabase(), "ses-stripped")).toEqual(
             new Set(["msg-keep"]),
         );
+        expect(getHiddenSeamPlaceholderIds(openDatabase(), "ses-stripped")).toEqual(new Set());
     });
 
     it("is a no-op for removed messages with no persisted references", async () => {
@@ -1165,6 +1647,34 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
         const state = readOverflowState("ses-on");
         expect(state.needsEmergencyRecovery).toBe(1);
         expect(state.detectedContextLimit).toBe(120000);
+    });
+
+    it("uses model identity carried by session.error instead of a prior session model", async () => {
+        useTempDataHome("context-event-overflow-explicit-model-");
+        const deps = createDeps(new Map());
+        updateSessionMeta(deps.db, "ses-explicit-model", {
+            lastObservedModelKey: "prior/model",
+        });
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "session.error",
+                properties: {
+                    sessionID: "ses-explicit-model",
+                    providerID: "current-provider",
+                    modelID: "current-model",
+                    error: OVERFLOW_ERROR,
+                },
+            },
+        });
+
+        expect(
+            getOverflowState(deps.db, "ses-explicit-model", "current-provider/current-model"),
+        ).toMatchObject({
+            detectedContextLimit: 120_000,
+            detectedContextLimitModelKey: "current-provider/current-model",
+        });
     });
 
     it("compaction OFF: overflow never arms recovery, but the provider limit is still recorded for raw-usage math", async () => {

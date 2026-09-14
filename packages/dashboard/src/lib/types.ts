@@ -111,7 +111,7 @@ export interface SessionSummary {
   is_subagent: boolean;
 }
 
-export type Harness = "opencode" | "pi" | "claude_code" | "codex";
+export type Harness = "opencode" | "pi" | "omp" | "claude_code" | "codex";
 
 export interface SessionFilter {
   harness?: Harness;
@@ -137,10 +137,16 @@ export interface SessionRow {
   is_subagent: boolean;
 }
 
+export interface SessionScanCondition {
+  code: string;
+  message: string;
+}
+
 export interface PagedSessions {
   rows: SessionRow[];
   total: number;
   has_more: boolean;
+  conditions: SessionScanCondition[];
 }
 
 export interface SessionMessageRow {
@@ -350,6 +356,24 @@ export interface DreamerProject {
   tasks: DreamerProjectTask[];
 }
 
+export type DreamRunFailureClass =
+  | "provider_timeout"
+  | "provider_error"
+  | "empty_completion"
+  | "no_models"
+  | "child_aborted"
+  | "parse_failed"
+  | "unknown";
+
+export interface DreamRunFailureDetail {
+  failure_class: DreamRunFailureClass;
+  model_attempted: string | null;
+  models_tried: string[];
+  provider_error: string | null;
+  timeout_ms: number | null;
+  child_session_id: string | null;
+}
+
 export interface DreamRunTask {
   name: string;
   durationMs: number;
@@ -357,6 +381,7 @@ export interface DreamRunTask {
   /** Failure detail only. Missing means no failure was recorded; an empty
    * string is treated as absent by the dashboard. */
   error?: string;
+  failure?: DreamRunFailureDetail;
   /** Successful progress/detail. Missing means no progress was reported; an
    * empty string is treated as absent by the dashboard. */
   progress?: string;
@@ -412,9 +437,12 @@ export interface DreamRun {
 
 export interface LogEntry {
   timestamp: string;
+  level: "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR" | null;
   component: string;
   session_id: string;
+  tags: string[];
   message: string;
+  kv: Record<string, string>;
   raw: string;
   cache_read: number | null;
   cache_write: number | null;
@@ -487,6 +515,7 @@ export type OpencodeInstallState = "cli" | "desktop" | "none";
 export interface ModelCatalogs {
   opencode: string[];
   pi: string[];
+  omp: string[];
 }
 
 export interface ProjectConfigEntry {

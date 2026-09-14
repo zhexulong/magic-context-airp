@@ -1,16 +1,31 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
+import {
+    REMOVED_AGENT_CONFIG_WARNING,
+    stripRemovedAgentConfig,
+} from "@magic-context/core/config/removed-agent-config";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import type { LocalEmbeddingRuntime } from "@magic-context/core/features/magic-context/memory/embedding-local";
 import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
+import {
+    formatSynapseLaneDescriptor,
+    SYNAPSE_DEFAULT_MODEL,
+    SynapseEmbeddingProvider,
+    toSynapseLaneDescriptor,
+} from "@magic-context/core/features/magic-context/memory/embedding-synapse";
+import {
+    formatShadowBackfillStall,
+    listShadowBackfillStalls,
+} from "@magic-context/core/features/magic-context/shadow-backfill-state";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
@@ -18,9 +33,15 @@ import {
     getMagicContextStorageDir,
     getMagicContextStorageResolution,
 } from "@magic-context/core/shared/data-path";
+import { parseJsoncRecovering } from "@magic-context/core/shared/jsonc-parser";
+import {
+    formatOpenCodeDbDoctorLine,
+    type OpenCodeDbPathResolution,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "@magic-context/core/shared/opencode-db-path";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
-
 import {
     isDevPathPluginEntry,
     isLocalPathPluginEntry,
@@ -39,9 +60,11 @@ import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
     formatLocalEmbeddingRuntimeWasmFallback,
+    formatLocalEmbeddingRuntimeWasmSelected,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import { formatGithubIssueFallback, submitGithubIssue } from "../lib/github-issue";
+import { formatLogFileInspection, inspectMagicContextLogs } from "../lib/log-lines";
 import { bundleIssueReport } from "../lib/logs-opencode";
 import { migrateDreamerV2ForDoctor } from "../lib/migrate-dreamer-v2-doctor";
 import { migrateExperimentalPinKeyFilesForDoctor } from "../lib/migrate-experimental-doctor";
@@ -56,7 +79,7 @@ import {
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
 import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
-import { detectConfigPaths, getMagicContextLogPath } from "../lib/paths";
+import { detectConfigPaths } from "../lib/paths";
 import { confirm, intro, log, outro, selectOne, spinner, text } from "../lib/prompts";
 import {
     sanitizeDiagnosticEndpoint,
@@ -73,6 +96,17 @@ import { reportAuthorityMarkers } from "./doctor-authority";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
+
+export function describeOpenCodeDatabaseDoctorCheck(
+    resolution: OpenCodeDbPathResolution,
+    exists = openCodeDbPathExists(resolution),
+): { ok: boolean; message: string } {
+    if (!exists) return { ok: false, message: formatOpenCodeDbDoctorLine(resolution) };
+    return {
+        ok: true,
+        message: `OpenCode session database: ${resolution.path} (source=${resolution.source}${resolution.channel ? `, channel=${resolution.channel}` : ""})`,
+    };
+}
 
 /**
  * Resolve the MC compaction mode for the doctor using the SAME loader the
@@ -111,7 +145,16 @@ export function migrateLegacyAgentEnabledConfigForDoctor(
     let changed = false;
     let fixes = 0;
 
-    const migrateLegacyAgentEnabled = (agentName: "dreamer" | "sidekick" | "historian"): void => {
+    const sanitized = stripRemovedAgentConfig(mcConfig, []);
+    if (sanitized !== mcConfig) {
+        for (const key of Object.keys(mcConfig)) delete mcConfig[key];
+        Object.assign(mcConfig, sanitized);
+        logs.warn(REMOVED_AGENT_CONFIG_WARNING);
+        changed = true;
+        fixes++;
+    }
+
+    const migrateLegacyAgentEnabled = (agentName: "dreamer" | "historian"): void => {
         const agent = mcConfig[agentName] as Record<string, unknown> | undefined;
         if (!agent || typeof agent !== "object" || !("enabled" in agent)) return;
 
@@ -139,21 +182,10 @@ export function migrateLegacyAgentEnabledConfigForDoctor(
                     'Removed deprecated dreamer.enabled (use dreamer.disable=true to turn off the Dreamer agent; use schedule="" for manual-only dreaming).',
                 );
             }
-            return;
-        }
-
-        if (disable !== true && enabled === false) {
-            agent.disable = true;
-            logs.success("Migrated sidekick.enabled=false → sidekick.disable=true.");
-        } else {
-            logs.success(
-                "Removed deprecated sidekick.enabled (use sidekick.disable=true to turn off Sidekick).",
-            );
         }
     };
 
     migrateLegacyAgentEnabled("dreamer");
-    migrateLegacyAgentEnabled("sidekick");
     migrateLegacyAgentEnabled("historian");
 
     return { changed, fixes };
@@ -394,19 +426,25 @@ async function runIssueFlow(): Promise<number> {
  *   - Provider that accepts the URL shape but doesn't implement embeddings
  *     (OpenRouter's /v1 for example) — same detection path.
  */
-// Local embeddings need the native ONNX runtime (onnxruntime-node). On Windows
-// it sometimes fails to install (its native binary download is interrupted), and
-// the plugin's static `import "onnxruntime-node"` then throws on every embedding
-// (#128). Surface it here with the fix instead of leaving users with the cryptic
-// resolver error in the log. Shared by the explicit-`local` branch AND the
-// no-config / default-provider path (local is the default, so a missing config
-// still means local embeddings).
-function checkLocalEmbeddingRuntimeForDoctor(): {
+// Local embeddings prefer onnxruntime-node and fall back to the Node WASM
+// bundle when the native addon is absent. Verify both lanes so a loadable
+// onnxruntime-web package cannot hide a missing persistence-capable bundle.
+// Shared by the explicit-`local` branch and the no-config/default-provider path.
+function checkLocalEmbeddingRuntimeForDoctor(runtimePreference: LocalEmbeddingRuntime = "auto"): {
     issues: number;
     localRuntimeBroken?: boolean;
     unverified?: boolean;
 } {
-    const runtime = checkLocalEmbeddingRuntime(getOpenCodePluginCacheRoots());
+    const runtime = checkLocalEmbeddingRuntime(
+        getOpenCodePluginCacheRoots(),
+        process.platform,
+        process.arch,
+        runtimePreference,
+    );
+    if (runtime.state === "wasm-selected") {
+        log.info(formatLocalEmbeddingRuntimeWasmSelected(runtime));
+        return { issues: 0 };
+    }
     if (runtime.state === "wasm-fallback") {
         log.warn(formatLocalEmbeddingRuntimeWasmFallback(runtime));
         return { issues: 0 };
@@ -419,7 +457,9 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success("Embedding provider: local (native runtime OK; Xenova/all-MiniLM-L6-v2 bundled)");
+    log.success(
+        "Embedding provider: local (native runtime selected and OK; Xenova/all-MiniLM-L6-v2 bundled)",
+    );
     return { issues: 0 };
 }
 
@@ -470,12 +510,53 @@ async function checkEmbeddingConfig(
     }
 
     if (provider === undefined || provider === "local") {
-        return checkLocalEmbeddingRuntimeForDoctor();
+        const runtimePreference =
+            embedding?.local_runtime === "native" || embedding?.local_runtime === "wasm"
+                ? embedding.local_runtime
+                : "auto";
+        return checkLocalEmbeddingRuntimeForDoctor(runtimePreference);
+    }
+
+    if (provider === "synapse") {
+        const loaded = loadPluginConfig(process.cwd());
+        if (!loaded.subc) {
+            log.error("Embedding provider is synapse but the subc connection block is missing");
+            return { issues: 1 };
+        }
+        const model =
+            typeof embedding?.model === "string" && embedding.model.trim().length > 0
+                ? embedding.model.trim()
+                : SYNAPSE_DEFAULT_MODEL;
+        const probeSpinner = spinner();
+        probeSpinner.start(`Testing Synapse embedding lane ${sanitizeDiagnosticText(model)}`);
+        try {
+            const metadata = await SynapseEmbeddingProvider.discover({
+                connectionFile: loaded.subc.connection_file,
+                projectRoot: process.cwd(),
+                session: "doctor:opencode",
+                model,
+            });
+            probeSpinner.stop("Synapse embedding lane probed");
+            log.success(
+                `Embedding provider: synapse — ${sanitizeDiagnosticText(
+                    formatSynapseLaneDescriptor(toSynapseLaneDescriptor(metadata)),
+                )}`,
+            );
+            return { issues: 0 };
+        } catch (error) {
+            probeSpinner.stop("Synapse embedding probe failed");
+            log.error(
+                `Synapse embedding lane unavailable: ${sanitizeDiagnosticText(
+                    error instanceof Error ? error.message : String(error),
+                )}`,
+            );
+            return { issues: 1 };
+        }
     }
 
     if (provider !== "openai-compatible") {
         log.warn(
-            `Unknown embedding provider: ${String(provider)} (expected local | openai-compatible | off)`,
+            `Unknown embedding provider: ${String(provider)} (expected local | openai-compatible | synapse | off)`,
         );
         return { issues: 1 };
     }
@@ -719,6 +800,10 @@ export async function runDoctor(
         );
     }
 
+    const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(resolveOpenCodeDbPath());
+    if (openCodeDbCheck.ok) pass(openCodeDbCheck.message);
+    else fail(openCodeDbCheck.message);
+
     // 1b. CLI vs npm latest
     const selfVersion = getSelfVersion();
     const [npmLatest, pluginNpmLatest] = await Promise.all([
@@ -754,7 +839,13 @@ export async function runDoctor(
                 text: raw.text,
                 configPath: paths.magicContextConfig,
             }).text;
-            parse(substituted);
+            const parsed = parseJsoncRecovering(substituted);
+            const issue = parsed.issues[0];
+            if (issue) {
+                throw new Error(
+                    `${paths.magicContextConfig}:${issue.line}:${issue.column}: ${issue.message} (runtime recovery does not make the file valid)`,
+                );
+            }
             pass("magic-context.jsonc parses as valid JSONC");
         } catch (err) {
             fail(
@@ -1364,6 +1455,9 @@ export async function runDoctor(
                 } catch {
                     // Don't fail the doctor on row-count introspection issues
                 }
+                for (const stall of listShadowBackfillStalls(db)) {
+                    warn(formatShadowBackfillStall(stall));
+                }
             } finally {
                 db.close();
             }
@@ -1446,13 +1540,16 @@ export async function runDoctor(
 
     // 10. Show diagnostics info (log file, historian dumps)
 
-    const logPath = getMagicContextLogPath("opencode");
-    if (existsSync(logPath)) {
-        const logStat = statSync(logPath);
-        const sizeKb = (logStat.size / 1024).toFixed(0);
-        log.info(`Log file: ${logPath} (${sizeKb} KB)`);
+    const logFiles = inspectMagicContextLogs("opencode");
+    const existingLogFiles = logFiles.filter((file) => file.exists);
+    if (existingLogFiles.length === 0) {
+        log.info(
+            `No plugin log file yet; checked: ${logFiles.map((file) => file.path).join(", ")}`,
+        );
     } else {
-        log.info(`Log file: ${logPath} (not yet created)`);
+        for (const file of existingLogFiles) {
+            log.info(`Log file read: ${formatLogFileInspection(file)}`);
+        }
     }
 
     // Historian dumps live per-project under `<dir>/.cortexkit/magic-context/historian/`.

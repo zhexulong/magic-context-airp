@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
+import { formatEmbedStatusText } from "../../hooks/magic-context/format-embed-status";
 import {
     chunkCanonicalText,
     loadCompartmentChunkEmbeddingsForSearch,
@@ -18,14 +20,21 @@ import {
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import {
+    getSynapseLaneIdentity,
+    SynapseEmbeddingProvider,
+    type SynapseLaneMetadata,
+} from "./memory/embedding-synapse";
 import { insertMemory } from "./memory/storage-memory";
 import {
     getStoredModelId,
     loadAllEmbeddings,
     saveEmbedding,
 } from "./memory/storage-memory-embeddings";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     _resetProjectEmbeddingRegistryForTests,
+    _setShadowBackfillNowForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
     embedSessionCompartmentChunks,
@@ -33,6 +42,7 @@ import {
     embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
     flushShadowEmbeddingBacklog,
+    getEmbeddingCoverageStatus,
     getProjectEmbeddingSnapshot,
     getShadowBackfillStopReason,
     markProjectLoadUntrusted,
@@ -119,6 +129,24 @@ function countRows(
     return (db.prepare(sql).get(...params) as { count: number }).count;
 }
 
+function insertMappedFtsRow(
+    db: NonNullable<ReturnType<typeof openDatabase>>,
+    sessionId: string,
+    ordinal: number,
+    messageId: string,
+    role: "user" | "assistant",
+    content: string,
+): void {
+    const result = db
+        .prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(sessionId, ordinal, messageId, role, content) as {
+        lastInsertRowid: number | bigint;
+    };
+    recordMessageFtsRowid(db, sessionId, ordinal, result.lastInsertRowid);
+}
+
 function seedCompartmentWithFts(
     db: NonNullable<ReturnType<typeof openDatabase>>,
     sessionId: string,
@@ -135,12 +163,22 @@ function seedCompartmentWithFts(
             p1: "P1 content",
         },
     ]);
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, 1, `${sessionId}-u1`, "user", "How do we avoid saturating the queue?");
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, 2, `${sessionId}-a2`, "assistant", "Use backpressure and bounded drains.");
+    insertMappedFtsRow(
+        db,
+        sessionId,
+        1,
+        `${sessionId}-u1`,
+        "user",
+        "How do we avoid saturating the queue?",
+    );
+    insertMappedFtsRow(
+        db,
+        sessionId,
+        2,
+        `${sessionId}-a2`,
+        "assistant",
+        "Use backpressure and bounded drains.",
+    );
     return getCompartments(db, sessionId)[0].id;
 }
 
@@ -164,12 +202,15 @@ function seedManyCompartmentsWithFts(
                 p1: `P1 content ${i}`,
             },
         ]);
-        db.prepare(
-            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-        ).run(sessionId, start, `${sessionId}-u${start}`, "user", `Question ${i}?`);
-        db.prepare(
-            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-        ).run(sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
+        insertMappedFtsRow(
+            db,
+            sessionId,
+            start,
+            `${sessionId}-u${start}`,
+            "user",
+            `Question ${i}?`,
+        );
+        insertMappedFtsRow(db, sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
     }
 }
 
@@ -197,9 +238,7 @@ function seedOversizedCompartmentWithFts(
     // ~6000 words ≈ thousands of tokens » the default chunk budget, all in one
     // assistant message → one oversized canonical line.
     const huge = Array.from({ length: 6000 }, (_, i) => `word${i}`).join(" ");
-    db.prepare(
-        "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
-    ).run(sessionId, 1, `${sessionId}-a1`, "assistant", huge);
+    insertMappedFtsRow(db, sessionId, 1, `${sessionId}-a1`, "assistant", huge);
     return getCompartments(db, sessionId)[0].id;
 }
 
@@ -217,7 +256,8 @@ describe("project embedding registry", () => {
     afterEach(() => {
         _resetProjectEmbeddingRegistryForTests();
         closeDatabase();
-        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = originalXdgDataHome;
         for (const dir of tempDirs) {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -226,6 +266,178 @@ describe("project embedding registry", () => {
             }
         }
         tempDirs.length = 0;
+    });
+
+    it("keeps a disclosed truncated chunk incomplete while persisting sibling rows", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:synapse-truncated-row";
+        const sessionId = "session-synapse-truncated-row";
+        const fingerprint = "fp-synapse-wire";
+        const metadata: SynapseLaneMetadata = {
+            model: "gte-modernbert-base-f16",
+            fingerprint,
+            table_epoch: 4,
+            max_tokens: 512,
+            max_tokens_source: "worker_bucket",
+            bucket_ladder: [128, 256, 512],
+            dims: 2,
+            dtype: "f16",
+            device_class: "ane",
+            certified: true,
+            warm_load_cost_hint_ms: 9,
+            laneIdentity: getSynapseLaneIdentity("gte-modernbert-base-f16", fingerprint),
+        };
+        _setTestProviderFactoryForProject(
+            () =>
+                new SynapseEmbeddingProvider({
+                    connectionFile: "fixture",
+                    projectRoot: "/repo",
+                    session: "test:truncated-row",
+                    metadata,
+                    clientFactory: async () => ({
+                        async call(_module: string, method: string, params?: unknown) {
+                            if (method !== "embed.batch") {
+                                throw new Error(`unexpected method ${method}`);
+                            }
+                            const items = (params as { items: Array<{ id: string; text: string }> })
+                                .items;
+                            return {
+                                result: {
+                                    fingerprint,
+                                    table_epoch: 4,
+                                    dims: 2,
+                                    payload: {
+                                        vectors: items.map((item, index) => ({
+                                            id: item.id,
+                                            vector: [item.text.length, 1],
+                                            submitted_sha256: createHash("sha256")
+                                                .update(item.text)
+                                                .digest("hex"),
+                                            content_sha256: createHash("sha256")
+                                                .update(
+                                                    index === 0 ? item.text.slice(0, 8) : item.text,
+                                                )
+                                                .digest("hex"),
+                                        })),
+                                        truncation_disclosures: items.map((_item, index) => ({
+                                            submitted_tokens: 16,
+                                            effective_tokens: index === 0 ? 8 : 16,
+                                            truncated: index === 0,
+                                        })),
+                                    },
+                                },
+                            };
+                        },
+                        close() {},
+                    }),
+                }),
+        );
+        const descriptor = {
+            lane: metadata.model,
+            device_class: "ane",
+            max_tokens: 512,
+            max_tokens_source: "worker_bucket" as const,
+            bucket_ladder: [128, 256, 512],
+            dims: 2,
+            dtype: "f16",
+            certified: true,
+            warm_load_cost_hint_ms: 9,
+            warm: true,
+        };
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: metadata.model,
+                max_input_tokens: 512,
+                synapse_connection_file: "fixture",
+                synapse_fingerprint: fingerprint,
+                synapse_table_epoch: 4,
+                synapse_dims: 2,
+                synapse_descriptor: descriptor,
+            } as unknown as EmbeddingConfig,
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/repo",
+        );
+        seedManyCompartmentsWithFts(db, sessionId, 2);
+        const compartments = getCompartments(db, sessionId);
+
+        const outcome = await embedSessionCompartmentChunks(db, projectIdentity, sessionId, {
+            batchSize: 2,
+        });
+
+        expect(outcome).toMatchObject({ status: "stalled", embedded: 1, failed: 1 });
+        const rows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            currentChunkModelId(projectIdentity),
+        );
+        expect(rows.map((row) => row.compartmentId)).toEqual([compartments[1].id]);
+        const coverage = getEmbeddingCoverageStatus(db, projectIdentity, sessionId);
+        expect(coverage).toMatchObject({
+            session: { embedded: 1, total: 2 },
+            synapseDescriptor: descriptor,
+        });
+        expect(formatEmbedStatusText(coverage, { status: "idle" })).toContain(
+            "Synapse — lane=gte-modernbert-base-f16; device_class=ane; max_tokens=512 (worker_bucket); certified=true; warm=yes; warm_load_cost_hint_ms=9",
+        );
+        const persisted = db
+            .prepare(
+                "SELECT provenance_json AS provenanceJson FROM embedding_registrations WHERE project_path = ?",
+            )
+            .get(projectIdentity) as { provenanceJson: string };
+        expect(JSON.parse(persisted.provenanceJson)).toMatchObject({
+            capability_descriptor: descriptor,
+        });
+    });
+
+    it("keeps query instructions out of stored-vector identities and folds document prefixes in", () => {
+        const db = useTempDb();
+        const projectIdentity = "git:prefix-identity";
+        const features = { memoryEnabled: true, gitCommitEnabled: true };
+        const baseConfig: EmbeddingConfig = {
+            provider: "openai-compatible",
+            model: "qwen/qwen3-embedding-8b:free",
+            endpoint: "https://openrouter.ai/api/v1",
+        };
+
+        const withFamilyDefault = registerProjectEmbedding(
+            db,
+            projectIdentity,
+            baseConfig,
+            features,
+            "/repo",
+        );
+        const withQueryDisabled = registerProjectEmbedding(
+            db,
+            projectIdentity,
+            { ...baseConfig, query_instruction: false },
+            features,
+            "/repo",
+        );
+        const withCustomQuery = registerProjectEmbedding(
+            db,
+            projectIdentity,
+            { ...baseConfig, query_instruction: "Instruct: custom\nQuery: " },
+            features,
+            "/repo",
+        );
+        const withDocumentPrefix = registerProjectEmbedding(
+            db,
+            projectIdentity,
+            { ...baseConfig, document_prefix: "search_document: " },
+            features,
+            "/repo",
+        );
+
+        expect(withQueryDisabled.modelId).toBe(withFamilyDefault.modelId);
+        expect(withQueryDisabled.chunkModelId).toBe(withFamilyDefault.chunkModelId);
+        expect(withCustomQuery.modelId).toBe(withFamilyDefault.modelId);
+        expect(withCustomQuery.chunkModelId).toBe(withFamilyDefault.chunkModelId);
+        expect(withDocumentPrefix.modelId).not.toBe(withFamilyDefault.modelId);
+        expect(withDocumentPrefix.chunkModelId).not.toBe(withFamilyDefault.chunkModelId);
     });
 
     it("preserves existing provider and runtime identity goldens", () => {
@@ -265,7 +477,7 @@ describe("project embedding registry", () => {
         }).toEqual({
             providerIdentity: "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357",
             runtimeFingerprint:
-                "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:f0bab7fe74e0f0a0",
+                "embedding-provider:c447205ebd551e83d18c4fd5fd8fc357:4bc2bab437bc88bc",
         });
         expect({
             providerIdentity: openai.providerIdentity,
@@ -1114,6 +1326,38 @@ describe("project embedding registry", () => {
         expect(batchCalls).toBe(1);
     });
 
+    it("caps each automatic chunk-drain tick and yields before provider work", async () => {
+        let timerRan = false;
+        let providerCalls = 0;
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        providerCalls += 1;
+                        expect(timerRan).toBe(true);
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        seedManyCompartmentsWithFts(db, "ses-tick-cap", 9);
+        recordSessionProjectIdentity(db, "ses-tick-cap", "git:tick-cap");
+        registerProjectEmbedding(
+            db,
+            "git:tick-cap",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/tick-cap",
+        );
+        setTimeout(() => {
+            timerRan = true;
+        }, 0);
+
+        expect(await embedUnembeddedCompartmentChunksForProject(db, "git:tick-cap")).toBe(8);
+        expect(await embedUnembeddedCompartmentChunksForProject(db, "git:tick-cap")).toBe(1);
+        expect(providerCalls).toBeGreaterThan(1);
+    });
+
     it("bounds provider call size even when one compartment has many windows (#207)", async () => {
         const callSizes: number[] = [];
         _setTestProviderFactoryForProject(
@@ -1378,6 +1622,57 @@ describe("project embedding registry", () => {
         ).toHaveLength(1);
     });
 
+    it("auto chunk drain defers compartments whose legacy FTS span is not mapped", async () => {
+        let providerCalls = 0;
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        providerCalls += 1;
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        db.prepare(
+            "UPDATE message_fts_rowid_map_backfill_state SET completed = 0, watermark_rowid = 0 WHERE id = 1",
+        ).run();
+        appendCompartments(db, "ses-unmapped", [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "u1",
+                endMessageId: "u1",
+                title: "Deferred legacy span",
+                content: "summary must not hide an unmapped transcript",
+                p1: "summary must not hide an unmapped transcript",
+            },
+        ]);
+        db.prepare(
+            "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES ('ses-unmapped', 1, 'u1', 'user', 'legacy transcript')",
+        ).run();
+        registerProjectEmbedding(
+            db,
+            "git:unmapped",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/unmapped",
+        );
+        recordSessionProjectIdentity(db, "ses-unmapped", "git:unmapped");
+
+        expect(await embedUnembeddedCompartmentChunksForProject(db, "git:unmapped")).toBe(0);
+        expect(providerCalls).toBe(0);
+        expect(
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-unmapped",
+                "git:unmapped",
+                currentChunkModelId("git:unmapped"),
+            ),
+        ).toHaveLength(0);
+    });
+
     it("embedSessionCompartmentChunks drains a whole session and reports progress", async () => {
         _setTestProviderFactoryForProject(
             (config) =>
@@ -1628,7 +1923,9 @@ describe("project embedding registry", () => {
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
     });
 
-    it("re-arms a stalled shadow backfill when the same identity registers after recovery", async () => {
+    it("re-arms a stalled shadow backfill only for an explicit manual run after recovery", async () => {
+        let now = Date.now();
+        _setShadowBackfillNowForTests(() => now);
         let providerRecovered = false;
         _setTestProviderFactoryForProject((config) => {
             if (config.provider === "local") return new FakeEmbeddingProvider(config.model);
@@ -1680,7 +1977,14 @@ describe("project embedding registry", () => {
         );
         expect(repeated?.generation).toBe(first?.generation);
         await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
+        expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(0);
 
+        now += 60 * 60 * 1000 + 1;
+        registerProjectShadowEmbedding(db, projectIdentity, shadowConfig, "/tmp/shadow-rearm", {
+            manualBackfill: true,
+        });
+        await flushShadowEmbeddingBacklog(projectIdentity);
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
         expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
     });

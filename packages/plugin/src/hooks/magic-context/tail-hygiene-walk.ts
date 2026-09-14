@@ -4,7 +4,6 @@ import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
 import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
-import { byteSize } from "./tag-content-primitives";
 import type { MessageLike } from "./tag-messages";
 import { isSyntheticTodoPart } from "./todo-view";
 
@@ -42,6 +41,7 @@ export interface TailHygieneMeasurement {
 export interface TailHygieneStructuralSignature {
     messageCount: number;
     partCounts: number[];
+    /** Legacy field name: a structural size proxy, not a UTF-8 byte count. */
     totalBytes: number;
 }
 
@@ -314,13 +314,17 @@ function messageIdForTag(tag: TagEntry): string | null {
     return tag.messageId.replace(/:(?:p|file)\d+$/, "");
 }
 
-function protectedTagNumbers(tags: readonly TagEntry[], protectedTags: number): Set<number> {
-    const active = Array.from(
-        new Set(tags.filter((tag) => tag.status === "active").map((tag) => tag.tagNumber)),
-    )
-        .sort((left, right) => right - left)
-        .slice(0, Math.max(0, protectedTags));
-    const protectedNumbers = new Set(active);
+/**
+ * Union projection form: protectedTagNumbers (tag-number set form).
+ * Coordinate space: tag-number space (Set<number>).
+ * Empty-window behavior: an empty set means zero tool tags are protected by the window;
+ * non-tool tags are not window members and remain governed solely by independent protections.
+ */
+function resolveProtectedTagNumbers(
+    tags: readonly TagEntry[],
+    protectedTagNumbersInput: ReadonlySet<number>,
+): Set<number> {
+    const protectedNumbers = new Set(protectedTagNumbersInput);
     const protectedCtxReduceTags = newestCtxReduceTagNumbers(
         tags.filter((tag) => tag.status === "active" && tag.type === "tool"),
     );
@@ -353,13 +357,13 @@ function buildTagAttribution(args: {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
     toolIdentities: ReadonlyMap<unknown, ToolPartIdentity>;
-    protectedTags: number;
+    protectedTagNumbers: ReadonlySet<number>;
 }): {
     protectedNumbers: ReadonlySet<number>;
     messageTags: ReadonlyMap<string, TagEntry>;
     toolTagsByPart: ReadonlyMap<unknown, TagEntry>;
 } {
-    const protectedNumbers = protectedTagNumbers(args.tags, args.protectedTags);
+    const protectedNumbers = resolveProtectedTagNumbers(args.tags, args.protectedTagNumbers);
     const messageTags = new Map<string, TagEntry>();
     const exactToolTags = new Map<string, TagEntry>();
     const orphanTagsByCall = new Map<string, TagEntry[]>();
@@ -494,10 +498,35 @@ function contentSignature(parts: readonly TailHygienePartMeasurement[]): string 
     return fnv1a32(parts.map((part) => `${part.key}:${part.contentHash}`).join("\0"));
 }
 
+function structuralSize(value: unknown): number {
+    if (typeof value === "string") return value.length;
+    if (Array.isArray(value)) {
+        let size = value.length;
+        for (let index = 0; index < value.length; index += 1) {
+            size += structuralSize(value[index]);
+        }
+        return size;
+    }
+    if (value !== null && typeof value === "object") {
+        let size = 0;
+        for (const key in value) {
+            if (Object.hasOwn(value, key)) {
+                size += 1 + structuralSize((value as Record<string, unknown>)[key]);
+            }
+        }
+        return size;
+    }
+    return 0;
+}
+
 /**
- * Capture a low-cost structural signature of the exact messages about to be
- * served. It intentionally does not hash content: production needs a cheap
- * last-writer alarm, while the full content-hash assertion remains a dev check.
+ * Capture a last-writer alarm, not a content hash. The legacy totalBytes field
+ * now sums string-leaf UTF-16 lengths and counts keys/array elements in one
+ * allocation-free tree walk, instead of materializing JSON and UTF-8 buffers.
+ * Like the old byte-length signature, it can miss same-length substitutions;
+ * the size proxy does not promise the same collision set or exact byte counts.
+ * The full content-hash assertion remains a separate dev-only check. Only the
+ * returned signature and per-message part-count array need to be allocated.
  */
 export function tailHygieneStructuralSignature(
     messages: readonly MessageLike[],
@@ -506,7 +535,7 @@ export function tailHygieneStructuralSignature(
     let totalBytes = 0;
     for (const message of messages) {
         partCounts.push(message.parts.length);
-        totalBytes += byteSize(JSON.stringify(message) ?? "");
+        totalBytes += structuralSize(message);
     }
     return { messageCount: messages.length, partCounts, totalBytes };
 }
@@ -528,7 +557,11 @@ export function sameTailHygieneStructuralSignature(
 export function measureTailHygiene(input: {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
-    protectedTags: number;
+    /**
+     * Canonical membership from computeProtectionWindow(persistedRows, snapshottedFloor).
+     * Coordinate space: tag-number. An empty set means the token window has no tool rows.
+     */
+    protectedTagNumbers: ReadonlySet<number>;
     /** Active tags whose drop is queued but not yet materialized into the rendered tail. */
     pendingDropTagNumbers?: ReadonlySet<number>;
 }): TailHygieneMeasurement {
@@ -538,7 +571,7 @@ export function measureTailHygiene(input: {
         messages: input.messages,
         tags: input.tags,
         toolIdentities,
-        protectedTags: input.protectedTags,
+        protectedTagNumbers: input.protectedTagNumbers,
     });
     const droppedToolOwners = new Set<string>();
     for (const [part, identity] of toolIdentities) {
@@ -724,7 +757,8 @@ function sameMeasuredPrefix(
 export function refreshTailHygieneBaseline(input: {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
-    protectedTags: number;
+    /** Canonical tag-number membership from persisted row mass and the floor snapshot. */
+    protectedTagNumbers: ReadonlySet<number>;
     pendingDropTagNumbers?: ReadonlySet<number>;
     cacheBusting: boolean;
     previous?: TailHygieneBaseline;
@@ -771,8 +805,8 @@ export function refreshTailHygieneBaseline(input: {
     ) {
         const part = measured.parts[index];
         turnDeltaT += part.tokens;
-        // The recency reserve always contains the newest completed tool output,
-        // so that output grows total mass T without growing reclaimable mass U.
+        // The canonical window always contains the newest tool-tag groups, so a newly
+        // appended attributed output grows total mass T without growing reclaimable mass U.
         if (part.kind !== "toolOutput") turnDeltaU += part.uTokens;
     }
     return {
@@ -796,7 +830,7 @@ export function effectiveTailHygiene(
 export function assertTailHygieneContentUnchanged(input: {
     messages: readonly MessageLike[];
     tags: readonly TagEntry[];
-    protectedTags: number;
+    protectedTagNumbers: ReadonlySet<number>;
     expectedSignature: string;
 }): void {
     const actual = measureTailHygiene(input).contentSignature;

@@ -12,12 +12,11 @@
 //
 //   Channel 2 (ceiling nudge): OpenCode delivers via the in-process client's
 //   `promptAsync` (which joins the in-flight runner on OpenCode >= 1.17.7). Pi
-//   queues a hidden custom message through `pi.sendMessage` with
-//   `deliverAs: "nextTurn"`. The `channel2_nudge_state` lease is persisted and
-//   token-bound, so sibling processes sharing a session database cannot change a
-//   lease after another process has claimed it. It carries the intent from the
-//   pipeline point that records it to the later `tool_result` or `agent_end`
-//   event that delivers it.
+//   sends a hidden custom steer at the next model boundary. The
+//   `channel2_nudge_state` lease is persisted and token-bound, so sibling
+//   processes sharing a session database cannot change a lease after another
+//   process has claimed it. It carries the intent from the pipeline point that
+//   records it to the later `tool_result` or `agent_end` event that delivers it.
 
 import { randomUUID } from "node:crypto";
 import {
@@ -28,6 +27,8 @@ import {
 	getChannel2NudgeClaim,
 	getChannel2NudgeState,
 	getLastNudgeUndropped,
+	getPendingOps,
+	getTagsByNumbers,
 	markChannel1PostReduceGracePending,
 	setChannel1NudgeState,
 	setLastNudgeUndropped,
@@ -185,7 +186,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 			decision.level,
 			decision.undroppedTokens,
 			reclaimableToolOutputCount(state.baselineParts),
-			state.oldestReclaimableToolTags,
+			currentReclaimHints(db, sessionId, state.oldestReclaimableToolTags),
 			decision.sticky,
 		),
 	};
@@ -216,7 +217,7 @@ interface PiSendMessage {
 			details?: unknown;
 		},
 		options?: {
-			deliverAs?: "steer" | "followUp" | "nextTurn";
+			deliverAs?: "steer" | "followUp";
 			triggerTurn?: boolean;
 		},
 	) => void;
@@ -224,16 +225,22 @@ interface PiSendMessage {
 
 const CHANNEL2_NUDGE_CUSTOM_TYPE = "magic-context:ceiling-nudge";
 
+// Pi 0.83 and oh-my-pi (OMP) 18.1.7 finish ordinary current-step tools before
+// draining a steer ahead of the next model call. OMP may cancel only tools that
+// explicitly opt into interruption, and emits paired synthetic results for them.
+const CHANNEL2_NUDGE_DELIVERY_MODE = "steer" as const;
+
 /**
  * Deliver a pending Channel 2 ceiling nudge for `sessionId`, if any. Safe to
  * call from both delivery sites; no-ops unless a `pending` intent exists.
  * Delivered as a hidden custom message (`sendMessage` + `display:false`) so it
  * reaches the model but is not presented as a literal user turn.
  *
- * Both delivery sites queue the message with deliverAs "nextTurn". Pi adds it
- * to the next real user turn instead of steering the active turn or starting an
- * autonomous follow-up. This avoids a busy-session race where an external user
- * prompt can be refused while Pi drains the synthetic continuation.
+ * Both delivery sites steer the active run at its next model boundary. Pi and
+ * OMP first finish ordinary tools in the current step, then append the nudge
+ * before the next model call. OMP pairs a synthetic result with any explicitly
+ * interruptible wait it cancels. On an idle session, `triggerTurn:true` starts a
+ * turn with the nudge just as OpenCode's `promptAsync` does.
  *
  * Lease: pending → claimed(token) → delivered. A token is issued while claiming,
  * re-checked immediately before send, and required to confirm or revert. This
@@ -280,7 +287,7 @@ export function maybeDeliverChannel2Pi(
 			content: buildChannel2Reminder(
 				undropped,
 				reclaimableToolOutputCount(baseline.baselineParts),
-				baseline.oldestReclaimableToolTags,
+				currentReclaimHints(db, sessionId, baseline.oldestReclaimableToolTags),
 			),
 			display: false,
 			details: { kind: "channel-2-ceiling-nudge" },
@@ -294,8 +301,11 @@ export function maybeDeliverChannel2Pi(
 			return false;
 		}
 		// display:false keeps the synthetic entry out of the Pi TUI while
-		// convertToLlm still presents it to the model on the next real user turn.
-		pi.sendMessage(message, { deliverAs: "nextTurn" });
+		// convertToLlm presents it to the model at the next model boundary.
+		pi.sendMessage(message, {
+			deliverAs: CHANNEL2_NUDGE_DELIVERY_MODE,
+			triggerTurn: true,
+		});
 	} catch (error) {
 		try {
 			const restored = casChannel2NudgeClaim(
@@ -354,4 +364,30 @@ export function maybeDeliverChannel2Pi(
 		);
 		return false;
 	}
+}
+
+// Delivery can follow a sibling emergency drop or an agent queue operation after the baseline was saved.
+function currentReclaimHints(
+	db: Database,
+	sessionId: string,
+	hints: SharedChannel1State["oldestReclaimableToolTags"],
+): NonNullable<SharedChannel1State["oldestReclaimableToolTags"]> {
+	if (!hints?.length) return [];
+	const active = new Set(
+		getTagsByNumbers(
+			db,
+			sessionId,
+			hints.map((tag) => tag.tagNumber),
+		)
+			.filter((tag) => tag.status === "active")
+			.map((tag) => tag.tagNumber),
+	);
+	const queued = new Set(
+		getPendingOps(db, sessionId)
+			.filter((op) => op.operation === "drop")
+			.map((op) => op.tagId),
+	);
+	return hints.filter(
+		(tag) => active.has(tag.tagNumber) && !queued.has(tag.tagNumber),
+	);
 }

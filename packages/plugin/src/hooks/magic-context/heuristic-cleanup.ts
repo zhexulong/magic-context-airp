@@ -40,16 +40,23 @@ export function applyHeuristicCleanup(
     targets: Map<number, TagTarget>,
     messageTagNumbers: Map<MessageLike, number>,
     config: {
-        protectedTags: number;
+        /** Exact token-window membership in tag-number space. */
+        protectedTagNumbers: ReadonlySet<number>;
         /**
-         * Tiered target-headroom emergency drop. Provided only on the the derived force band
-         * force-materialize (cache-busting) pass; undefined on routine execute
-         * passes (Phase 2 removed routine age-based tool drops entirely). When
+         * Exact token-window cutoff in tag-number space. A null cutoff means the
+         * persisted tool population is empty and applies no tag-number threshold.
+         */
+        protectedCutoff: number | null;
+        /**
+         * Tiered target-headroom emergency drop. Provided only on force-materialization
+         * passes at or above the derived force band; undefined on routine execute
+         * passes, which do not perform age-based tool drops. When
          * present, the emergency drop runs before dedup/injection-strip.
          */
         emergency?: {
             currentTotalInputTokens: number;
             ceilingTokens: number;
+            usagePercentage?: number;
         };
         /**
          * Whether ordinary deduplication, injection stripping, and caveman
@@ -78,14 +85,10 @@ export function applyHeuristicCleanup(
     // preload is provided we now load active-only directly (the partial
     // index makes this O(active rows) instead of O(all rows)).
     const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
-    // `maxTag` must reflect the true session max (including dropped/compacted
-    // rows) so the protected-cutoff window stays anchored to the most recent
-    // tag regardless of status. Previous code computed this from `tags`,
-    // which was correct only when `tags` was the full set; we now look up
-    // the authoritative max via an O(log N) backward index seek so the
-    // contract holds whether `tags` is full or active-only.
+    // Emergency floor accounting still needs the true session max, including
+    // dropped and compacted rows. Protection itself comes only from the canonical
+    // window projections supplied by the transform entry.
     const maxTag = getMaxTagNumberBySession(db, sessionId);
-    const protectedCutoff = maxTag - config.protectedTags;
 
     let droppedTools = 0;
     let emergencyDroppedTools = 0;
@@ -95,8 +98,8 @@ export function applyHeuristicCleanup(
 
     // ── Tiered target-headroom emergency drop (Phase 2) ──
     // Replaces the old need-blind routine age-drop + `dropAllTools` nuke. Runs
-    // only when the caller supplies `emergency` (i.e. the derived force band force-materialize
-    // cache-busting pass). Selection is pure (`planEmergencyDrop`); we apply the
+    // only when the caller supplies `emergency` on a force-materialization pass.
+    // Selection is pure (`planEmergencyDrop`); we apply the
     // returned plan and latch the pressure episode so it cannot trickle.
     if (config.emergency) {
         const emergency = config.emergency;
@@ -118,9 +121,10 @@ export function applyHeuristicCleanup(
             tags: droppableTags as readonly EmergencyDropTag[],
             floorTags: activeTags as readonly EmergencyDropTag[],
             maxTag,
-            protectedTags: config.protectedTags,
+            protectedCutoff: config.protectedCutoff,
             currentTotalInputTokens: emergency.currentTotalInputTokens,
             ceilingTokens: emergency.ceilingTokens,
+            usagePercentage: emergency.usagePercentage,
             priorInputSample,
             hasPriorDrop: priorInputSample > 0,
         });
@@ -138,31 +142,40 @@ export function applyHeuristicCleanup(
                     if (!toDrop.has(tag.tagNumber)) continue;
                     if (tag.status !== "active" || tag.type !== "tool") continue;
                     const target = targets.get(tag.tagNumber);
-                    const recent = newestEmergencyTags.has(tag.tagNumber);
-                    const result = recent
-                        ? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
-                        : (target?.drop?.() ?? "absent");
+                    const recent =
+                        (emergency.usagePercentage ?? 0) < 95 &&
+                        newestEmergencyTags.has(tag.tagNumber);
+                    // Removing the result separator beside native reasoning lets Anthropic
+                    // merge signed assistant turns, so this safety case always keeps the pair.
+                    const reasoningSafeSkeleton = target?.requiresToolArcSkeleton === true;
+                    const skeleton = recent || reasoningSafeSkeleton;
+                    const result = reasoningSafeSkeleton
+                        ? (target?.truncate?.() ?? "absent")
+                        : recent
+                          ? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
+                          : (target?.drop?.() ?? "absent");
                     if (result === "removed" || result === "truncated") {
                         updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
                         updateTagDropMode(
                             db,
                             sessionId,
                             tag.tagNumber,
-                            recent ? "truncated" : "full",
+                            skeleton ? "truncated" : "full",
                         );
                         droppedTools++;
                         emergencyDroppedTools++;
                         emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
                     }
                 }
-            })();
+            }).immediate();
             sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
         } else {
             sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
         }
-        // Latch every force-episode evaluation, including one with no eligible
-        // target, until pressure exits or an independent bust rearms the lane.
-        setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
+        // A no-op spent no cache rewrite and must not consume the episode's batch.
+        if (emergencyDroppedTools > 0) {
+            setEmergencyDropSample(db, sessionId, emergency.currentTotalInputTokens);
+        }
     }
 
     if (config.routine !== false) {
@@ -170,7 +183,9 @@ export function applyHeuristicCleanup(
             // Strip or drop system injections (todo continuation, skill reminders, etc.)
             for (const tag of tags) {
                 if (tag.status !== "active") continue;
-                if (tag.tagNumber > protectedCutoff) continue;
+                if (config.protectedCutoff !== null && tag.tagNumber >= config.protectedCutoff) {
+                    continue;
+                }
                 if (tag.type !== "message") continue;
 
                 const target = targets.get(tag.tagNumber);
@@ -204,7 +219,7 @@ export function applyHeuristicCleanup(
                     }
                 }
             }
-        })();
+        }).immediate();
     }
 
     // Deduplication: auto-drop older identical tool calls (same tool + same params)
@@ -236,7 +251,7 @@ export function applyHeuristicCleanup(
         const fingerprintGroups = new Map<string, TagEntry[]>();
         for (const [compositeKey, fingerprint] of toolFingerprints) {
             const tag = tagsByCompositeKey.get(compositeKey);
-            if (!tag || tag.tagNumber > protectedCutoff) continue;
+            if (!tag || config.protectedTagNumbers.has(tag.tagNumber)) continue;
             const group = fingerprintGroups.get(fingerprint) ?? [];
             group.push(tag);
             fingerprintGroups.set(fingerprint, group);
@@ -262,7 +277,7 @@ export function applyHeuristicCleanup(
                     }
                 }
             }
-        })();
+        }).immediate();
     }
 
     if (droppedTools > 0 || deduplicatedTools > 0 || droppedInjections > 0) {
@@ -283,7 +298,7 @@ export function applyHeuristicCleanup(
         const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
             enabled: true,
             minChars: config.caveman.minChars,
-            protectedTags: config.protectedTags,
+            protectedCutoff: config.protectedCutoff,
         });
         compressedTextTags =
             cavemanResult.compressedToLite +

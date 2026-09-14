@@ -23,13 +23,13 @@ describe("MagicContextConfigSchema", () => {
                 cache_ttl: "5m",
                 prompt_surface: { default: "full" },
                 execute_threshold_percentage: 65,
-                protected_tags: 20,
                 clear_reasoning_age: 50,
                 history_budget_percentage: DEFAULT_HISTORY_BUDGET_PERCENTAGE,
                 historian_timeout_ms: DEFAULT_HISTORIAN_TIMEOUT_MS,
                 embedding: {
                     provider: "local",
                     model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                    local_runtime: "auto",
                 },
                 memory: {
                     enabled: true,
@@ -46,7 +46,6 @@ describe("MagicContextConfigSchema", () => {
             expect(result.historian_timeout_ms).toBeGreaterThanOrEqual(10 * 60_000);
             expect(result.historian).toBeUndefined();
             expect(result.dreamer).toBeUndefined();
-            expect(result.sidekick).toBeUndefined();
             expect(result.pi).toBeUndefined();
             expect(result.mural).toEqual({ enabled: false });
         });
@@ -107,6 +106,7 @@ describe("MagicContextConfigSchema", () => {
                 },
                 temporal_awareness: false,
                 keep_subagents: false,
+                debug_rpc: false,
                 todowrite: {
                     enabled: false,
                     overlay: false,
@@ -146,15 +146,6 @@ describe("MagicContextConfigSchema", () => {
                 pi: {
                     subagent_extensions: ["@example/provider", "./extensions/local.ts"],
                 },
-                sidekick: {
-                    disable: false,
-                    model: "qwen-test",
-                    fallback_models: ["qwen-fallback"],
-                    temperature: 0.1,
-                    variant: "fast",
-                    timeout_ms: 12_000,
-                    system_prompt: "Custom prompt",
-                },
                 compaction: {
                     enabled: true,
                 },
@@ -178,19 +169,6 @@ describe("MagicContextConfigSchema", () => {
             ).toBe(false);
         });
 
-        it("applies sidekick defaults when the object is present", () => {
-            const result = MagicContextConfigSchema.parse({
-                sidekick: {
-                    model: "github-copilot/gpt-5.4",
-                },
-            });
-
-            expect(result.sidekick).toEqual({
-                model: "github-copilot/gpt-5.4",
-                timeout_ms: 30000,
-            });
-        });
-
         it("accepts disable on hidden agents and strips deprecated top-level enabled", () => {
             const result = MagicContextConfigSchema.parse({
                 historian: { disable: true },
@@ -204,14 +182,11 @@ describe("MagicContextConfigSchema", () => {
                         "maintain-docs": { schedule: "0 * * * *" },
                     },
                 },
-                sidekick: { disable: true, enabled: true },
             });
 
             expect(result.historian?.disable).toBe(true);
             expect(result.dreamer?.disable).toBe(true);
-            expect(result.sidekick?.disable).toBe(true);
             expect("enabled" in (result.dreamer as Record<string, unknown>)).toBe(false);
-            expect("enabled" in (result.sidekick as Record<string, unknown>)).toBe(false);
             expect(result.dreamer?.tasks["review-user-memories"].schedule).toBe("");
             expect(result.dreamer?.tasks["maintain-docs"].schedule).toBe("0 * * * *");
             expect(result.dreamer?.tasks["classify-memories"].schedule).toBe("0 6 * * *");
@@ -308,6 +283,19 @@ describe("MagicContextConfigSchema", () => {
                                 },
                                 thinking_level: "high",
                             },
+                            omp: {
+                                model: {
+                                    model: "opencode/work-historian",
+                                    thinking_level: "auto",
+                                },
+                                fallback_models: [
+                                    {
+                                        model: "opencode/work-historian-fallback",
+                                        thinking_level: "inherit",
+                                    },
+                                ],
+                                thinking_level: "max",
+                            },
                         },
                         dreamer: {
                             opencode: {
@@ -330,10 +318,16 @@ describe("MagicContextConfigSchema", () => {
                                 ],
                                 thinking_level: "high",
                             },
-                        },
-                        sidekick: {
-                            model: "anthropic/work-sidekick",
-                            fallback_models: ["openai/work-sidekick-fallback"],
+                            omp: {
+                                model: "opencode/work-dreamer",
+                                fallback_models: [
+                                    {
+                                        model: "opencode/work-dreamer-fallback",
+                                        thinking_level: "auto",
+                                    },
+                                ],
+                                thinking_level: "inherit",
+                            },
                         },
                     },
                 },
@@ -350,7 +344,10 @@ describe("MagicContextConfigSchema", () => {
             expect(result.profiles?.work?.dreamer?.pi?.fallback_models).toEqual([
                 { model: "openai/work-dreamer-fallback", thinking_level: "minimal" },
             ]);
-            expect(result.profiles?.work?.sidekick?.model).toBe("anthropic/work-sidekick");
+            expect(result.profiles?.work?.historian?.omp?.fallback_models).toEqual([
+                { model: "opencode/work-historian-fallback", thinking_level: "inherit" },
+            ]);
+            expect(result.profiles?.work?.dreamer?.omp?.thinking_level).toBe("inherit");
         });
 
         it("rejects timeout_minutes in a dreamer profile", () => {
@@ -406,7 +403,7 @@ describe("MagicContextConfigSchema", () => {
                     },
                 },
                 { work: { dreamer: { tasks: { verify: { schedule: "0 3 * * *" } } } } },
-                { work: { sidekick: { timeout_ms: 60_000 } } },
+                { work: { dreamer: { timeout_ms: 60_000 } } },
             ];
 
             for (const profiles of profilesWithExcludedFields) {
@@ -485,6 +482,14 @@ describe("MagicContextConfigSchema", () => {
                         fallback_models: ["openai/gpt-5.4"],
                         thinking_level: "medium",
                     },
+                    omp: {
+                        model: {
+                            model: "opencode/gpt-5.4",
+                            thinking_level: "auto",
+                        },
+                        fallback_models: [{ model: "openai/gpt-5.4", thinking_level: "inherit" }],
+                        thinking_level: "max",
+                    },
                 },
                 dreamer: {
                     disable: false,
@@ -519,6 +524,29 @@ describe("MagicContextConfigSchema", () => {
                             },
                         },
                     },
+                    omp: {
+                        model: "opencode/gpt-5.4",
+                        fallback_models: [
+                            { model: "opencode/gpt-5.4-mini", thinking_level: "auto" },
+                        ],
+                        thinking_level: "inherit",
+                        tasks: {
+                            verify: {
+                                model: {
+                                    model: "opencode/gpt-5.4",
+                                    thinking_level: "max",
+                                },
+                                fallback_models: [
+                                    {
+                                        model: "opencode/gpt-5.4-mini",
+                                        thinking_level: "off",
+                                    },
+                                ],
+                                thinking_level: "auto",
+                                timeout_minutes: 30,
+                            },
+                        },
+                    },
                 },
             });
 
@@ -528,12 +556,18 @@ describe("MagicContextConfigSchema", () => {
                 promotion_threshold: 4,
             });
             expect(result.dreamer?.opencode?.tasks?.verify?.timeout_minutes).toBe(30);
+            expect(result.historian?.omp?.model).toEqual({
+                model: "opencode/gpt-5.4",
+                thinking_level: "auto",
+            });
+            expect(result.dreamer?.omp?.tasks?.verify?.thinking_level).toBe("auto");
         });
 
         it("rejects cross-harness vocabulary, non-array fallbacks, and execution fields at metadata depth", () => {
             const invalidConfigs = [
                 { historian: { opencode: { thinking_level: "high" } } },
                 { historian: { pi: { variant: "high" } } },
+                { historian: { omp: { variant: "high" } } },
                 {
                     dreamer: {
                         opencode: { tasks: { verify: { thinking_level: "high" } } },
@@ -604,17 +638,27 @@ describe("MagicContextConfigSchema", () => {
             ).toThrow();
         });
 
-        it("rejects protected_tags greater than 100", () => {
-            expect(() => MagicContextConfigSchema.parse({ protected_tags: 101 })).toThrow();
-        });
-
-        it("rejects protected_tags less than 1", () => {
-            expect(() => MagicContextConfigSchema.parse({ protected_tags: 0 })).toThrow();
-        });
-
-        it("accepts protected_tags boundary values", () => {
-            expect(MagicContextConfigSchema.parse({ protected_tags: 1 }).protected_tags).toBe(1);
+        it("accepts protected_tags at any value including 0 and 101 as deprecated inert key", () => {
+            expect(MagicContextConfigSchema.parse({ protected_tags: 101 }).protected_tags).toBe(
+                101,
+            );
+            expect(MagicContextConfigSchema.parse({ protected_tags: 0 }).protected_tags).toBe(0);
             expect(MagicContextConfigSchema.parse({ protected_tags: 20 }).protected_tags).toBe(20);
+        });
+
+        it("enforces protected_tokens override range at both ends", () => {
+            expect(() => MagicContextConfigSchema.parse({ protected_tokens: 3999 })).toThrow();
+            expect(() => MagicContextConfigSchema.parse({ protected_tokens: 1_000_001 })).toThrow();
+            expect(() => MagicContextConfigSchema.parse({ protected_tokens: 30000.5 })).toThrow();
+            expect(
+                MagicContextConfigSchema.parse({ protected_tokens: 4000 }).protected_tokens,
+            ).toBe(4000);
+            expect(
+                MagicContextConfigSchema.parse({ protected_tokens: 1_000_000 }).protected_tokens,
+            ).toBe(1_000_000);
+            expect(
+                MagicContextConfigSchema.parse({ protected_tokens: 30000 }).protected_tokens,
+            ).toBe(30000);
         });
 
         it("rejects clear_reasoning_age below minimum", () => {
@@ -656,17 +700,64 @@ describe("MagicContextConfigSchema", () => {
             ).toThrow();
         });
 
+        it("preserves embedding instruction prefixes byte-for-byte and accepts false", () => {
+            const queryInstruction = "Instruct: custom task\nQuery: ";
+            const documentPrefix = "search_document: ";
+            const parsed = MagicContextConfigSchema.parse({
+                embedding: {
+                    provider: "openai-compatible",
+                    endpoint: "http://localhost:1234/v1",
+                    model: "custom/model",
+                    query_instruction: queryInstruction,
+                    document_prefix: documentPrefix,
+                },
+            }).embedding;
+
+            expect(parsed).toMatchObject({
+                query_instruction: queryInstruction,
+                document_prefix: documentPrefix,
+            });
+            expect(
+                MagicContextConfigSchema.parse({
+                    embedding: {
+                        provider: "openai-compatible",
+                        endpoint: "http://localhost:1234/v1",
+                        model: "custom/model",
+                        query_instruction: false,
+                    },
+                }).embedding,
+            ).toMatchObject({ query_instruction: false });
+        });
+
+        it("defaults local embedding runtime to auto and accepts explicit overrides", () => {
+            expect(
+                MagicContextConfigSchema.parse({ embedding: { provider: "local" } }).embedding,
+            ).toMatchObject({ local_runtime: "auto" });
+            expect(
+                MagicContextConfigSchema.parse({
+                    embedding: { provider: "local", local_runtime: "wasm" },
+                }).embedding,
+            ).toMatchObject({ local_runtime: "wasm" });
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    embedding: { provider: "local", local_runtime: "unsafe" },
+                }).success,
+            ).toBe(false);
+        });
+
         it("accepts a configured local embedding dtype", () => {
             const result = MagicContextConfigSchema.parse({
                 embedding: {
                     provider: "local",
                     model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                    local_runtime: "auto",
                     local_dtype: "q8",
                 },
             });
             expect(result.embedding).toEqual({
                 provider: "local",
                 model: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+                local_runtime: "auto",
                 local_dtype: "q8",
             });
         });
@@ -678,6 +769,7 @@ describe("MagicContextConfigSchema", () => {
             expect(result.embedding).toEqual({
                 provider: "local",
                 model: DEFAULT_LOCAL_EMBEDDING_MODEL,
+                local_runtime: "auto",
             });
             expect("local_dtype" in result.embedding).toBe(false);
         });

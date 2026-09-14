@@ -9,14 +9,22 @@ import {
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import type { DreamingTask } from "../../../config/schema/magic-context";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import {
+    HiddenCompletionRefusal,
+    type HiddenCompletionExecutor,
+} from "../../../hooks/magic-context/compartment-runner-types";
 import type { RawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
+import { teardownChildSession } from "../../../shared/child-session-teardown";
 import { describeError } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
+import { isRecord } from "../../../shared/record-type-guard";
+import { sanitizeDiagnosticText } from "../../../shared/redaction";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { dreamFailureCode } from "../../../shared/user-facing-codes";
 import { getCompartmentEvents } from "../compartment-events";
 import {
     getMemoriesByProject,
@@ -27,9 +35,10 @@ import {
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
-import { getActiveUserMemories } from "../user-memory/storage-user-memory";
 import { type ClassifyModuleClient, runClassify } from "./classify";
+import { takeCurateSafetyRefusalCount } from "./curate-memory-safety";
 import { evaluateSmartNotes } from "./evaluate-smart-notes";
+import { archiveExpiredMemories } from "./expire-memories";
 import {
     acquireLeaseWithAcquisition,
     type LeaseAcquisition,
@@ -59,7 +68,12 @@ import {
     type RetrospectiveRawProvider,
     readRetrospectiveScanWindow,
 } from "./retrospective-raw-provider";
-import { type DreamRunMemoryChanges, insertDreamRun } from "./storage-dream-runs";
+import {
+    type DreamRunFailureDetail,
+    type DreamRunMemoryChanges,
+    formatDreamRunFailure,
+    insertDreamRun,
+} from "./storage-dream-runs";
 import {
     getTaskScheduleState,
     isRetrospectiveWindowProcessed,
@@ -78,6 +92,7 @@ import {
     type RetrospectivePromptEvent,
 } from "./task-prompts";
 import {
+    DREAM_TASK_CAPABILITIES,
     type DreamTaskName,
     type DreamTaskProgress,
     type DreamTaskRunBacklog,
@@ -92,7 +107,10 @@ import type {
 import { runVerify } from "./verify";
 
 export interface DreamTaskExecutorDeps {
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    /** Existing user session used by a completion-only host. */
+    parentSessionId?: string;
     /** Filesystem directory of the project this drain owns (NOT the identity). */
     sessionDirectory: string;
     /** Opens the OpenCode DB read-only (for the key-files candidate scan). The
@@ -136,6 +154,38 @@ export interface DreamTaskExecutorDeps {
 /** A failed task either hot-retries (transient: provider/network/rate-limit/
  *  timeout/abort/lease/busy) or advances to the next cron slot (permanent:
  *  model-not-found, validation, parse). Classify off the error shape. */
+function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
+    const prompt = shared.getPromptFailureDetail(error);
+    if (prompt) {
+        return {
+            failure_class: prompt.failureClass,
+            model_attempted: prompt.modelAttempted,
+            models_tried: prompt.modelsTried,
+            provider_error: prompt.providerError,
+            timeout_ms: prompt.timeoutMs,
+            child_session_id: prompt.childSessionId,
+        };
+    }
+
+    const described = describeError(error);
+    const message = described.brief;
+    const providerFailure =
+        error instanceof HiddenCompletionRefusal ||
+        (error instanceof Error && error.name === "DreamerProviderOutputFailureError");
+    return {
+        failure_class: providerFailure
+            ? "provider_error"
+            : /no models?|model chain is empty/i.test(message)
+              ? "no_models"
+              : "unknown",
+        model_attempted: null,
+        models_tried: [],
+        provider_error: providerFailure ? sanitizeDiagnosticText(message).slice(0, 500) : null,
+        timeout_ms: null,
+        child_session_id: null,
+    };
+}
+
 function classifyFailure(error: unknown): { transient: boolean; brief: string } {
     const described = describeError(error);
     const brief = described.brief;
@@ -205,8 +255,67 @@ function validateCurateAssistantText(text: string): string {
     return text;
 }
 
+interface CurateMemoryOperationSummary {
+    totalCalls: number;
+    completedActions: string[];
+}
+
+interface CurateValidatedOutput {
+    text: string | null;
+    memoryOperations: CurateMemoryOperationSummary;
+}
+
+function inspectCurateMemoryOperations(messages: unknown): CurateMemoryOperationSummary {
+    const summary: CurateMemoryOperationSummary = { totalCalls: 0, completedActions: [] };
+    if (!Array.isArray(messages)) return summary;
+
+    for (const message of messages) {
+        if (!isRecord(message) || !isRecord(message.info) || message.info.role !== "assistant") {
+            continue;
+        }
+        if (!Array.isArray(message.parts)) continue;
+        for (const part of message.parts) {
+            if (!isRecord(part) || part.type !== "tool") continue;
+            const toolName = part.tool ?? part.name;
+            if (toolName !== "ctx_memory") continue;
+            summary.totalCalls += 1;
+            if (!isRecord(part.state) || part.state.status !== "completed") continue;
+            const input = isRecord(part.state.input) ? part.state.input : null;
+            summary.completedActions.push(
+                typeof input?.action === "string" ? input.action : "unknown",
+            );
+        }
+    }
+
+    return summary;
+}
+
+function formatExpiredArchiveProgress(count: number): string {
+    return `curate: archived ${count} expired ${count === 1 ? "memory" : "memories"}`;
+}
+
+function formatCurateMemoryOperations(actions: readonly string[]): string {
+    const actionCounts = new Map<string, number>();
+    for (const action of actions) actionCounts.set(action, (actionCounts.get(action) ?? 0) + 1);
+    const actionDetail = [...actionCounts]
+        .map(([action, count]) => (count === 1 ? action : `${action} ×${count}`))
+        .join(", ");
+    const noun = actions.length === 1 ? "operation" : "operations";
+    return `curate: ${actions.length} memory ${noun} applied${actionDetail ? ` (${actionDetail})` : ""}`;
+}
+
+function requireDreamClient(client: PluginContext["client"] | undefined): PluginContext["client"] {
+    if (!client)
+        throw new HiddenCompletionRefusal(
+            "hidden_tools_unsupported",
+            "This dream task requires the child-session tool transport",
+            true,
+        );
+    return client;
+}
+
 /**
- * Build the TaskExecutor the v2 scheduler drives. The scheduler owns the keyed
+ * Build the TaskExecutor the shared task scheduler drives. The scheduler owns the keyed
  * domain lease + holderId and hands them in; this executor runs one task's actual
  * work (LLM loop / specialized runner), renews the lease during the run, aborts
  * if the lease is lost, and writes one per-task dream_runs telemetry row.
@@ -223,10 +332,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
     let parentSessionIdPromise: Promise<string | undefined> | undefined;
 
     const resolveParentSessionId = (): Promise<string | undefined> => {
+        if (deps.hiddenCompletionExecutor) return Promise.resolve(deps.parentSessionId);
         if (!parentSessionIdPromise) {
             parentSessionIdPromise = (async () => {
                 try {
-                    const listResponse = await deps.client.session.list({
+                    const listResponse = await requireDreamClient(deps.client).session.list({
                         query: { directory: deps.sessionDirectory },
                     });
                     const sessions = shared.normalizeSDKResponse(
@@ -274,6 +384,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         const parent = await resolveParentSessionId();
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
         if (
+            config.task === "curate" ||
             config.task === "map-memories" ||
             config.task === "compress-cues" ||
             config.task === "classify-memories" ||
@@ -311,6 +422,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 /** Successful progress/detail; empty strings are omitted so absent
                  *  and empty have the same persisted meaning. */
                 progress?: string | null;
+                failure?: DreamRunFailureDetail;
             },
         ): void => {
             try {
@@ -325,6 +437,13 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             durationMs: Date.now() - startedAt,
                             resultChars: 0,
                             ...(status === "failed" && error ? { error } : {}),
+                            ...(status === "failed"
+                                ? {
+                                      failure:
+                                          extra?.failure ??
+                                          dreamRunFailureDetail(error ?? "unknown dreamer failure"),
+                                  }
+                                : {}),
                             ...(extra?.progress ? { progress: extra.progress } : {}),
                             backlog: (() => {
                                 const end =
@@ -382,7 +501,24 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         try {
+            if (
+                deps.hiddenCompletionExecutor?.capabilities.tools === false &&
+                DREAM_TASK_CAPABILITIES[config.task].requiresTools
+            ) {
+                throw new HiddenCompletionRefusal(
+                    "hidden_tools_unsupported",
+                    `${config.task} requires tools; opencode2 hidden completions have no tool loop`,
+                    true,
+                );
+            }
             if (config.task === "compress-cues") {
+                if (deps.hiddenCompletionExecutor?.capabilities.tools === false) {
+                    throw new HiddenCompletionRefusal(
+                        "unsupported_transport",
+                        "compress-cues is tool-free but its hidden completion transport is not yet connected on opencode2",
+                        true,
+                    );
+                }
                 if (deps.mural?.enabled !== true) {
                     // Config-gated no-op, but say so: a silent "completed" here
                     // reads as a successful run in /ctx-dream summaries and would
@@ -396,7 +532,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 // then default model settings.
                 const result = await runCompressCues({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -424,7 +560,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "review-user-memories") {
                 const result = await reviewUserMemories({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
                     holderId,
@@ -446,7 +582,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "map-memories") {
                 const result = await mapMemories({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -493,7 +629,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
                 const result = await runVerify({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -576,6 +712,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 const result = await runClassify({
                     db,
                     client: deps.client,
+                    hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -604,7 +741,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "promote-primers") {
                 const result = await promotePrimers({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     sessionDirectory: deps.sessionDirectory,
                     holderId,
@@ -624,7 +761,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "refresh-primers") {
                 const result = await refreshPrimers({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -648,7 +785,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (config.task === "evaluate-smart-notes") {
                 const result = await evaluateSmartNotes({
                     db,
-                    client: deps.client,
+                    client: requireDreamClient(deps.client),
                     projectIdentity,
                     parentSessionId: parent,
                     sessionDirectory: deps.sessionDirectory,
@@ -697,12 +834,23 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 parent,
                 recordRun,
                 computeMemoryDelta,
+                reportProgress,
+                leaseAcquisition,
+                moduleRoute,
             });
         } catch (error) {
             const { transient, brief } = classifyFailure(error);
-            recordRun("failed", brief);
-            log(`[dreamer] task ${config.task} failed (transient=${transient}): ${brief}`);
-            return { status: "failed", transient, error: brief };
+            const failure = dreamRunFailureDetail(error);
+            recordRun("failed", brief, { failure });
+            log(
+                `[dreamer] task ${config.task} failed code=${dreamFailureCode(failure.failure_class)} (transient=${transient}): ${brief}`,
+            );
+            return {
+                status: "failed",
+                transient,
+                error: brief,
+                failureDetail: formatDreamRunFailure(failure),
+            };
         } finally {
             deps.onProgress?.(null, config.task);
         }
@@ -906,9 +1054,10 @@ async function runRetrospectiveTask(
     );
 
     let childSessionId: string | null = null;
+    let promptSettled = false;
     try {
         const createResponse = await createChildSessionWithFence({
-            client: deps.client,
+            client: requireDreamClient(deps.client),
             db,
             parentSessionId: parent ?? undefined,
             title: "magic-context-dream-retrospective",
@@ -930,8 +1079,9 @@ async function runRetrospectiveTask(
         // token usage without double counting.
         const runChildTurn = async (system: string, userText: string) => {
             const remainingMs = Math.max(0, deadline - Date.now());
-            return shared.promptSyncWithValidatedOutputRetry(
-                deps.client,
+            promptSettled = false;
+            const run = await shared.promptSyncWithValidatedOutputRetry(
+                requireDreamClient(deps.client),
                 {
                     path: { id: sessionId },
                     query: { directory: deps.sessionDirectory },
@@ -948,7 +1098,9 @@ async function runRetrospectiveTask(
                     fallbackModels: config.fallbackModels,
                     callContext: "dreamer:retrospective",
                     fetchOutput: async () => {
-                        const messagesResponse = await deps.client.session.messages({
+                        const messagesResponse = await requireDreamClient(
+                            deps.client,
+                        ).session.messages({
                             path: { id: sessionId },
                             query: { directory: deps.sessionDirectory, limit: 50 },
                         });
@@ -963,6 +1115,8 @@ async function runRetrospectiveTask(
                     },
                 },
             );
+            promptSettled = true;
+            return run;
         };
 
         const finish = (
@@ -1118,13 +1272,15 @@ async function runRetrospectiveTask(
         return finish(deepenRun, scan.maxScannedTs);
     } finally {
         heartbeat.stop();
-        // PRIVACY: a retrospective child's prompt embeds raw cross-session user
-        // text from the friction window. Always delete the child — even on
-        // failure, and even when keep_subagents is set. The debug-retention flag
-        // must never persist another session's raw user text on disk.
-        if (childSessionId) {
-            await deps.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-        }
+        await teardownChildSession({
+            client: requireDreamClient(deps.client),
+            sessionId: childSessionId,
+            sessionDirectory: deps.sessionDirectory,
+            promptSettled,
+            privacySensitive: true,
+            context: "[dreamer] retrospective",
+            log,
+        });
     }
 }
 
@@ -1147,11 +1303,16 @@ async function runAgenticTask(
                     archived: number;
                     merged: number;
                 } | null;
+                progress?: string | null;
+                failure?: DreamRunFailureDetail;
             },
         ) => void;
         computeMemoryDelta: (
             before: ReturnType<typeof getMemoryCountsByStatus>,
         ) => { written: number; deleted: number; archived: number; merged: number } | null;
+        reportProgress: (processed: number, refused?: number) => void;
+        leaseAcquisition: LeaseAcquisition;
+        moduleRoute?: DreamerModuleRoute;
     },
 ): Promise<TaskExecOutcome> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
@@ -1172,27 +1333,6 @@ async function runAgenticTask(
                   structure: existsSync(`${docsDir}/STRUCTURE.md`),
               }
             : undefined;
-    const userMemories =
-        task === "curate"
-            ? getActiveUserMemories(db).map((um) => ({ id: um.id, content: um.content }))
-            : undefined;
-
-    // verify / verify-broad / classify-memories now run via their own non-agentic
-    // manifest runners and never reach runAgenticTask. The agentic path handles
-    // curate / maintain-docs only.
-    let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
-    if (task === "curate") {
-        curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
-        log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
-    }
-
-    const taskPrompt = buildDreamTaskPrompt(task, {
-        projectPath: projectIdentity,
-        lastDreamAt: lastRunAt ? String(lastRunAt) : null,
-        existingDocs,
-        userMemories,
-        curate: curateMemories ? { memories: curateMemories } : undefined,
-    });
 
     const abortController = new AbortController();
     let leaseLost = false;
@@ -1208,9 +1348,45 @@ async function runAgenticTask(
     );
 
     let childSessionId: string | null = null;
+    let promptSettled = false;
+    let expiredArchived = 0;
     try {
+        // Curate owns the TTL lifecycle transition. It runs after the memory-domain
+        // lease heartbeat starts and uses the same authority-specific archive path
+        // as curate's ctx_memory operations.
+        let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
+        if (task === "curate") {
+            expiredArchived = await archiveExpiredMemories({
+                db,
+                projectIdentity,
+                holderId,
+                leaseKey,
+                leaseAcquisition: helpers.leaseAcquisition,
+                moduleRoute: helpers.moduleRoute,
+            });
+            if (leaseLost) throw new Error("Dream lease lost during expired-memory archive");
+            curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
+            log(
+                `[dreamer] curate pool: in_scope=${curateMemories.length} expired_archived=${expiredArchived}`,
+            );
+            if (curateMemories.length === 0 && expiredArchived > 0) {
+                const progress = formatExpiredArchiveProgress(expiredArchived);
+                helpers.recordRun("completed", null, {
+                    memoryChanges: helpers.computeMemoryDelta(memoryBefore),
+                    progress,
+                });
+                return { status: "completed", detail: progress };
+            }
+        }
+
+        const taskPrompt = buildDreamTaskPrompt(task, {
+            projectPath: projectIdentity,
+            lastDreamAt: lastRunAt ? String(lastRunAt) : null,
+            existingDocs,
+            curate: curateMemories ? { memories: curateMemories } : undefined,
+        });
         const createResponse = await createChildSessionWithFence({
-            client: deps.client,
+            client: requireDreamClient(deps.client),
             db,
             parentSessionId: parent ?? undefined,
             title: `magic-context-dream-${task}`,
@@ -1229,7 +1405,7 @@ async function runAgenticTask(
 
         const remainingMs = Math.max(0, deadline - Date.now());
         const run = await shared.promptSyncWithValidatedOutputRetry(
-            deps.client,
+            requireDreamClient(deps.client),
             {
                 path: { id: sessionId },
                 query: { directory: docsDir },
@@ -1257,23 +1433,50 @@ async function runAgenticTask(
                 fallbackModels: config.fallbackModels,
                 callContext: `dreamer:${task}`,
                 fetchOutput: async () => {
-                    const messagesResponse = await deps.client.session.messages({
-                        path: { id: sessionId },
-                        query: { directory: docsDir, limit: 50 },
-                    });
+                    const messagesResponse = await requireDreamClient(deps.client).session.messages(
+                        {
+                            path: { id: sessionId },
+                            query: {
+                                directory: docsDir,
+                                // Curate can use up to 150 steps, so its applied-operation
+                                // count must not be truncated to the newest 50 messages.
+                                ...(task === "curate" ? {} : { limit: 50 }),
+                            },
+                        },
+                    );
                     return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
                         preferResponseOnMissingData: true,
                     });
                 },
-                validateOutput: (messages) => {
+                validateOutput: (messages): string | CurateValidatedOutput => {
                     const text = extractLatestAssistantText(messages);
+                    if (task !== "curate") {
+                        if (!text) throw new Error("Dreamer returned no assistant output.");
+                        return text;
+                    }
+
+                    const memoryOperations = inspectCurateMemoryOperations(messages);
+                    if (text) validateCurateAssistantText(text);
+                    if (memoryOperations.completedActions.length > 0) {
+                        return { text, memoryOperations };
+                    }
                     if (!text) throw new Error("Dreamer returned no assistant output.");
-                    return task === "curate" ? validateCurateAssistantText(text) : text;
+                    if (memoryOperations.totalCalls > 0) {
+                        throw new Error("Curate returned no completed ctx_memory tool result.");
+                    }
+                    return { text, memoryOperations };
                 },
             },
         );
+        promptSettled = true;
 
         if (leaseLost) throw new Error("Dream lease lost during task");
+
+        const curateRefused = task === "curate" ? takeCurateSafetyRefusalCount(sessionId) : 0;
+        if (curateRefused > 0) {
+            helpers.reportProgress(curateRefused, curateRefused);
+            log(`[dreamer] curate safety summary: refused=${curateRefused}`);
+        }
 
         if (parent) {
             recordChildInvocation({
@@ -1296,16 +1499,33 @@ async function runAgenticTask(
             }
         }
 
+        const curateOutput =
+            task === "curate" ? (run.validated as CurateValidatedOutput) : undefined;
+        const progress = [
+            expiredArchived > 0 ? formatExpiredArchiveProgress(expiredArchived) : null,
+            curateOutput && curateOutput.memoryOperations.completedActions.length > 0
+                ? formatCurateMemoryOperations(curateOutput.memoryOperations.completedActions)
+                : null,
+            curateRefused > 0 ? `curate: refused ${curateRefused} unsafe mutation(s)` : null,
+        ]
+            .filter((value): value is string => Boolean(value))
+            .join("; ");
         helpers.recordRun("completed", null, {
             memoryChanges: helpers.computeMemoryDelta(memoryBefore),
+            progress: progress || null,
         });
-        return { status: "completed" };
+        return { status: "completed", ...(progress ? { detail: progress } : {}) };
     } finally {
         heartbeat.stop();
-        // These children contain full memory-pool snapshots or generated project
-        // docs context, so debug-retention must not keep them on disk after a run.
-        if (childSessionId) {
-            await deps.client.session.delete({ path: { id: childSessionId } }).catch(() => {});
-        }
+        if (childSessionId) takeCurateSafetyRefusalCount(childSessionId);
+        await teardownChildSession({
+            client: requireDreamClient(deps.client),
+            sessionId: childSessionId,
+            sessionDirectory: docsDir,
+            promptSettled,
+            privacySensitive: true,
+            context: `[dreamer] ${task}`,
+            log,
+        });
     }
 }

@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -27,12 +27,25 @@ it("formats an unavailable post-drop projection without a percent suffix", () =>
     expect(formatProjectedPostDropPercentage(67.54)).toBe("67.5%");
 });
 
+it("keeps both historian redundancy skip log sites named and actionable", () => {
+    const source = readFileSync(join(import.meta.dir, "compartment-trigger.ts"), "utf8");
+    expect(
+        source.match(/historian redundancy skip: summarizer not needed this pass/g),
+    ).toHaveLength(2);
+    expect(source).toContain(
+        "queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}%",
+    );
+    expect(source).not.toContain("compartment trigger: skipping force band");
+    expect(source).not.toContain("because projected post-drop usage is");
+});
+
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

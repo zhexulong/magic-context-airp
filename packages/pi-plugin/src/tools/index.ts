@@ -25,6 +25,28 @@ import { createCtxSearchTool } from "./ctx-search";
 import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
+const CTX_MEMORY_TOOL_NAME = "ctx_memory";
+
+/**
+ * Keep Pi's active tool set aligned with the current project's memory policy.
+ * The definition stays registered so a later session can re-enable it without
+ * restarting the Pi process; the ctx_memory call-time guard remains in place.
+ */
+export function syncCtxMemoryToolEnabled(
+	pi: Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">,
+	memoryEnabled: boolean,
+): void {
+	const activeTools = pi.getActiveTools();
+	const isActive = activeTools.includes(CTX_MEMORY_TOOL_NAME);
+	if (memoryEnabled === isActive) return;
+
+	pi.setActiveTools(
+		memoryEnabled
+			? [...activeTools, CTX_MEMORY_TOOL_NAME]
+			: activeTools.filter((toolName) => toolName !== CTX_MEMORY_TOOL_NAME),
+	);
+}
+
 export interface RegisterToolsOptions {
 	db: ContextDatabase;
 	ensureProjectRegistered?: (
@@ -52,11 +74,10 @@ export interface RegisterToolsOptions {
 	dreamerEnabled?: boolean;
 	/** Resolve smart-note enablement from the current cwd at tool-call time. */
 	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
-	/** When false, omit ctx_memory from the registered surface. Sidekick only
-	 *  needs read-only ctx_search; dreamer and the main agent keep ctx_memory. */
+	/** When false, omit ctx_memory from the registered surface. */
 	memoryToolEnabled?: boolean;
 	/** When true, omit session-scoped tools (ctx_note, ctx_expand) from the
-	 *  registered surface. Set by `--no-session` children (sidekick, dreamer):
+	 *  registered surface. Set by `--no-session` Dreamer children:
 	 *  those tools resolve `ctx.sessionManager.getSessionId()` to the EPHEMERAL
 	 *  child session, so ctx_note would write notes orphaned under the hidden
 	 *  child id and ctx_expand would expand the child's empty transcript. */

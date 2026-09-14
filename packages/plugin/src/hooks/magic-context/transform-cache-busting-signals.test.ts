@@ -15,21 +15,41 @@
  * or dropped /ctx-flush intent.
  */
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { replaceAllCompartmentState } from "../../features/magic-context/compartment-storage";
+import {
+    appendCompartments,
+    replaceAllCompartmentState,
+} from "../../features/magic-context/compartment-storage";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
+    advanceToolReclaimWatermark,
     closeDatabase,
+    getHiddenSeamPlaceholderIds,
+    getOldestActiveUnprotectedToolTags,
     getOrCreateSessionMeta,
+    getPendingOps,
+    getStrippedPlaceholderIds,
+    getTagsBySession,
     openDatabase,
+    queueM0Mutation,
+    queuePendingOp,
 } from "../../features/magic-context/storage";
+import { getTrailingBlankDecisions } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getTailHygieneTags,
+    insertTag,
+    markWhitespaceAssistantTagInert,
+} from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { registerActiveCompartmentRun } from "./compartment-runner";
+import { createChatMessageHook } from "./hook-handlers";
+import * as prefixRenderer from "./inject-compartments";
 import { createTransform } from "./transform";
 
 /**
@@ -76,7 +96,8 @@ function useTempDataHome(prefix: string): void {
 
 afterEach(() => {
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
     for (const dir of tempDirs) {
         try {
@@ -109,6 +130,32 @@ function buildSimpleMessages(sessionId: string): TestMessage[] {
     ];
 }
 
+function serializeProviderWire(messages: TestMessage[], providerID: string): string {
+    const grouped: Array<{ role: string; content: TestPart[] }> = [];
+    for (const message of messages) {
+        const content = message.parts
+            .filter(
+                (part) => providerID !== "anthropic" || part.type !== "text" || part.text !== "",
+            )
+            .map((part) => {
+                if (part.type !== "text") return structuredClone(part);
+                const historyEnd = part.text.indexOf("</session-history>\n\n");
+                return historyEnd < 0
+                    ? structuredClone(part)
+                    : {
+                          ...part,
+                          text: part.text.slice(historyEnd + "</session-history>\n\n".length),
+                      };
+            });
+        if (content.length === 0) continue;
+        const previous = grouped.at(-1);
+        if (previous?.role === message.info.role)
+            previous.content.push(...structuredClone(content));
+        else grouped.push({ role: message.info.role, content: structuredClone(content) });
+    }
+    return JSON.stringify(grouped);
+}
+
 function buildMessagesWithIgnoredCommandOutput(sessionId: string): TestMessage[] {
     return [
         ...buildSimpleMessages(sessionId),
@@ -124,17 +171,7 @@ function buildMessagesWithIgnoredCommandOutput(sessionId: string): TestMessage[]
 }
 
 describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
-    it("Test 1: historian publish while compartment is running — history rebuild is one-shot, materialization persists", async () => {
-        // Scenario from Oracle: historian publishes mid-session (signaling
-        // both historyRefresh + pendingMaterialization), but a different
-        // compartment run is still active so heuristics can't materialize
-        // yet. The pre-refactor bug: every subsequent defer pass would
-        // re-fire the flush flag and rebuild `<session-history>` until
-        // compartmentRunning lifted, burning cache reuse for nothing.
-        //
-        // After the fix: history rebuild fires exactly once (consumed by
-        // prepareCompartmentInjection then drained), and materialization
-        // intent persists across blocked passes until heuristics run.
+    it("Test 1: historian overlap drains an explicit history refresh exactly once", async () => {
         useTempDataHome("ctx-busting-test1-");
         const sessionId = "ses-historian-publish";
         const historyRefreshSessions = new Set<string>();
@@ -155,31 +192,20 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
-
-        // First pass establishes the session in the DB.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
-
-        // Simulate historian publication: signals BOTH history refresh and
-        // pending materialization (per the new producer rule).
         historyRefreshSessions.add(sessionId);
         pendingMaterializationSessions.add(sessionId);
-
-        // Block compartment using the in-memory promise registry (this is
-        // what postprocess actually consults).
         const lift = blockCompartmentRun(sessionId);
 
         try {
-            // Defer pass A: prepareCompartmentInjection consumes
-            // historyRefresh and drains it. Heuristics are blocked by
-            // compartmentRunning, so pendingMaterialization survives.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
 
             expect(historyRefreshSessions.has(sessionId)).toBe(false); // drained
-            expect(pendingMaterializationSessions.has(sessionId)).toBe(true); // persisted
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
             lift();
         }
@@ -215,7 +241,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
@@ -236,12 +262,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         expect(historyRefreshSessions.has(sessionId)).toBe(false);
     });
 
-    it("Test 3: /ctx-flush while compartment is running — materialization survives the blocked pass and runs on next safe pass", async () => {
-        // Scenario from Oracle: user runs /ctx-flush, but compartment is
-        // still running. The flush MUST survive into the next pass once
-        // compartmentRunning lifts. The pre-refactor design coupled this
-        // signal to history rebuild, but the consumer logic was correct;
-        // the new design makes the persistence semantics explicit.
+    it("Test 3: /ctx-flush drains during a historian run without a second pass", async () => {
         useTempDataHome("ctx-busting-test3-");
         const sessionId = "ses-flush-during-compartment";
         const historyRefreshSessions = new Set<string>();
@@ -262,47 +283,28 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
-
-        // Establish session.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
-
-        // Block compartment using in-memory promise registry.
         const lift = blockCompartmentRun(sessionId);
 
         try {
-            // Simulate /ctx-flush: signals all three (we use the relevant two
-            // for this scope — system-prompt set is exercised in its own
-            // module's tests).
             historyRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
-
-            // Pass A: blocked. historyRefresh drained by injection rebuild.
-            // pendingMaterialization persists because heuristics can't run.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(historyRefreshSessions.has(sessionId)).toBe(false);
-            expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
-
-            // Lift the block (simulate compartment finishing).
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
             lift();
-
-            // Pass B: heuristics CAN run now. pendingMaterialization gets
-            // drained by the heuristics block (line ~360 of postprocess).
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
-            // Always lift if not already lifted (no-op if resolver was called).
             lift();
         }
     });
 
-    it("Test 4: delayed heuristic execution after the active run settles — pendingMaterialization drains exactly once", async () => {
-        // Variant of Test 3 emphasizing that pendingMaterialization
-        // drains on the FIRST safe pass after the block lifts, and stays
-        // drained on subsequent passes (no spurious re-add).
+    it("Test 4: explicit materialization stays drained after the active run settles", async () => {
         useTempDataHome("ctx-busting-test4-");
         const sessionId = "ses-delayed-drain";
         const historyRefreshSessions = new Set<string>();
@@ -323,35 +325,22 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
-
-        // Establish session.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
-
-        // Block compartment using in-memory promise registry + signal flush.
         const lift = blockCompartmentRun(sessionId);
         pendingMaterializationSessions.add(sessionId);
 
         try {
-            // Pass A: blocked.
-            await transform({}, { messages: buildSimpleMessages(sessionId) });
-            expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
-
-            // Pass B: still blocked. Materialization still pending.
-            await transform({}, { messages: buildSimpleMessages(sessionId) });
-            expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
-
-            // Lift block.
-            lift();
-
-            // Pass C: heuristics run, drain.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
-
-            // Pass D: stays drained.
+            await transform({}, { messages: buildSimpleMessages(sessionId) });
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+            lift();
+            await transform({}, { messages: buildSimpleMessages(sessionId) });
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
@@ -386,7 +375,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
@@ -438,7 +427,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         ).toBe(true);
     });
 
-    it("Test 9: deferred helper blocks active low-context runs", () => {
+    it("Test 9: deferred helper consumes published state during an active run", () => {
         expect(
             canConsumeDeferredOnThisPass({
                 schedulerDecision: "execute",
@@ -446,7 +435,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
                 justAwaitedPublication: false,
                 activeRunBlocksMaterialization: true,
             }),
-        ).toBe(false);
+        ).toBe(true);
     });
 
     it("Test 10: just-awaited publication overrides the active-run block", () => {
@@ -501,7 +490,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
@@ -521,6 +510,451 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         expect(deferredMaterializationSessions.has(sessionId)).toBe(true);
     });
 
+    for (const providerID of ["anthropic", "openai"] as const) {
+        it(`keeps ${providerID} seam bytes stable through fold, re-exposure, and marker landing`, async () => {
+            useTempDataHome(`ctx-busting-marker-seam-${providerID}-`);
+            const sessionId = `ses-marker-seam-${providerID}`;
+            const db = openDatabase();
+            const historyRefreshSessions = new Set<string>();
+            const pendingMaterializationSessions = new Set<string>();
+            const deferredHistoryRefreshSessions = new Set<string>();
+            const deferredMaterializationSessions = new Set<string>();
+            let decision: "execute" | "defer" = "execute";
+            const sourceMessages = (): TestMessage[] => [
+                {
+                    info: { id: "hidden-tool-owner", role: "assistant", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "tool",
+                            callID: "hidden-tool-call",
+                            state: { output: "never served ".repeat(2_000), tool: "read" },
+                        },
+                    ],
+                },
+                {
+                    info: { id: "marker-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "marker boundary" }],
+                },
+                {
+                    info: { id: "hidden-assistant-a", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "old assistant a" }],
+                },
+                {
+                    info: { id: "hidden-assistant-b", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "old assistant b" }],
+                },
+                {
+                    info: {
+                        id: "assistant-compartment-end",
+                        role: "assistant",
+                        sessionID: sessionId,
+                    },
+                    parts: [{ type: "text", text: "fold through here" }],
+                },
+                {
+                    info: { id: "retained-head-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retained head" }],
+                },
+                {
+                    info: { id: "retained-user", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "retain me" }],
+                },
+            ];
+            const transform = createTransform({
+                tagger: createTagger(),
+                scheduler: { shouldExecute: mock(() => decision) },
+                contextUsageMap: new Map([
+                    [
+                        sessionId,
+                        { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                    ],
+                ]),
+                db,
+                liveModelBySession: new Map([
+                    [sessionId, { providerID, modelID: `${providerID}-test-model` }],
+                ]),
+                historyRefreshSessions,
+                pendingMaterializationSessions,
+                deferredHistoryRefreshSessions,
+                deferredMaterializationSessions,
+                lastHeuristicsTurnId: new Map<string, string>(),
+                clearReasoningAge: 50,
+                protectedTokens: 0,
+            });
+
+            await transform({}, { messages: sourceMessages() });
+            const hiddenTags = getTagsBySession(db, sessionId).filter(
+                (tag) =>
+                    tag.messageId === "hidden-assistant-a:p0" ||
+                    tag.messageId === "hidden-assistant-b:p0",
+            );
+            expect(hiddenTags).toHaveLength(2);
+            for (const tag of hiddenTags) queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+            replaceAllCompartmentState(
+                db,
+                sessionId,
+                [
+                    {
+                        sequence: 1,
+                        startMessage: 1,
+                        endMessage: 5,
+                        startMessageId: "hidden-tool-owner",
+                        endMessageId: "assistant-compartment-end",
+                        title: "folded prefix",
+                        content: "folded content",
+                    },
+                ],
+                [],
+            );
+            deferredHistoryRefreshSessions.add(sessionId);
+            deferredMaterializationSessions.add(sessionId);
+
+            const foldMessages = sourceMessages();
+            await transform({}, { messages: foldMessages });
+            const foldWire = serializeProviderWire(foldMessages, providerID);
+            expect(foldMessages.some((message) => message.info.id === "hidden-assistant-a")).toBe(
+                false,
+            );
+            expect(getStrippedPlaceholderIds(db, sessionId)).toEqual(
+                new Set(["hidden-assistant-a", "hidden-assistant-b"]),
+            );
+            expect(getHiddenSeamPlaceholderIds(db, sessionId)).toEqual(
+                new Set(["hidden-assistant-a", "hidden-assistant-b"]),
+            );
+
+            const tagsAfterFold = getTagsBySession(db, sessionId);
+            const trimmedIds = new Set([
+                "hidden-tool-owner",
+                "marker-user:p0",
+                "hidden-assistant-a:p0",
+                "hidden-assistant-b:p0",
+                "assistant-compartment-end:p0",
+            ]);
+            expect(
+                tagsAfterFold
+                    .filter((tag) => trimmedIds.has(tag.messageId))
+                    .every((tag) => tag.status === "compacted"),
+            ).toBe(true);
+            expect(
+                getTailHygieneTags(db, sessionId).some((tag) => trimmedIds.has(tag.messageId)),
+            ).toBe(false);
+            const hiddenToolTag = tagsAfterFold.find((tag) => tag.type === "tool");
+            expect(hiddenToolTag?.status).toBe("compacted");
+            expect(
+                getOldestActiveUnprotectedToolTags(db, sessionId, new Set(), 10).some(
+                    (tag) => tag.tagNumber === hiddenToolTag?.tagNumber,
+                ),
+            ).toBe(false);
+
+            db.exec("CREATE TEMP TABLE stripped_placeholder_writes (count INTEGER NOT NULL)");
+            db.exec("INSERT INTO stripped_placeholder_writes VALUES (0)");
+            db.exec(`CREATE TEMP TRIGGER count_stripped_placeholder_writes
+                AFTER UPDATE OF stripped_placeholder_ids ON session_meta
+                WHEN OLD.stripped_placeholder_ids IS NOT NEW.stripped_placeholder_ids
+                BEGIN UPDATE stripped_placeholder_writes SET count = count + 1; END`);
+
+            decision = "defer";
+            const replayMessages = sourceMessages().filter(
+                (message) =>
+                    message.info.id === "retained-head-user" ||
+                    message.info.id === "hidden-assistant-a" ||
+                    message.info.id === "hidden-assistant-b" ||
+                    message.info.id === "retained-user",
+            );
+            await transform({}, { messages: replayMessages });
+            const replayWire = serializeProviderWire(replayMessages, providerID);
+            expect(replayWire).toBe(foldWire);
+
+            const markerLandedMessages = sourceMessages().filter(
+                (message) =>
+                    message.info.id === "retained-head-user" || message.info.id === "retained-user",
+            );
+            await transform({}, { messages: markerLandedMessages });
+            expect(serializeProviderWire(markerLandedMessages, providerID)).toBe(replayWire);
+            expect(getStrippedPlaceholderIds(db, sessionId)).toEqual(
+                new Set(["hidden-assistant-a", "hidden-assistant-b"]),
+            );
+            expect(db.prepare("SELECT count FROM stripped_placeholder_writes").get()).toEqual({
+                count: 0,
+            });
+
+            decision = "execute";
+            deferredHistoryRefreshSessions.add(sessionId);
+            deferredMaterializationSessions.add(sessionId);
+            const repeatedFoldMessages = sourceMessages();
+            await transform({}, { messages: repeatedFoldMessages });
+            expect(getTagsBySession(db, sessionId)).toHaveLength(tagsAfterFold.length);
+        });
+    }
+
+    it("keeps a tagged whitespace shell byte-identical after a marker-advance drain", async () => {
+        useTempDataHome("ctx-busting-marker-whitespace-shell-");
+        const sessionId = "ses-marker-whitespace-shell";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const deferredHistoryRefreshSessions = new Set<string>();
+        const deferredMaterializationSessions = new Set<string>();
+        let decision: "execute" | "defer" = "execute";
+        const sourceMessages = (includeBlank: boolean, includeTool: boolean): TestMessage[] => [
+            {
+                info: { id: "marker-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "marker boundary" }],
+            },
+            {
+                info: { id: "retained-head-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "retained head" }],
+            },
+            {
+                info: { id: "blank-owner", role: "assistant", sessionID: sessionId },
+                parts: [
+                    ...(includeBlank ? ([{ type: "text", text: " " }] as TestPart[]) : []),
+                    ...(includeTool
+                        ? ([
+                              {
+                                  type: "tool",
+                                  callID: "drained-tool",
+                                  state: { output: "old tool output", tool: "read" },
+                              },
+                          ] as TestPart[])
+                        : []),
+                ],
+            },
+            {
+                info: { id: "target-assistant", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "The static flag didn't take" }],
+            },
+            {
+                info: { id: "tail-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "continue" }],
+            },
+        ];
+        insertTag(db, sessionId, "blank-owner:p0", "message", 1, 16778, 0, null, 0, null, null, {
+            tokenCount: 0,
+            inputTokenCount: null,
+            reasoningTokenCount: null,
+        });
+        markWhitespaceAssistantTagInert(db, sessionId, 16778, "blank-owner:p0");
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: mock(() => decision) },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "anthropic", modelID: "anthropic-test-model" }],
+            ]),
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            deferredHistoryRefreshSessions,
+            deferredMaterializationSessions,
+            lastHeuristicsTurnId: new Map<string, string>(),
+            clearReasoningAge: 50,
+            protectedTokens: 0,
+        });
+
+        pendingMaterializationSessions.add(sessionId);
+        await transform({}, { messages: sourceMessages(true, true) });
+        expect(getTrailingBlankDecisions(db, sessionId).get("blank-owner")).toBe("strip");
+        const toolTag = getTagsBySession(db, sessionId).find(
+            (tag) => tag.type === "tool" && tag.messageId === "drained-tool",
+        );
+        expect(toolTag).toBeDefined();
+        // The token window always retains the newest three tool tags. Add three
+        // newer persisted arcs so this fixture's queued target is eligible to drain.
+        const newestTagNumber = Math.max(
+            ...getTagsBySession(db, sessionId).map((tag) => tag.tagNumber),
+        );
+        for (let offset = 1; offset <= 3; offset += 1) {
+            insertTag(
+                db,
+                sessionId,
+                `window-displacer-${offset}`,
+                "tool",
+                80_000,
+                newestTagNumber + offset,
+                0,
+                "read",
+                0,
+                `window-displacer-owner-${offset}`,
+                null,
+                { tokenCount: 20_000, inputTokenCount: 0, reasoningTokenCount: 0 },
+            );
+        }
+        queuePendingOp(db, sessionId, toolTag!.tagNumber, "drop");
+        replaceAllCompartmentState(
+            db,
+            sessionId,
+            [
+                {
+                    sequence: 1,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "marker-user",
+                    endMessageId: "marker-user",
+                    title: "advanced marker",
+                    content: "folded marker prefix",
+                },
+            ],
+            [],
+        );
+        deferredHistoryRefreshSessions.add(sessionId);
+        deferredMaterializationSessions.add(sessionId);
+
+        const foldMessages = sourceMessages(true, false);
+        await transform({}, { messages: foldMessages });
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        const foldAssistant = (
+            JSON.parse(serializeProviderWire(foldMessages, "anthropic")) as Array<{
+                role: string;
+                content: TestPart[];
+            }>
+        ).find((message) => JSON.stringify(message).includes("The static flag didn't take"));
+
+        decision = "defer";
+        const replayMessages = sourceMessages(false, false).slice(1);
+        await transform({}, { messages: replayMessages });
+        const replayAssistant = (
+            JSON.parse(serializeProviderWire(replayMessages, "anthropic")) as Array<{
+                role: string;
+                content: TestPart[];
+            }>
+        ).find((message) => JSON.stringify(message).includes("The static flag didn't take"));
+
+        expect(replayAssistant).toEqual(foldAssistant);
+    });
+
+    it("Astra xhigh -> high keeps the next defer pass byte-identical and pending", async () => {
+        useTempDataHome("ctx-astra-variant-defer-");
+        const sessionId = "ses-astra-variant-defer";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const lastHeuristicsTurnId = new Map<string, string>();
+        const liveModelBySession = new Map<string, { providerID: string; modelID: string }>();
+        const variantBySession = new Map<string, string | undefined>();
+        const shouldExecute = mock(() => "defer" as const);
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            liveModelBySession,
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+            clearReasoningAge: 50,
+            protectedTokens: 0,
+        });
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession,
+            variantBySession,
+            agentBySession: new Map<string, string>(),
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "xhigh",
+            model: { providerID: "openai-codex", modelID: "gpt-6-astra" },
+        });
+        await transform({}, { messages: buildSimpleMessages(sessionId) });
+        const beforeFlip = buildSimpleMessages(sessionId);
+        await transform({}, { messages: beforeFlip });
+        const beforeHash = createHash("sha256").update(JSON.stringify(beforeFlip)).digest("hex");
+        queuePendingOp(db, sessionId, 1, "drop");
+
+        await hook({
+            sessionID: sessionId,
+            variant: "high",
+            model: { providerID: "github-copilot", modelID: "gpt-6-astra" },
+        });
+        const afterFlip = buildSimpleMessages(sessionId);
+        await transform({}, { messages: afterFlip });
+        const afterHash = createHash("sha256").update(JSON.stringify(afterFlip)).digest("hex");
+
+        expect(afterHash).toBe(beforeHash);
+        expect(historyRefreshSessions.size).toBe(0);
+        expect(systemPromptRefreshSessions.size).toBe(0);
+        expect(pendingMaterializationSessions.size).toBe(0);
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
+        expect(shouldExecute).toHaveBeenCalled();
+    });
+
+    it("Fable 5.1 variant change keeps the next pass deferred and pending ops untouched", async () => {
+        useTempDataHome("ctx-fable-variant-defer-");
+        const sessionId = "ses-fable-variant-defer";
+        const db = openDatabase();
+        const historyRefreshSessions = new Set<string>();
+        const systemPromptRefreshSessions = new Set<string>();
+        const pendingMaterializationSessions = new Set<string>();
+        const lastHeuristicsTurnId = new Map<string, string>();
+        const liveModelBySession = new Map<string, { providerID: string; modelID: string }>();
+        const shouldExecute = mock(() => "defer" as const);
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 30, inputTokens: 30_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            liveModelBySession,
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+            clearReasoningAge: 50,
+            protectedTokens: 0,
+        });
+        await transform({}, { messages: buildSimpleMessages(sessionId) });
+        shouldExecute.mockClear();
+        queuePendingOp(db, sessionId, 1, "drop");
+
+        const hook = createChatMessageHook({
+            db,
+            liveModelBySession,
+            variantBySession: new Map<string, string | undefined>(),
+            agentBySession: new Map<string, string>(),
+            historyRefreshSessions,
+            systemPromptRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "high",
+            model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+        });
+        await hook({
+            sessionID: sessionId,
+            variant: "medium",
+            model: { providerID: "anthropic", modelID: "claude-fable-5-1" },
+        });
+
+        expect(historyRefreshSessions.size).toBe(0);
+        expect(systemPromptRefreshSessions.size).toBe(0);
+        expect(pendingMaterializationSessions.size).toBe(0);
+        const nextPass = buildSimpleMessages(sessionId);
+        await transform({}, { messages: nextPass });
+        expect(shouldExecute).toHaveBeenCalled();
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
+    });
+
     it("keeps ignored Desktop command output byte-stable across three quiet passes", async () => {
         useTempDataHome("ctx-stripped-command-output-");
         const sessionId = "ses-stripped-command-output";
@@ -538,7 +972,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions: new Set<string>(),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
@@ -567,7 +1001,22 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         const pendingMaterializationSessions = new Set<string>();
         const deferredMaterializationSessions = new Set<string>([sessionId]);
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
-        replaceAllCompartmentState(db, sessionId, [], []);
+        replaceAllCompartmentState(
+            db,
+            sessionId,
+            [
+                {
+                    sequence: 1,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "m-user",
+                    endMessageId: "m-user",
+                    title: "Published summary",
+                    content: "Published summary",
+                },
+            ],
+            [],
+        );
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -584,7 +1033,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
 
         await transform({}, { messages: buildSimpleMessages(sessionId) });
@@ -593,7 +1042,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         expect(deferredMaterializationSessions.has(sessionId)).toBe(false);
     });
 
-    it("Test 13: active low-context execute does not consume deferred state", async () => {
+    it("Test 13: active low-context execute consumes deferred state", async () => {
         useTempDataHome("ctx-busting-test13-");
         const sessionId = "ses-active-execute";
         const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
@@ -617,13 +1066,13 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
                 deferredMaterializationSessions,
                 lastHeuristicsTurnId: new Map<string, string>(),
                 clearReasoningAge: 50,
-                protectedTags: 1,
+                protectedTokens: 1,
                 client: testClient,
                 directory: testDirectory,
             });
             await transform({}, { messages: buildSimpleMessages(sessionId) });
-            expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
-            expect(deferredMaterializationSessions.has(sessionId)).toBe(true);
+            expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(false);
+            expect(deferredMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
             lift();
         }
@@ -650,7 +1099,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions: new Set<string>(),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(false);
@@ -679,7 +1128,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         expect(historyRefreshSessions.has(sessionId)).toBe(false);
@@ -688,7 +1137,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         expect(deferredMaterializationSessions.has(sessionId)).toBe(false);
     });
 
-    it("Test 16: explicit blocked refresh materializes next pass without another history signal", async () => {
+    it("Test 16: explicit refresh is delivered during historian overlap", async () => {
         useTempDataHome("ctx-busting-test16-");
         const sessionId = "ses-explicit-blocked";
         const db = openDatabase();
@@ -724,17 +1173,13 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
         const lift = blockCompartmentRun(sessionId);
         let passAText = "";
         try {
-            // Warm-up: materialize m[0] first so pass A is a SOFT pass (not a
-            // first_render HARD fold). A hard fold would correctly drain through
-            // the compartment veto via fold-exec — this test specifically covers
-            // the blocked-defer path on a NON-busting pass.
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             historyRefreshSessions.add(sessionId);
             pendingMaterializationSessions.add(sessionId);
@@ -742,7 +1187,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             await transform({}, { messages: passA });
             passAText = JSON.stringify(passA[0]);
             expect(historyRefreshSessions.has(sessionId)).toBe(false);
-            expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
             lift();
         }
@@ -774,7 +1219,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions: new Set<string>(),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
         const first = buildSimpleMessages(sessionId);
         await transform({}, { messages: first });
@@ -803,7 +1248,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions: mat,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
         await transform({}, { messages: buildSimpleMessages("B") });
         expect(set.has("A")).toBe(true);
@@ -841,14 +1286,14 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(false);
         expect(deferredMaterializationSessions.has(sessionId)).toBe(false);
     });
 
-    it("Test 21: blocked explicit refresh retries materialization without rebuild", async () => {
+    it("Test 21: explicit refresh does not need a retry after historian overlap", async () => {
         useTempDataHome("ctx-busting-test21-");
         const sessionId = "ses-test21";
         const historyRefreshSessions = new Set<string>();
@@ -884,16 +1329,12 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
             client: testClient,
             directory: testDirectory,
         });
 
         const lift = blockCompartmentRun(sessionId);
-        // Warm-up: materialize m[0] first so pass A is a SOFT pass (not a
-        // first_render HARD fold, which would correctly drain through the
-        // compartment veto via fold-exec). This test covers the blocked-defer
-        // retry path on a NON-busting pass.
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         historyRefreshSessions.add(sessionId);
         pendingMaterializationSessions.add(sessionId);
@@ -901,7 +1342,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         try {
             await transform({}, { messages: passA });
             expect(historyRefreshSessions.has(sessionId)).toBe(false);
-            expect(pendingMaterializationSessions.has(sessionId)).toBe(true);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
         } finally {
             lift();
         }
@@ -936,7 +1377,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             deferredMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
-            protectedTags: 1,
+            protectedTokens: 1,
         });
         await Promise.all([
             transform({}, { messages: buildSimpleMessages("A") }),
@@ -950,3 +1391,240 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
 
 // Reference unused imports to satisfy TS / silence linter:
 void getOrCreateSessionMeta;
+
+it.each([
+    "queued",
+    "age",
+])("published A and %s drops drain together during historian B; B then waits for execute", async (dropLane) => {
+    useTempDataHome("ctx-published-drain-");
+    const sessionId = "ses-published-drain";
+    const db = openDatabase();
+    let decision: "execute" | "defer" = "defer";
+    const deferredHistoryRefreshSessions = new Set<string>();
+    const deferredMaterializationSessions = new Set<string>();
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        scheduler: { shouldExecute: () => decision },
+        contextUsageMap: new Map([
+            [
+                sessionId,
+                { usage: { percentage: 75.02, inputTokens: 75020 }, updatedAt: Date.now() },
+            ],
+        ]),
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        deferredHistoryRefreshSessions,
+        deferredMaterializationSessions,
+        lastHeuristicsTurnId: new Map(),
+        clearReasoningAge: 100000,
+        protectedTokens: 1,
+        client: testClient,
+        directory: testDirectory,
+    });
+    const raw = (): TestMessage[] => [
+        ...buildSimpleMessages(sessionId),
+        {
+            info: { id: "next-history", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "next history" }],
+        },
+        {
+            info: { id: "old-tool", role: "assistant" },
+            parts: [
+                {
+                    type: "tool",
+                    callID: "old-call",
+                    state: { tool: "read", output: "old payload ".repeat(200) },
+                },
+            ],
+        },
+        {
+            info: { id: "latest-user", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "continue" }],
+        },
+    ];
+    const publish = (sequence: number, title: string) => {
+        appendCompartments(db, sessionId, [
+            {
+                sequence,
+                startMessage: sequence,
+                endMessage: sequence,
+                startMessageId: ["m-user", "m-assistant", "next-history"][sequence - 1]!,
+                endMessageId: ["m-user", "m-assistant", "next-history"][sequence - 1]!,
+                title,
+                content: title,
+            },
+        ]);
+        deferredHistoryRefreshSessions.add(sessionId);
+        deferredMaterializationSessions.add(sessionId);
+    };
+    publish(1, "BASELINE");
+    await transform({}, { messages: raw() });
+    publish(2, "PUBLISHED_A");
+    const tag = getTagsBySession(db, sessionId).find((t) => t.messageId === "old-call");
+    expect(tag).toBeDefined();
+    for (let offset = 1; offset <= 3; offset++) {
+        insertTag(
+            db,
+            sessionId,
+            `newer-${offset}`,
+            "tool",
+            80000,
+            tag!.tagNumber + 100 + offset,
+            0,
+            "read",
+            0,
+            `newer-owner-${offset}`,
+            null,
+            { tokenCount: 20000, inputTokenCount: 0, reasoningTokenCount: 0 },
+        );
+    }
+    if (dropLane === "queued") queuePendingOp(db, sessionId, tag!.tagNumber, "drop");
+    advanceToolReclaimWatermark(db, sessionId, tag!.tagNumber);
+    const lift = blockCompartmentRun(sessionId);
+    try {
+        decision = "execute";
+        const passN = raw();
+        await transform({}, { messages: passN });
+        expect(JSON.stringify(passN.slice(0, 2))).toContain("PUBLISHED_A");
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        expect(JSON.stringify(passN)).not.toContain("old payload");
+        lift();
+        await Promise.resolve();
+        publish(3, "PUBLISHED_B");
+        decision = "defer";
+        const replay = raw();
+        await transform({}, { messages: replay });
+        expect(JSON.stringify(replay)).toBe(JSON.stringify(passN));
+        expect(JSON.stringify(replay)).not.toContain("PUBLISHED_B");
+        decision = "execute";
+        const nextBust = raw();
+        await transform({}, { messages: nextBust });
+        expect(JSON.stringify(nextBust.slice(0, 2))).toContain("PUBLISHED_B");
+    } finally {
+        lift();
+    }
+});
+
+it("contention replays the complete transform including the persisted raw boundary", async () => {
+    useTempDataHome("ctx-whole-pass-contention-");
+    const sessionId = "ses-whole-pass-contention";
+    const db = openDatabase();
+    appendCompartments(db, sessionId, [
+        {
+            sequence: 1,
+            startMessage: 1,
+            endMessage: 1,
+            startMessageId: "m-user",
+            endMessageId: "m-user",
+            title: "BASELINE",
+            content: "BASELINE",
+        },
+    ]);
+    let decision: "execute" | "defer" = "defer";
+    const deferredHistoryRefreshSessions = new Set<string>();
+    const deferredMaterializationSessions = new Set<string>();
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        scheduler: { shouldExecute: () => decision },
+        contextUsageMap: new Map([
+            [sessionId, { usage: { percentage: 75, inputTokens: 75000 }, updatedAt: Date.now() }],
+        ]),
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: new Set(),
+        deferredHistoryRefreshSessions,
+        deferredMaterializationSessions,
+        lastHeuristicsTurnId: new Map(),
+        clearReasoningAge: 100000,
+        protectedTokens: 1,
+        client: testClient,
+        directory: testDirectory,
+    });
+    const raw = (): TestMessage[] => [
+        ...buildSimpleMessages(sessionId),
+        {
+            info: { id: "old-tool", role: "assistant" },
+            parts: [
+                {
+                    type: "tool",
+                    callID: "old-call",
+                    state: { tool: "read", output: "old output ".repeat(200) },
+                },
+            ],
+        },
+        {
+            info: { id: "latest-user", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "continue" }],
+        },
+    ];
+    const baseline = raw();
+    await transform({}, { messages: baseline });
+    const frozen = JSON.stringify(baseline);
+    const tool = getTagsBySession(db, sessionId).find((t) => t.messageId === "old-call")!;
+    for (let n = 1; n <= 3; n++)
+        insertTag(
+            db,
+            sessionId,
+            `pad-${n}`,
+            "tool",
+            80000,
+            tool.tagNumber + 100 + n,
+            0,
+            "read",
+            0,
+            `pad-owner-${n}`,
+            null,
+            { tokenCount: 20000, inputTokenCount: 0, reasoningTokenCount: 0 },
+        );
+    advanceToolReclaimWatermark(db, sessionId, tool.tagNumber);
+    appendCompartments(db, sessionId, [
+        {
+            sequence: 2,
+            startMessage: 2,
+            endMessage: 2,
+            startMessageId: "m-assistant",
+            endMessageId: "m-assistant",
+            title: "PUBLISHED_A",
+            content: "PUBLISHED_A",
+        },
+    ]);
+    deferredHistoryRefreshSessions.add(sessionId);
+    deferredMaterializationSessions.add(sessionId);
+    let contend = true;
+    const original = prefixRenderer.injectM0M1;
+    const injection = spyOn(prefixRenderer, "injectM0M1").mockImplementation((options) => {
+        if (contend && !options.preparedPrefix) options.state.cachedM1Bytes = null;
+        return original({
+            ...options,
+            beforePhase3ForTest:
+                contend && !options.messages
+                    ? () => {
+                          queueM0Mutation(db, { sessionId, mutationType: "compartment_merge" });
+                      }
+                    : undefined,
+        });
+    });
+    const lift = blockCompartmentRun(sessionId);
+    try {
+        decision = "execute";
+        for (let pass = 0; pass < 2; pass++) {
+            const messages = raw();
+            await transform({}, { messages });
+            expect(JSON.stringify(messages)).toBe(frozen);
+            expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
+        }
+        contend = false;
+        const delivered = raw();
+        await transform({}, { messages: delivered });
+        expect(JSON.stringify(delivered.slice(0, 2))).toContain("PUBLISHED_A");
+        expect(JSON.stringify(delivered)).not.toContain("old output");
+        decision = "defer";
+        const replay = raw();
+        await transform({}, { messages: replay });
+        expect(JSON.stringify(replay)).toBe(JSON.stringify(delivered));
+    } finally {
+        injection.mockRestore();
+        lift();
+    }
+});

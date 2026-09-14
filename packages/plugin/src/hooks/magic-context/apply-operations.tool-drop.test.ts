@@ -27,7 +27,8 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 afterEach(() => {
     closeDatabase();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs) {
         try {
             rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -104,7 +105,7 @@ describe("apply operations for tool drops", () => {
         padSkeletonWindow(db, toolTagId!);
 
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
         expect(didMutate).toBe(true);
@@ -136,7 +137,7 @@ describe("apply operations for tool drops", () => {
         // No padding: the tool is within the newest-20 window, so the agent
         // drop keeps the structural skeleton (anti-hallucination anchor).
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
         expect(didMutate).toBe(true);
@@ -180,7 +181,7 @@ describe("apply operations for tool drops", () => {
 
         const { targets } = tagMessages("ses-1", messages, tagger, db);
         queuePendingOp(db, "ses-1", 7, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
 
         // Open arc: the drop is deferred (not applied), the pending op stays
         // queued, the tag stays active, and the LIVE task part is byte-identical
@@ -225,7 +226,7 @@ describe("apply operations for tool drops", () => {
 
         // Within the skeleton window → truncate (skeleton) path, as before.
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
         // No reclaim regression: the completed arc still clamps.
@@ -238,7 +239,7 @@ describe("apply operations for tool drops", () => {
         };
         expect(wire).not.toBe(taskPart);
         expect(wire.state.output).toBe(`[dropped \u00a7${toolTagId}\u00a7]`);
-        expect(wire.state.input.prompt).toBe("Inves...[truncated]");
+        expect(wire.state.input).toEqual({ dropped: `[dropped §${toolTagId}§]` });
 
         // ...but the LIVE object OpenCode still holds is byte-identical (the long
         // prompt is intact), so a background child spawning from it is unharmed.
@@ -282,7 +283,7 @@ describe("apply operations for tool drops", () => {
             "ses-1",
             db,
             targets,
-            0,
+            new Set(),
             undefined,
             [],
             [{ id: 0, sessionId: "ses-1", tagId: tagId!, operation: "drop", queuedAt: 0 }],
@@ -353,7 +354,7 @@ describe("apply operations for tool drops", () => {
         const { targets } = tagMessages("ses-1", messages, tagger, db);
         queuePendingOp(db, "ses-1", 7, "drop");
 
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
 
         expect(didMutate).toBe(false);
         expect(hasCall(messages, "call-orphan")).toBe(true);
@@ -393,7 +394,7 @@ describe("apply operations for tool drops", () => {
         expect(messageTagId).toBeDefined();
 
         queuePendingOp(db, "ses-1", messageTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets, 2);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set([4, 5]));
 
         expect(didMutate).toBe(false);
         expect(getPendingOps(db, "ses-1")).toHaveLength(1);
@@ -441,7 +442,7 @@ describe("apply operations for tool drops", () => {
         expect(messageTagId).toBeDefined();
 
         queuePendingOp(db, "ses-1", messageTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets, 2);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set([6, 7]));
 
         expect(didMutate).toBe(true);
         expect(getPendingOps(db, "ses-1")).toHaveLength(0);
@@ -461,7 +462,7 @@ describe("apply operations for tool drops", () => {
         const { targets } = tagMessages("ses-1", messages, tagger, db);
         queuePendingOp(db, "ses-1", 8, "drop");
 
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
 
         expect(didMutate).toBe(false);
         expect(getPendingOps(db, "ses-1")).toHaveLength(0);
@@ -569,7 +570,7 @@ describe("apply operations for tool drops", () => {
         padSkeletonWindow(db, toolTagId!);
 
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
         expect(didMutate).toBe(true);
@@ -607,7 +608,7 @@ describe("apply operations for tool drops", () => {
         padSkeletonWindow(db, toolTagId!);
 
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
         expect(didMutate).toBe(true);
@@ -638,7 +639,7 @@ describe("apply operations for tool drops", () => {
         queuePendingOp(db, "ses-1", messageTagId!, "drop");
         updateTagStatus(db, "ses-1", messageTagId!, "compacted");
 
-        const didMutate = applyPendingOperations("ses-1", db, targets);
+        const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
         expect(didMutate).toBe(false);
@@ -669,7 +670,7 @@ describe("apply operations for tool drops", () => {
             expect(userMsgTagId).toBeDefined();
 
             queuePendingOp(db, "ses-1", userMsgTagId!, "drop");
-            const didMutate = applyPendingOperations("ses-1", db, targets);
+            const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
 
             expect(didMutate).toBe(true);
             expect(getTagById(db, "ses-1", userMsgTagId!)?.status).toBe("dropped");
@@ -734,7 +735,7 @@ describe("apply operations for tool drops", () => {
             expect(asstMsgTagId).toBeDefined();
 
             queuePendingOp(db, "ses-1", asstMsgTagId!, "drop");
-            const didMutate = applyPendingOperations("ses-1", db, targets);
+            const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
 
             expect(didMutate).toBe(true);
             expect(messages[1]?.parts).toEqual([
@@ -761,7 +762,7 @@ describe("apply operations for tool drops", () => {
             const { targets } = tagMessages("ses-1", messages, tagger, db);
             const userMsgTagId = tagger.getTag("ses-1", "m-user:p0", "message");
             queuePendingOp(db, "ses-1", userMsgTagId!, "drop");
-            applyPendingOperations("ses-1", db, targets);
+            applyPendingOperations("ses-1", db, targets, new Set());
 
             const text = (messages[0]?.parts[0] as { text: string }).text;
             expect(text).toBe(`[dropped §${userMsgTagId}§]`);

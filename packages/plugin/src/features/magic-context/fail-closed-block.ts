@@ -88,11 +88,7 @@ const OPENCODE_INTERNAL_AGENT_NAMES = new Set(["title", "summary", "compaction"]
  * session is blocked — otherwise recovery work and background maintenance stall.
  */
 function isMagicContextHiddenAgentName(agent: string): boolean {
-    if (
-        agent === "sidekick" ||
-        agent === "smart-note-compiler" ||
-        agent.startsWith("smart-note-")
-    ) {
+    if (agent === "smart-note-compiler" || agent.startsWith("smart-note-")) {
         return true;
     }
     if (agent === "historian" || agent.startsWith("historian-")) return true;
@@ -225,8 +221,8 @@ export function formatFailClosedBlockingMessage(reason: FailClosedReason): strin
             ].join(" ");
         }
         return [
-            `Magic Context cannot migrate the shared database because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
-            "Restart the blocking process (it will pick up the new build and migrate on start), or shut it down and retry.",
+            `Magic Context cannot migrate the shared database (one database serves every project on this machine) because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
+            "Restart the blocking process — even one from a different project — and it will pick up the new build and migrate on start; or shut it down and retry.",
             `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
         ].join(" ");
     }

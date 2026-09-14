@@ -27,9 +27,16 @@ export interface PromotedMemoryRef {
     content: string;
 }
 
+export interface PromoteSessionFactsDurableResult {
+    /** Newly inserted memories that still need embedding. */
+    newMemoryRefs: PromotedMemoryRef[];
+    /** Valid promotable facts that inserted a row or updated an existing row. */
+    factsPromoted: number;
+}
+
 function isPromotableCategory(
     category: string,
-    domain: MemoryDomain,
+    domain: MemoryDomain = "coding-project",
 ): category is MemoryCategory {
     // INTERACTION_EPISODE is a durable category only in the explicit ongoing
     // interaction domain. Keep the coding-project allowlist unchanged rather
@@ -59,8 +66,9 @@ export function promoteSessionFactsDurable(
     projectPath: string,
     facts: SessionFact[],
     domain: MemoryDomain = "coding-project",
-): PromotedMemoryRef[] {
-    const refs: PromotedMemoryRef[] = [];
+): PromoteSessionFactsDurableResult {
+    const newMemoryRefs: PromotedMemoryRef[] = [];
+    let factsPromoted = 0;
     for (const fact of facts) {
         if (
             !fact ||
@@ -90,6 +98,7 @@ export function promoteSessionFactsDurable(
 
         if (existingMemory) {
             updateMemorySeenCount(db, existingMemory.id);
+            factsPromoted += 1;
             continue;
         }
 
@@ -116,10 +125,11 @@ export function promoteSessionFactsDurable(
         };
 
         const memory = insertMemory(db, memoryInput);
-        refs.push({ memoryId: memory.id, content: memory.content });
+        newMemoryRefs.push({ memoryId: memory.id, content: memory.content });
+        factsPromoted += 1;
     }
 
-    return refs;
+    return { newMemoryRefs, factsPromoted };
 }
 
 /**

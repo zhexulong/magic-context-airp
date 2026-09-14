@@ -1,9 +1,10 @@
-import { describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase } from "../features/magic-context/storage";
-import { startDreamScheduleTimer } from "./dream-timer";
+import { recordSessionProjectIdentity } from "../features/magic-context/session-project-storage";
+import { markSessionCleanupPending, openDatabase } from "../features/magic-context/storage";
+import { _resetDreamTimerForTests, startDreamScheduleTimer } from "./dream-timer";
 
 /**
  * Regression coverage for the schema-fence / null-DB crash:
@@ -45,6 +46,9 @@ describe("schema-fence null-DB contract", () => {
 });
 
 describe("dream-timer registration cleanup", () => {
+    afterEach(() => {
+        _resetDreamTimerForTests();
+    });
     test("stale same-directory cleanup preserves the replacement registration", async () => {
         const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-cleanup-"));
         const timerHandle = {
@@ -80,6 +84,66 @@ describe("dream-timer registration cleanup", () => {
             cleanupReplacement?.();
             setIntervalSpy.mockRestore();
             clearIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    test("picks up a durable Rust deletion from the cold-boot startup tick", async () => {
+        const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-rust-delete-"));
+        const timerHandle = {
+            unref: mock(() => {}),
+        } as unknown as ReturnType<typeof setInterval>;
+        const timeoutHandle = {
+            unref: mock(() => {}),
+        } as unknown as ReturnType<typeof setTimeout>;
+        let startupCallback: (() => void) | undefined;
+        const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+            callback: () => void,
+        ) => {
+            startupCallback ??= callback;
+            return timeoutHandle;
+        }) as typeof setTimeout);
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(
+            (() => timerHandle) as typeof setInterval,
+        );
+        const deleteSession = mock(async () => {});
+        const closeSession = mock(() => {});
+        const projectIdentity = "git:dream-timer-rust-delete";
+        const sessionId = "ses-dream-timer-rust-delete";
+        const db = openDatabase();
+        if (!db) throw new Error("test database unavailable");
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        markSessionCleanupPending(db, sessionId, true);
+        let cleanup: (() => void) | undefined;
+
+        try {
+            cleanup = await startDreamScheduleTimer({
+                directory,
+                projectIdentity,
+                harness: "opencode",
+                client: {} as never,
+                ensureRegistered: async () => undefined,
+                sessionCleanupModuleClient: { deleteSession, closeSession },
+            });
+            startupCallback?.();
+            const pendingCount = () =>
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM pending_session_cleanup WHERE session_id = ?",
+                    )
+                    .get(sessionId) as { count: number };
+            for (let attempt = 0; attempt < 100; attempt += 1) {
+                if (pendingCount().count === 0) break;
+                await Promise.resolve();
+            }
+
+            expect(deleteSession).toHaveBeenCalledWith(sessionId, directory);
+            expect(closeSession).toHaveBeenCalledWith(sessionId);
+            expect(pendingCount()).toEqual({ count: 0 });
+        } finally {
+            cleanup?.();
+            setTimeoutSpy.mockRestore();
+            setIntervalSpy.mockRestore();
             rmSync(directory, { recursive: true, force: true });
         }
     });
@@ -193,21 +257,17 @@ describe("dream-timer null-DB guards (static)", () => {
 });
 
 describe("dream-timer startup is fail-open at the index.ts call site (static)", () => {
-    // The awaited startDreamScheduleTimer(...) in index.ts runs BEFORE the hooks
-    // are returned from server(). If it throws, the transform/compaction pipeline
-    // never registers and every session's context balloons. The call must be
-    // wrapped so any throw is logged and swallowed.
+    // Startup must not await optional timer registration. Its promise still needs
+    // a rejection handler so a late timer failure remains visible and contained.
     const indexSource = readFileSync(join(import.meta.dir, "../index.ts"), "utf8");
 
-    test("await startDreamScheduleTimer is wrapped in try/catch", () => {
-        const callIdx = indexSource.indexOf("await startDreamScheduleTimer(");
+    test("starts registration fire-and-forget and observes late rejection", () => {
+        const callIdx = indexSource.indexOf("void startDreamScheduleTimer(");
         expect(callIdx).toBeGreaterThan(0);
-        // The 200 chars before the call must contain a `try {`, and the call must
-        // be followed (within a small window) by a `catch`.
-        const before = indexSource.slice(Math.max(0, callIdx - 200), callIdx);
-        const after = indexSource.slice(callIdx, callIdx + 300);
-        expect(before).toContain("try {");
-        expect(after).toContain("catch");
+        expect(indexSource).not.toContain("await startDreamScheduleTimer(");
+        const after = indexSource.slice(callIdx, callIdx + 500);
+        expect(after).toContain(".catch((err)");
+        expect(after).toContain("continuing without it");
     });
 });
 
@@ -225,16 +285,18 @@ describe("dream-timer message-history maintenance (static)", () => {
     });
 });
 
-describe("dream-timer historian child maintenance (static)", () => {
+describe("dream-timer internal child maintenance (static)", () => {
     const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
 
-    test("runs the historian sweep before the dreamer-enabled guard", () => {
-        const historianSweep = source.indexOf("sweepOrphanedHistorianChildren(reg)");
+    test("runs the shared historian/privacy sweep before the dreamer-enabled guard", () => {
+        const internalSweep = source.indexOf("await sweepOrphanedInternalChildren(");
         const dreamerGuard = source.indexOf("if (!dreamingEnabled || !dreamerConfig)");
 
-        expect(historianSweep).toBeGreaterThan(0);
-        expect(dreamerGuard).toBeGreaterThan(historianSweep);
+        expect(internalSweep).toBeGreaterThan(0);
+        expect(dreamerGuard).toBeGreaterThan(internalSweep);
         expect(source).toContain("reg.historianChildSweep !== undefined");
+        expect(source).toContain("privacy: retrospectiveOrphanStaleMs(privacyTimeoutMinutes)");
+        expect(source).toContain("historian: historianOrphanStaleMs");
     });
 });
 

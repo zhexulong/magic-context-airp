@@ -12,6 +12,7 @@ import {
     existsSync,
     mkdirSync,
     readFileSync,
+    readdirSync,
     realpathSync,
     statSync,
     writeFileSync,
@@ -19,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { prepareContextDatabase } from "../prepare-context-db";
+import { assertMockEndpoint, assertMockProviders, pinMockAgents } from "../mock-routing";
 import {
     buildHermeticBinaries,
     detectRustModePrereqs,
@@ -26,17 +28,30 @@ import {
 } from "../rust-runner/hermetic-subc";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-// Prefer the bundled `dist/index.js` (what published users actually run)
-// over raw `src/index.ts`. The bundled file is one ~5MB file with all imports
-// inlined; loading it is fast even on cold runners. The TS-source path
-// triggers Bun's runtime TS transpile + dynamic resolution across hundreds
-// of submodule imports — on slow Linux CI runners this can take long enough
-// to make `opencode serve` appear hung when it's just blocked in plugin
-// load. Production never loads from src/, so testing src/ doesn't reflect
-// reality and exposes us to a slowness path users never see.
+const PLUGIN_SRC_ROOT = join(REPO_ROOT, "packages/plugin/src");
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
-const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
-const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
+const PLUGIN_SRC_ENTRY = join(PLUGIN_SRC_ROOT, "index.ts");
+
+function newestSourceMtime(directory: string): number {
+    let newest = 0;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const path = join(directory, entry.name);
+        newest = Math.max(
+            newest,
+            entry.isDirectory() ? newestSourceMtime(path) : statSync(path).mtimeMs,
+        );
+    }
+    return newest;
+}
+
+// A fresh bundle is the closest production representation and avoids slow source
+// loading on CI. Ignored dist files can survive a local checkout, though, so never
+// let an older bundle silently test different code from the current source tree.
+const PLUGIN_ENTRY =
+    existsSync(PLUGIN_DIST_ENTRY) &&
+    statSync(PLUGIN_DIST_ENTRY).mtimeMs >= newestSourceMtime(PLUGIN_SRC_ROOT)
+        ? PLUGIN_DIST_ENTRY
+        : PLUGIN_SRC_ENTRY;
 
 export interface IsolatedEnv {
     configDir: string;
@@ -59,6 +74,12 @@ export interface SpawnedOpencode {
 export interface SpawnOptions {
     /** URL of the mock Anthropic server, e.g. "http://127.0.0.1:12345" */
     mockProviderURL: string;
+    /** Provider id registered for the mock. Defaults to "mock-anthropic". */
+    mockProviderID?: string;
+    /** AI SDK provider package used by the mock. Defaults to "@ai-sdk/anthropic". */
+    mockProviderAPI?: "@ai-sdk/anthropic" | "@ai-sdk/openai";
+    /** Model id exposed by the mock provider. Defaults to "mock-sonnet". */
+    mockModelID?: string;
     /** Port for opencode serve. Default: random available */
     port?: number;
     /** magic-context.jsonc overrides. Defaults keep most features on. */
@@ -70,7 +91,7 @@ export interface SpawnOptions {
     /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
     prepareContextDatabase?: boolean;
     /** Expected Magic Context state after startup; readiness waits for this state. Defaults to enabled. */
-    expectedMagicContextState?: "enabled" | "conflict-disabled";
+    expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
     /**
      * Reuse a pre-created isolated env instead of allocating a fresh one. The
      * Rust-mode harness creates the env first so a hermetic subc daemon can
@@ -233,9 +254,8 @@ export function createIsolatedEnv(): IsolatedEnv {
 /**
  * Write opencode.json + magic-context.jsonc + tui.json into config/workdir.
  *
- * - opencode.json: registers our plugin via file:// spec, defines a mock-anthropic
- *   provider and a mock model, sets provider.mock-anthropic.options.baseURL to the
- *   mock server's URL.
+ * - opencode.json: registers our plugin via file:// spec and defines a configurable
+ *   mock provider/model whose baseURL points to the local mock server.
  * - magic-context.jsonc: starts with small thresholds so tests trigger historian
  *   deterministically with modest scripted token counts.
  */
@@ -245,6 +265,35 @@ function writeConfigs(
     opts: SpawnOptions,
 ): void {
     const pluginSpec = `file://${PLUGIN_ENTRY}`;
+    const mockProviderID = opts.mockProviderID ?? "mock-anthropic";
+    const mockProviderAPI = opts.mockProviderAPI ?? "@ai-sdk/anthropic";
+    const mockModelID = opts.mockModelID ?? "mock-sonnet";
+    const providerConfig = (
+        api: "@ai-sdk/anthropic" | "@ai-sdk/openai",
+        modelID: string,
+    ): Record<string, unknown> => ({
+        api,
+        name: api === "@ai-sdk/openai" ? "Mock OpenAI Responses" : "Mock Anthropic",
+        npm: api,
+        env: [],
+        options: {
+            apiKey: "test-key-not-real",
+            baseURL: mockProviderURL,
+        },
+        models: {
+            [modelID]: {
+                id: modelID,
+                name: `Mock ${modelID}`,
+                cost: { input: 0, output: 0 },
+                limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
+                modalities: {
+                    input: ["text", "image", "pdf"],
+                    output: ["text"],
+                },
+                options: {},
+            },
+        },
+    });
 
     const opencodeConfig: Record<string, unknown> = {
         $schema: "https://opencode.ai/config.json",
@@ -256,36 +305,29 @@ function writeConfigs(
         // detector disables itself and the plugin becomes a no-op.
         compaction: { auto: false, prune: false },
         provider: {
-            "mock-anthropic": {
-                api: "@ai-sdk/anthropic",
-                name: "Mock Anthropic",
-                npm: "@ai-sdk/anthropic",
-                env: [],
-                options: {
-                    apiKey: "test-key-not-real",
-                    baseURL: mockProviderURL,
-                },
-                models: {
-                    "mock-sonnet": {
-                        id: "mock-sonnet",
-                        name: "Mock Sonnet",
-                        cost: { input: 0, output: 0 },
-                        limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
-                        // Advertise image + pdf input support so OpenCode does
-                        // not substitute inline file parts with "this model
-                        // does not support X input" text messages. Matches the
-                        // real Sonnet capabilities this mock is standing in for.
-                        modalities: {
-                            input: ["text", "image", "pdf"],
-                            output: ["text"],
-                        },
-                        options: {},
-                    },
-                },
-            },
+            [mockProviderID]: providerConfig(mockProviderAPI, mockModelID),
+            ...(mockProviderAPI === "@ai-sdk/openai"
+                ? {
+                      "mock-anthropic-setup": providerConfig(
+                          "@ai-sdk/anthropic",
+                          "mock-sonnet",
+                      ),
+                  }
+                : {}),
         },
         ...(opts.openCodeConfigExtra ?? {}),
     };
+
+    const registeredProviders = opencodeConfig.provider as Record<string, { options?: { baseURL?: string } }>;
+    assertMockEndpoint(registeredProviders[mockProviderID]?.options?.baseURL, mockProviderURL);
+    for (const provider of Object.values(registeredProviders)) {
+        assertMockEndpoint(provider.options?.baseURL, mockProviderURL);
+    }
+    // Prevent environment credentials and the built-in catalog from enabling
+    // providers absent from the fixture, including automatic small-model calls.
+    opencodeConfig.enabled_providers = Object.keys(registeredProviders);
+    opencodeConfig.model = `${mockProviderID}/${mockModelID}`;
+    opencodeConfig.small_model = `${mockProviderID}/${mockModelID}`;
 
     // magic-context defaults tuned for fast triggering in tests. This is the
     // USER-tier config: thresholds live here because project-tier thresholds are
@@ -300,14 +342,16 @@ function writeConfigs(
         execute_threshold_percentage: 40,
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
-        sidekick: { disable: true },
-        ...(opts.magicContextConfig ?? {}),
+        ...pinMockAgents(opts.magicContextConfig, `${mockProviderID}/${mockModelID}`),
     };
     if (opts.userSubcConnectionFile) {
         magicContext.subc = { connection_file: opts.userSubcConnectionFile };
     }
 
     writeFileSync(join(env.configDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
+    if (process.env.MC_E2E_TRACE_PROVIDER === "1") {
+        console.error(`[mock-config] ${JSON.stringify({ configDir: env.configDir, mockProviderURL, opencodeConfig, magicContext })}`);
+    }
 
     // The plugin's loadPluginConfig() looks for magic-context.jsonc under
     // ${XDG_CONFIG_HOME}/opencode/magic-context.jsonc (user config) or
@@ -350,9 +394,11 @@ function writeConfigs(
 }
 
 export interface ReadinessOptions {
-    expectedMagicContextState?: "enabled" | "conflict-disabled";
+    expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
     pluginLogPath?: string;
     pluginLogStartOffset?: number;
+    mockProviderID?: string;
+    mockModelID?: string;
 }
 
 const CONFLICT_DISABLE_VERDICT = "[magic-context] disabled due to conflicts:";
@@ -400,6 +446,8 @@ export async function waitForReady(
     const deadline = Date.now() + timeoutMs;
     const FETCH_TIMEOUT_MS = 2_000;
     const expectedMagicContextState = options.expectedMagicContextState ?? "enabled";
+    const mockProviderID = options.mockProviderID ?? "mock-anthropic";
+    const mockModelID = options.mockModelID ?? "mock-sonnet";
     if (expectedMagicContextState === "conflict-disabled" && !options.pluginLogPath) {
         throw new Error("conflict-disabled readiness requires a plugin log path");
     }
@@ -469,7 +517,7 @@ export async function waitForReady(
                 throw new Error("Magic Context conflict-disable verdict is not ready");
             }
         });
-    } else {
+    } else if (expectedMagicContextState === "enabled") {
         await waitForStage("magicContext", async () => {
             const toolIds = await fetchJson(toolsUrl, "plugin tools");
             if (!Array.isArray(toolIds) || !toolIds.includes("ctx_search")) {
@@ -489,15 +537,15 @@ export async function waitForReady(
                   (provider) =>
                       provider &&
                       typeof provider === "object" &&
-                      (provider as { id?: unknown }).id === "mock-anthropic",
+                      (provider as { id?: unknown }).id === mockProviderID,
               )
             : null;
         const models =
             mockProvider && typeof mockProvider === "object"
                 ? (mockProvider as { models?: unknown }).models
                 : null;
-        if (!models || typeof models !== "object" || !("mock-sonnet" in models)) {
-            throw new Error("mock-anthropic/mock-sonnet provider config is not ready");
+        if (!models || typeof models !== "object" || !(mockModelID in models)) {
+            throw new Error(`${mockProviderID}/${mockModelID} provider config is not ready`);
         }
     });
 }
@@ -576,6 +624,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         if (key === "OPENCODE_SERVER_PASSWORD") continue;
         if (key === "OPENCODE_SERVER_USERNAME") continue;
         if (key === "NODE_ENV") continue;
+        // Plugin unit-test preload sets this so bare openDatabase() cannot touch
+        // the developer's real DB. The OpenCode child must use the harness data
+        // dir instead; leaking the preload path makes the plugin look at a
+        // throwaway tree that is not the isolated session under test.
+        if (key === "MAGIC_CONTEXT_TEST_DATA_DIR") continue;
         // Strip any inherited subc supervised-launch identity. When the test
         // process is itself launched under a subc supervisor (e.g. an AFT/Alfonso
         // worktree sets SUBC_MODULE_ID=aft), the plugin's Rust module client would
@@ -672,7 +725,16 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
             expectedMagicContextState: resolvedOpts.expectedMagicContextState,
             pluginLogPath,
             pluginLogStartOffset,
+            mockProviderID: resolvedOpts.mockProviderID,
+            mockModelID: resolvedOpts.mockModelID,
         });
+        const providers = await fetch(`${url}/config/providers`).then((response) => response.json());
+        assertMockProviders(providers, resolvedOpts.mockProviderURL);
+        if (process.env.MC_E2E_TRACE_PROVIDER === "1") {
+            const endpoints = (providers as { providers: Array<{ id: string; options?: { baseURL?: string } }> }).providers
+                .map((provider) => ({ id: provider.id, baseURL: provider.options?.baseURL }));
+            console.error(`[mock-effective-providers] ${JSON.stringify({ url, endpoints })}`);
+        }
     } catch (err) {
         // Surface captured output on boot failure to help debugging.
         child.kill("SIGTERM");

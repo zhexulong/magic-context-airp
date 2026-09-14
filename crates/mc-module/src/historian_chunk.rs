@@ -14,7 +14,9 @@ use serde_json::Value;
 
 use crate::boundary::BoundaryResolution;
 use crate::ck_wire::{CkIngressMessage, CkKind, FlatBlock};
-use crate::historian::{compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest};
+use crate::historian::{
+    compute_chunk_fingerprint, ChunkSnapshotItem, HistorianFireRequest, HistorianNoFireCause,
+};
 use crate::historian_prompt::{
     build_compartment_agent_prompt, build_reference_blocks_from_stored,
     render_historian_memory_block, CompartmentPromptInputs,
@@ -100,6 +102,7 @@ struct Builder {
     commit_cluster_count: usize,
     last_flushed_role: String,
     tool_call_summaries: HashMap<String, String>,
+    completed_tool_arcs: Vec<MessageRange>,
 }
 
 impl Builder {
@@ -107,6 +110,7 @@ impl Builder {
         budget: usize,
         start_ordinal: u64,
         tool_call_summaries: HashMap<String, String>,
+        completed_tool_arcs: Vec<MessageRange>,
     ) -> Self {
         Self {
             budget,
@@ -121,6 +125,7 @@ impl Builder {
             commit_cluster_count: 0,
             last_flushed_role: String::new(),
             tool_call_summaries,
+            completed_tool_arcs,
         }
     }
 
@@ -273,8 +278,17 @@ impl Builder {
         };
         let block_tokens = estimate_tokens(&block_text) + separator_tokens;
         if self.total_tokens + block_tokens > self.budget && self.total_tokens > 0 {
-            self.current_block = Some(block);
-            return false;
+            // A result can share a user message with large steering text. If the
+            // emitted prefix contains its invocation, include that result before
+            // stopping between formatted blocks, even when that exceeds the budget.
+            let splits_completed_arc = self
+                .completed_tool_arcs
+                .iter()
+                .any(|arc| arc.start <= self.last_ordinal && arc.end > self.last_ordinal);
+            if !splits_completed_arc {
+                self.current_block = Some(block);
+                return false;
+            }
         }
         if block.role == "A" && !block.commit_hashes.is_empty() && self.last_flushed_role != "A" {
             self.commit_cluster_count += 1;
@@ -375,7 +389,12 @@ pub fn build_historian_chunk(
         .min()
         .unwrap_or(start_ordinal);
     let tool_call_summaries = build_tool_call_summary_lookup(blocks);
-    let mut builder = Builder::new(token_budget, start, tool_call_summaries);
+    let mut builder = Builder::new(
+        token_budget,
+        start,
+        tool_call_summaries,
+        completed_tool_arc_ranges(blocks),
+    );
     let blocks_by_mid = grouped_blocks_by_mid(blocks);
     let mut highest_scanned_ordinal = end_placeholder(start);
     for message in messages.iter().filter(|message| !message.ck.meta.synthetic) {
@@ -439,7 +458,7 @@ pub fn build_historian_chunk(
             lines: builder.line_meta,
             present_ordinals,
             tool_only_ranges,
-            completed_tool_arcs: completed_tool_arc_ranges(blocks),
+            completed_tool_arcs: builder.completed_tool_arcs,
         },
         snapshot,
         end_message_id: builder.last_message_id,
@@ -457,6 +476,8 @@ pub struct HistorianAssemblerConfig {
     pub project_slug: String,
     pub model_chain: Vec<String>,
     pub token_budget: usize,
+    pub historian_context_limit_tokens: Option<usize>,
+    pub max_output_tokens: u32,
     pub boundary: BoundaryResolution,
     pub memory_enabled: bool,
     pub auto_promote: bool,
@@ -479,6 +500,10 @@ pub enum HistorianNoFireReason {
         eligible_end_ordinal: u64,
     },
     EmptyChunk,
+    FilteredNoiseSkipped {
+        start_ordinal: u64,
+        end_ordinal: u64,
+    },
     BelowBudget {
         token_estimate: usize,
         minimum: usize,
@@ -488,10 +513,27 @@ pub enum HistorianNoFireReason {
     },
 }
 
+impl HistorianNoFireReason {
+    pub const fn cause(&self) -> HistorianNoFireCause {
+        match self {
+            Self::NoModels => HistorianNoFireCause::NoModels,
+            Self::EmptyEligibleRange { .. } => HistorianNoFireCause::EmptyEligibleRange,
+            Self::EmptyChunk | Self::FilteredNoiseSkipped { .. } => {
+                HistorianNoFireCause::EmptyChunk
+            }
+            Self::BelowBudget { .. } => HistorianNoFireCause::BelowSubstanceFloor,
+            Self::MissingBlockIdentity { .. } => HistorianNoFireCause::MissingBlockIdentity,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AssembledHistorianFiring {
     pub prompt: String,
     pub model_chain: Vec<String>,
+    pub producer_source_tokens: usize,
+    pub historian_context_limit_tokens: Option<usize>,
+    pub max_output_tokens: u32,
     pub chunk: HistorianBuiltChunk,
     /// Original CK messages in the compacted interval, serialized for durable ctx_expand.
     pub raw_chunk_messages: String,
@@ -505,6 +547,8 @@ pub struct AssembledHistorianFiring {
     pub to_ordinal: u64,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    /// Trigger evidence carried into the firing transition so it can attach the producer model.
+    pub recent_decision: Option<mc_store::HistorianRecentDecision>,
     /// Native message ids mapped to local YYYY-MM-DD dates for temporal headings.
     pub boundary_dates: BTreeMap<String, String>,
 }
@@ -534,6 +578,10 @@ impl AssembledHistorianFiring {
             content_language,
             prompt: &self.prompt,
             model_chain: &self.model_chain,
+            temperature: None,
+            producer_source_tokens: self.producer_source_tokens,
+            historian_context_limit_tokens: self.historian_context_limit_tokens,
+            max_output_tokens: self.max_output_tokens,
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
             chunk_fingerprint: &self.chunk_fingerprint,
@@ -549,6 +597,7 @@ impl AssembledHistorianFiring {
             validate_options: self.validate_options,
             now_ms: self.now_ms,
             failure_backoff_at_ms: self.failure_backoff_at_ms,
+            recent_decision: self.recent_decision.clone(),
             completion_now_ms: crate::now_ms,
             publication_fence: None,
         }
@@ -624,6 +673,53 @@ pub fn assemble_historian_firing(
         eligible_end,
     );
     if chunk.text.is_empty() || chunk.chunk.lines.is_empty() {
+        // An empty producer input is not necessarily an empty read. Persist only
+        // complete observed ranges so absent raw messages cannot be declared noise.
+        let rows: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                !m.ck.meta.synthetic && m.ordinal >= chunk_start && m.ordinal < eligible_end
+            })
+            .collect();
+        if chunk.text.is_empty()
+            && chunk.chunk.lines.is_empty()
+            && rows.len() as u64 == eligible_end - chunk_start
+            && rows.iter().enumerate().all(|(i, m)| {
+                m.ordinal == chunk_start + i as u64
+                    && live.iter().filter(|b| b.mid == m.mid).count() == m.ck.content.len()
+            })
+        {
+            let endpoint = |m: &CkIngressMessage| {
+                live.iter()
+                    .rev()
+                    .find(|b| b.ordinal == m.ordinal)
+                    .map(|b| b.id.clone())
+                    .unwrap_or_else(|| m.mid.clone())
+            };
+            let marker = StoredCompartment {
+                start_message: chunk_start as i64,
+                end_message: (eligible_end - 1) as i64,
+                start_message_id: endpoint(rows[0]),
+                end_message_id: endpoint(rows[rows.len() - 1]),
+                episode_type: Some("filtered-noise".to_string()),
+                importance: 1,
+                created_at: now_ms,
+                ..Default::default()
+            };
+            if store.append_filtered_noise_marker(
+                &config.session_id,
+                &marker,
+                expected_revert_epoch,
+                compartment_set_generation,
+            )? {
+                return Ok(AssembleHistorianFiringOutcome::NoFire(
+                    HistorianNoFireReason::FilteredNoiseSkipped {
+                        start_ordinal: chunk_start,
+                        end_ordinal: eligible_end - 1,
+                    },
+                ));
+            }
+        }
         return Ok(AssembleHistorianFiringOutcome::NoFire(
             HistorianNoFireReason::EmptyChunk,
         ));
@@ -686,11 +782,39 @@ pub fn assemble_historian_firing(
     );
     let memories = store.load_active_memories(&config.project_path, now_ms)?;
     let memory_block = render_historian_memory_block(&memories);
+    let oversize_atomic_unit =
+        estimate_tokens(&chunk.text) > config.token_budget
+            && chunk.chunk.completed_tool_arcs.iter().any(|arc| {
+                arc.start <= chunk.chunk.end_index && arc.end >= chunk.chunk.start_index
+            });
+    let input_source = if oversize_atomic_unit {
+        chunk.text.clone()
+    } else {
+        truncate_historian_input_if_needed(&chunk.text, config.token_budget)
+    };
+    let producer_source_tokens = estimate_tokens(&input_source);
+    if config.boundary.oversize_atomic_unit || oversize_atomic_unit {
+        let raw_chunk_tokens: usize = live
+            .iter()
+            .filter(|block| {
+                !block.synthetic
+                    && block.ordinal >= chunk.chunk.start_index
+                    && block.ordinal <= chunk.chunk.end_index
+            })
+            .map(|block| estimate_tokens(&block.bytes))
+            .sum();
+        let guard_reason = crate::historian::producer_window_failure_reason(
+            producer_source_tokens,
+            config.historian_context_limit_tokens,
+            config.max_output_tokens,
+        );
+        eprintln!("[mc-module][{}] historian oversize admission: range={}-{} rawChunkTokens={} producerSourceTokens={} historianChunkTokens={} guardReason={}", config.session_id, chunk.chunk.start_index, chunk.chunk.end_index, raw_chunk_tokens, producer_source_tokens, config.token_budget, guard_reason.as_deref().unwrap_or("none"));
+    }
     let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
         seed_examples: &reference_blocks.seed_examples,
         session_references: &reference_blocks.session_references,
         project_memory: &memory_block,
-        input_source: &truncate_historian_input_if_needed(&chunk.text, config.token_budget),
+        input_source: &input_source,
         memory_enabled: config.memory_enabled,
         extraction_free: config.extraction_free,
     });
@@ -712,6 +836,9 @@ pub fn assemble_historian_firing(
         AssembledHistorianFiring {
             prompt,
             model_chain: config.model_chain,
+            producer_source_tokens,
+            historian_context_limit_tokens: config.historian_context_limit_tokens,
+            max_output_tokens: config.max_output_tokens,
             from_ordinal: chunk.chunk.start_index,
             to_ordinal: chunk.chunk.end_index,
             raw_chunk_messages,
@@ -730,6 +857,7 @@ pub fn assemble_historian_firing(
             },
             now_ms,
             failure_backoff_at_ms: config.failure_backoff_at_ms,
+            recent_decision: None,
             boundary_dates,
             chunk,
         },
@@ -1441,6 +1569,104 @@ mod tests {
     }
 
     #[test]
+    fn issue_424_six_cap_component_reaches_producer_and_validates_whole() {
+        let result = |id: &str| CkKind::ToolResult {
+            id: id.to_string(),
+            tool_name: "read".to_string(),
+            output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                text: "result value\n".repeat(1667),
+            }),
+            provider_executed: false,
+        };
+        let steering = format!("{}CAPACITY_STEERING_END", "result value\n".repeat(44000));
+        let messages = vec![
+            msg(
+                "a1",
+                1,
+                "assistant",
+                ["call1", "call2"]
+                    .iter()
+                    .map(|id| CkKind::ToolCall {
+                        id: id.to_string(),
+                        name: "read".to_string(),
+                        input: json!({}),
+                        provider_executed: false,
+                    })
+                    .collect(),
+            ),
+            msg("t2", 2, "tool", vec![result("call2")]),
+            msg("u3", 3, "user", vec![text(&steering), result("call1")]),
+            msg("u4", 4, "user", vec![text("protected tail")]),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let raw_component_tokens: usize = projection
+            .blocks
+            .iter()
+            .filter(|block| block.ordinal < 4)
+            .map(|block| estimate_tokens(&block.bytes))
+            .sum();
+        assert!(raw_component_tokens > 6 * 30970);
+        assert!(raw_component_tokens < 7 * 30970);
+        let built = build_historian_chunk(&messages, &projection.blocks, 1, 32000, 4);
+        assert_eq!(built.chunk.end_index, 3);
+        assert!(!built.has_more);
+        assert!(built.text.contains("CAPACITY_STEERING_END"));
+        let (_dir, store) = store_for_tests();
+        let outcome = assemble_historian_firing(
+            &store,
+            &messages,
+            &projection.blocks,
+            &projection.identity_by_mid,
+            HistorianAssemblerConfig {
+                session_id: "issue424-capacity".to_string(),
+                project_path: "/proj".to_string(),
+                project_slug: "proj".to_string(),
+                model_chain: vec!["test/model".to_string()],
+                token_budget: 32000,
+                historian_context_limit_tokens: None,
+                max_output_tokens: 32_000,
+                boundary: crate::boundary::BoundaryResolution {
+                    protected_start_ordinal: 4,
+                    eligible_head: 1..4,
+                    n_tokens: 9910.0,
+                    floored_by_live_prompt: false,
+                    fenced_by_open_arc: false,
+                    true_raw_eligible_tokens: raw_component_tokens as f64,
+                    oversize_atomic_unit: true,
+                    raw_message_count: 4,
+                    boundary_reason: "test".to_string(),
+                },
+                memory_enabled: false,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
+                extraction_free: false,
+                in_emergency: false,
+                force_keep_last_compartment: true,
+                fold_is_only_reclaim: true,
+                failure_backoff_at_ms: 0,
+                min_chunk_tokens: 0,
+            },
+            1,
+        )
+        .unwrap();
+        let AssembleHistorianFiringOutcome::Fire(firing) = outcome else {
+            panic!("expected firing: {outcome:?}");
+        };
+        assert!(
+            firing.prompt.contains(&built.text),
+            "producer must receive the whole formatted component"
+        );
+        let validated = crate::historian_validate::validate_historian_output(
+            &historian_output(1, 3, 4),
+            &firing.chunk.chunk,
+            &firing.prior_compartments,
+            firing.validate_options,
+        )
+        .expect("whole component validates");
+        assert_eq!(validated.compartments[0].end_message, 3);
+    }
+
+    #[test]
     fn tool_result_only_message_absorbs_into_preceding_assistant_block() {
         let messages = vec![
             msg(
@@ -1481,6 +1707,148 @@ mod tests {
         assert_eq!(built.chunk.lines[1].message_id, "t2#0");
     }
 
+    #[test]
+    fn filtered_noise_head_persists_progress_without_producer_or_rendered_content() {
+        let (_dir, store) = store_for_tests();
+        store
+            .append_compartments("noise", &[stored_compartment(1, 1, 769, "prior#0")])
+            .unwrap();
+        // OpenCode ingress removes ignored text but retains its message ordinal.
+        let messages = vec![
+            msg("notice", 770, "user", vec![]),
+            msg(
+                "aborted",
+                771,
+                "assistant",
+                vec![CkKind::Reasoning {
+                    text: "aborted thinking".to_string(),
+                    signature: None,
+                }],
+            ),
+            msg(
+                "real",
+                772,
+                "user",
+                vec![text("real protected user content")],
+            ),
+        ];
+        let projection = project_messages(&messages).unwrap();
+        let config = HistorianAssemblerConfig {
+            session_id: "noise".to_string(),
+            project_path: "/proj".to_string(),
+            project_slug: "proj".to_string(),
+            model_chain: vec!["p/m".to_string()],
+            token_budget: 32000,
+            historian_context_limit_tokens: None,
+            max_output_tokens: 32000,
+            boundary: crate::boundary::BoundaryResolution {
+                protected_start_ordinal: 772,
+                eligible_head: 770..772,
+                n_tokens: 0.0,
+                floored_by_live_prompt: false,
+                fenced_by_open_arc: false,
+                true_raw_eligible_tokens: 10.0,
+                oversize_atomic_unit: false,
+                raw_message_count: 772,
+                boundary_reason: "test".to_string(),
+            },
+            memory_enabled: false,
+            auto_promote: false,
+            user_memory_collection_enabled: false,
+            extraction_free: false,
+            in_emergency: true,
+            force_keep_last_compartment: false,
+            fold_is_only_reclaim: false,
+            failure_backoff_at_ms: 0,
+            min_chunk_tokens: 0,
+        };
+        let assemble = |cfg| {
+            assemble_historian_firing(
+                &store,
+                &messages,
+                &projection.blocks,
+                &projection.identity_by_mid,
+                cfg,
+                1,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            assemble(config.clone()),
+            AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::FilteredNoiseSkipped {
+                start_ordinal: 770,
+                end_ordinal: 771
+            })
+        ));
+        let rows = store
+            .load_historian_assembly_snapshot("noise")
+            .unwrap()
+            .compartments;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].end_message, 771);
+        let snapshot = store.load_historian_assembly_snapshot("noise").unwrap();
+        let next_marker = StoredCompartment {
+            start_message: 772,
+            end_message: 772,
+            ..Default::default()
+        };
+        assert!(!store
+            .append_filtered_noise_marker(
+                "noise",
+                &next_marker,
+                snapshot.revert_epoch + 1,
+                snapshot.compartment_set_generation
+            )
+            .unwrap());
+        assert!(!store
+            .append_filtered_noise_marker(
+                "noise",
+                &next_marker,
+                snapshot.revert_epoch,
+                CompartmentSetGeneration {
+                    max_sequence: 1,
+                    count: 1
+                }
+            )
+            .unwrap());
+        let marker = crate::decay_render::DecayRenderCompartment::from(&rows[1]);
+        assert_eq!(
+            crate::decay_render::render_compartment_at_tier(&marker, 1),
+            ""
+        );
+        assert_eq!(
+            crate::memory_render::render_new_compartments(&[&marker]),
+            ""
+        );
+        let render = |rows: &[StoredCompartment]| {
+            crate::decay_render::render_stored_compartments(rows, 60000.0, estimate_tokens)
+        };
+        assert_eq!(render(&rows), render(&rows[..1]));
+        let references = |rows: &[StoredCompartment]| {
+            build_reference_blocks_from_stored("noise", 772, rows).session_references
+        };
+        assert_eq!(references(&rows), references(&rows[..1]));
+        assert!(matches!(
+            assemble(config.clone()),
+            AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::EmptyChunk)
+        ));
+        assert_eq!(
+            store
+                .load_historian_assembly_snapshot("noise")
+                .unwrap()
+                .compartments
+                .len(),
+            2
+        );
+        let mut advanced = config;
+        advanced.boundary.eligible_head = 772..773;
+        advanced.boundary.protected_start_ordinal = 773;
+        let AssembleHistorianFiringOutcome::Fire(firing) = assemble(advanced) else {
+            panic!("real content must now progress")
+        };
+        assert!(firing.chunk.text.contains("real protected user content"));
+    }
+
     fn tiny_chunk_assemble(in_emergency: bool) -> AssembleHistorianFiringOutcome {
         use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
@@ -1510,6 +1878,8 @@ mod tests {
                 project_slug: "proj".to_string(),
                 model_chain: vec!["prov/model".to_string()],
                 token_budget: 32_000,
+                historian_context_limit_tokens: None,
+                max_output_tokens: 32_000,
                 boundary: crate::boundary::BoundaryResolution {
                     protected_start_ordinal: 2,
                     eligible_head: 0..2,
@@ -1565,6 +1935,8 @@ mod tests {
                 project_slug: "proj".to_string(),
                 model_chain: vec!["prov/model".to_string()],
                 token_budget: 32_000,
+                historian_context_limit_tokens: None,
+                max_output_tokens: 32_000,
                 boundary: crate::boundary::BoundaryResolution {
                     protected_start_ordinal: 2,
                     eligible_head: 0..2,
@@ -1645,6 +2017,8 @@ mod tests {
                 project_slug: "proj".to_string(),
                 model_chain: vec!["prov/model".to_string()],
                 token_budget: 32_000,
+                historian_context_limit_tokens: None,
+                max_output_tokens: 32_000,
                 boundary: crate::boundary::BoundaryResolution {
                     protected_start_ordinal: 10,
                     eligible_head: 0..10,
@@ -1712,13 +2086,48 @@ mod tests {
     }
 
     #[test]
+    fn assembly_no_fire_reasons_preserve_distinct_canonical_causes() {
+        let cases = [
+            (HistorianNoFireReason::NoModels, "no_models"),
+            (
+                HistorianNoFireReason::EmptyEligibleRange {
+                    start_ordinal: 8,
+                    eligible_end_ordinal: 8,
+                },
+                "protected_tail",
+            ),
+            (HistorianNoFireReason::EmptyChunk, "no_new_raw_history"),
+            (
+                HistorianNoFireReason::BelowBudget {
+                    token_estimate: 20,
+                    minimum: 512,
+                },
+                "below_min_chunk",
+            ),
+            (
+                HistorianNoFireReason::MissingBlockIdentity {
+                    message_id: "m1".to_string(),
+                },
+                "invalid_boundary_identity",
+            ),
+        ];
+
+        for (reason, canonical) in cases {
+            assert_eq!(reason.cause().canonical_cause(), canonical);
+        }
+    }
+
+    #[test]
     fn below_budget_when_tail_reclaim_not_fold_only() {
         // Tail reducers exist (owned-llmrunner leg): substance floor blocks below emergency.
         match tiny_chunk_assemble(false) {
-            AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::BelowBudget {
-                minimum,
-                ..
-            }) => assert_eq!(minimum, 512),
+            AssembleHistorianFiringOutcome::NoFire(
+                reason @ HistorianNoFireReason::BelowBudget { minimum, .. },
+            ) => {
+                assert_eq!(minimum, 512);
+                assert_eq!(reason.cause(), HistorianNoFireCause::BelowSubstanceFloor);
+                assert_eq!(reason.cause().canonical_cause(), "below_min_chunk");
+            }
             other => panic!("expected BelowBudget no-fire, got {other:?}"),
         }
     }
@@ -1791,6 +2200,43 @@ mod tests {
         );
         let stopped = project_and_build(&messages, 1, 1, 4);
         assert!(stopped.has_more);
+    }
+
+    #[test]
+    fn substance_is_formatted_content_not_scan_saturation() {
+        let messages = vec![
+            msg("u1", 1, "user", vec![text("short")]),
+            msg(
+                "noise2",
+                2,
+                "user",
+                vec![text("<!-- OMO_INTERNAL_INITIATOR -->")],
+            ),
+            msg(
+                "a3",
+                3,
+                "assistant",
+                vec![text(&"long narrative ".repeat(1000))],
+            ),
+        ];
+        let stopped = project_and_build(&messages, 1, 6, 4);
+        assert!(stopped.has_more);
+        assert!(
+            stopped.token_estimate < 512,
+            "a saturated scan is not 512 tokens of substance"
+        );
+        assert!(!stopped.text.contains("OMO_INTERNAL"));
+        let filtered = project_and_build(&messages[..2], 1, 32_000, 3);
+        assert_eq!(stopped.text, filtered.text);
+        assert_eq!(stopped.token_estimate, filtered.token_estimate);
+        assert!(matches!(
+            tiny_chunk_assemble(false),
+            AssembleHistorianFiringOutcome::NoFire(HistorianNoFireReason::BelowBudget { .. })
+        ));
+        let AssembleHistorianFiringOutcome::Fire(firing) = tiny_chunk_assemble(true) else {
+            panic!("emergency escape must still fire")
+        };
+        assert!(firing.chunk.text.contains("tiny prompt"));
     }
 
     #[test]

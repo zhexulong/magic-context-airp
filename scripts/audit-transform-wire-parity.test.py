@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "audit-transform-wire-parity.py"
 DATE = "2026-08-27"
+EMPTY_NEWEST_DATE = "2026-08-28"
 
 
 class AuditTransformWireParityTest(unittest.TestCase):
@@ -25,10 +26,14 @@ class AuditTransformWireParityTest(unittest.TestCase):
         self.assertEqual(
             contract["calibration"]["ts"],
             {
-                "temperature": 0.1,
+                "temperature": None,
                 "max_output_tokens": 32_000,
                 "await_timeout_ms": 600_000,
             },
+        )
+        self.assertEqual(
+            contract["temperature_request_shapes"]["ts"],
+            {"absent": None, "explicit_0_1": 0.1, "explicit_0": 0},
         )
         self.assertEqual(contract["request_shape"]["pi"], ["system", "user"])
         self.assertEqual(contract["request_shape"]["rust"], ["system", "user"])
@@ -55,7 +60,7 @@ class AuditTransformWireParityTest(unittest.TestCase):
         )
 
         broken = json.loads(json.dumps(contract))
-        broken["calibration"]["ts"]["temperature"] = 1.0
+        broken["calibration"]["ts"]["temperature"] = 0.1
         self.assertEqual(
             module["historian_producer_invariants"](broken),
             ["historian_ts_calibration_triple_diverges"],
@@ -373,6 +378,61 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             self.assertEqual(matrix["unexplained_wire_invariants"][0]["lane"], "ts")
 
+    def test_provider_matrix_keeps_anthropic_value_space_divergences_as_findings(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            temp = Path(temporary)
+            dump_dir = temp / "dumps"
+            dump_dir.mkdir()
+            roots = {"rust": temp / "rust-project", "ts": temp / "ts-project"}
+            for lane, project in roots.items():
+                (project / ".cortexkit").mkdir(parents=True)
+                (project / ".cortexkit" / "magic-context.jsonc").write_text(
+                    json.dumps({"transform_mode": lane})
+                )
+                self._write_dump(
+                    dump_dir,
+                    f"ses_{lane}",
+                    project,
+                    f"{lane}-call",
+                    "anthropic",
+                    0 if lane == "rust" else 1,
+                )
+
+            rust_path = next(dump_dir.glob("*ses_rust*.body.json"))
+            rust_body = json.loads(rust_path.read_text())
+            rust_body["messages"].append(
+                {"role": "assistant", "content": [{"type": "text", "text": ""}]}
+            )
+            rust_path.write_text(json.dumps(rust_body))
+
+            ts_path = next(dump_dir.glob("*ses_ts*.body.json"))
+            ts_body = json.loads(ts_path.read_text())
+            ts_body["messages"].append({"role": "assistant", "content": "[dropped]"})
+            ts_path.write_text(json.dumps(ts_body))
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--date",
+                    DATE,
+                    "--rust-session",
+                    "ses_rust",
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            matrix = json.loads(completed.stdout)["provider_matrix_parity"]
+            axes = {row["axis"]: row for row in matrix["unexplained_byte_classes"]}
+            self.assertEqual(axes["empty_content_shapes"]["verdict"], "divergent_value_space")
+            self.assertEqual(
+                axes["dropped_placeholder_shapes"]["verdict"],
+                "divergent_value_space",
+            )
+
     def test_provider_matrix_supports_openai_responses_wire(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             temp = Path(temporary)
@@ -513,6 +573,129 @@ class AuditTransformWireParityTest(unittest.TestCase):
             tool_axis["shared"], ["cardinality=balanced;adjacency=valid"]
         )
 
+    def test_non_live_mode_recovers_rootless_lanes_or_refuses_loudly(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            temp = Path(temporary)
+            dump_dir = temp / "dumps"
+            dump_dir.mkdir()
+            self._write_dump(
+                dump_dir,
+                "ses_rust",
+                temp / "hidden-rust-project",
+                "rust-call",
+                "anthropic",
+                0,
+            )
+            self._write_dump(
+                dump_dir,
+                "ses_ts",
+                temp / "hidden-ts-project",
+                "ts-call",
+                "anthropic",
+                1,
+            )
+            for path in dump_dir.glob("*.body.json"):
+                body = json.loads(path.read_text())
+                body["system"] = [{"type": "text", "text": "Identity without a project root"}]
+                path.write_text(json.dumps(body))
+
+            refused = subprocess.run(
+                ["python3", str(SCRIPT), str(dump_dir), "--date", DATE],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(refused.stdout, "")
+            self.assertIn(
+                "non-live provider differ refused: 2 served captures were all excluded",
+                refused.stderr,
+            )
+
+            context_db = temp / "context.db"
+            store_db = temp / "store.db"
+            self._write_context_db(context_db)
+            self._write_store_db(store_db)
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--date",
+                    DATE,
+                    "--context-db",
+                    str(context_db),
+                    "--store-db",
+                    str(store_db),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            report = json.loads(completed.stdout)
+            self.assertEqual(
+                report["lane_verification"]["denominator_dump_counts"],
+                {"rust": 1, "ts": 1},
+            )
+            self.assertEqual(
+                report["lane_verification"]["durable_authority_resolution"],
+                {"resolved_dumps": 2, "remaining_unverified_dumps": 0},
+            )
+            self.assertEqual(report["excluded_unverified_dumps"], [])
+            self.assertEqual(
+                {row["status"] for row in report["lane_verification"]["sessions"]},
+                {"resolved_from_durable_authority"},
+            )
+            self.assertEqual(
+                report["provider_matrix_parity"]["inventory_by_lane"],
+                {
+                    "rust": {"anthropic:anthropic": 1},
+                    "ts": {"anthropic:anthropic": 1},
+                },
+            )
+
+            with sqlite3.connect(store_db) as db:
+                now = int(
+                    dt.datetime(2026, 8, 27, 12, tzinfo=dt.timezone.utc).timestamp()
+                    * 1000
+                )
+                db.execute(
+                    "INSERT INTO mc_cache_state VALUES (?, ?, ?)",
+                    ("ses_ts", now, json.dumps({"initialized": True})),
+                )
+            ambiguous = subprocess.run(
+                [
+                    "python3",
+                    str(SCRIPT),
+                    str(dump_dir),
+                    "--date",
+                    DATE,
+                    "--context-db",
+                    str(context_db),
+                    "--store-db",
+                    str(store_db),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            ambiguous_report = json.loads(ambiguous.stdout)
+            self.assertEqual(
+                ambiguous_report["lane_verification"]["denominator_dump_counts"],
+                {"rust": 1, "unverified": 1},
+            )
+            ts_row = next(
+                row
+                for row in ambiguous_report["lane_verification"]["sessions"]
+                if row["session"] == "ses_ts"
+            )
+            self.assertEqual(ts_row["observed_lane"], "ambiguous")
+            self.assertEqual(ts_row["status"], "durable_authority_ambiguous")
+            self.assertEqual(len(ambiguous_report["excluded_unverified_dumps"]), 1)
+
     def test_live_mode_uses_read_only_coordinate_evidence(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             temp = Path(temporary)
@@ -584,9 +767,11 @@ class AuditTransformWireParityTest(unittest.TestCase):
                     str(dump_dir),
                     "--live",
                     "--date",
-                    DATE,
+                    EMPTY_NEWEST_DATE,
                     "--after",
-                    f"{DATE}T00-00-00",
+                    f"{EMPTY_NEWEST_DATE}T00-00-00",
+                    "--min-provider-bodies",
+                    "3",
                     "--context-db",
                     str(context_db),
                     "--store-db",
@@ -609,6 +794,16 @@ class AuditTransformWireParityTest(unittest.TestCase):
             )
             report = json.loads(completed.stdout)
             self.assertEqual(report["method"]["mode"], "live")
+            self.assertEqual(
+                report["method"]["capture_window"],
+                {
+                    "minimum_provider_bodies": 3,
+                    "body_count": 3,
+                    "requested_lower_bound": f"{EMPTY_NEWEST_DATE}T00-00-00",
+                    "effective_lower_bound": f"{DATE}T12-00-00-000Z",
+                    "lower_bound_widened": True,
+                },
+            )
             self.assertEqual(report["method"]["sqlite_contract"], {"readonly": True})
             live_helper = (ROOT / "scripts" / "audit-transform-wire-parity-live.ts").read_text()
             self.assertEqual(live_helper.count("new Database("), 1)
@@ -631,6 +826,31 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 if row["provider_family"] == "openai:openai_responses"
             ]
             self.assertEqual([row["lane"] for row in responses], ["ts"])
+            self.assertEqual(
+                report["live_probe"]["decision_window"]["scheduler_history"],
+                {
+                    "rows": 2,
+                    "decisions": {"defer": 2},
+                    "pass_bands": {"Defer": 2},
+                    "defer_reasons": {"none": 1, "legacy_mid_turn_boundary": 1},
+                },
+            )
+            self.assertEqual(
+                report["live_probe"]["decision_window"]["historian_no_fire"],
+                {
+                    "rows": 2,
+                    "causes": {
+                        "legacy_trigger_false": 1,
+                        "protected_tail": 1,
+                    },
+                    "raw_causes": {
+                        "ProtectedTailWindowEmpty": 1,
+                        "trigger_false": 1,
+                    },
+                    "detail_kinds": {"trigger_false": 2},
+                    "legacy_generic_rows": 1,
+                },
+            )
             self.assertEqual(
                 report["provider_live"]["lane_coordinate_coverage"],
                 {
@@ -992,22 +1212,37 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 dt.datetime(2026, 8, 27, 12, tzinfo=dt.timezone.utc).timestamp() * 1000
             )
             db.execute("INSERT INTO cortexkit_schema_version VALUES ('mc_cache', 50)")
-            db.execute(
+            db.executemany(
                 "INSERT INTO mc_cache_state VALUES (?, ?, ?)",
-                (
-                    "ses_rust",
-                    now,
-                    json.dumps(
-                        {
-                            "initialized": True,
-                            "caveman_age_basis_tag": 9,
-                            "last_usage": {
-                                "current_total_input_tokens": 100,
-                                "context_limit_tokens": 200,
-                            },
-                        }
+                [
+                    (
+                        "ses_rust",
+                        now,
+                        json.dumps(
+                            {
+                                "initialized": True,
+                                "caveman_age_basis_tag": 9,
+                                "last_usage": {
+                                    "current_total_input_tokens": 100,
+                                    "context_limit_tokens": 200,
+                                },
+                                "historian": {
+                                    "last_no_fire": "trigger_false{raw_cause=ProtectedTailWindowEmpty,canonical_cause=protected_tail,eligible~0k}"
+                                },
+                            }
+                        ),
                     ),
-                ),
+                    (
+                        "ses_rust_legacy",
+                        now,
+                        json.dumps(
+                            {
+                                "initialized": True,
+                                "historian": {"last_no_fire": "trigger_false"},
+                            }
+                        ),
+                    ),
+                ],
             )
             db.executemany(
                 "INSERT INTO mc_tags VALUES (?, ?)",
@@ -1018,9 +1253,36 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 "INSERT INTO mc_project_mural_artifacts VALUES (?, ?, 'mural-hash', ?)",
                 ("git:rust", b"data:image/png;base64,cG5n", now),
             )
+            scheduler_history = json.dumps(
+                [
+                    {
+                        "timestamp_ms": now,
+                        "scheduler_decision": "Defer",
+                        "drain_latch_active": False,
+                    },
+                    {
+                        "timestamp_ms": now + 1,
+                        "scheduler_decision": "Defer",
+                        "canonical_decision": "defer",
+                        "defer_reason": "mid_turn_boundary",
+                        "drain_latch_active": False,
+                    },
+                ]
+            )
             db.execute(
                 "INSERT INTO mc_pass_trace VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("ses_rust", "[]", "[]", now, now, None, None, 3, 0, None),
+                (
+                    "ses_rust",
+                    scheduler_history,
+                    "[]",
+                    now,
+                    now,
+                    None,
+                    None,
+                    3,
+                    0,
+                    None,
+                ),
             )
             db.execute(
                 "INSERT INTO mc_compartments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

@@ -158,7 +158,7 @@ describe("promotion", () => {
         it("promotes a new ARCHITECTURE_DECISIONS fact", () => {
             db = makeMemoryDatabase();
 
-            promoteSessionFactsDurable(db, "ses-1", "/repo/project", [
+            const result = promoteSessionFactsDurable(db, "ses-1", "/repo/project", [
                 {
                     category: "ARCHITECTURE_DECISIONS",
                     content: "Use SQLite for cross-session memory",
@@ -172,6 +172,8 @@ describe("promotion", () => {
                 computeNormalizedHash("Use SQLite for cross-session memory"),
             );
 
+            expect(result.factsPromoted).toBe(1);
+            expect(result.newMemoryRefs).toHaveLength(1);
             expect(memory).not.toBeNull();
             expect(memory?.sourceSessionId).toBe("ses-1");
             expect(memory?.sourceType).toBe("historian");
@@ -297,7 +299,7 @@ describe("promotion", () => {
                 content: "Use createX naming for factories",
             });
 
-            promoteSessionFactsDurable(db, "ses-2", "/repo/project", [
+            const result = promoteSessionFactsDurable(db, "ses-2", "/repo/project", [
                 { category: "NAMING", content: "use createx naming for factories" },
             ]);
 
@@ -308,6 +310,7 @@ describe("promotion", () => {
                 computeNormalizedHash("Use createX naming for factories"),
             );
 
+            expect(result).toEqual({ newMemoryRefs: [], factsPromoted: 1 });
             expect(memory?.seenCount).toBe(2);
         });
 

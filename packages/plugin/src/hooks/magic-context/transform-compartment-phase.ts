@@ -24,10 +24,16 @@ import {
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
 import { primeTailRawMessageCache, withRawSessionMessageCache } from "./read-session-chunk";
-import { sendIgnoredMessage } from "./send-session-notification";
+import { sendStatusNotification } from "./send-session-notification";
 import type { MessageLike } from "./transform-operations";
+import type {
+    HiddenCompletionExecutor,
+    HiddenCompartmentRunnerDeps,
+} from "./compartment-runner-types";
 
 interface RunCompartmentPhaseArgs {
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    compactionMarkerStrategy?: HiddenCompartmentRunnerDeps["compactionMarkerStrategy"];
     canRunCompartments: boolean;
     fullFeatureMode: boolean;
     /** Compaction-off mode (issue #266): no historian start, no 95% block,
@@ -49,6 +55,8 @@ interface RunCompartmentPhaseArgs {
     historyBudgetTokens?: number;
     historianTimeoutMs?: number;
     historianModel?: ModelInput;
+    historianContextLimit?: number;
+    historianMaxOutputTokens?: number;
     fallbackModels?: readonly ModelInput[];
     compartmentDirectory: string;
     messages: MessageLike[];
@@ -148,10 +156,16 @@ export function runCompartmentPhase(
 
     return withRawSessionMessageCache(() => {
         try {
+            const preResolved = args.preResolvedBoundarySnapshot;
+            const hasPreResolvedAnchor = preResolved?.lastCompartmentEndMessageId !== undefined;
             primeTailRawMessageCache({
                 sessionId: args.resolvedSessionId,
-                lastCompartmentEnd: getLastCompartmentEndMessage(args.db, args.resolvedSessionId),
-                anchorMessageId: getLastCompartmentEndMessageId(args.db, args.resolvedSessionId),
+                lastCompartmentEnd: hasPreResolvedAnchor
+                    ? preResolved.offset - 1
+                    : getLastCompartmentEndMessage(args.db, args.resolvedSessionId),
+                anchorMessageId: hasPreResolvedAnchor
+                    ? (preResolved.lastCompartmentEndMessageId ?? null)
+                    : getLastCompartmentEndMessageId(args.db, args.resolvedSessionId),
             });
         } catch (error) {
             // Priming is a pure optimization — on any failure the phase falls
@@ -199,8 +213,18 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             rebuiltHistoryThisPass,
         };
     }
-    let rawEligibility: ReturnType<typeof getRawHistoryEligibility> | null = null;
-    let lastObservedCompartmentEnd = -1;
+    let rawEligibility: ReturnType<typeof getRawHistoryEligibility> | null =
+        args.preResolvedBoundarySnapshot
+            ? {
+                  lastCompartmentEnd: args.preResolvedBoundarySnapshot.offset - 1,
+                  offset: args.preResolvedBoundarySnapshot.offset,
+                  rawMessageCount: args.preResolvedBoundarySnapshot.rawMessageCountAtTrigger,
+                  hasRawBeyondLastCompartment:
+                      args.preResolvedBoundarySnapshot.rawMessageCountAtTrigger >=
+                      args.preResolvedBoundarySnapshot.offset,
+              }
+            : null;
+    let lastObservedCompartmentEnd = rawEligibility?.lastCompartmentEnd ?? -1;
     let cachedBoundarySnapshot: ProtectedTailBoundarySnapshot | null = null;
 
     function hasNewRawHistoryForCompartment(): boolean {
@@ -312,7 +336,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             );
             updateSessionMeta(args.db, args.sessionId, { compartmentInProgress: false });
             compartmentInProgress = false;
-        } else if (!args.client) {
+        } else if (!args.client && !args.hiddenCompletionExecutor) {
             sessionLog(args.sessionId, "transform: cannot start compartment agent without client");
             updateSessionMeta(args.db, args.sessionId, { compartmentInProgress: false });
             compartmentInProgress = false;
@@ -320,6 +344,8 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             sessionLog(args.sessionId, "transform: compartmentInProgress flag set, starting agent");
             startCompartmentAgent({
                 client: args.client,
+                hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+                compactionMarkerStrategy: args.compactionMarkerStrategy,
                 db: args.db,
                 sessionId: args.sessionId,
                 historianChunkTokens: args.historianChunkTokens,
@@ -328,6 +354,8 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 historyBudgetTokens: args.historyBudgetTokens,
                 historianTimeoutMs: args.historianTimeoutMs,
                 model: args.historianModel,
+                historianContextLimit: args.historianContextLimit,
+                historianMaxOutputTokens: args.historianMaxOutputTokens,
                 fallbackModels: args.fallbackModels,
                 directory: args.compartmentDirectory,
                 fallbackModelId: args.fallbackModelId,
@@ -358,13 +386,19 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         args.contextUsage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE
     ) {
         let activeRun = getActiveCompartmentRun(args.sessionId);
-        if (!activeRun && hasEligibleHistoryForCompartment() && args.client) {
+        if (
+            !activeRun &&
+            hasEligibleHistoryForCompartment() &&
+            (args.client || args.hiddenCompletionExecutor)
+        ) {
             sessionLog(
                 args.sessionId,
                 `transform: 95% reached (${args.contextUsage.percentage.toFixed(1)}%), force-starting compartment agent and blocking`,
             );
             startCompartmentAgent({
                 client: args.client,
+                hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+                compactionMarkerStrategy: args.compactionMarkerStrategy,
                 db: args.db,
                 sessionId: args.sessionId,
                 historianChunkTokens: args.historianChunkTokens,
@@ -373,6 +407,8 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 historyBudgetTokens: args.historyBudgetTokens,
                 historianTimeoutMs: args.historianTimeoutMs,
                 model: args.historianModel,
+                historianContextLimit: args.historianContextLimit,
+                historianMaxOutputTokens: args.historianMaxOutputTokens,
                 fallbackModels: args.fallbackModels,
                 directory: args.compartmentDirectory,
                 fallbackModelId: args.fallbackModelId,
@@ -397,7 +433,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             // while historian compacts. Without this, users have no idea what's happening.
             //
             // CRITICAL: This notification creates a user message via session.prompt
-            // with noReply:true. The message is PERSISTED to OpenCode's session DB,
+            // as an ignored no-reply post. OpenCode PERSISTS it to the session DB,
             // which gives it a higher ID than the latest assistant. OpenCode's
             // runLoop break condition checks `lastUser.id < lastAssistant.id`, and
             // a fresh notification-user-message every transform pass makes that
@@ -411,7 +447,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             if (args.client && !activeRun.notificationSent) {
                 activeRun.notificationSent = true;
                 const notifParams = args.getNotificationParams?.() ?? {};
-                void sendIgnoredMessage(
+                void sendStatusNotification(
                     args.client,
                     args.sessionId,
                     `⏳ Context at ${args.contextUsage.percentage.toFixed(0)}% — Magic Context is comparting history before continuing. This may take up to 2 minutes.`,

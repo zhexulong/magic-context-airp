@@ -8,19 +8,22 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(test)]
+use mc_store::HistorianDecision;
 use mc_store::{
     CompartmentSetGeneration, FactCandidate, HistorianChunkRange, HistorianDurableState,
     HistorianEventCandidate, HistorianPhase, HistorianPrimerCandidate, HistorianPublishError,
     HistorianPublishPredicate, HistorianPublishRequest, HistorianPublishResult,
-    HistorianSelectedMessageIdentity, HistorianUserMemoryCandidate, McStore, McStoreError,
-    StoredCompartment,
+    HistorianRecentDecision, HistorianSelectedMessageIdentity, HistorianUserMemoryCandidate,
+    McStore, McStoreError, StoredCompartment,
 };
 
 use crate::historian_producer::{
-    ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError, ProducerOutput,
-    RunHandle, RunState,
+    ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError, ProducerErrorBody,
+    ProducerOutput, RunHandle, RunState,
 };
 use crate::historian_validate::{
     validate_historian_output, HistorianChunk, HistorianValidationError, StoredCompartmentRange,
@@ -33,6 +36,76 @@ pub const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 const CHAIN_EXHAUSTED_PERMANENT_PREFIX: &str = "chain-exhausted-permanent:";
 const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
 const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
+pub(crate) const MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX: &str =
+    "model_unresolvable_chain_exhausted:";
+pub(crate) const MODEL_UNRESOLVABLE_PUBLISHED_PREFIX: &str = "published_with_model_unresolvable:";
+
+#[derive(Debug, Default)]
+struct HistorianModelUnresolvableCacheState {
+    generation: u64,
+    model_chain: Vec<String>,
+    reasons: BTreeMap<String, String>,
+}
+
+/// Models rejected by Broca's resolver for the current module/config generation. The handler
+/// shares this cache across sessions; changing the effective chain advances the generation and
+/// discards every prior refusal.
+#[derive(Debug, Default)]
+pub struct HistorianModelUnresolvableCache {
+    state: Mutex<HistorianModelUnresolvableCacheState>,
+}
+
+impl HistorianModelUnresolvableCache {
+    pub(crate) fn activate_chain(&self, model_chain: &[String]) -> u64 {
+        let mut state = self.state.lock().expect("historian model cache mutex");
+        if state.model_chain != model_chain {
+            state.generation = state.generation.wrapping_add(1).max(1);
+            state.model_chain = model_chain.to_vec();
+            state.reasons.clear();
+        }
+        state.generation
+    }
+
+    fn cached_reason(&self, generation: u64, model: &str) -> Option<String> {
+        let state = self.state.lock().expect("historian model cache mutex");
+        (state.generation == generation)
+            .then(|| state.reasons.get(model).cloned())
+            .flatten()
+    }
+
+    pub(crate) fn cached_reasons(
+        &self,
+        generation: u64,
+        model_chain: &[String],
+    ) -> Vec<(String, String)> {
+        model_chain
+            .iter()
+            .filter_map(|model| {
+                self.cached_reason(generation, model)
+                    .map(|reason| (model.clone(), reason))
+            })
+            .collect()
+    }
+
+    pub(crate) fn all_models_unresolvable(&self, generation: u64, model_chain: &[String]) -> bool {
+        !model_chain.is_empty()
+            && model_chain
+                .iter()
+                .all(|model| self.cached_reason(generation, model).is_some())
+    }
+
+    fn record(&self, generation: u64, model: &str, reason: &str) -> bool {
+        let mut state = self.state.lock().expect("historian model cache mutex");
+        if state.generation != generation {
+            return false;
+        }
+        if state.reasons.contains_key(model) {
+            return false;
+        }
+        state.reasons.insert(model.to_string(), reason.to_string());
+        true
+    }
+}
 
 /// Project a validated compartment onto the durable store row shape. Validation
 /// resolves the message-id endpoints and tiers; publication stamps the row and
@@ -69,16 +142,19 @@ fn to_stored_compartment(
     }
 }
 
-/// Project a validated fact candidate onto the store's promotion input. The
-/// historian promotes facts with no importance/expiry/source at publish time —
-/// classification and decay are later, cache-neutral passes.
-fn to_store_fact(f: &crate::historian_validate::FactCandidate) -> FactCandidate {
+/// Project a validated fact candidate onto the store's promotion input. Historian facts
+/// have no importance or expiry at publish time, but retain the source session so later
+/// maintenance can relate them to the publication that created them.
+fn to_store_fact(
+    f: &crate::historian_validate::FactCandidate,
+    source_session_id: &str,
+) -> FactCandidate {
     FactCandidate {
         category: f.category.clone(),
         content: f.content.clone(),
         importance: None,
         expires_at: None,
-        source_session_id: None,
+        source_session_id: Some(source_session_id.to_string()),
     }
 }
 
@@ -180,6 +256,113 @@ pub enum FireOutcome {
     Busy(HistorianDurableState),
 }
 
+/// Rust's concrete reason for declining a historian firing. The raw variant name stays
+/// available for Rust incident tooling while `canonical_cause` maps the decision onto the
+/// TypeScript operator vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorianNoFireCause {
+    HistorianAlreadyInProgress,
+    LiveHistorianClaimBusy,
+    RestartRecoveryInProgress,
+    CheapGateBelowTriggerBudget,
+    NoLiveMessageAtOrAfterOffset,
+    RawTailInspectionFailed,
+    ProjectedPostDropSatisfied,
+    ProtectedTailWindowEmpty,
+    BelowProactiveFloor,
+    BelowMinimumEligibleContent,
+    DrainBudgetSpent,
+    MissingBoundarySnapshot,
+    StaleBoundarySnapshot,
+    EmptyFilteredChunk,
+    InvalidChunkCoverage,
+    NoModels,
+    ModelUnresolvable,
+    FailureBackoff,
+    ValidationRejected,
+    ChainExhausted,
+    PendingRewrite,
+    StateLoadFailed,
+    ContinuedOrdinalOffsetMissing,
+    MissingBoundary,
+    EmptyEligibleRange,
+    EmptyChunk,
+    BelowSubstanceFloor,
+    MissingBlockIdentity,
+    AssemblyFailed,
+    SubagentSession,
+}
+
+impl HistorianNoFireCause {
+    pub const fn raw_cause(self) -> &'static str {
+        match self {
+            Self::HistorianAlreadyInProgress => "HistorianAlreadyInProgress",
+            Self::LiveHistorianClaimBusy => "LiveHistorianClaimBusy",
+            Self::RestartRecoveryInProgress => "RestartRecoveryInProgress",
+            Self::CheapGateBelowTriggerBudget => "CheapGateBelowTriggerBudget",
+            Self::NoLiveMessageAtOrAfterOffset => "NoLiveMessageAtOrAfterOffset",
+            Self::RawTailInspectionFailed => "RawTailInspectionFailed",
+            Self::ProjectedPostDropSatisfied => "ProjectedPostDropSatisfied",
+            Self::ProtectedTailWindowEmpty => "ProtectedTailWindowEmpty",
+            Self::BelowProactiveFloor => "BelowProactiveFloor",
+            Self::BelowMinimumEligibleContent => "BelowMinimumEligibleContent",
+            Self::DrainBudgetSpent => "DrainBudgetSpent",
+            Self::MissingBoundarySnapshot => "MissingBoundarySnapshot",
+            Self::StaleBoundarySnapshot => "StaleBoundarySnapshot",
+            Self::EmptyFilteredChunk => "EmptyFilteredChunk",
+            Self::InvalidChunkCoverage => "InvalidChunkCoverage",
+            Self::NoModels => "NoModels",
+            Self::ModelUnresolvable => "ModelUnresolvable",
+            Self::FailureBackoff => "FailureBackoff",
+            Self::ValidationRejected => "ValidationRejected",
+            Self::ChainExhausted => "ChainExhausted",
+            Self::PendingRewrite => "PendingRewrite",
+            Self::StateLoadFailed => "StateLoadFailed",
+            Self::ContinuedOrdinalOffsetMissing => "ContinuedOrdinalOffsetMissing",
+            Self::MissingBoundary => "MissingBoundary",
+            Self::EmptyEligibleRange => "EmptyEligibleRange",
+            Self::EmptyChunk => "EmptyChunk",
+            Self::BelowSubstanceFloor => "BelowSubstanceFloor",
+            Self::MissingBlockIdentity => "MissingBlockIdentity",
+            Self::AssemblyFailed => "AssemblyFailed",
+            Self::SubagentSession => "SubagentSession",
+        }
+    }
+
+    pub const fn canonical_cause(self) -> &'static str {
+        match self {
+            Self::HistorianAlreadyInProgress
+            | Self::LiveHistorianClaimBusy
+            | Self::RestartRecoveryInProgress => "in_flight",
+            Self::CheapGateBelowTriggerBudget => "cheap_skip",
+            Self::NoLiveMessageAtOrAfterOffset | Self::EmptyChunk => "no_new_raw_history",
+            Self::RawTailInspectionFailed => "raw_history_unavailable",
+            Self::ProjectedPostDropSatisfied => "redundancy_skip",
+            Self::ProtectedTailWindowEmpty | Self::MissingBoundary | Self::EmptyEligibleRange => {
+                "protected_tail"
+            }
+            Self::BelowMinimumEligibleContent | Self::BelowSubstanceFloor => "below_min_chunk",
+            Self::DrainBudgetSpent => "drain_budget",
+            Self::MissingBoundarySnapshot => "missing_boundary_snapshot",
+            Self::StaleBoundarySnapshot => "stale_boundary_snapshot",
+            Self::EmptyFilteredChunk => "below_min_chunk",
+            Self::InvalidChunkCoverage => "invalid_chunk_coverage",
+            Self::BelowProactiveFloor => "below_proactive_floor",
+            Self::NoModels => "no_models",
+            Self::ModelUnresolvable => "model_unresolvable",
+            Self::FailureBackoff => "failure_backoff",
+            Self::ValidationRejected => "validation_rejected",
+            Self::ChainExhausted => "chain_exhausted",
+            Self::PendingRewrite => "pending_rewrite",
+            Self::StateLoadFailed => "state_load_failed",
+            Self::ContinuedOrdinalOffsetMissing => "state_incomplete",
+            Self::MissingBlockIdentity => "invalid_boundary_identity",
+            Self::AssemblyFailed => "assembly_failed",
+            Self::SubagentSession => "subagent_session",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum HistorianStateError {
     InvalidRange {
@@ -256,6 +439,7 @@ pub fn fire(
     expected_revert_epoch: u64,
     compartment_set_generation: CompartmentSetGeneration,
     fired_at_ms: i64,
+    recent_decision: Option<HistorianRecentDecision>,
 ) -> Result<FireOutcome, HistorianStateError> {
     if from_ordinal > to_ordinal {
         return Err(HistorianStateError::InvalidRange {
@@ -265,6 +449,16 @@ pub fn fire(
     }
     if current.state != HistorianPhase::Idle {
         return Ok(FireOutcome::Busy(current.clone()));
+    }
+
+    let mut recent_decisions = current.recent_decisions.clone();
+    if let Some(decision) = recent_decision {
+        let mut decision_state = HistorianDurableState {
+            recent_decisions,
+            ..HistorianDurableState::default()
+        };
+        decision_state.start_recent_fire(decision);
+        recent_decisions = decision_state.recent_decisions;
     }
 
     Ok(FireOutcome::Fired(HistorianDurableState {
@@ -285,6 +479,7 @@ pub fn fire(
         last_failure: current.last_failure.clone(),
         // A fire resolves whatever skip reason preceded it.
         last_no_fire: None,
+        recent_decisions,
         consecutive_publish_failures: current.consecutive_publish_failures,
     }))
 }
@@ -329,7 +524,7 @@ pub fn tx_committed(
     current: &HistorianDurableState,
 ) -> Result<HistorianDurableState, HistorianStateError> {
     require_phase(current, HistorianPhase::Publishing, "tx_committed")?;
-    let mut next = idle_after_success(current.firing_seq);
+    let mut next = idle_after_success(current);
     next.consecutive_publish_failures = 0;
     Ok(next)
 }
@@ -365,6 +560,7 @@ pub fn abandon_with_detail(
         firing_seq: current.firing_seq,
         failure_backoff_at_ms: Some(failure_backoff_at_ms),
         last_failure: detail.or_else(|| current.last_failure.clone()),
+        recent_decisions: current.recent_decisions.clone(),
         consecutive_publish_failures: current.consecutive_publish_failures,
         ..HistorianDurableState::default()
     }
@@ -478,7 +674,12 @@ pub fn publish_validated_chunk(
         .map(|c| to_stored_compartment(c, request.created_at_ms, request.boundary_dates))
         .collect();
     let facts: Vec<FactCandidate> = if request.promote_facts {
-        request.validated.facts.iter().map(to_store_fact).collect()
+        request
+            .validated
+            .facts
+            .iter()
+            .map(|fact| to_store_fact(fact, request.session_id))
+            .collect()
     } else {
         Vec::new()
     };
@@ -758,6 +959,16 @@ pub trait HistorianProducerDriver: Send {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
+    async fn start_with_temperature(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.start(session_id, system, prompt, model).await
+    }
     async fn start_with_generation(
         &mut self,
         session_id: &str,
@@ -821,6 +1032,25 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::start(self, session_id, system, prompt, model).await
     }
 
+    async fn start_with_temperature(
+        &mut self,
+        session_id: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        HistorianProducer::start_with_temperature(
+            self,
+            session_id,
+            system,
+            prompt,
+            model,
+            temperature,
+        )
+        .await
+    }
+
     async fn start_with_generation(
         &mut self,
         session_id: &str,
@@ -837,7 +1067,7 @@ impl HistorianProducerDriver for HistorianProducer {
             prompt,
             model,
             max_output_tokens,
-            temperature,
+            Some(temperature),
         )
         .await
     }
@@ -907,6 +1137,10 @@ pub struct HistorianFireRequest<'a> {
     pub content_language: Option<&'a str>,
     pub prompt: &'a str,
     pub model_chain: &'a [String],
+    pub temperature: Option<f64>,
+    pub producer_source_tokens: usize,
+    pub historian_context_limit_tokens: Option<usize>,
+    pub max_output_tokens: u32,
     pub from_ordinal: u64,
     pub to_ordinal: u64,
     pub chunk_fingerprint: &'a str,
@@ -923,6 +1157,7 @@ pub struct HistorianFireRequest<'a> {
     pub validate_options: ValidateOptions,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
+    pub recent_decision: Option<HistorianRecentDecision>,
     pub completion_now_ms: fn() -> i64,
     pub publication_fence: Option<&'a dyn HistorianPublicationFence>,
 }
@@ -1156,6 +1391,37 @@ pub(crate) fn completion_failure_backoff_at_ms(
     completed_at_ms.saturating_add(cooldown_ms)
 }
 
+fn abandon_chain_failure(
+    current: &HistorianDurableState,
+    error: &HistorianProducerError,
+    decision: ProducerFailureDecision,
+    earliest_reset_ms: Option<i64>,
+    detail: Option<String>,
+) -> HistorianDurableState {
+    let mut next = abandon_with_detail(current, decision.failure_backoff_at_ms, detail);
+    let refused = matches!(
+        error.classification().map(|value| value.class),
+        Some(ErrorClass::Transient | ErrorClass::Permanent | ErrorClass::AuthRequired)
+    ) || (!error.has_class_field() && error.is_retryable_model_failure());
+    if !decision.try_next_model && refused {
+        record_chain_outage(&mut next, earliest_reset_ms);
+    }
+    next
+}
+
+fn record_chain_outage(next: &mut HistorianDurableState, earliest_reset_ms: Option<i64>) {
+    let reset = earliest_reset_ms
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "unknown".into());
+    let outage = format!("chain_exhausted earliest_provider_reset={reset} retry=probe; serving retained context and reductions");
+    next.last_failure = Some(format!(
+        "{}; {outage}",
+        next.last_failure.as_deref().unwrap_or("")
+    ));
+    next.last_no_fire = Some(outage);
+}
+
 fn classified_backoff_at_ms(
     now_ms: i64,
     default_failure_backoff_at_ms: i64,
@@ -1203,6 +1469,118 @@ fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
     }
 }
 
+pub(crate) fn model_unresolvable_detail(
+    failures: &[(String, String)],
+    chain_exhausted: bool,
+) -> String {
+    let reasons = failures
+        .iter()
+        .map(|(model, reason)| format!("model_unresolvable:{model}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if chain_exhausted {
+        format!("{MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX}{reasons}")
+    } else {
+        reasons
+    }
+}
+
+fn detail_with_model_unresolvable(
+    failures: &[(String, String)],
+    detail_prefix: Option<&str>,
+    detail: String,
+) -> String {
+    let detail = prefixed_detail(detail_prefix, detail);
+    if failures.is_empty() {
+        detail
+    } else {
+        format!("{}; {detail}", model_unresolvable_detail(failures, false))
+    }
+}
+
+fn remaining_uncached_models(
+    models: &[String],
+    cache: Option<&HistorianModelUnresolvableCache>,
+    generation: u64,
+) -> Vec<String> {
+    models
+        .iter()
+        .filter(|model| {
+            cache
+                .and_then(|cache| cache.cached_reason(generation, model))
+                .is_none()
+        })
+        .cloned()
+        .collect()
+}
+
+fn abandon_model_unresolvable(
+    current: &HistorianDurableState,
+    detail: String,
+    earliest_reset_ms: Option<i64>,
+) -> HistorianDurableState {
+    let mut next = abandon_with_detail(current, 0, Some(detail));
+    next.failure_backoff_at_ms = earliest_reset_ms;
+    if next
+        .last_failure
+        .as_deref()
+        .is_some_and(|detail| detail.contains("chain_exhausted"))
+    {
+        record_chain_outage(&mut next, earliest_reset_ms);
+    }
+    next
+}
+
+fn persist_idle_model_unresolvable_detail(
+    store: &McStore,
+    session_id: &str,
+    expected_firing_seq: Option<u64>,
+    detail: String,
+) -> Result<u64, HistorianStateError> {
+    for attempt in 0..3 {
+        let loaded = store.load(session_id)?;
+        if loaded.meta.historian.state != HistorianPhase::Idle
+            || expected_firing_seq
+                .is_some_and(|expected| loaded.meta.historian.firing_seq != expected)
+        {
+            return Ok(loaded.row_version.unwrap_or(0));
+        }
+        let mut meta = loaded.meta.clone();
+        meta.historian.last_failure = Some(detail.clone());
+        meta.historian.last_no_fire = None;
+        meta.historian.failure_backoff_at_ms = None;
+        match store.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+            Ok(row_version) => return Ok(row_version),
+            Err(McStoreError::CasConflict { .. }) if attempt < 2 => continue,
+            Err(error) => return Err(HistorianStateError::Store(error)),
+        }
+    }
+    unreachable!("the model-unresolvable CAS loop returns from every attempt")
+}
+
+pub(crate) const PRODUCER_WINDOW_REFUSAL_MARGIN_PERCENT: usize = 15;
+
+pub(crate) fn producer_window_failure_reason(
+    producer_source_tokens: usize,
+    context_limit_tokens: Option<usize>,
+    max_output_tokens: u32,
+) -> Option<String> {
+    let context_limit_tokens = context_limit_tokens?;
+    if producer_source_tokens == 0 {
+        return None;
+    }
+    let usable_input_tokens = context_limit_tokens.saturating_sub(max_output_tokens as usize);
+    let source_scaled = (producer_source_tokens as u128).saturating_mul(100);
+    let refusal_scaled = (usable_input_tokens as u128)
+        .saturating_mul((100 + PRODUCER_WINDOW_REFUSAL_MARGIN_PERCENT) as u128);
+    if source_scaled < refusal_scaled {
+        return None;
+    }
+    Some(format!(
+        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} context_limit_tokens={context_limit_tokens} max_output_tokens={max_output_tokens} refusal_margin=0.15"
+    ))
+}
+
 pub async fn run_historian_firing<P>(
     producer: &mut P,
     request: HistorianFireRequest<'_>,
@@ -1210,16 +1588,56 @@ pub async fn run_historian_firing<P>(
 where
     P: HistorianProducerDriver + ?Sized,
 {
+    run_historian_firing_with_model_cache(producer, request, None, 0).await
+}
+
+pub(crate) async fn run_historian_firing_with_model_cache<P>(
+    producer: &mut P,
+    request: HistorianFireRequest<'_>,
+    model_unresolvable_cache: Option<&HistorianModelUnresolvableCache>,
+    model_chain_generation: u64,
+) -> Result<HistorianDriveOutcome, HistorianDriveError>
+where
+    P: HistorianProducerDriver + ?Sized,
+{
     if request.model_chain.is_empty() {
         return Err(HistorianDriveError::NoModels);
+    }
+    if let Some(reason) = producer_window_failure_reason(
+        request.producer_source_tokens,
+        request.historian_context_limit_tokens,
+        request.max_output_tokens,
+    ) {
+        let loaded = request.store.load(request.session_id)?;
+        let mut meta = loaded.meta.clone();
+        meta.historian.last_failure = Some(reason.clone());
+        meta.historian.failure_backoff_at_ms = Some(request.failure_backoff_at_ms);
+        request
+            .store
+            .commit(request.session_id, loaded.row_version, &loaded.core, &meta)?;
+        eprintln!(
+            "[mc-module][{}] historian oversize admission refused before spawn: {reason}",
+            request.session_id
+        );
+        return Err(HistorianDriveError::Producer(
+            HistorianProducerError::context_overflow(reason),
+        ));
     }
 
     let mut auth_blocked_providers = Vec::new();
     let mut all_failures_permanent = true;
+    let mut earliest_provider_reset_ms: Option<i64> = None;
+    let mut model_unresolvable_failures = Vec::new();
     let mut prompt = request.prompt.to_string();
 
     for (index, model) in request.model_chain.iter().enumerate() {
         if provider_is_auth_blocked(&auth_blocked_providers, model) {
+            continue;
+        }
+        if let Some(reason) = model_unresolvable_cache
+            .and_then(|cache| cache.cached_reason(model_chain_generation, model))
+        {
+            model_unresolvable_failures.push((model.clone(), reason));
             continue;
         }
         verify_chunk_fingerprint(
@@ -1227,7 +1645,11 @@ where
             request.observed_chunk_fingerprint,
         )?;
         let loaded = request.store.load(request.session_id)?;
-        let fired = match fire(
+        let mut recent_decision = request.recent_decision.clone();
+        if let Some(decision) = recent_decision.as_mut() {
+            decision.producer_model = Some(model.clone());
+        }
+        let mut fired = match fire(
             &loaded.meta.historian,
             request.from_ordinal,
             request.to_ordinal,
@@ -1236,10 +1658,18 @@ where
             request.expected_revert_epoch,
             request.compartment_set_generation,
             request.now_ms,
+            recent_decision,
         )? {
             FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(state)),
             FireOutcome::Fired(state) => state,
         };
+        if !model_unresolvable_failures.is_empty() {
+            fired.last_failure = Some(model_unresolvable_detail(
+                &model_unresolvable_failures,
+                false,
+            ));
+            fired.failure_backoff_at_ms = None;
+        }
         persist_historian_state(request.store, request.session_id, fired.clone())?;
 
         let producer_session_id = historian_producer_session_id(
@@ -1248,38 +1678,91 @@ where
             fired.firing_seq,
         );
         let handle = match producer
-            .start(
+            .start_with_temperature(
                 &producer_session_id,
                 request.system.as_ref(),
                 &prompt,
                 model,
+                request.temperature,
             )
             .await
         {
             Ok(handle) => handle,
             Err(err) => {
+                if let Some(body) = err.model_unresolvable_open_body() {
+                    let reason = format!("{}: {}", body.code, body.message);
+                    model_unresolvable_failures.push((model.clone(), reason.clone()));
+                    if model_unresolvable_cache
+                        .is_some_and(|cache| cache.record(model_chain_generation, model, &reason))
+                    {
+                        eprintln!(
+                            "[mc-module] historian model unresolvable for generation {}: {model}: {reason}",
+                            model_chain_generation
+                        );
+                    }
+                    let remaining = remaining_uncached_models(
+                        &request.model_chain[index + 1..],
+                        model_unresolvable_cache,
+                        model_chain_generation,
+                    );
+                    let exhausted = !has_eligible_model(&remaining, &auth_blocked_providers);
+                    persist_historian_state(
+                        request.store,
+                        request.session_id,
+                        abandon_model_unresolvable(
+                            &fired,
+                            model_unresolvable_detail(&model_unresolvable_failures, exhausted),
+                            earliest_provider_reset_ms,
+                        ),
+                    )?;
+                    producer.close().await;
+                    if !exhausted {
+                        continue;
+                    }
+                    return Err(HistorianDriveError::Producer(err));
+                }
+
                 let completed_at_ms = (request.completion_now_ms)();
                 let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                     request.now_ms,
                     request.failure_backoff_at_ms,
                     completed_at_ms,
                 );
-                let decision = decide_producer_failure(
+                let remaining = remaining_uncached_models(
+                    &request.model_chain[index + 1..],
+                    model_unresolvable_cache,
+                    model_chain_generation,
+                );
+                let mut decision = decide_producer_failure(
                     &err,
                     model,
-                    &request.model_chain[index + 1..],
+                    &remaining,
                     &mut auth_blocked_providers,
                     &mut all_failures_permanent,
                     completed_at_ms,
                     failure_backoff_at_ms,
                 );
+                if let Some(reset) = err.provider_retry_at_ms(completed_at_ms) {
+                    earliest_provider_reset_ms =
+                        Some(earliest_provider_reset_ms.map_or(reset, |prior| prior.min(reset)));
+                }
+                if !decision.try_next_model {
+                    if let Some(reset) =
+                        earliest_provider_reset_ms.filter(|reset| *reset > completed_at_ms)
+                    {
+                        decision.failure_backoff_at_ms = reset;
+                    }
+                }
                 persist_historian_state(
                     request.store,
                     request.session_id,
-                    abandon_with_detail(
+                    abandon_chain_failure(
                         &fired,
-                        decision.failure_backoff_at_ms,
-                        Some(prefixed_detail(
+                        &err,
+                        decision,
+                        earliest_provider_reset_ms,
+                        Some(detail_with_model_unresolvable(
+                            &model_unresolvable_failures,
                             decision.detail_prefix,
                             format!("producer start ({model}): {err:?}"),
                         )),
@@ -1304,8 +1787,12 @@ where
                     Ok(output) => output,
                     Err(recovery_err) => {
                         let _ = producer.cancel(&handle.run_id).await;
-                        let detail = format!(
-                            "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
+                        let detail = detail_with_model_unresolvable(
+                            &model_unresolvable_failures,
+                            None,
+                            format!(
+                                "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
+                            ),
                         );
                         let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                             request.now_ms,
@@ -1330,22 +1817,41 @@ where
                     request.failure_backoff_at_ms,
                     completed_at_ms,
                 );
-                let decision = decide_producer_failure(
+                let remaining = remaining_uncached_models(
+                    &request.model_chain[index + 1..],
+                    model_unresolvable_cache,
+                    model_chain_generation,
+                );
+                let mut decision = decide_producer_failure(
                     &err,
                     model,
-                    &request.model_chain[index + 1..],
+                    &remaining,
                     &mut auth_blocked_providers,
                     &mut all_failures_permanent,
                     completed_at_ms,
                     failure_backoff_at_ms,
                 );
+                if let Some(reset) = err.provider_retry_at_ms(completed_at_ms) {
+                    earliest_provider_reset_ms =
+                        Some(earliest_provider_reset_ms.map_or(reset, |prior| prior.min(reset)));
+                }
+                if !decision.try_next_model {
+                    if let Some(reset) =
+                        earliest_provider_reset_ms.filter(|reset| *reset > completed_at_ms)
+                    {
+                        decision.failure_backoff_at_ms = reset;
+                    }
+                }
                 persist_historian_state(
                     request.store,
                     request.session_id,
-                    abandon_with_detail(
+                    abandon_chain_failure(
                         &awaiting,
-                        decision.failure_backoff_at_ms,
-                        Some(prefixed_detail(
+                        &err,
+                        decision,
+                        earliest_provider_reset_ms,
+                        Some(detail_with_model_unresolvable(
+                            &model_unresolvable_failures,
                             decision.detail_prefix,
                             format!("producer output ({model}): {err:?}"),
                         )),
@@ -1387,7 +1893,12 @@ where
             Err(HistorianDriveError::Validation(err)) => {
                 // Validation rejection is model-local output failure. Exhaust the
                 // configured fallback chain before returning the final rejection.
-                if has_eligible_model(&request.model_chain[index + 1..], &auth_blocked_providers) {
+                let remaining = remaining_uncached_models(
+                    &request.model_chain[index + 1..],
+                    model_unresolvable_cache,
+                    model_chain_generation,
+                );
+                if has_eligible_model(&remaining, &auth_blocked_providers) {
                     prompt = crate::historian_prompt::build_historian_repair_prompt(
                         request.prompt,
                         &output.text,
@@ -1400,6 +1911,19 @@ where
             }
             Err(err) => return Err(err),
         };
+        let row_version = if model_unresolvable_failures.is_empty() {
+            row_version
+        } else {
+            persist_idle_model_unresolvable_detail(
+                request.store,
+                request.session_id,
+                Some(fired.firing_seq),
+                format!(
+                    "{MODEL_UNRESOLVABLE_PUBLISHED_PREFIX}{}",
+                    model_unresolvable_detail(&model_unresolvable_failures, false)
+                ),
+            )?
+        };
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
             row_version,
             producer_session_id,
@@ -1408,7 +1932,16 @@ where
         }));
     }
 
-    Err(HistorianDriveError::NoModels)
+    let detail = model_unresolvable_detail(&model_unresolvable_failures, true);
+    persist_idle_model_unresolvable_detail(
+        request.store,
+        request.session_id,
+        None,
+        detail.clone(),
+    )?;
+    Err(HistorianDriveError::Producer(HistorianProducerError::Subc(
+        ProducerErrorBody::untagged("model_unresolvable", detail),
+    )))
 }
 
 pub async fn reattach_historian_producer<P>(
@@ -1703,9 +2236,10 @@ fn require_phase(
     }
 }
 
-fn idle_after_success(firing_seq: u64) -> HistorianDurableState {
+fn idle_after_success(current: &HistorianDurableState) -> HistorianDurableState {
     HistorianDurableState {
-        firing_seq,
+        firing_seq: current.firing_seq,
+        recent_decisions: current.recent_decisions.clone(),
         ..HistorianDurableState::default()
     }
 }
@@ -1812,6 +2346,8 @@ mod tests {
             upgrade_state: String::new(),
             is_subagent: false,
             protected_tags: 20,
+            protected_tags_present: false,
+            protected_tokens_effective: None,
             provider_id: None,
             model_key: None,
             clear_reasoning_age: 50,
@@ -1874,6 +2410,8 @@ mod tests {
             temporal_awareness: true,
             now_ms: 0,
             execute_threshold_percentage: 65.0,
+            protected_tokens_floor: 16_000,
+            protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
             cache_ttl: "5m".to_string(),
@@ -2073,6 +2611,7 @@ mod tests {
         observed_sessions: Vec<String>,
         observed_systems: Vec<String>,
         observed_prompts: Vec<String>,
+        observed_temperatures: Vec<Option<f64>>,
         await_run_ids: Vec<String>,
         cancels: Vec<String>,
         closes: usize,
@@ -2123,6 +2662,18 @@ mod tests {
             self.starts
                 .pop_front()
                 .expect("scripted start result available")
+        }
+
+        async fn start_with_temperature(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.observed_temperatures.push(temperature);
+            self.start(session_id, system, prompt, model).await
         }
 
         async fn await_output(
@@ -2226,6 +2777,10 @@ mod tests {
             content_language: None,
             prompt,
             model_chain: models,
+            temperature: None,
+            producer_source_tokens: 1,
+            historian_context_limit_tokens: None,
+            max_output_tokens: 32_000,
             from_ordinal: 2,
             to_ordinal: 4,
             chunk_fingerprint: "fp",
@@ -2241,6 +2796,7 @@ mod tests {
             validate_options: validate_options(),
             now_ms: 123,
             failure_backoff_at_ms: 999,
+            recent_decision: None,
             completion_now_ms: || 123,
             publication_fence: None,
         }
@@ -2288,8 +2844,65 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            recent_decisions: Vec::new(),
             consecutive_publish_failures: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn producer_window_guard_refuses_two_x_and_admits_one_point_zero_five_x() {
+        let refused_dir = tempfile::tempdir().unwrap();
+        let refused_store = store(refused_dir.path());
+        seed_prior_compartment(&refused_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut refused_request = fire_request(
+            &refused_store,
+            "placeholder prompt",
+            &models,
+            &chunk,
+            &prior,
+        );
+        refused_request.producer_source_tokens = 20_000;
+        refused_request.historian_context_limit_tokens = Some(11_000);
+        refused_request.max_output_tokens = 1_000;
+        let mut refused_producer = ScriptedProducer::default();
+
+        assert!(run_historian_firing(&mut refused_producer, refused_request)
+            .await
+            .is_err());
+        assert!(refused_producer.observed_starts.is_empty());
+        let refused_state = refused_store.load("ses").unwrap().meta.historian;
+        assert_eq!(refused_state.failure_backoff_at_ms, Some(999));
+        assert_eq!(
+            refused_state.last_failure.as_deref(),
+            Some("producer_source_exceeds_window producer_source_tokens=20000 usable_input_tokens=10000 context_limit_tokens=11000 max_output_tokens=1000 refusal_margin=0.15")
+        );
+
+        let admitted_dir = tempfile::tempdir().unwrap();
+        let admitted_store = store(admitted_dir.path());
+        seed_prior_compartment(&admitted_store);
+        let mut admitted_request = fire_request(
+            &admitted_store,
+            "placeholder prompt",
+            &models,
+            &chunk,
+            &prior,
+        );
+        admitted_request.producer_source_tokens = 10_500;
+        admitted_request.historian_context_limit_tokens = Some(11_000);
+        admitted_request.max_output_tokens = 1_000;
+        let mut admitted_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-window-edge")))
+            .with_output(Ok(producer_output(historian_xml("within margin"))));
+
+        assert!(
+            run_historian_firing(&mut admitted_producer, admitted_request)
+                .await
+                .is_ok()
+        );
+        assert_eq!(admitted_producer.observed_starts.len(), 1);
     }
 
     #[tokio::test]
@@ -2445,18 +3058,15 @@ mod tests {
             .with_start(Ok(run_handle("run-2")))
             .with_output(Ok(producer_output(historian_xml("fallback model summary"))));
 
-        let outcome = run_historian_firing(
-            &mut producer,
-            fire_request(
-                &fallback_store,
-                "placeholder prompt",
-                &models,
-                &chunk,
-                &prior,
-            ),
-        )
-        .await
-        .unwrap();
+        let mut request = fire_request(
+            &fallback_store,
+            "placeholder prompt",
+            &models,
+            &chunk,
+            &prior,
+        );
+        request.temperature = Some(0.0);
+        let outcome = run_historian_firing(&mut producer, request).await.unwrap();
         let HistorianDriveOutcome::Completed(success) = outcome else {
             panic!("expected completed fallback outcome");
         };
@@ -2475,6 +3085,7 @@ mod tests {
             ],
             "fallback retries author a new session/run instead of resuming under another model"
         );
+        assert_eq!(producer.observed_temperatures, vec![Some(0.0), Some(0.0)]);
         assert_eq!(
             fallback_store
                 .load("ses")
@@ -2512,6 +3123,213 @@ mod tests {
         let state = overflow_store.load("ses").unwrap().meta.historian;
         assert_eq!(state.state, HistorianPhase::Idle);
         assert_eq!(state.firing_seq, 1);
+    }
+
+    fn live_model_unresolvable_open_error() -> HistorianProducerError {
+        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "open_failed",
+            "open failed: run resolution failed: no apikey credential for provider 'opencode' (credential id 'apikey:opencode')",
+        ))
+    }
+
+    #[tokio::test]
+    async fn open_resolution_refusal_advances_and_records_skipped_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
+        let cache = HistorianModelUnresolvableCache::default();
+        let generation = cache.activate_chain(&models);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(live_model_unresolvable_open_error()))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml(
+                "fallback after unresolved primary",
+            ))));
+        let request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+
+        let outcome =
+            run_historian_firing_with_model_cache(&mut producer, request, Some(&cache), generation)
+                .await
+                .unwrap();
+
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("expected unresolved primary to advance to fallback model");
+        };
+        assert_eq!(success.model, "google/model-b");
+        assert_eq!(producer.observed_starts.len(), 2);
+        let state = store.load("ses").unwrap().meta.historian;
+        let detail = state.last_failure.expect("skipped model remains durable");
+        assert!(detail.contains("model_unresolvable:opencode/model-a"));
+        assert!(detail.contains("no apikey credential for provider 'opencode'"));
+        assert_eq!(state.failure_backoff_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn transport_open_refusal_stays_on_primary_and_arms_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let mut producer = ScriptedProducer::default().with_start(Err(
+            HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                "open_failed",
+                "open failed: route closed before bind completed",
+            )),
+        ));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.observed_starts.len(), 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert!(!state
+            .last_failure
+            .as_deref()
+            .unwrap_or_default()
+            .contains("model_unresolvable"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_chain_exhaustion_records_every_model_without_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
+        let cache = HistorianModelUnresolvableCache::default();
+        let generation = cache.activate_chain(&models);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(live_model_unresolvable_open_error()))
+            .with_start(Err(HistorianProducerError::Subc(
+                ProducerErrorBody::untagged(
+                    "open_failed",
+                    "open failed: run resolution failed: unknown model 'model-b' for provider 'google'",
+                ),
+            )));
+        let request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+
+        let err =
+            run_historian_firing_with_model_cache(&mut producer, request, Some(&cache), generation)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(err, HistorianDriveError::Producer(_)));
+        assert_eq!(producer.observed_starts.len(), 2);
+        let state = store.load("ses").unwrap().meta.historian;
+        let detail = state.last_failure.expect("chain failure remains durable");
+        assert!(detail.starts_with(MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX));
+        assert!(detail.contains("model_unresolvable:opencode/model-a"));
+        assert!(detail.contains("model_unresolvable:google/model-b"));
+        assert_eq!(state.failure_backoff_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn generation_cache_opens_unresolved_model_only_once_across_firings() {
+        let models = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
+        let cache = HistorianModelUnresolvableCache::default();
+        let generation = cache.activate_chain(&models);
+
+        let dir_one = tempfile::tempdir().unwrap();
+        let store_one = store(dir_one.path());
+        seed_prior_compartment(&store_one);
+        let chunk_one = historian_chunk();
+        let prior_one = prior_ranges();
+        let mut first = ScriptedProducer::default()
+            .with_start(Err(live_model_unresolvable_open_error()))
+            .with_start(Ok(run_handle("run-first-b")))
+            .with_output(Ok(producer_output(historian_xml("first fallback"))));
+        let first_request = fire_request(
+            &store_one,
+            "placeholder prompt",
+            &models,
+            &chunk_one,
+            &prior_one,
+        );
+        run_historian_firing_with_model_cache(&mut first, first_request, Some(&cache), generation)
+            .await
+            .unwrap();
+
+        let dir_two = tempfile::tempdir().unwrap();
+        let store_two = store(dir_two.path());
+        seed_prior_compartment(&store_two);
+        let chunk_two = historian_chunk();
+        let prior_two = prior_ranges();
+        let mut second = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-second-b")))
+            .with_output(Ok(producer_output(historian_xml("second fallback"))));
+        let second_request = fire_request(
+            &store_two,
+            "placeholder prompt",
+            &models,
+            &chunk_two,
+            &prior_two,
+        );
+        run_historian_firing_with_model_cache(
+            &mut second,
+            second_request,
+            Some(&cache),
+            generation,
+        )
+        .await
+        .unwrap();
+
+        let model_a_open_count = first
+            .observed_starts
+            .iter()
+            .chain(&second.observed_starts)
+            .filter(|(_, model)| model == "opencode/model-a")
+            .count();
+        assert_eq!(model_a_open_count, 1);
+        assert_eq!(
+            second
+                .observed_starts
+                .iter()
+                .map(|(_, model)| model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["google/model-b"]
+        );
+        assert!(store_two
+            .load("ses")
+            .unwrap()
+            .meta
+            .historian
+            .last_failure
+            .as_deref()
+            .unwrap_or_default()
+            .contains("model_unresolvable:opencode/model-a"));
+    }
+
+    #[test]
+    fn model_unresolvable_cache_invalidates_when_chain_changes() {
+        let cache = HistorianModelUnresolvableCache::default();
+        let first_chain = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
+        let first_generation = cache.activate_chain(&first_chain);
+        assert!(cache.record(first_generation, &first_chain[0], "open_failed: unresolved"));
+        assert!(cache
+            .cached_reason(first_generation, &first_chain[0])
+            .is_some());
+
+        let second_chain = vec!["anthropic/model-c".to_string()];
+        let second_generation = cache.activate_chain(&second_chain);
+        assert_ne!(second_generation, first_generation);
+        assert!(cache
+            .cached_reason(second_generation, &first_chain[0])
+            .is_none());
+        assert!(cache
+            .cached_reason(first_generation, &first_chain[0])
+            .is_none());
     }
 
     #[tokio::test]
@@ -2589,6 +3407,53 @@ mod tests {
             "all-permanent chain exhaustion must be visible in durable state: {:?}",
             state.last_failure
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_chain_keeps_earliest_reset_and_tries_third_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["primary/a".into(), "google/b".into(), "third/c".into()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "refused",
+                "unavailable",
+                ErrorClass::Permanent,
+                None,
+            )))
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "429",
+                r#"{"quotaResetTimeStamp":"2026-09-11T20:34:51Z","quotaResetDelay":"5760s"}"#,
+                ErrorClass::Transient,
+                None,
+            )))
+            .with_start(Err(HistorianProducerError::tagged_subc(
+                "429",
+                r#"{"quotaResetTimeStamp":"2026-09-11T21:34:51Z"}"#,
+                ErrorClass::Transient,
+                None,
+            )));
+        run_historian_firing(
+            &mut producer,
+            fire_request(&store, "prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(producer.observed_starts.len(), 3);
+        let state = store.load("ses").unwrap().meta.historian;
+        let reset = chrono::DateTime::parse_from_rfc3339("2026-09-11T20:34:51Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(state.failure_backoff_at_ms, Some(reset));
+        let detail = state.last_no_fire.unwrap();
+        assert!(detail.contains("chain_exhausted"));
+        assert!(detail.contains("2026-09-11T20:34:51"));
+        assert!(detail.contains("probe"));
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2845,6 +3710,7 @@ mod tests {
                 count: 1,
             },
             1,
+            None,
         )
         .unwrap()
         {
@@ -2900,6 +3766,7 @@ mod tests {
                 count: 1,
             },
             1,
+            None,
         )
         .unwrap()
         {
@@ -2975,6 +3842,7 @@ mod tests {
                     count: 1,
                 },
                 1,
+                None,
             )
             .unwrap()
             {
@@ -3085,6 +3953,7 @@ mod tests {
                 count: 1,
             },
             1,
+            None,
         )
         .unwrap()
         {
@@ -3132,6 +4001,7 @@ mod tests {
             0,
             CompartmentSetGeneration::default(),
             1,
+            None,
         )
         .unwrap()
         {
@@ -3173,6 +4043,7 @@ mod tests {
                 0,
                 CompartmentSetGeneration::default(),
                 2,
+                None,
             )
             .unwrap(),
             FireOutcome::Fired(_)
@@ -3437,6 +4308,7 @@ mod tests {
                 0,
                 CompartmentSetGeneration::default(),
                 124,
+                None,
             )
             .unwrap(),
             FireOutcome::Fired(_)
@@ -3466,6 +4338,7 @@ mod tests {
                 count: 1,
             },
             1,
+            None,
         )
         .unwrap()
         {
@@ -3829,6 +4702,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            recent_decisions: Vec::new(),
             consecutive_publish_failures: 0,
         };
         let rv = store
@@ -3879,6 +4753,14 @@ mod tests {
         assert_eq!(c2.p1.as_deref(), Some("second arc full and exact"));
         assert_eq!(c2.legacy, 0);
         assert_eq!(c2.created_at, 123);
+        let memories = store.load_active_memories("git:proj", 0).unwrap();
+        assert_eq!(memories.len(), 1);
+        let fact = store.get_memory_full(memories[0].id).unwrap().unwrap();
+        assert_eq!(fact.source_session_id.as_deref(), Some("ses"));
+        assert_eq!(fact.first_seen_at, 123);
+        assert_eq!(fact.created_at, 123);
+        assert_eq!(fact.updated_at, 123);
+        assert_eq!(fact.last_seen_at, 123);
     }
 
     #[test]
@@ -4000,6 +4882,7 @@ mod tests {
             0,
             CompartmentSetGeneration::default(),
             100,
+            None,
         )
         .unwrap()
         {
@@ -4018,6 +4901,7 @@ mod tests {
                 0,
                 CompartmentSetGeneration::default(),
                 101,
+                None,
             )
             .unwrap(),
             FireOutcome::Busy(_)
@@ -4047,6 +4931,7 @@ mod tests {
             0,
             CompartmentSetGeneration::default(),
             100,
+            None,
         )
         .unwrap()
         {
@@ -4119,6 +5004,7 @@ mod tests {
                 0,
                 CompartmentSetGeneration::default(),
                 1000,
+                None,
             )
             .unwrap(),
             FireOutcome::Fired(_)
@@ -4136,6 +5022,7 @@ mod tests {
             42,
             CompartmentSetGeneration::default(),
             100,
+            None,
         )
         .unwrap()
         {
@@ -4297,6 +5184,7 @@ mod tests {
             7,
             CompartmentSetGeneration::default(),
             1,
+            None,
         )
         .unwrap()
         {
@@ -4352,6 +5240,7 @@ mod tests {
                 0,
                 CompartmentSetGeneration::default(),
                 10,
+                None,
             )
             .unwrap()
             {
@@ -4424,7 +5313,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_floor_only_between_defers_is_byte_invisible_to_transform() {
+    fn historian_fire_and_no_fire_meta_are_byte_invisible_to_transform() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         store
@@ -4436,6 +5325,36 @@ mod tests {
         let request = req(vec![item("m1", 1, "raw"), item("t2", 2, "tail")]);
         run_transform(&store, &request);
         let before = run_transform(&store, &request);
+        let wire_sha =
+            |messages: &[CkWireMessage]| crate::sha256_hex(&serde_json::to_vec(messages).unwrap());
+        let before_sha = wire_sha(&before);
+
+        let loaded = store.load("ses").unwrap();
+        let mut no_fire_meta = loaded.meta.clone();
+        no_fire_meta
+            .historian
+            .record_recent_decision(HistorianRecentDecision {
+                at_ms: 10,
+                request_observed_at_ms: 9,
+                decision: HistorianDecision::NoFire,
+                cause: "below_proactive_floor".to_string(),
+                eligible_tokens: 200,
+                bar_tokens: 19_500,
+                pressure_pct: 40,
+                drain_latch: false,
+                chunk_range: Some(HistorianChunkRange {
+                    from_ordinal: 2,
+                    to_ordinal: 2,
+                }),
+                producer_model: None,
+                completed_at_ms: None,
+                apply_row_version: None,
+            });
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &no_fire_meta)
+            .unwrap();
+        let after_no_fire = run_transform(&store, &request);
+        assert_eq!(wire_sha(&after_no_fire), before_sha);
 
         let mut meta = store.load("ses").unwrap().meta;
         let selected_range_identities = vec![HistorianSelectedMessageIdentity {
@@ -4455,6 +5374,21 @@ mod tests {
         state.chunk_fingerprint = "tail-fp".into();
         state.selected_range_identities = selected_range_identities.clone();
         state.producer_run_id = Some("run-3".into());
+        state.recent_decisions = meta.historian.recent_decisions.clone();
+        state.record_recent_decision(HistorianRecentDecision {
+            at_ms: 20,
+            request_observed_at_ms: 19,
+            decision: HistorianDecision::Fired,
+            cause: "trigger_true:pressure".to_string(),
+            eligible_tokens: 20_000,
+            bar_tokens: 19_500,
+            pressure_pct: 60,
+            drain_latch: false,
+            chunk_range: state.chunk_range.clone(),
+            producer_model: Some("test/model".to_string()),
+            completed_at_ms: None,
+            apply_row_version: None,
+        });
         meta.historian = state;
         let row_version = store
             .commit(
@@ -4495,12 +5429,17 @@ mod tests {
             .unwrap();
 
         let after = run_transform(&store, &request);
+        assert_eq!(wire_sha(&after), before_sha);
         assert_eq!(
             after, before,
-            "publication floor and deduped facts never render"
+            "historian decision metadata, publication floor, and deduped facts never render"
         );
         let loaded = store.load("ses").unwrap();
         assert_eq!(loaded.meta.publication_floor_ordinal, Some(3));
         assert_eq!(loaded.meta.coverage_ordinal, Some(1));
+        let fire_decision = loaded.meta.historian.recent_decisions.last().unwrap();
+        assert_eq!(fire_decision.decision, HistorianDecision::Fired);
+        assert!(fire_decision.completed_at_ms.is_some());
+        assert_eq!(fire_decision.apply_row_version, loaded.row_version);
     }
 }

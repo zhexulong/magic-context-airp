@@ -183,6 +183,16 @@ function ongoingInteractionToolReceiptFactXml() {
 </output>`;
 }
 
+function successXmlWithEvent(fact: string) {
+	return `${successXml(fact)}
+<events>
+<causal_incident at_compartment="1">
+<summary>Pi wrapup promotion regression</summary>
+<disposition>fixed</disposition>
+</causal_incident>
+</events>`;
+}
+
 function twoCompartmentSuccessXml() {
 	return `<compartment start="1" end="2" title="Initial Pi slice"><p1>Summarized the first Pi turn.</p1></compartment>
 <compartment start="3" end="4" title="Provisional Pi slice"><p1>Summarized the provisional Pi turn.</p1></compartment>
@@ -276,6 +286,8 @@ async function runHistorianWith(args: {
 	providerMessages?: RawMessage[];
 	forceKeepLastCompartment?: boolean;
 	historianChunkTokens?: number;
+	historianContextLimit?: number;
+	maxOutputTokens?: number;
 	beforeRun?: (db: ReturnType<typeof createTestDb>) => void;
 	ensureProjectRegistered?: Parameters<
 		typeof runPiHistorian
@@ -296,6 +308,8 @@ async function runHistorianWith(args: {
 		fallbackModels: args.fallbackModels,
 		fallbackModelId: args.fallbackModelId,
 		historianChunkTokens: args.historianChunkTokens ?? 20_000,
+		historianContextLimit: args.historianContextLimit,
+		maxOutputTokens: args.maxOutputTokens,
 		signal: args.signal,
 		retryBackoffMs: args.retryBackoffMs,
 		twoPass: args.twoPass,
@@ -349,6 +363,47 @@ describe("runPiHistorian", () => {
 			if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
 			else process.env.NODE_ENV = previousNodeEnv;
 			closeQuietly(db);
+		}
+	});
+
+	it("does not spawn beyond the producer window and still spawns within the margin", async () => {
+		const messages = rawMessages();
+		const firstMessage = messages[0];
+		if (!firstMessage)
+			throw new Error("producer-window fixture requires a source message");
+		messages[0] = {
+			...firstMessage,
+			parts: [{ type: "text", text: "producer source token ".repeat(2_000) }],
+		};
+		const refusedRunner = runnerReturning([successXml()]);
+		const refused = await runHistorianWith({
+			runner: refusedRunner,
+			providerMessages: messages,
+			historianChunkTokens: 100_000,
+			historianContextLimit: 32_001,
+			maxOutputTokens: 32_000,
+		});
+		try {
+			expect(refusedRunner.run).toHaveBeenCalledTimes(0);
+			expect(
+				getHistorianFailureState(refused.db, "ses-historian").lastError,
+			).toContain("producer_source_exceeds_window");
+		} finally {
+			closeQuietly(refused.db);
+		}
+
+		const admittedRunner = runnerReturning([successXml()]);
+		const admitted = await runHistorianWith({
+			runner: admittedRunner,
+			providerMessages: messages,
+			historianChunkTokens: 100_000,
+			historianContextLimit: 1_000_000,
+			maxOutputTokens: 32_000,
+		});
+		try {
+			expect(admittedRunner.run).toHaveBeenCalledTimes(1);
+		} finally {
+			closeQuietly(admitted.db);
 		}
 	});
 
@@ -580,8 +635,12 @@ describe("runPiHistorian", () => {
 			closeQuietly(db);
 		}
 	});
-	it("runs the Pi subagent, parses output, and publishes compartments and facts", async () => {
-		const { db, runner } = await runHistorianWith({ outputs: [successXml()] });
+	it("runs the Pi subagent and records facts and events that actually publish", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [
+				successXmlWithEvent("Pi historian facts can promote to memory."),
+			],
+		});
 		try {
 			expect(runner.run).toHaveBeenCalledTimes(1);
 			expect(getCompartments(db, "ses-historian")).toEqual([
@@ -599,6 +658,20 @@ describe("runPiHistorian", () => {
 			expect(
 				getMemoriesByProject(db, projectPath).map((m) => m.content),
 			).toContain("Pi historian facts can promote to memory.");
+			const row = db
+				.prepare(
+					"SELECT facts_emitted, events_emitted, facts_by_category_json FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+				)
+				.get("ses-historian") as {
+				facts_emitted: number;
+				events_emitted: number;
+				facts_by_category_json: string;
+			};
+			expect(row.facts_emitted).toBe(1);
+			expect(row.events_emitted).toBe(1);
+			expect(JSON.parse(row.facts_by_category_json)).toEqual(
+				expect.objectContaining({ facts_promoted: 1, events_published: 1 }),
+			);
 		} finally {
 			closeQuietly(db);
 		}
@@ -872,7 +945,7 @@ describe("runPiHistorian", () => {
 		}
 	});
 
-	it("notifies failed historian runs once with the transient failure framing", async () => {
+	it("notifies failed historian runs once with a stable reference code", async () => {
 		clearPiHistorianAlertState("ses-historian");
 		const notices: string[] = [];
 		const notifyIssue = mock((text: string) => {
@@ -881,8 +954,10 @@ describe("runPiHistorian", () => {
 		const first = await runHistorianWith({ outputs: [""], notifyIssue });
 		try {
 			expect(notifyIssue).toHaveBeenCalledTimes(1);
-			expect(notices[0]).toContain("Hit a transient issue comparting history");
-			expect(notices[0]).toContain("only be alerted again");
+			expect(notices[0]).toContain(
+				"History compression could not finish this turn. It will retry automatically. (MC-H01)",
+			);
+			expect(notices[0]).not.toContain("Historian returned empty output");
 		} finally {
 			closeQuietly(first.db);
 		}
@@ -992,6 +1067,34 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("persists and reports a marker that must wait for a future kept entry", async () => {
+		const notifyIssue = mock(async () => undefined);
+		const entries = Array.from({ length: 2 }, (_, index) => ({
+			type: "message",
+			id: `entry-${index + 1}`,
+			message: { role: index % 2 === 0 ? "user" : "assistant" },
+		}));
+		const { db } = await runHistorianWith({
+			outputs: [successXml()],
+			readBranchEntries: () => entries,
+			notifyIssue,
+		});
+		try {
+			expect(getPendingPiCompactionMarkerState(db, "ses-historian")).toEqual(
+				expect.objectContaining({
+					firstKeptEntryId: null,
+					endMessageId: "m2",
+					ordinal: 2,
+				}),
+			);
+			expect(notifyIssue).toHaveBeenCalledWith(
+				expect.stringContaining("waiting for a resolvable kept entry"),
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("does not let Pi discard-last reopen a completed invocation/result arc", async () => {
 		const { db } = await runHistorianWith({
 			outputs: [twoCompartmentSuccessXml()],
@@ -1011,6 +1114,36 @@ describe("runPiHistorian", () => {
 					(compartment) => compartment.endMessage,
 				),
 			).toEqual([2, 4]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("keeps the provisional final compartment during emergency recovery", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [twoCompartmentSuccessXml()],
+			providerMessages: rawMessages(5),
+			boundarySnapshot: makeBoundarySnapshot({
+				protectedTailStart: 5,
+				protectedTailStartMessageId: "m5",
+				eligibleEndOrdinal: 5,
+				eligibleEndMessageId: "m4",
+				rawMessageCountAtTrigger: 5,
+				rawLastMessageIdAtTrigger: "m5",
+			}),
+			beforeRun: (database) => {
+				recordOverflowDetected(database, "ses-historian", 100_000);
+			},
+		});
+		try {
+			const compartments = getCompartments(db, "ses-historian");
+			expect(compartments.map((compartment) => compartment.endMessage)).toEqual(
+				[2, 4],
+			);
+			expect(compartments.map((compartment) => compartment.title)).toEqual([
+				"Initial Pi slice",
+				"Provisional Pi slice",
+			]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -1054,14 +1187,38 @@ describe("runPiHistorian", () => {
 			closeQuietly(midLoop.db);
 		}
 
+		const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+			() => {},
+		);
 		const finalChunk = await runHistorianWith({
-			outputs: [successXml("Pi final wrapup facts stay deferred.")],
+			outputs: [successXmlWithEvent("Pi final wrapup facts stay deferred.")],
 			forceKeepLastCompartment: true,
 		});
 		try {
 			expect(getCompartments(finalChunk.db, "ses-historian")).toHaveLength(1);
 			expect(getMemoriesByProject(finalChunk.db, projectPath)).toEqual([]);
+			const row = finalChunk.db
+				.prepare(
+					"SELECT facts_emitted, events_emitted, facts_by_category_json FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+				)
+				.get("ses-historian") as {
+				facts_emitted: number;
+				events_emitted: number;
+				facts_by_category_json: string;
+			};
+			expect(row.facts_emitted).toBe(1);
+			expect(row.events_emitted).toBe(1);
+			expect(JSON.parse(row.facts_by_category_json)).toEqual(
+				expect.objectContaining({ facts_promoted: 0, events_published: 0 }),
+			);
+			expect(logSpy).toHaveBeenCalledWith(
+				"ses-historian",
+				expect.stringContaining(
+					"historian unanchored promotion skipped: reason=weak_lookahead_final_compartment",
+				),
+			);
 		} finally {
+			logSpy.mockRestore();
 			closeQuietly(finalChunk.db);
 		}
 	});
@@ -1172,4 +1329,30 @@ describe("runPiHistorian", () => {
 			}
 		});
 	});
+});
+
+it("persists a boundary-only marker for a fully filtered Pi head without spawning a producer", async () => {
+	const messages = rawMessages(3);
+	messages[0].parts = [{ type: "text", text: "ignored status", ignored: true }];
+	messages[1].role = "assistant";
+	messages[1].parts = [{ type: "reasoning", text: "aborted thinking" }];
+	const { db, runner } = await runHistorianWith({
+		providerMessages: messages,
+		boundarySnapshot: makeBoundarySnapshot({
+			protectedTailStart: 3,
+			eligibleEndOrdinal: 3,
+			rawMessageCountAtTrigger: 3,
+			usagePercentage: 114,
+		}),
+	});
+	try {
+		expect(runner.run).toHaveBeenCalledTimes(0);
+		const rows = getCompartments(db, "ses-historian");
+		expect(rows).toHaveLength(1);
+		expect(rows[0].endMessage).toBe(2);
+		expect(rows[0].content).toBe("");
+		expect(rows[0].endMessageId).toBe(messages[1].id);
+	} finally {
+		closeQuietly(db);
+	}
 });

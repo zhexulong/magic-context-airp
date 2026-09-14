@@ -2,7 +2,7 @@
  * Magic Context — Pi subagent extension entry.
  *
  * This is a lean extension entry loaded ONLY in child Pi processes
- * spawned by `PiSubagentRunner` (sidekick, dreamer, historian, etc.).
+ * spawned by `PiSubagentRunner` (dreamer, historian, etc.).
  * It registers Magic Context's tool surface for the subagent — nothing
  * else.
  *
@@ -24,7 +24,7 @@
  *
  * What this entry registers for `--no-session` children:
  *   - `ctx_search` — read-only search over shared memories/messages/git
- *   - `ctx_memory` — dreamer only; sidekick is retrieval-only and uses ctx_search
+ *   - `ctx_memory` — dreamer only
  *
  * Session-scoped `ctx_note`/`ctx_expand` stay omitted because hidden child
  * sessions have no useful transcript or parent note id to target.
@@ -48,8 +48,7 @@
  *
  * Tool/action allowlists via Pi flags:
  *   --magic-context-dreamer-actions  Register ctx_memory with the dreamer
- *                                     action surface. Off by default; sidekick
- *                                     receives ctx_search only.
+ *                                     action surface. Off by default.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -61,6 +60,7 @@ import { log } from "@magic-context/core/shared/logger";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import { loadPiConfig } from "./config";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import { resolvePiHarnessKind } from "./pi-harness-kind";
 import { registerMagicContextTools } from "./tools";
 
 const SUBAGENT_DREAMER_ACTIONS_FLAG = "magic-context-dreamer-actions";
@@ -68,12 +68,9 @@ const SUBAGENT_DREAMER_ACTIONS_FLAG = "magic-context-dreamer-actions";
 let openedDb: ContextDatabase | undefined;
 
 export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
-	// Mark this Pi process as a Magic Context subagent in the shared
-	// harness state. session-scoped writes from any code path that
-	// reaches the shared core will tag rows with harness='pi' the same
-	// way the main extension does — but in practice subagents shouldn't
-	// be writing session-scoped state at all.
-	setHarness("pi");
+	// Keep any unexpected session-scoped child write attributed to its actual
+	// Pi-compatible host, even though hidden children normally avoid those writes.
+	setHarness(resolvePiHarnessKind());
 
 	pi.registerFlag(SUBAGENT_DREAMER_ACTIONS_FLAG, {
 		description:
@@ -109,8 +106,6 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				resolveProjectIdentity: (ctx) =>
 					resolveProjectIdentityForSession(ctx.cwd, cfg.allow_home_project),
-				// Sidekick is retrieval-only and consumes untrusted /ctx-aug prompt text,
-				// so only dreamer subagents register ctx_memory in child processes.
 				memoryToolEnabled: dreamerActionsEnabled,
 				allowDreamerActions: dreamerActionsEnabled,
 				// `--no-session` children resolve getSessionId() to the ephemeral

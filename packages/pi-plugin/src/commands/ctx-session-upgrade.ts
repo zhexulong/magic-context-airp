@@ -96,7 +96,7 @@ export function registerCtxSessionUpgradeCommand(
 			if (!currentDeps.historianModel) {
 				sendStatus({
 					title: "/ctx-session-upgrade",
-					text: "## Session Upgrade\n\nUnavailable because `historian.model` is not configured.",
+					text: "## Session Upgrade\n\nUnavailable because the active harness's historian model is not configured.",
 					level: "error",
 				});
 				return;
@@ -139,10 +139,8 @@ export function registerCtxSessionUpgradeCommand(
 				? `${ctx.model.provider}/${ctx.model.id}`
 				: undefined;
 
-			// Migration runs only when memory is enabled — parity with OpenCode,
-			// whose orchestrator gates on `runMigration = memory.enabled !== false
-			// && historian.model` (recomp-orchestrator drives migration off that
-			// flag, NOT unconditionally). With memory disabled there is no memory
+			// This command reaches migration only after confirming an active historian
+			// model, and migration runs only when memory is enabled. With memory disabled there is no memory
 			// pool to re-organize, so re-categorizing would be a no-op at best and
 			// could touch a pool the user opted out of at worst.
 			const migrationEnabled = currentDeps.memoryEnabled;
@@ -345,15 +343,10 @@ export function registerCtxSessionUpgradeCommand(
 						return;
 					}
 
-					// DEFERRED staging (background-safe): stage the native marker as a
-					// pending blob + signal a DEFERRED history refresh so the next
-					// transform pass (at a turn boundary) drains and applies it. The
-					// detached run must NOT apply the marker eagerly (appendCompaction
-					// mutates getBranch immediately, which from a background task could
-					// land mid-turn) nor use the eager history/materialization signals
-					// — those would force a materialization on whatever pass is
-					// running, possibly mid-turn, busting the cache. Mirrors the
-					// background historian's onPublished (signalPiDeferred*).
+					// Deferred staging lets the native marker and history refresh ride the
+					// next genuine bust. The detached run must not mutate getBranch or
+					// force materialization eagerly because either could alter an otherwise
+					// cache-stable pass. This mirrors the historian's deferred publish signals.
 					//
 					// Isolated in its own try/catch: marker staging is best-effort (the
 					// next incremental historian pass re-stages a covering marker), so a

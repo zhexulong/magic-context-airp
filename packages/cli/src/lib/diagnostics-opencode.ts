@@ -9,7 +9,6 @@
 // information.
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
@@ -19,7 +18,14 @@ import {
     getMagicContextStorageResolution,
     getProjectMagicContextHistorianDir,
 } from "@magic-context/core/shared/data-path";
+import {
+    formatOpenCodeDbDoctorLine,
+    type OpenCodeDbPathResolution,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "@magic-context/core/shared/opencode-db-path";
 import { parse as parseJsonc } from "comment-json";
+import { inspectMagicContextLogs, type LogFileInspection } from "./log-lines";
 import { detectOpenCodeInstallations } from "./opencode-detect";
 import { describeOpenCodeInstallations, type OpenCodeInstallationReport } from "./opencode-helpers";
 import {
@@ -28,12 +34,7 @@ import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME,
 } from "./opencode-plugin-cache";
-import {
-    type ConfigPaths,
-    detectConfigPaths,
-    getMagicContextHistorianDir,
-    getMagicContextLogPath,
-} from "./paths";
+import { type ConfigPaths, detectConfigPaths, getMagicContextHistorianDir } from "./paths";
 import { sanitizeConfigValue, sanitizeDiagnosticText, sanitizePathString } from "./redaction";
 
 export interface DiagnosticReport {
@@ -77,21 +78,23 @@ export interface DiagnosticReport {
             prune: boolean;
         };
     };
+    openCodeDatabase?: OpenCodeDbPathResolution & { exists: boolean };
+    /** Compatibility alias for the first existing candidate, or the legacy path. */
     logFile: {
         path: string;
         exists: boolean;
         sizeKb: number;
     };
+    logFiles?: LogFileInspection[];
     /**
      * Recent active OpenCode sessions (five parent groups, with up to three
      * newest children per group). Used to anchor historian-dump lookups to
      * real project directories and to power the session picker in the `--issue`
      * flow.
      *
-     * Populated only when bun:sqlite is available (under Bun) and OpenCode's
-     * own DB at ~/.local/share/opencode/opencode.db exists. Empty array on
-     * Node-only runs (and the diagnostics report falls back to the legacy
-     * tmp-dir historian listing).
+     * Populated only when bun:sqlite is available (under Bun) and the resolved
+     * OpenCode session DB exists. Empty array on Node-only runs (and the
+     * diagnostics report falls back to the legacy tmp-dir historian listing).
      */
     recentSessions: RecentSessionSummary[];
     /**
@@ -527,13 +530,11 @@ export function collectRecentSessionsFromDatabase(
  * itself. The published CLI normally runs under Node, so it returns [] there
  * and the rest of doctor continues with its other diagnostics.
  */
-async function collectRecentSessions(): Promise<RecentSessionSummary[]> {
-    // env-first: honor XDG/HOME overrides (and sandboxed doctor test runs)
-    // instead of Bun's homedir(), which ignores a runtime HOME override.
-    const dataHome =
-        process.env.XDG_DATA_HOME || join(process.env.HOME || homedir(), ".local", "share");
-    const opencodeDbPath = join(dataHome, "opencode", "opencode.db");
-    if (!existsSync(opencodeDbPath)) return [];
+async function collectRecentSessions(
+    resolution: OpenCodeDbPathResolution,
+): Promise<RecentSessionSummary[]> {
+    const opencodeDbPath = resolution.path;
+    if (!openCodeDbPathExists(resolution)) return [];
 
     if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
         return [];
@@ -788,8 +789,8 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
     const storageDirPath = storageResolution.path;
     const contextDbPath = join(storageDirPath, "context.db");
 
-    const logPath = getMagicContextLogPath("opencode");
-    const logFileSize = existsSync(logPath) ? statSync(logPath).size : 0;
+    const logFiles = inspectMagicContextLogs("opencode");
+    const primaryLog = logFiles.find((file) => file.exists) ?? logFiles[0];
 
     // Resolve the MC compaction mode via the same loader + accessor the
     // plugin uses, so diagnostics never re-derives the compaction decision.
@@ -806,7 +807,8 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
         );
     }
     const conflictResult = detectConflicts(process.cwd(), { compactionEnabled });
-    const recentSessions = await collectRecentSessions();
+    const openCodeDatabaseResolution = resolveOpenCodeDbPath();
+    const recentSessions = await collectRecentSessions(openCodeDatabaseResolution);
     const opencodeInstallations = describeOpenCodeInstallations(detectOpenCodeInstallations());
     const activeInstallation = opencodeInstallations[0];
     let openCodeInstallKind: "cli" | "desktop" | "none" = "none";
@@ -840,6 +842,10 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
             exists: existsSync(storageDirPath),
             contextDbSizeBytes: fileSize(contextDbPath),
         },
+        openCodeDatabase: {
+            ...openCodeDatabaseResolution,
+            exists: openCodeDbPathExists(openCodeDatabaseResolution),
+        },
         conflicts: {
             hasConflict: conflictResult.hasConflict,
             reasons: conflictResult.reasons,
@@ -847,10 +853,11 @@ export async function collectDiagnostics(): Promise<DiagnosticReport> {
             nativeCompaction: conflictResult.nativeCompaction,
         },
         logFile: {
-            path: logPath,
-            exists: existsSync(logPath),
-            sizeKb: Math.round(logFileSize / 1024),
+            path: primaryLog.path,
+            exists: primaryLog.exists,
+            sizeKb: primaryLog.sizeKb,
         },
+        logFiles,
         recentSessions,
         historianDumps: collectHistorianDumps(recentSessions),
         historianFailures: await collectHistorianFailures(storageDirPath),
@@ -935,6 +942,13 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         `- OS: ${report.platform} ${report.arch}`,
         `- Node: ${report.nodeVersion}`,
         `- OpenCode installed: ${report.opencodeInstalled} [${report.opencodeInstallKind}]${report.opencodeVersion ? ` (${report.opencodeVersion})` : ""}`,
+        ...(report.openCodeDatabase
+            ? [
+                  report.openCodeDatabase.exists
+                      ? `- OpenCode session database: ${sanitizeString(report.openCodeDatabase.path)} (source=${report.openCodeDatabase.source}${report.openCodeDatabase.channel ? `, channel=${report.openCodeDatabase.channel}` : ""})`
+                      : `- ${formatOpenCodeDbDoctorLine(report.openCodeDatabase)}`,
+              ]
+            : []),
         `- Plugin registered in opencode config: ${report.opencodeConfigHasPlugin}`,
         `- Plugin registered in tui config: ${report.tuiConfigHasPlugin}`,
         `- magic-context.jsonc parse error: ${report.magicContextConfig.parseError ?? "none"}`,
@@ -995,9 +1009,10 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
                   "```",
               ].join("\n"),
         "",
-        "### Log file",
-        `- Path: ${sanitizeString(report.logFile.path)}`,
-        `- Exists: ${report.logFile.exists}`,
-        `- Size: ${report.logFile.sizeKb} KB`,
+        "### Log files",
+        ...(report.logFiles ?? [report.logFile]).map(
+            (file) =>
+                `- ${sanitizeString(file.path)}: exists=${file.exists}, grammar=${"grammar" in file ? file.grammar : "unknown"}, lines=${"lineCount" in file ? file.lineCount : 0}, size=${file.sizeKb} KB`,
+        ),
     ].join("\n");
 }

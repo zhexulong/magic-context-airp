@@ -13,11 +13,13 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
 	closeDatabase,
@@ -27,9 +29,11 @@ import {
 	__resetSchemaFenceStateForTests,
 	LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
+import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
 
+import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
 import { __test, PiSubagentRunner } from "./subagent-runner";
 
 const baseOptions: SubagentRunOptions = {
@@ -56,10 +60,12 @@ const OMP_ALLOWLISTABLE_TOOLS: Readonly<Record<string, true>> = {
 };
 
 beforeEach(() => {
+	__setPiHarnessKindForTesting(undefined);
 	__test.resetProviderFormCache();
 });
 
 afterEach(() => {
+	__setPiHarnessKindForTesting(undefined);
 	closeDatabase();
 	__resetSchemaFenceStateForTests();
 });
@@ -151,11 +157,18 @@ function runnerWith(
 	childOrChildren: MockChild | MockChild[],
 	{
 		piBinary = "pi-test",
+		invocation,
 		platform,
 		extraArgs,
 		subagentExtensions,
 	}: {
 		piBinary?: string;
+		invocation?: {
+			command: string;
+			prefixArgs: string[];
+			targetHarness: "pi" | "omp";
+			fallbackDiagnostic?: string;
+		};
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
 		subagentExtensions?: readonly string[];
@@ -172,6 +185,7 @@ function runnerWith(
 	});
 	const runner = new PiSubagentRunner({
 		piBinary,
+		invocation,
 		platform,
 		extraArgs,
 		subagentExtensions,
@@ -202,6 +216,64 @@ function agentEnd(messages: unknown[]) {
 
 function nextTick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function writePiCliFixture(bin: string, useBinShim = false) {
+	const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-layout-"));
+	const packageRoot = join(
+		root,
+		"node_modules",
+		"@earendil-works",
+		"pi-coding-agent",
+	);
+	const cliPath = join(packageRoot, bin);
+	mkdirSync(packageRoot, { recursive: true });
+	mkdirSync(dirname(cliPath), { recursive: true });
+	writeFileSync(
+		join(packageRoot, "package.json"),
+		JSON.stringify({
+			name: "@earendil-works/pi-coding-agent",
+			bin: { pi: bin },
+		}),
+	);
+	writeFileSync(cliPath, "#!/usr/bin/env node\n");
+	if (!useBinShim) return { root, packageRoot, cliPath, entry: cliPath };
+
+	const shim = join(root, "bin", "pi");
+	mkdirSync(dirname(shim), { recursive: true });
+	symlinkSync(cliPath, shim);
+	return { root, packageRoot, cliPath, entry: shim };
+}
+
+// OMP (@oh-my-pi/pi-coding-agent) declares `bin: { omp: "dist/cli.js" }` and
+// ships no `pi` bin. The resolver must accept the `omp` key so an OMP host
+// without a standalone `pi` on PATH still spawns its own CLI instead of the
+// bare `pi` fallback (which ENOENTs).
+function writeOmpCliFixture(bin: string, useBinShim = false) {
+	const root = mkdtempSync(join(tmpdir(), "mc-omp-cli-layout-"));
+	const packageRoot = join(
+		root,
+		"node_modules",
+		"@oh-my-pi",
+		"pi-coding-agent",
+	);
+	const cliPath = join(packageRoot, bin);
+	mkdirSync(packageRoot, { recursive: true });
+	mkdirSync(dirname(cliPath), { recursive: true });
+	writeFileSync(
+		join(packageRoot, "package.json"),
+		JSON.stringify({
+			name: "@oh-my-pi/pi-coding-agent",
+			bin: { omp: bin },
+		}),
+	);
+	writeFileSync(cliPath, "#!/usr/bin/env node\n");
+	if (!useBinShim) return { root, packageRoot, cliPath, entry: cliPath };
+
+	const shim = join(root, "bin", "omp");
+	mkdirSync(dirname(shim), { recursive: true });
+	symlinkSync(cliPath, shim);
+	return { root, packageRoot, cliPath, entry: shim };
 }
 
 const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
@@ -237,14 +309,270 @@ describe("subagent-runner pure helpers", () => {
 		).toEqual({ text: null, stopReason: null, errorMessage: null });
 	});
 
-	it("distinguishes Pi from embedded Node hosts", () => {
-		expect(__test.isGenericRuntimeExecutable("/usr/bin/node24")).toBe(true);
-		expect(__test.isPiCliScript("/app/node_modules/.bin/next")).toBe(false);
-		expect(
-			__test.isPiCliScript(
-				"/app/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-			),
-		).toBe(true);
+	it.each([
+		["legacy dist layout", "dist/cli.js"],
+		["bundled dist layout", "dist/bundle/cli.js"],
+	])("resolves the %s through package.json bin", (_label, bin) => {
+		const fixture = writePiCliFixture(bin);
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node.exe",
+				argv1: fixture.entry,
+				platform: "win32",
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node.exe",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+				targetHarness: "pi",
+			});
+			expect(__test.isPiCliScript(fixture.entry)).toBe(true);
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a bundled CLI from the running module paths' package.json", () => {
+		const fixture = writePiCliFixture("dist/bundle/cli.js");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: "/embedded-host/start.js",
+				resolvePackageJson: () => join(fixture.packageRoot, "package.json"),
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+				targetHarness: "pi",
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a bin-shim symlink to the package-declared Pi CLI", () => {
+		const fixture = writePiCliFixture("dist/bundle/cli.js", true);
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+				targetHarness: "pi",
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves the global OMP bin shim via bin.omp, never the bare pi fallback", () => {
+		// npm installs `omp` as a symlink to the package's `bin.omp` entry. Follow
+		// that real layout so the target harness comes from the resolved package,
+		// not merely from an entry path whose basename happens to contain `omp`.
+		const fixture = writeOmpCliFixture("dist/cli.js", true);
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+				targetHarness: "omp",
+			});
+			expect(invocation.command).not.toBe("pi");
+			expect(invocation.fallbackDiagnostic).toBeUndefined();
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses OMP argv when the resolved binary is OMP despite a Pi host label", () => {
+		const fixture = writeOmpCliFixture("dist/cli.js");
+		try {
+			__setPiHarnessKindForTesting("pi");
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			const args = buildArgsForTest(baseOptions, {
+				targetHarness: invocation.targetHarness,
+			});
+
+			expect(args).toContain("--no-rules");
+			expect(args).not.toContain("--no-prompt-templates");
+			expect(args).not.toContain("--no-context-files");
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses Pi argv when the resolved binary is Pi despite an OMP host label", () => {
+		const fixture = writePiCliFixture("dist/cli.js");
+		try {
+			__setPiHarnessKindForTesting("omp");
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			const args = buildArgsForTest(baseOptions, {
+				targetHarness: invocation.targetHarness,
+			});
+
+			expect(args).toContain("--no-prompt-templates");
+			expect(args).toContain("--no-context-files");
+			expect(args).not.toContain("--no-rules");
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps resolving a Pi host via bin.pi unchanged", () => {
+		const fixture = writePiCliFixture("dist/cli.js");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(fixture.cliPath)],
+				targetHarness: "pi",
+			});
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it("still resolves a string bin (no object map)", () => {
+		const root = mkdtempSync(join(tmpdir(), "mc-pi-string-bin-"));
+		const packageRoot = join(
+			root,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+		);
+		const cliPath = join(packageRoot, "dist/cli.js");
+		mkdirSync(dirname(cliPath), { recursive: true });
+		writeFileSync(
+			join(packageRoot, "package.json"),
+			JSON.stringify({
+				name: "@earendil-works/pi-coding-agent",
+				bin: "dist/cli.js",
+			}),
+		);
+		writeFileSync(cliPath, "#!/usr/bin/env node\n");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: cliPath,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation).toEqual({
+				command: "/runtime/node",
+				prefixArgs: [realpathSync(cliPath)],
+				targetHarness: "pi",
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls through to the bare pi fallback when the manifest has neither bin.pi nor bin.omp", () => {
+		const root = mkdtempSync(join(tmpdir(), "mc-pi-no-bin-"));
+		const packageRoot = join(
+			root,
+			"node_modules",
+			"@earendil-works",
+			"pi-coding-agent",
+		);
+		const cliPath = join(packageRoot, "dist/cli.js");
+		mkdirSync(dirname(cliPath), { recursive: true });
+		writeFileSync(
+			join(packageRoot, "package.json"),
+			JSON.stringify({
+				name: "@earendil-works/pi-coding-agent",
+				bin: { other: "dist/cli.js" },
+			}),
+		);
+		writeFileSync(cliPath, "#!/usr/bin/env node\n");
+		try {
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: cliPath,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation.command).toBe("pi");
+			expect(invocation.fallbackDiagnostic).toContain("script-detection miss");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back with a self-diagnosing miss when no Pi package resolves", () => {
+		const invocation = __test.resolvePiInvocation({
+			execPath: "/runtime/node",
+			argv1: "/not-a-pi-host/cli.js",
+			resolvePackageJson: () => null,
+		});
+		expect(invocation.command).toBe("pi");
+		expect(invocation.fallbackDiagnostic).toContain(
+			"script-detection miss on /not-a-pi-host/cli.js",
+		);
+	});
+
+	it("rejects a package bin that escapes its package root", () => {
+		const fixture = writePiCliFixture("../outside-cli.js");
+		try {
+			writeFileSync(
+				join(fixture.root, "node_modules", "@earendil-works", "outside-cli.js"),
+				"",
+			);
+			const invocation = __test.resolvePiInvocation({
+				execPath: "/runtime/node",
+				argv1: fixture.entry,
+				resolvePackageJson: () => null,
+			});
+			expect(invocation.command).toBe("pi");
+			expect(invocation.fallbackDiagnostic).toContain("outside-cli.js");
+		} finally {
+			rmSync(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		[".EXE", "/Pi/pi.exe", "/Pi/pi.exe", []],
+		[".CMD", "/Pi/pi.cmd", "cmd.exe", ["/d", "/s", "/c", "/Pi/pi.cmd"]],
+		[
+			".PS1",
+			"/Pi/pi.ps1",
+			"powershell.exe",
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-File", "/Pi/pi.ps1"],
+		],
+	])("uses the PATHEXT-resolved %s Pi command without shell:true", (extension, expectedPath, command, prefixArgs) => {
+		const invocation = __test.resolvePiInvocation({
+			execPath: "/runtime/node.exe",
+			argv1: "/not-a-pi-host/cli.js",
+			platform: "win32",
+			env: { PATH: "/Pi", PATHEXT: extension },
+			resolvePackageJson: () => null,
+			fs: {
+				existsSync: (path) => path === expectedPath,
+				statSync: () => ({ isFile: () => true }),
+			},
+		});
+		expect(invocation.command).toBe(command);
+		expect(invocation.prefixArgs).toEqual(prefixArgs);
+		expect(invocation.fallbackDiagnostic).toContain(
+			`Windows PATHEXT resolved ${expectedPath}`,
+		);
 	});
 	it("builds argv with system prompt, primary model, and prompt last", () => {
 		expect(
@@ -256,8 +584,8 @@ describe("subagent-runner pure helpers", () => {
 			"--print",
 			"--mode",
 			"json",
-			// `--no-session` keeps historian / sidekick / dreamer /
-			// recomp / compressor child sessions out of `pi resume`
+			// `--no-session` keeps historian, dreamer, recomp, and compressor
+			// child sessions out of `pi resume`
 			// and the session picker (uses Pi's
 			// SessionManager.inMemory()).
 			"--no-session",
@@ -286,11 +614,11 @@ describe("subagent-runner pure helpers", () => {
 		expect(historian).toEqual(
 			expect.arrayContaining(["--extension", "/tmp/historian-calibration.js"]),
 		);
-		const sidekick = buildArgsForTest(
-			{ ...baseOptions, agent: "sidekick" },
+		const dreamer = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
 		);
-		expect(sidekick).not.toContain("/tmp/historian-calibration.js");
+		expect(dreamer).not.toContain("/tmp/historian-calibration.js");
 	});
 
 	it("passes the active entry thinking level through Pi's --thinking flag", () => {
@@ -324,7 +652,7 @@ describe("subagent-runner pure helpers", () => {
 		const args = buildArgsForTest(
 			{
 				...baseOptions,
-				agent: "sidekick",
+				agent: "dreamer-retrospective",
 				model: "anthropic/claude-sonnet",
 			},
 			{
@@ -386,6 +714,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("uses PI_CODING_AGENT_DIR only for a positively identified OMP host", () => {
+		__setPiHarnessKindForTesting("omp");
 		const root = mkdtempSync(join(homedir(), ".mc-omp-host-test-"));
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const previousPackageDir = process.env.PI_PACKAGE_DIR;
@@ -416,6 +745,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("uses the OMP default agent dir when PI_CODING_AGENT_DIR is unset", () => {
+		__setPiHarnessKindForTesting("omp");
 		const root = mkdtempSync(join(homedir(), ".mc-omp-default-host-test-"));
 		const previous = {
 			agentDir: process.env.PI_CODING_AGENT_DIR,
@@ -459,6 +789,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("gives a named OMP profile precedence over a stale agent-dir override", () => {
+		__setPiHarnessKindForTesting("omp");
 		const root = mkdtempSync(join(homedir(), ".mc-omp-profile-host-test-"));
 		const previous = {
 			agentDir: process.env.PI_CODING_AGENT_DIR,
@@ -524,6 +855,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("emits only OMP-supported startup flags and tool names on an OMP host", () => {
+		__setPiHarnessKindForTesting("omp");
 		const root = mkdtempSync(join(homedir(), ".mc-omp-argv-test-"));
 		const previousPackageDir = process.env.PI_PACKAGE_DIR;
 		writeFileSync(
@@ -558,7 +890,7 @@ describe("subagent-runner pure helpers", () => {
 
 	it("always includes --no-session so child sessions don't appear in pi resume", () => {
 		// Pinned-down regression: the user-visible promise of magic-context
-		// hidden subagents is that historian/sidekick/dreamer runs never
+		// hidden subagents is that historian/dreamer runs never
 		// pollute Pi's session list. If this assertion ever fails, the
 		// child sessions WILL show up in `pi resume` again.
 		const args = buildArgsForTest({
@@ -634,20 +966,13 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--no-tools");
 	});
 
-	it("locks historian and sidekick to explicit read-only allow-lists", () => {
+	it("locks historian to an explicit read-only allow-list", () => {
 		const historianArgs = buildArgsForTest({
 			...baseOptions,
 			agent: "historian",
 		});
 		expect(historianArgs).toEqual(
 			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
-		);
-		const sidekickArgs = buildArgsForTest({
-			...baseOptions,
-			agent: "sidekick",
-		});
-		expect(sidekickArgs).toEqual(
-			expect.arrayContaining(["--tools", "read,grep,find,ls,ctx_search"]),
 		);
 	});
 
@@ -922,9 +1247,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("does not set --magic-context-dreamer-actions for non-dreamer agents", () => {
 		// Even if the bundle were present, only dreamer-equivalent agents should
-		// receive ctx_memory in the child extension. Historian, sidekick,
-		// compressor etc. stay without the dreamer flag.
-		for (const agent of ["historian", "sidekick", "compressor", "recomp"]) {
+		// receive ctx_memory in the child extension. Historian, compressor,
+		// and recomp agents stay without the dreamer flag.
+		for (const agent of ["historian", "compressor", "recomp"]) {
 			const args = buildArgsForTest({
 				...baseOptions,
 				agent,
@@ -936,6 +1261,139 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
+	it("records OMP message_end usage in subagent_invocations", async () => {
+		__setPiHarnessKindForTesting("omp");
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
+		});
+		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-"));
+		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+		const previousXdgDataHome = process.env.XDG_DATA_HOME;
+		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+		process.env.XDG_DATA_HOME = testDataDir;
+		closeDatabase();
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "anthropic/claude-sonnet",
+				accountingSessionId: "omp-accounting-session",
+				accountingSubagent: "historian",
+			});
+			child.writeStdoutLine({
+				// Captured OMP 18.1.11 shape: usage lives on each assistant
+				// message_end message, including intermediate tool turns.
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", name: "read", id: "call-1" }],
+					stopReason: "toolUse",
+					usage: {
+						input: 1_200,
+						output: 80,
+						cacheRead: 300,
+						cacheWrite: 20,
+						totalTokens: 1_600,
+						reasoningTokens: 10,
+						cost: { input: 0.01 },
+					},
+				},
+			});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+					usage: {
+						input: 400,
+						output: 30,
+						cacheRead: 100,
+						cacheWrite: 5,
+						totalTokens: 535,
+						reasoningTokens: 4,
+						cost: { output: 0.02 },
+					},
+				},
+			});
+			child.emitClose(0);
+
+			expect(await resultPromise).toMatchObject({
+				ok: true,
+				assistantText: "done",
+			});
+			const db = openDatabase();
+			if (!db) throw new Error("accounting test database did not open");
+			const [row] = getSubagentInvocations(db, "omp-accounting-session");
+			expect(row).toMatchObject({
+				harness: "omp",
+				inputTokens: 1_600,
+				outputTokens: 110,
+				cacheReadTokens: 400,
+				cacheWriteTokens: 25,
+			});
+		} finally {
+			closeDatabase();
+			if (previousTestDataDir === undefined)
+				delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+			if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = previousXdgDataHome;
+			rmSync(testDataDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps successful OMP invocation at zero tokens when stream omits usage", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
+		});
+		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-empty-"));
+		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+		const previousXdgDataHome = process.env.XDG_DATA_HOME;
+		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+		process.env.XDG_DATA_HOME = testDataDir;
+		closeDatabase();
+		try {
+			const resultPromise = runner.run({
+				...baseOptions,
+				accountingSessionId: "omp-accounting-empty",
+				accountingSubagent: "historian",
+			});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			});
+			child.emitClose(0);
+
+			expect(await resultPromise).toMatchObject({
+				ok: true,
+				assistantText: "done",
+			});
+			const db = openDatabase();
+			if (!db) throw new Error("accounting test database did not open");
+			const [row] = getSubagentInvocations(db, "omp-accounting-empty");
+			expect(row).toMatchObject({
+				inputTokens: 0,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0,
+			});
+		} finally {
+			closeDatabase();
+			if (previousTestDataDir === undefined)
+				delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+			if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = previousXdgDataHome;
+			rmSync(testDataDir, { recursive: true, force: true });
+		}
+	});
+
 	it("refuses to spawn known zero-tool agents without a system prompt", async () => {
 		const spawnImpl = mock(() => {
 			throw new Error("spawn must not be reached");
@@ -962,6 +1420,30 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			});
 		}
 		expect(spawnImpl).not.toHaveBeenCalled();
+	});
+
+	it("surfaces the checked paths when the bare Pi fallback ENOENTs", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: {
+				command: "pi",
+				prefixArgs: [],
+				targetHarness: "pi",
+				fallbackDiagnostic:
+					"script-detection miss on /host/cli.js, /host/node_modules/@earendil-works/pi-coding-agent/package.json",
+			},
+		});
+
+		const resultPromise = runner.run(baseOptions);
+		child.emitError(new Error("spawn pi ENOENT"));
+
+		expect(await resultPromise).toEqual({
+			ok: false,
+			reason: "spawn_failed",
+			error:
+				"spawn pi ENOENT after script-detection miss on /host/cli.js, /host/node_modules/@earendil-works/pi-coding-agent/package.json",
+			durationMs: expect.any(Number),
+		});
 	});
 
 	it("treats a terminal stop turn as success even when drain SIGTERM closes the child", async () => {
@@ -1039,6 +1521,87 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		if (result.ok) expect(result.toolCallCount).toBe(2);
 	});
 
+	it("accepts a tool-only dreamer run after a completed ctx_memory result", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run({ ...baseOptions, agent: "dreamer" });
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "curate-1",
+						name: "ctx_memory",
+						arguments: { action: "archive" },
+					},
+				],
+				stopReason: "toolUse",
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "curate-1",
+				toolName: "ctx_memory",
+				content: [{ type: "text", text: "Archived memory." }],
+				isError: false,
+			},
+		});
+		child.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: true,
+			assistantText: "",
+			toolCallCount: 1,
+			completedToolCalls: [
+				{ name: "ctx_memory", arguments: { action: "archive" } },
+			],
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined },
+		});
+	});
+
+	it("rejects a tool-only dreamer run when ctx_memory returned an error", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run({ ...baseOptions, agent: "dreamer" });
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "curate-error",
+						name: "ctx_memory",
+						arguments: { action: "archive" },
+					},
+				],
+				stopReason: "toolUse",
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "curate-error",
+				toolName: "ctx_memory",
+				content: [{ type: "text", text: "Archive rejected." }],
+				isError: true,
+			},
+		});
+		child.emitClose(0);
+
+		const result = await resultPromise;
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toBe("no_assistant");
+	});
+
 	it("spawns pi, parses stdout, trims assistant text, and captures stderr", async () => {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
@@ -1093,6 +1656,76 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("preserves an explicit zero historian temperature in the child environment", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
+		const resultPromise = runner.run({
+			...baseOptions,
+			model: "test/historian",
+			temperature: 0,
+		});
+		child.writeStdoutLine({ type: "session", id: "s1" });
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose(0);
+		await resultPromise;
+
+		const [, , spawnOptions] = (spawnImpl.mock.calls as unknown[][])[0] as [
+			string,
+			string[],
+			{ env: NodeJS.ProcessEnv },
+		];
+		expect(spawnOptions.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE).toBe("0");
+	});
+
+	it("omits historian temperature from the spawned child environment when unspecified", async () => {
+		const previousTemperature = process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+		delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+		try {
+			const child = createMockChild();
+			const { runner, spawnImpl } = runnerWith(child, {
+				piBinary: "custom-pi",
+			});
+			const resultPromise = runner.run({
+				...baseOptions,
+				model: "test/historian",
+			});
+			child.writeStdoutLine({ type: "session", id: "s1" });
+			child.writeStdoutLine(
+				agentEnd([
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "ok" }],
+						stopReason: "stop",
+					},
+				]),
+			);
+			child.emitClose(0);
+			await resultPromise;
+
+			const [, , spawnOptions] = (spawnImpl.mock.calls as unknown[][])[0] as [
+				string,
+				string[],
+				{ env: NodeJS.ProcessEnv },
+			];
+			expect(spawnOptions.env).not.toHaveProperty(
+				"MAGIC_CONTEXT_HISTORIAN_TEMPERATURE",
+			);
+		} finally {
+			if (previousTemperature === undefined)
+				delete process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+			else
+				process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = previousTemperature;
+		}
+	});
+
 	it("with no piBinary override, spawns the host runtime + cli.js (Windows-safe, #177)", async () => {
 		// Default resolution must NOT spawn a bare "pi" (which ENOENTs on Windows
 		// because npm installs a pi.cmd shim, not a literal pi). It re-invokes the
@@ -1107,6 +1740,13 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		);
 		const cliPath = join(distDir, "cli.js");
 		mkdirSync(distDir, { recursive: true });
+		writeFileSync(
+			join(dirname(distDir), "package.json"),
+			JSON.stringify({
+				name: "@earendil-works/pi-coding-agent",
+				bin: { pi: "dist/cli.js" },
+			}),
+		);
 		writeFileSync(cliPath, "");
 		const previousScript = process.argv[1];
 		process.argv[1] = cliPath;
@@ -1133,7 +1773,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				spawnImpl.mock.calls as unknown[][]
 			)[0] as [string, string[], { shell?: boolean }];
 			expect(command).toBe(process.execPath);
-			expect(spawnArgs[0]).toBe(cliPath);
+			expect(spawnArgs[0]).toBe(realpathSync(cliPath));
 			// Crucially, never a bare "pi".
 			expect(command).not.toBe("pi");
 			expect(opts.shell).toBeFalsy();
@@ -1283,7 +1923,10 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const spawnImpl = mock(() => {
 			throw new Error("ENOENT pi");
 		});
-		const runner = new PiSubagentRunner({ spawnImpl: spawnImpl as never });
+		const runner = new PiSubagentRunner({
+			piBinary: "pi-test",
+			spawnImpl: spawnImpl as never,
+		});
 
 		expect(await runner.run(baseOptions)).toEqual({
 			ok: false,
@@ -1563,6 +2206,34 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("surfaces the provider error behind empty assistant text", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage:
+						"OpenAI API error (400): Unsupported parameter: temperature",
+				},
+			]),
+		);
+		child.emitClose(0);
+
+		expect(await resultPromise).toEqual({
+			ok: false,
+			reason: "no_assistant",
+			error:
+				"pi assistant produced empty text (provider error: OpenAI API error (400): Unsupported parameter: temperature)",
+			durationMs: expect.any(Number),
+			meta: { stderr: undefined, sawProtocolOutput: true },
+		});
+	});
+
 	it("returns no_assistant for empty stdout and successful exit", async () => {
 		// Issue #238: an empty-stdout exit-0 primary now fires the one-shot
 		// isolated retry. When the isolated attempt ALSO exits 0 with no output,
@@ -1593,6 +2264,61 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl).toHaveBeenCalledTimes(2);
 		expect(spawnImpl.mock.calls[0]?.[1]).not.toContain("--no-extensions");
 		expect(spawnImpl.mock.calls[1]?.[1]).toContain("--no-extensions");
+	});
+
+	it("surfaces the error behind a bundled source line on non-zero exit", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const sourceLine =
+			// The literal `${VERSION2}` imitates minified source text quoted by a
+			// stack trace; it is data, not an interpolation.
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: fixture reproduces raw source text
+			`263 | ${"FROM cacheInterceptorV${VERSION2} ".repeat(100)}`.slice(
+				0,
+				3_000,
+			);
+		const stderr = [
+			sourceLine,
+			"^",
+			"SqliteError: database is locked",
+			"    at openDatabase (bundle.js:100:20)",
+			"    at runHistorian (runner.js:12:4)",
+		].join("\n");
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStderr(stderr);
+		child.emitClose(1);
+
+		const result = await resultPromise;
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.reason).toBe("non_zero_exit");
+			expect(result.error).toContain("SqliteError: database is locked");
+			expect(result.error).not.toContain(sourceLine);
+			expect(result.error).toContain("at openDatabase (bundle.js:100:20)");
+		}
+	});
+
+	it("keeps the tail when a chatty child exceeds the stderr buffer cap", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const stderr = `${"head-only\n".repeat(2_000)}${"tail-only\n".repeat(2_000)}`;
+
+		const resultPromise = runner.run(baseOptions);
+		child.writeStderr(stderr);
+		child.emitClose(7);
+
+		const result = await resultPromise;
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.reason).toBe("non_zero_exit");
+			expect(result.error).toContain("tail-only");
+			expect(result.error).not.toContain("head-only");
+			expect(result.meta?.stderr).toContain("tail-only");
+			expect(result.meta?.stderr).not.toContain("head-only");
+		}
 	});
 
 	it("returns non_zero_exit with stderr and exit metadata", async () => {
@@ -2223,7 +2949,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const args = buildArgsForTest(
 			{
 				...baseOptions,
-				agent: "sidekick",
+				agent: "dreamer-retrospective",
 				model: "anthropic/claude-sonnet",
 			},
 			{

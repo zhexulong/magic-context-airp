@@ -17,6 +17,7 @@ use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+use mc_store::RenderedCompartmentCoverage;
 use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredMemory, StoredNote};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
@@ -227,6 +228,8 @@ pub struct M1Composition {
     /// Number of memory corrections represented in the m1 body, for the pressure backstop.
     pub memory_update_count: usize,
     pub new_coverage: Option<(String, u64)>,
+    /// Coverage of the compartment delta composed into these bytes, independent of applied meta.
+    pub rendered_coverage: RenderedCompartmentCoverage,
     pub note_deliveries: Vec<NoteDelivery>,
     /// True only when the pending profile version produced a non-empty, budgeted block.
     pub profile_rendered: bool,
@@ -322,6 +325,15 @@ pub fn compose_m1_from_store(
         .collect();
     let new_comp_refs: Vec<&DecayRenderCompartment> = new_comp_decay.iter().collect();
     let new_compartments_block = render_new_compartments(&new_comp_refs);
+    let rendered_coverage =
+        new_comps
+            .last()
+            .map_or_else(RenderedCompartmentCoverage::default, |last| {
+                RenderedCompartmentCoverage::from_coverage(
+                    last.sequence,
+                    Some(last.end_message.max(0) as u64),
+                )
+            });
 
     // a new compartment EXTENDS coverage when the full set's coverage end is past what
     // m0+m1 currently cover (meta.coverage_ordinal). Then the SOFT advances the anchor.
@@ -491,6 +503,7 @@ pub fn compose_m1_from_store(
     );
 
     Ok(M1Composition {
+        rendered_coverage,
         body,
         memory_update_count: mutations.len(),
         new_coverage,
@@ -630,8 +643,8 @@ mod tests {
         let fixture = FixtureBuilder::store();
         let store = &fixture.store;
         let p = "git:proj";
-        let s0 = m1_revision_signal(&store, p, "ses").unwrap();
-        let s1 = m1_revision_signal(&store, p, "ses").unwrap();
+        let s0 = m1_revision_signal(store, p, "ses").unwrap();
+        let s1 = m1_revision_signal(store, p, "ses").unwrap();
         assert_eq!(s0, s1, "stable store → stable signal");
         assert_ne!(s0, 0, "a computed signal is never the empty marker 0");
 
@@ -639,7 +652,7 @@ mod tests {
         store
             .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
             .unwrap();
-        let s2 = m1_revision_signal(&store, p, "ses").unwrap();
+        let s2 = m1_revision_signal(store, p, "ses").unwrap();
         assert_ne!(s1, s2, "new compartment → signal moves");
     }
 
@@ -648,10 +661,10 @@ mod tests {
         let fixture = FixtureBuilder::store();
         let store = &fixture.store;
         let before =
-            m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 1, true, 0)
+            m1_revision_signal_parts_for_pass(store, "git:proj", "git:proj", "ses", 1, true, 0)
                 .unwrap();
         let after =
-            m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 2, true, 0)
+            m1_revision_signal_parts_for_pass(store, "git:proj", "git:proj", "ses", 2, true, 0)
                 .unwrap();
 
         assert_ne!(before.revision, after.revision);
@@ -734,14 +747,13 @@ mod tests {
             .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
             .unwrap();
         let before =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
-                .unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
 
         let memory = store
             .insert_memory(insert_input(project, "CONSTRAINTS", "private rule", 1))
             .unwrap();
         store
-            .update_memory_content(project, memory, "changed private rule", 2)
+            .update_memory_content(project, memory, "changed private rule", None, 2)
             .unwrap();
         let foreign_memory = store
             .insert_memory(insert_input(
@@ -752,24 +764,22 @@ mod tests {
             ))
             .unwrap();
         store
-            .update_memory_content(foreign, foreign_memory, "changed shared rule", 4)
+            .update_memory_content(foreign, foreign_memory, "changed shared rule", None, 4)
             .unwrap();
         let after_memory =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
-                .unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
         assert_eq!(after_memory.revision, before.revision);
         assert_eq!(after_memory.max_memory_id, 0);
         assert_eq!(after_memory.max_memory_mutation_id, 0);
         let enabled_after_memory =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, true, 0).unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, true, 0).unwrap();
         assert_ne!(enabled_after_memory.revision, before.revision);
 
         store
             .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
             .unwrap();
         let after_compartment =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
-                .unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
         assert_ne!(after_compartment.revision, after_memory.revision);
     }
 
@@ -798,7 +808,7 @@ mod tests {
             .max_memory_mutation_id(&[project.to_string()])
             .unwrap();
         store
-            .update_memory_content(project, baseline, "corrected private rule", 2)
+            .update_memory_content(project, baseline, "corrected private rule", None, 2)
             .unwrap();
         store
             .insert_memory(insert_input(project, "ARCHITECTURE", "new private rule", 3))
@@ -812,7 +822,7 @@ mod tests {
         meta.user_profile_version = 2;
         meta.m1_user_profile_version = 1;
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -841,7 +851,7 @@ mod tests {
         // a HARD folded everything (folded_seq covers all, no new memories/mutations)
         let meta = meta_after_hard(5, Some(50), 100, 9, vec![1, 2]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             "git:proj",
             "git:proj",
             "ses",
@@ -868,7 +878,7 @@ mod tests {
             .unwrap();
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             "git:proj",
             "git:proj",
             "ses",
@@ -903,7 +913,7 @@ mod tests {
         // meta: folded_seq=1, coverage=10 (matches the only compartment), folded max_mem=0
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             "git:proj",
             "git:proj",
             "ses",
@@ -924,6 +934,189 @@ mod tests {
             m1.new_coverage, None,
             "memory-only delta keeps the boundary put"
         );
+    }
+
+    #[test]
+    fn interleaved_memory_deltas_match_the_typescript_byte_fixture_and_next_hard_fold() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let project = "git:proj";
+        let initial_ids = [
+            store
+                .insert_memory(insert_input(project, "CONFIG_VALUES", "original alpha", 1))
+                .unwrap(),
+            store
+                .insert_memory(insert_input(project, "CONSTRAINTS", "archive beta", 1))
+                .unwrap(),
+            store
+                .insert_memory(insert_input(
+                    project,
+                    "CONSTRAINTS",
+                    "merge source gamma",
+                    1,
+                ))
+                .unwrap(),
+            store
+                .insert_memory(insert_input(
+                    project,
+                    "CONSTRAINTS",
+                    "merge target delta",
+                    1,
+                ))
+                .unwrap(),
+        ];
+        assert_eq!(initial_ids, [1, 2, 3, 4]);
+        let hard = crate::m0_compose::compose_m0_from_store(
+            store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: "ses",
+                project_path: project,
+                project_directory: fixture.dir.path().to_str().unwrap(),
+                now_ms: 1,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        assert_eq!(hard.rendered_memory_ids, initial_ids);
+        let meta = meta_after_hard(
+            hard.folded_compartment_seq,
+            hard.coverage_ordinal,
+            hard.max_memory_id,
+            hard.memory_mutation_cursor,
+            hard.rendered_memory_ids.clone(),
+        );
+
+        store
+            .update_memory_content(
+                project,
+                initial_ids[0],
+                "updated <alpha> & stable",
+                Some("CONSTRAINTS"),
+                10,
+            )
+            .unwrap();
+        store
+            .archive_memory(project, initial_ids[1], None, 11)
+            .unwrap();
+        let first = compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &meta,
+            1,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+
+        let late_source = store
+            .insert_memory(insert_input(
+                project,
+                "CONSTRAINTS",
+                "late merge source epsilon",
+                20,
+            ))
+            .unwrap();
+        assert!(late_source > hard.max_memory_id);
+        store
+            .merge_memories(
+                project,
+                initial_ids[3],
+                &[initial_ids[2], late_source],
+                "merged <delta> & sources",
+                30,
+            )
+            .unwrap();
+        let second = compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &meta,
+            1,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+        let reconciled = crate::m0_compose::compose_m0_from_store(
+            store,
+            &crate::m0_compose::M0ComposeInputs {
+                session_id: "ses",
+                project_path: project,
+                project_directory: fixture.dir.path().to_str().unwrap(),
+                now_ms: 30,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        let reconciled_meta = meta_after_hard(
+            reconciled.folded_compartment_seq,
+            reconciled.coverage_ordinal,
+            reconciled.max_memory_id,
+            reconciled.memory_mutation_cursor,
+            reconciled.rendered_memory_ids.clone(),
+        );
+        let post_hard = compose_m1_from_store(
+            store,
+            project,
+            project,
+            "ses",
+            &reconciled_meta,
+            30,
+            true,
+            8_000.0,
+            4_000.0,
+            true,
+            no_estimate,
+        )
+        .unwrap();
+
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/memory-update-delta-parity.json"))
+                .unwrap();
+        let xml_block = |text: &str, tag: &str| {
+            let start_tag = format!("<{tag}>");
+            let end_tag = format!("</{tag}>");
+            let start = text.find(&start_tag).unwrap();
+            let end = text[start..].find(&end_tag).unwrap() + start + end_tag.len();
+            text[start..end].to_string()
+        };
+        assert_eq!(
+            xml_block(&first.body, "memory-updates"),
+            expected["first_delta"].as_str().unwrap()
+        );
+        assert_eq!(
+            xml_block(&second.body, "memory-updates"),
+            expected["second_delta"].as_str().unwrap()
+        );
+        assert_eq!(
+            xml_block(&reconciled.m0_bytes, "project-memory"),
+            expected["reconciled_m0"].as_str().unwrap()
+        );
+        assert_eq!(post_hard.body, crate::memory_render::M1_PLACEHOLDER);
     }
 
     #[test]
@@ -957,7 +1150,7 @@ mod tests {
             match case {
                 "update" => {
                     store
-                        .update_memory_content(project, target, "corrected", 2)
+                        .update_memory_content(project, target, "corrected", None, 2)
                         .unwrap();
                 }
                 "archive" => {
@@ -1019,22 +1212,22 @@ mod tests {
         let folded_cursor = store
             .max_memory_mutation_id(&[project.to_string()])
             .unwrap();
-        let before = m1_revision_signal(&store, project, "ses").unwrap();
+        let before = m1_revision_signal(store, project, "ses").unwrap();
 
         store
             .merge_memories(project, target, &[source], "merged correction", 2)
             .unwrap();
 
-        let after = m1_revision_signal(&store, project, "ses").unwrap();
+        let after = m1_revision_signal(store, project, "ses").unwrap();
         assert_ne!(before, after, "the atomic merge must move the m1 revision");
         assert_eq!(
             after,
-            m1_revision_signal(&store, project, "ses").unwrap(),
+            m1_revision_signal(store, project, "ses").unwrap(),
             "the merge moves the revision once rather than creating a live render input"
         );
         let meta = meta_after_hard(1, Some(10), folded_max, folded_cursor, vec![source]);
         let first = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1048,7 +1241,7 @@ mod tests {
         )
         .unwrap();
         let replay = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1101,7 +1294,7 @@ mod tests {
 
         let meta = meta_after_hard(0, None, source, folded_cursor, vec![source]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1159,7 +1352,7 @@ mod tests {
 
         let meta = meta_after_hard(1, Some(10), folded_max, folded_cursor, vec![source]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1234,7 +1427,7 @@ mod tests {
             .unwrap();
 
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1281,7 +1474,7 @@ mod tests {
             .merge_memories(project, terminal, &[middle], "terminal merged", 3)
             .unwrap();
         let chain = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1361,7 +1554,7 @@ mod tests {
             .unwrap();
         store.archive_memory(project, target, None, 3).unwrap();
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1440,7 +1633,7 @@ mod tests {
             .max_memory_mutation_id(&membership.union_identities)
             .unwrap();
         let grant = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1472,7 +1665,7 @@ mod tests {
             )
             .unwrap();
         let revoke = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1507,7 +1700,7 @@ mod tests {
         store
             .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
             .unwrap();
-        let before_signal = m1_revision_signal(&store, project, "ses").unwrap();
+        let before_signal = m1_revision_signal(store, project, "ses").unwrap();
         let cursor = store
             .max_memory_mutation_id(&[project.to_string()])
             .unwrap();
@@ -1515,7 +1708,7 @@ mod tests {
         store
             .insert_memory(insert_input(project, "CONSTRAINTS", "brand new", 1))
             .unwrap();
-        let after_signal = m1_revision_signal(&store, project, "ses").unwrap();
+        let after_signal = m1_revision_signal(store, project, "ses").unwrap();
         assert_ne!(before_signal, after_signal, "insert moves max_memory_id");
         assert_eq!(
             store
@@ -1526,7 +1719,7 @@ mod tests {
         );
         let meta = meta_after_hard(1, Some(10), 0, cursor, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1571,7 +1764,7 @@ mod tests {
 
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1602,7 +1795,7 @@ mod tests {
         };
         assert_ne!(
             before,
-            m1_revision_signal(&store, own, "ses").unwrap(),
+            m1_revision_signal(store, own, "ses").unwrap(),
             "the new memory advances the digest"
         );
     }

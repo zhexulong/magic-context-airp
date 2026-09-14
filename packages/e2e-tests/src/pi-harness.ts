@@ -3,6 +3,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { assertHistorianMockRouting } from "./mock-routing";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { prepareContextDatabase } from "./prepare-context-db";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
@@ -20,6 +21,7 @@ export interface PiTestHarnessOptions {
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
   mockDefault?: MockResponse;
+  extensionsBeforeMagicContext?: string[];
   /** Share the cortexkit DB with another harness. */
   sharedDataDir?: string;
   /** Optional working directory override before the persistent Pi process starts. */
@@ -123,13 +125,28 @@ export class PiTestHarness {
     const timeoutMs = options.timeoutMs ?? 180_000;
     const events: PiRpcEvent[] = [];
     let capturing = false;
+    let submittedTurnEnded = false;
     const unsubscribe = this.rpc.onEvent((event) => {
       if (event.type === "agent_start") capturing = true;
       if (capturing) events.push(event);
+      if (event.type === "agent_end" && Array.isArray(event.messages)) {
+        submittedTurnEnded ||= event.messages.some((message: { role?: string; content?: unknown }) => {
+          if (message.role !== "user") return false;
+          const content = typeof message.content === "string"
+            ? message.content
+            : Array.isArray(message.content)
+              ? message.content.filter((part) => part.type === "text").map((part) => part.text).join("")
+              : undefined;
+          return content === text;
+        });
+      }
     });
+    // Pi 0.83 emits agent_end before extension-triggered continuations. Only
+    // agent_settled closes the run, including any ceiling-nudge steer; an end
+    // event for a different user/custom message cannot complete this prompt.
     const agentEnd = this.rpc.waitForEvent(
-      (event) => capturing && event.type === "agent_end",
-      { timeoutMs, label: "agent_end" },
+      (event) => submittedTurnEnded && event.type === "agent_settled",
+      { timeoutMs, label: "submitted turn agent_settled" },
     );
 
     try {
@@ -206,10 +223,65 @@ export class PiTestHarness {
     requireSuccessfulResponse(response);
   }
 
+  async compactNowExpectCancelled(): Promise<void> {
+    const response = await this.rpc.sendCommand("compact");
+    if (response.success || !response.error?.includes("Compaction cancelled")) {
+      throw new Error(`Expected Pi compaction cancellation, received ${JSON.stringify(response)}`);
+    }
+  }
+
+  async invokeExtensionCommand(command: string): Promise<void> {
+    const response = await this.rpc.sendCommand("prompt", { message: `/${command}` });
+    requireSuccessfulResponse(response);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const state = await this.getState();
+      if (!state.isStreaming && !state.isCompacting) return;
+      await Bun.sleep(20);
+    }
+    throw new Error(`Pi extension command /${command} did not settle`);
+  }
+
   async newSession(): Promise<void> {
     const response = await this.rpc.sendCommand<{ cancelled?: boolean }>("new_session");
     const data = requireSuccessfulResponse(response);
     if (data?.cancelled) throw new Error("Pi new_session was cancelled by an extension");
+  }
+
+  /** Exercise Pi's in-process extension/resource reload without replacing the RPC process. */
+  async reloadExtensions(): Promise<void> {
+    const response = await this.rpc.sendCommand(
+      "prompt",
+      { message: "/e2e-reload-extensions" },
+      { timeoutMs: 60_000, label: "Pi extension reload" },
+    );
+    requireSuccessfulResponse(response);
+    const extensionErrors = this.rpc.getExtensionErrors();
+    if (extensionErrors.length > 0) {
+      throw new Error(`Pi extension reload error: ${JSON.stringify(extensionErrors)}`);
+    }
+  }
+
+  /** Restart Pi and explicitly resume the same saved session. */
+  async restart(): Promise<void> {
+    const beforeRestart = await this.getState();
+    this.closeContextDb();
+    await this.rpc.restart();
+
+    if (!beforeRestart.sessionFile) return;
+    const response = await this.rpc.sendCommand<{ cancelled?: boolean }>(
+      "switch_session",
+      { sessionPath: beforeRestart.sessionFile },
+      { timeoutMs: 60_000, label: "resume Pi session after restart" },
+    );
+    const resumed = requireSuccessfulResponse(response);
+    if (resumed.cancelled) throw new Error("Pi session resume was cancelled by an extension");
+
+    const afterRestart = await this.getState();
+    if (beforeRestart.sessionId && afterRestart.sessionId !== beforeRestart.sessionId) {
+      throw new Error(
+        `Pi restart resumed session ${afterRestart.sessionId ?? "missing"}, expected ${beforeRestart.sessionId}`,
+      );
+    }
   }
 
   get lastTurn(): PiRunResult | null {
@@ -298,16 +370,19 @@ export class PiTestHarness {
     return this.mock.requests();
   }
 
-  async dispose(): Promise<void> {
-    if (this.contextDbCached) {
-      try {
-        this.contextDbCached.close();
-      } catch {
-        // ignore close errors
-      }
-      this.contextDbCached = null;
+  assertHistorianRequestsUseMock(): void {
+    if (this.expectMagicContext && this.hasContextDb()) {
+      assertHistorianMockRouting(this.contextDb(), "pi", "anthropic/claude-haiku-4-5");
     }
-    await this.rpc.shutdown();
-    await this.mock.stop();
+  }
+
+  async dispose(): Promise<void> {
+    try {
+      this.assertHistorianRequestsUseMock();
+    } finally {
+      this.closeContextDb();
+      await this.rpc.shutdown();
+      await this.mock.stop();
+    }
   }
 }

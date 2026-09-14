@@ -19,7 +19,9 @@ function createDb(): Database {
       reasoning_byte_size INTEGER NOT NULL DEFAULT 0,
       caveman_depth INTEGER NOT NULL DEFAULT 0,
       harness TEXT NOT NULL DEFAULT 'opencode',
-      tool_owner_message_id TEXT DEFAULT NULL
+      tool_owner_message_id TEXT DEFAULT NULL,
+      token_count INTEGER DEFAULT NULL,
+      entry_fingerprint TEXT DEFAULT NULL
     );
     CREATE TABLE pending_ops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +91,6 @@ describe("ctx_reduce drop queueing", () => {
     it("returns queued ack immediately and stores pending drops", async () => {
         const tools = createCtxReduceTools({
             db,
-            protectedTags: 3,
         });
 
         const result = await tools.ctx_reduce.execute({ drop: "1,2" }, {

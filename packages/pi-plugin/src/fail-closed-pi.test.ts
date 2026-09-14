@@ -8,6 +8,7 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
+import { contextHost } from "./pi-context-host.test";
 
 type Handler = (...args: unknown[]) => unknown;
 
@@ -34,6 +35,37 @@ function createFakePi() {
 }
 
 describe("registerPiFailClosedSurface", () => {
+	for (const reason of [
+		{
+			kind: "schema_fence" as const,
+			persistedVersion: 65,
+			supportedVersion: 64,
+		},
+		{ kind: "storage_failure" as const, cause: "storage cannot open" },
+		{
+			kind: "migration_guard" as const,
+			persistedVersion: 65,
+			supportedVersion: 64,
+			blockingProcesses: [{ kind: "Pi" as const, pid: 123 }],
+		},
+	]) {
+		it(`aborts the installed Pi runner for ${reason.kind}`, async () => {
+			const fake = createFakePi();
+			const host = contextHost();
+			Object.assign(fake.pi, host.api);
+			registerPiFailClosedSurface(fake.pi as never, {
+				reason,
+				tryReopen: async () => null,
+				onRecovered: async () => {},
+			});
+			const handler = fake.handlers.get("context")?.[0];
+			expect(handler).toBeDefined();
+			const raw = [{ role: "user", content: "original", timestamp: 1 }];
+			const served = await host.emit(handler as never, raw, {});
+			host.assertRefused(served, raw);
+		});
+	}
+
 	it("cancels session_before_compact and throws fence error from context", async () => {
 		const fake = createFakePi();
 		registerPiFailClosedSurface(fake.pi as never, {
@@ -131,5 +163,43 @@ describe("registerPiFailClosedSurface", () => {
 			fake.emit("context", { messages: [] }, {}),
 		).resolves.toBeUndefined();
 		expect(opens).toBe(1);
+	});
+
+	it("keeps blocking until late runtime installation completes, then releases both hooks", async () => {
+		const fake = createFakePi();
+		let finishRuntime!: () => void;
+		const runtimeInstalled = new Promise<void>((resolve) => {
+			finishRuntime = resolve;
+		});
+		const fakeDb = { __test: true } as unknown as ContextDatabase;
+		const diagnostics: string[] = [];
+		const surface = registerPiFailClosedSurface(fake.pi as never, {
+			reason: { kind: "storage_failure", cause: "boot deadline" },
+			tryReopen: async () => fakeDb,
+			onRecovered: async () => runtimeInstalled,
+			report: (message) => diagnostics.push(message),
+		});
+
+		const adoption = surface.adoptRecovered(fakeDb);
+		await Promise.resolve();
+		expect(diagnostics).toEqual([
+			"[magic-context][pi] fail-closed blocking surface registered (storage_failure); primary turns will error until storage recovers or the build is upgraded",
+		]);
+		await expect(fake.emit("session_before_compact", {}, {})).resolves.toEqual({
+			cancel: true,
+		});
+
+		finishRuntime();
+		await expect(adoption).resolves.toBe(true);
+		expect(diagnostics).toEqual([
+			"[magic-context][pi] fail-closed blocking surface registered (storage_failure); primary turns will error until storage recovers or the build is upgraded",
+			"[magic-context][pi] storage recovered; full Magic Context runtime installed and fail-closed cleared",
+		]);
+		await expect(
+			fake.emit("context", { messages: [] }, {}),
+		).resolves.toBeUndefined();
+		await expect(
+			fake.emit("session_before_compact", {}, {}),
+		).resolves.toBeUndefined();
 	});
 });

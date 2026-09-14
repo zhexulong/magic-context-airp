@@ -744,7 +744,7 @@ export const MIGRATIONS: Migration[] = [
     },
     {
         version: 15,
-        description: "Add deferred_execute_state column for boundary execution drain",
+        description: "Add the now-retired deferred_execute_state column",
         up: (db: Database) => {
             const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
                 name?: string;
@@ -2890,6 +2890,41 @@ export const MIGRATIONS: Migration[] = [
             );
         },
     },
+    {
+        version: 83,
+        description: "add indexed rowid access for message FTS content",
+        up(db: Database): void {
+            // Schema migration only: legacy FTS rows are deliberately mapped by the
+            // bounded asynchronous runtime backfill, never inside migration startup.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS message_fts_rowid_map (
+                    session_id TEXT NOT NULL,
+                    message_ordinal INTEGER NOT NULL,
+                    fts_rowid INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, message_ordinal)
+                );
+
+                CREATE TABLE IF NOT EXISTS message_fts_rowid_map_backfill_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    watermark_rowid INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+                    (id, watermark_rowid, completed, updated_at)
+                VALUES (1, 0, 0, 0);
+            `);
+        },
+    },
+    {
+        version: 84,
+        description: "persist protected-token floor state per session",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta")) return;
+            ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
+            ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
+        },
+    },
 ];
 
 /**
@@ -2986,8 +3021,26 @@ export function runMigrations(db: Database): void {
     let touchedLegacyAuthorityBatch = false;
     while (true) {
         let migration: Migration | undefined;
+        const migrationState: { value?: Migration } = {};
         let currentVersion = 0;
         try {
+            // A current database needs no write lock. This read-only fast path is
+            // important during parallel startup: a sibling's ordinary IMMEDIATE
+            // transaction must not make a fresh opener wait merely to discover
+            // that there is no migration to apply. Pending databases still re-read
+            // under BEGIN IMMEDIATE below before selecting the migration.
+            currentVersion = getCurrentVersion(db);
+            const pendingMigration = MIGRATIONS.find(
+                (candidate) =>
+                    candidate.version > currentVersion &&
+                    !isMigrationApplied(db, candidate.version),
+            );
+            if (!pendingMigration) break;
+            // The transaction callback owns `migration`. Keep it undefined until
+            // BEGIN IMMEDIATE succeeds so lock-acquisition failures retain the
+            // retryable MigrationLockBusyError classification below.
+            migration = undefined;
+
             const transactionStartedAt = performance.now();
             const applied = db
                 .transaction(() => {
@@ -3002,6 +3055,7 @@ export function runMigrations(db: Database): void {
                             candidate.version > currentVersion &&
                             !isMigrationApplied(db, candidate.version),
                     );
+                    migrationState.value = migration;
                     if (!migration) return false;
 
                     if (!loggedPlan) {
@@ -3024,6 +3078,7 @@ export function runMigrations(db: Database): void {
                 })
                 .immediate();
             logSlowWriteTransaction("migration-runner", transactionStartedAt);
+            migration = migrationState.value;
 
             if (!applied || !migration) break;
             if (migration.version <= 61) touchedLegacyAuthorityBatch = true;

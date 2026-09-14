@@ -40,12 +40,28 @@ const CONNECT_BACKOFF_WAIT_JITTER_MS = 100;
 const HANDSHAKE_TIMEOUT_MS = 2_000;
 const MODULE_SEND_TIMEOUT_MS = 15_000;
 export const TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS = 5_000;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS = 15_000;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_PER_MESSAGE_MS = 2;
+export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MAX_MS = 90_000;
+
 /**
- * A completed giant page series makes the module assemble, project, and encode the whole cold
- * snapshot. ASTRO-scale cold passes have exceeded five seconds while still making progress, so
- * leave enough headroom for that one execute attempt without weakening steady-state deadlines.
+ * Cold execution includes full projection and native encoding after the final page lands.
+ * The hermetic 9.6k-message/8k-tool cold gate completes module-side in 8.0s at load 9 and
+ * 10.2s at load 18 after the cold-path fixes, and this box routinely runs at load 40+ during
+ * release gates. A 15s floor plus two milliseconds per message keeps ~3x margin over the
+ * measured cold time (30s for ENGRAM's 7.4k messages, 34s for ASTRO's 9.6k); a miss is no
+ * longer fatal because a completed series the requester abandoned is adopted by the next
+ * identical pass, but each miss still costs the user one refused turn.
  */
-export const TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS = 30_000;
+export function transformColdStartExecuteTimeoutMs(seedMessageCount: number): number {
+    const messages = Number.isSafeInteger(seedMessageCount) ? Math.max(0, seedMessageCount) : 0;
+    return Math.min(
+        TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MAX_MS,
+        TRANSFORM_COLD_START_EXECUTE_TIMEOUT_MS +
+            messages * TRANSFORM_COLD_START_EXECUTE_TIMEOUT_PER_MESSAGE_MS,
+    );
+}
+
 /** Consumer deadline for the module's exported historian::MAX_WRAPUP_REQUEST_BUDGET. */
 export const MAX_WRAPUP_REQUEST_BUDGET_MS = 3_800_000;
 const SERIAL_LANE_MAX_WAITERS = 16;
@@ -196,6 +212,15 @@ interface OpeningRoute {
     promise: Promise<EnsuredRoute>;
 }
 
+export interface ModuleCallTimings {
+    lane: number;
+    route: number;
+    encode: number;
+    issue: number;
+    responseWait: number;
+    settle: number;
+}
+
 export class SubcModuleTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
@@ -224,11 +249,13 @@ export class SubcModuleTransport {
     private connectionGeneration = 0;
     private stateSyncCapabilityCache: {
         generation: number;
-        capabilities: { state_sync_deltas?: boolean };
+        capabilities: { state_sync_deltas?: boolean; state_sync_resume?: boolean };
     } | null = null;
 
     /** Returns the capability snapshot for the currently live SUBC connection. */
-    getCachedStateSyncCapabilities(): { state_sync_deltas?: boolean } | undefined {
+    getCachedStateSyncCapabilities():
+        | { state_sync_deltas?: boolean; state_sync_resume?: boolean }
+        | undefined {
         const cached = this.stateSyncCapabilityCache;
         if (!cached || cached.generation !== this.connectionGeneration) return undefined;
         return cached.capabilities;
@@ -242,7 +269,7 @@ export class SubcModuleTransport {
     async stateSyncCapabilities(args: {
         sessionId: string;
         projectRoot: string;
-    }): Promise<{ state_sync_deltas?: boolean }> {
+    }): Promise<{ state_sync_deltas?: boolean; state_sync_resume?: boolean }> {
         const cached = this.getCachedStateSyncCapabilities();
         if (cached) return cached;
         const response = await this.call({
@@ -254,7 +281,10 @@ export class SubcModuleTransport {
         const raw = isRecord(response) ? response : {};
         const value = isRecord(raw.result) ? raw.result : raw;
         const epochs = isRecord(value.epochs) ? value.epochs : {};
-        const capabilities = { state_sync_deltas: epochs.state_sync_deltas === true };
+        const capabilities = {
+            state_sync_deltas: epochs.state_sync_deltas === true,
+            ...(epochs.state_sync_resume === true ? { state_sync_resume: true } : {}),
+        };
         this.stateSyncCapabilityCache = { generation: this.connectionGeneration, capabilities };
         return capabilities;
     }
@@ -458,6 +488,8 @@ export class SubcModuleTransport {
             | "dreamer.run_task"
             | "memory.set_classification";
         body: unknown;
+        /** Per-call durations; responseWait includes the client's opaque receive and decode. */
+        onTimings?: (timings: ModuleCallTimings) => void;
         signal?: AbortSignal;
         /** Do not retry after reconnecting; let the caller rebuild for the new connection. */
         generationSensitive?: boolean;
@@ -466,6 +498,15 @@ export class SubcModuleTransport {
         /** Distinguishes cheap page admission from the cold execute on the completed series. */
         attemptClass?: "transform_page_upload" | "transform_series_execute";
     }): Promise<unknown> {
+        const callStartedAt = performance.now();
+        const timings: ModuleCallTimings = {
+            lane: 0,
+            route: 0,
+            encode: 0,
+            issue: 0,
+            responseWait: 0,
+            settle: 0,
+        };
         const wrapupInFlight = (this.wrapupSessions.get(args.sessionId) ?? 0) > 0;
         const attemptTimeoutMs =
             args.timeoutMs ??
@@ -500,19 +541,37 @@ export class SubcModuleTransport {
             );
         } catch (error) {
             finishWrapupTracking();
+            if (args.method === "state_sync" && isDeadlineFailure(error)) {
+                const body = isRecord(args.body) ? args.body : {};
+                throw Object.assign(
+                    new Error(
+                        `state_sync timeout stage=correctness_lane page=${body.seed_batch_index ?? 0}/${body.seed_batch_total ?? 1} series=${body.seed_id ?? "delta"} budget_ms=${attemptTimeoutMs}`,
+                    ),
+                    {
+                        code: "state_sync_timeout",
+                        stage: "correctness_lane",
+                        page: body.seed_batch_index ?? 0,
+                        pages: body.seed_batch_total ?? 1,
+                        series: body.seed_id ?? null,
+                        cause: error,
+                    },
+                );
+            }
             throw error;
         }
-        let activeAttemptClient: SubcClient | null = null;
-        const onAbort = () => {
-            // The completed-series deadline is a pass budget, not evidence that the socket died.
-            // Closing it would relabel a slow execute as reconnect and make the caller re-upload.
-            if (args.attemptClass === "transform_series_execute") return;
-            this.invalidateConnection(activeAttemptClient ?? this.client);
-        };
+        timings.lane = performance.now() - callStartedAt;
+        let rejectAbort!: (reason: unknown) => void;
+        const aborted = new Promise<never>((_resolve, reject) => {
+            rejectAbort = reject;
+        });
+        aborted.catch(() => {});
+        // Cancellation abandons only this request. The shared socket may still be serving
+        // other sessions, and the module may durably finish the abandoned operation.
+        const onAbort = () =>
+            rejectAbort(args.signal?.reason ?? new Error("module transport call aborted"));
         args.signal?.addEventListener("abort", onAbort, { once: true });
         try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
-                activeAttemptClient = null;
                 let ensuredRoute: EnsuredRoute | null = null;
                 try {
                     if (args.signal?.aborted) {
@@ -521,25 +580,39 @@ export class SubcModuleTransport {
                     // Each attempt gets its own timeout, apart from the queue wait limit, so a dead
                     // socket can hit the deadline and still be replaced on one reconnect.
                     const attemptDeadlineMs = Date.now() + attemptTimeoutMs;
+                    const routeStartedAt = performance.now();
                     ensuredRoute = await this.ensureRoute(
                         args.sessionId,
                         args.projectRoot,
                         attemptDeadlineMs,
                         args.signal,
                     );
-                    activeAttemptClient = ensuredRoute.client;
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
+                    timings.route += performance.now() - routeStartedAt;
+                    const encodeStartedAt = performance.now();
+                    // Pre-encoded JSON retains the JSON frame flag; binary denotes an opaque
+                    // request protocol, not a preference for how the reply is decoded.
+                    const body =
+                        args.body instanceof Uint8Array
+                            ? args.body
+                            : Buffer.from(JSON.stringify(args.body));
+                    timings.encode += performance.now() - encodeStartedAt;
+                    const issueStartedAt = performance.now();
+                    const request = ensuredRoute.client.request(ensuredRoute.route, body, {
+                        priority: Priority.Background,
+                        admissionClass: AdmissionClass.Normal,
+                        timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
+                    });
+                    timings.issue += performance.now() - issueStartedAt;
+                    const waitStartedAt = performance.now();
                     const response = await this.beforeDeadline(
-                        ensuredRoute.client.request(ensuredRoute.route, args.body, {
-                            priority: Priority.Background,
-                            admissionClass: AdmissionClass.Normal,
-                            timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
-                        }),
+                        Promise.race([request, aborted]),
                         attemptDeadlineMs,
                         "waiting for the module response",
                     );
+                    timings.responseWait += performance.now() - waitStartedAt;
                     if (
                         this.client !== ensuredRoute.client ||
                         this.connectionGeneration !== ensuredRoute.generation
@@ -550,6 +623,23 @@ export class SubcModuleTransport {
                     }
                     return response;
                 } catch (error) {
+                    if (args.signal?.aborted) throw args.signal.reason ?? error;
+                    if (args.method === "state_sync" && isDeadlineFailure(error)) {
+                        const body = isRecord(args.body) ? args.body : {};
+                        throw Object.assign(
+                            new Error(
+                                `state_sync timeout stage=module_ack page=${body.seed_batch_index ?? 0}/${body.seed_batch_total ?? 1} series=${body.seed_id ?? "delta"} budget_ms=${attemptTimeoutMs}`,
+                            ),
+                            {
+                                code: "state_sync_timeout",
+                                stage: "module_ack",
+                                page: body.seed_batch_index ?? 0,
+                                pages: body.seed_batch_total ?? 1,
+                                series: body.seed_id ?? null,
+                                cause: error,
+                            },
+                        );
+                    }
                     if (
                         args.attemptClass === "transform_series_execute" &&
                         isDeadlineFailure(error)
@@ -587,6 +677,17 @@ export class SubcModuleTransport {
             args.signal?.removeEventListener("abort", onAbort);
             finishWrapupTracking();
             releaseLane();
+            timings.settle = Math.max(
+                0,
+                performance.now() -
+                    callStartedAt -
+                    timings.lane -
+                    timings.route -
+                    timings.encode -
+                    timings.issue -
+                    timings.responseWait,
+            );
+            args.onTimings?.(timings);
         }
     }
 

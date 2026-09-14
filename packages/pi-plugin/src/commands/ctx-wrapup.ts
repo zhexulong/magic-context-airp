@@ -6,7 +6,7 @@ import type {
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
-	releaseCompartmentLease,
+	releaseCompartmentLeaseBestEffort,
 	renewCompartmentLease,
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import {
@@ -25,10 +25,12 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { resolveExecuteThreshold } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import {
+	describeBoundaryDiagnostics,
 	hasRunnableCompartmentWindow,
 	resolveWrapupProtectedTailBoundary,
 } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
 import { setRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
+import { sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { COMPACTION_OFF_COMMAND_UNAVAILABLE } from "../compaction-off-pi";
@@ -40,7 +42,10 @@ import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import { runPiHistorian } from "../pi-historian-runner";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
-import { readPiSessionMessages } from "../read-session-pi";
+import {
+	readPiSessionMessagePage,
+	readPiSessionMessages,
+} from "../read-session-pi";
 import { updateStatusLine } from "../status-line";
 import { createCtxStatusSender, resolveSessionId } from "./pi-command-utils";
 
@@ -153,7 +158,7 @@ export function registerCtxWrapupCommand(
 			if (!currentDeps.historianModel) {
 				sendStatus({
 					title: "/ctx-wrapup",
-					text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because `historian.model` is not configured.",
+					text: "## Magic Wrapup\n\n/ctx-wrapup is unavailable because the active harness's historian model is not configured.",
 					level: "error",
 				});
 				return;
@@ -203,7 +208,14 @@ export async function runPiWrapup(
 		return "## Magic Wrapup — Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
 	}
 
-	const provider = { readMessages: () => readPiSessionMessages(ctx) };
+	const provider = {
+		readMessages: () => readPiSessionMessages(ctx),
+		readMessagePage: (
+			afterOrdinal: number,
+			limit: number,
+			finalWatermark: number,
+		) => readPiSessionMessagePage(ctx, afterOrdinal, limit, finalWatermark),
+	};
 	const unregister = setRawMessageProvider(sessionId, provider);
 	let holderId = "";
 	try {
@@ -342,6 +354,10 @@ export async function runPiWrapup(
 				lastEnd = getLastCompartmentEndMessage(deps.db, sessionId);
 				if (lastEnd + 1 >= targetEligibleEndOrdinal) break;
 				if (!hasRunnableCompartmentWindow(plan.snapshot)) {
+					sessionLog(
+						sessionId,
+						`wrapup no-op: ${describeBoundaryDiagnostics(plan.snapshot)}`,
+					);
 					failure = `No runnable wrapup boundary is available yet; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
 					break;
 				}
@@ -367,6 +383,11 @@ export async function runPiWrapup(
 					failure = `${ownershipLostReason}; wrapped up through message ${lastEnd}. Run /ctx-wrapup again to continue.`;
 					break;
 				}
+				// Boundary diagnostics belong in the log; the chat line stays a plain progress sentence.
+				sessionLog(
+					sessionId,
+					`wrapup chunk ${chunkIndex}: ${describeBoundaryDiagnostics(plan.snapshot)}`,
+				);
 				sendStatus({
 					title: "/ctx-wrapup",
 					text: `## Magic Wrapup\n\nChunk ${chunkIndex}: wrapping messages ${plan.snapshot.offset}-${plan.snapshot.eligibleEndOrdinal - 1} (~${plan.snapshot.trueRawEligibleTokens.toLocaleString()} eligible tokens remain).`,
@@ -442,9 +463,12 @@ export async function runPiWrapup(
 							}),
 						ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 						forceDrainQuota: true,
-						// The runner applies this only to the actual final chunk; token-capped
-						// chunks are downgraded based on readSessionChunk().hasMore.
-						forceKeepLastCompartment: true,
+						// The boundary resolver caps each run's window, so chunk.hasMore cannot
+						// see the full drain target. Request weak-lookahead preservation only
+						// for the window that reaches that target; the runner still downgrades
+						// the hint if its own chunk reader stops early within the window.
+						forceKeepLastCompartment:
+							plan.snapshot.eligibleEndOrdinal >= plan.targetEligibleEndOrdinal,
 						onPublished: () => {
 							updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd });
 							signalPiDeferredHistoryRefresh(sessionId);
@@ -453,7 +477,12 @@ export async function runPiWrapup(
 					});
 				} finally {
 					clearInterval(leaseRenewal);
-					releaseCompartmentLease(deps.db, sessionId, leaseHolder);
+					releaseCompartmentLeaseBestEffort(
+						deps.db,
+						sessionId,
+						leaseHolder,
+						sessionLog,
+					);
 				}
 
 				const afterEnd = getLastCompartmentEndMessage(deps.db, sessionId);
@@ -508,6 +537,8 @@ function resolvePiContextLimit(
 	return (
 		resolvePiUsableContextLimit({
 			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+			rawContextWindowSource:
+				usage?.contextWindow === undefined ? "catalog" : "observed",
 			model: ctx.model,
 			detectedContextLimit,
 		}) ?? 128_000

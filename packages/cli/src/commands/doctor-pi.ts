@@ -15,6 +15,16 @@ import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
 } from "@magic-context/core/features/magic-context/memory/embedding-probe";
+import {
+    formatSynapseLaneDescriptor,
+    SYNAPSE_DEFAULT_MODEL,
+    SynapseEmbeddingProvider,
+    toSynapseLaneDescriptor,
+} from "@magic-context/core/features/magic-context/memory/embedding-synapse";
+import {
+    formatShadowBackfillStall,
+    listShadowBackfillStalls,
+} from "@magic-context/core/features/magic-context/shadow-backfill-state";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
 import {
@@ -23,10 +33,11 @@ import {
 } from "@magic-context/core/shared/data-path";
 import {
     isPrototypePollutionKey,
+    parseJsoncRecovering,
     sanitizeParsedJson,
 } from "@magic-context/core/shared/jsonc-parser";
 import { loadPiConfig } from "@magic-context/pi-core/config";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { parse as parseCommentJson, stringify as stringifyJsonc } from "comment-json";
 
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -44,6 +55,7 @@ import {
     checkLocalEmbeddingRuntimeByResolution,
     formatLocalEmbeddingRuntimeDoctorWarning,
     formatLocalEmbeddingRuntimeWasmFallback,
+    formatLocalEmbeddingRuntimeWasmSelected,
     isLocalEmbeddingRuntimeBroken,
 } from "../lib/embedding-runtime";
 import {
@@ -51,9 +63,9 @@ import {
     type GhCommandResult,
     submitGithubIssue,
 } from "../lib/github-issue";
+import { formatLogFileInspection, inspectMagicContextLogs, readLogLines } from "../lib/log-lines";
 import { bundleIssueReport } from "../lib/logs-pi";
 import {
-    getMagicContextLogPath,
     getPiAgentConfigDir,
     getPiCacheRoot,
     getPiUserConfigPath,
@@ -126,6 +138,7 @@ interface DoctorDeps {
 export interface RunDoctorOptions extends V22BackfillCommandArgs {
     force?: boolean;
     issue?: boolean;
+    report?: string;
     help?: boolean;
     cwd?: string;
     prompts?: PromptIO;
@@ -163,6 +176,9 @@ function printDoctorHelp(): void {
     console.log("    magic-context-pi doctor          Run health checks");
     console.log("    magic-context-pi doctor --force  Repair safe issues, then re-check");
     console.log("    magic-context-pi doctor --issue  Create a sanitized bug report");
+    console.log(
+        "    magic-context-pi doctor --issue --report <path>  Write a report without prompting",
+    );
     console.log(
         "    magic-context-pi doctor --check-v22-backfill  Show v22 memory backfill status",
     );
@@ -245,7 +261,7 @@ function readJsonc(path: string): {
 } {
     try {
         return {
-            value: parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>,
+            value: parseCommentJson(readFileSync(path, "utf-8")) as Record<string, unknown>,
         };
     } catch (error) {
         return {
@@ -266,7 +282,23 @@ function readMagicContextJsonc(
         const raw = loadRawConfigFile({ configPath: path, tier });
         if (!raw)
             return { value: {}, error: "config file disappeared while doctor was reading it" };
-        return { value: parseJsonc(raw.text) as Record<string, unknown> };
+        const substituted = substituteConfigVariables({
+            text: raw.text,
+            configPath: path,
+            isProjectConfig: tier === "project",
+        });
+        const parsed = parseJsoncRecovering<Record<string, unknown>>(substituted.text);
+        const value =
+            parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value)
+                ? parsed.value
+                : {};
+        const issue = parsed.issues[0];
+        return issue
+            ? {
+                  value,
+                  error: `${path}:${issue.line}:${issue.column}: ${issue.message} (runtime recovery does not make the file valid)`,
+              }
+            : { value };
     } catch (error) {
         return {
             value: {},
@@ -333,9 +365,12 @@ function readConfigForEmbedding(
             isProjectConfig,
         });
         const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(substituted.text) as Record<string, unknown>, {
-            onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
-        });
+        const parsed = sanitizeParsedJson(
+            parseCommentJson(substituted.text) as Record<string, unknown>,
+            {
+                onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
+            },
+        );
         if (rejectedKeyPaths.length > 0) {
             throw new Error("unsafe prototype-pollution key in config");
         }
@@ -503,7 +538,7 @@ async function runHealthChecks(options: {
             add(
                 results,
                 "fail",
-                `Pi ${version} is older than required ${MIN_PI_VERSION}. Subagents (historian/dreamer/sidekick) use the long-form \`--extension\` flag introduced in Pi 0.71.0; older versions hard-fail with "Unknown option". Run \`pi update\` (or \`npm install -g @earendil-works/pi-coding-agent@latest\`).`,
+                `Pi ${version} is older than required ${MIN_PI_VERSION}. Subagents (historian/dreamer) use the long-form \`--extension\` flag introduced in Pi 0.71.0; older versions hard-fail with "Unknown option". Run \`pi update\` (or \`npm install -g @earendil-works/pi-coding-agent@latest\`).`,
             );
         } else if (version) {
             add(results, "pass", `Pi version meets minimum ${MIN_PI_VERSION} requirement`);
@@ -675,6 +710,9 @@ async function runHealthChecks(options: {
                     (table) => `${table}=${countTable(db as ContextDatabase, table) ?? "n/a"}`,
                 ).join(", ");
                 add(results, "info", `Shared DB row counts: ${counts}`);
+                for (const stall of listShadowBackfillStalls(db)) {
+                    add(results, "warn", formatShadowBackfillStall(stall));
+                }
             }
         } catch (error) {
             if (error instanceof UnsupportedSchemaVersionError) {
@@ -733,7 +771,40 @@ async function runHealthChecks(options: {
             userRaw ?? undefined,
         );
     }
-    if (mergedEmbedding.provider === "openai-compatible") {
+    if (mergedEmbedding.provider === "synapse") {
+        const subc = loadedConfig.config.subc;
+        const model =
+            typeof mergedEmbedding.model === "string" && mergedEmbedding.model.trim().length > 0
+                ? mergedEmbedding.model.trim()
+                : SYNAPSE_DEFAULT_MODEL;
+        if (!subc) {
+            add(results, "fail", "Embedding provider is synapse but the subc block is missing");
+        } else {
+            try {
+                const metadata = await SynapseEmbeddingProvider.discover({
+                    connectionFile: subc.connection_file,
+                    projectRoot: options.cwd,
+                    session: "doctor:pi",
+                    model,
+                });
+                add(
+                    results,
+                    "pass",
+                    `Embedding provider: synapse — ${sanitizeDiagnosticText(
+                        formatSynapseLaneDescriptor(toSynapseLaneDescriptor(metadata)),
+                    )}`,
+                );
+            } catch (error) {
+                add(
+                    results,
+                    "fail",
+                    `Synapse embedding lane unavailable: ${sanitizeDiagnosticText(
+                        error instanceof Error ? error.message : String(error),
+                    )}`,
+                );
+            }
+        }
+    } else if (mergedEmbedding.provider === "openai-compatible") {
         const endpoint =
             typeof mergedEmbedding.endpoint === "string" ? mergedEmbedding.endpoint.trim() : "";
         const model = typeof mergedEmbedding.model === "string" ? mergedEmbedding.model.trim() : "";
@@ -776,20 +847,32 @@ async function runHealthChecks(options: {
     } else if (loadedConfig.config.embedding.provider === "off") {
         add(results, "info", "Embedding provider disabled");
     } else {
-        // Local (default) provider: verify the native ONNX runtime
-        // (onnxruntime-node) actually resolves + has its platform binary. On
-        // Windows it sometimes fails to install and the plugin's static import
-        // throws on every embedding (#128). Layout-agnostic resolution from the
-        // installed plugin dir; stays silent if no plugin dir can be inspected.
+        // Local (default) provider: verify the native ONNX runtime and the
+        // persistence-capable Node WASM fallback. Resolution starts from the
+        // installed plugin dir and stays silent when no tree can be inspected.
         let runtimeReported = false;
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
-            const runtime = checkLocalEmbeddingRuntimeByResolution(pluginDir);
+            const runtime = checkLocalEmbeddingRuntimeByResolution(
+                pluginDir,
+                process.platform,
+                process.arch,
+                loadedConfig.config.embedding.provider === "local"
+                    ? loadedConfig.config.embedding.local_runtime
+                    : "auto",
+                // Pi runs extensions under Node even when the CLI itself was launched by Bun.
+                { isBun: false, isElectron: false },
+            );
+            if (runtime.state === "wasm-selected") {
+                add(results, "info", formatLocalEmbeddingRuntimeWasmSelected(runtime));
+                runtimeReported = true;
+                break;
+            }
             if (runtime.state === "ok") {
                 add(
                     results,
                     "pass",
-                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime OK)`,
+                    `Embedding provider: ${loadedConfig.config.embedding.provider} (native runtime selected and OK)`,
                 );
                 runtimeReported = true;
                 break;
@@ -810,7 +893,7 @@ async function runHealthChecks(options: {
             add(
                 results,
                 "warn",
-                `Embedding provider ${loadedConfig.config.embedding.provider}: native runtime unverified (${runtimeUnverifiedReason})`,
+                `Embedding provider ${loadedConfig.config.embedding.provider}: selected runtime unverified (${runtimeUnverifiedReason})`,
             );
         }
     }
@@ -859,25 +942,26 @@ async function runHealthChecks(options: {
         add(results, "pass", "Pi extension cache clean (no stale cached package found)");
     }
 
-    const logPath = getMagicContextLogPath("pi");
-    if (existsSync(logPath)) {
-        const stat = statSync(logPath);
-        const sizeKb = (stat.size / 1024).toFixed(0);
-        const lines = readFileSync(logPath, "utf-8")
-            .split(/\r?\n/)
-            .map((line) => line.trim())
-            .filter(Boolean);
-        add(results, "info", `Log file: ${logPath} (${sizeKb} KB)`);
+    const logFiles = inspectMagicContextLogs("pi");
+    const existingLogFiles = logFiles.filter((file) => file.exists);
+    if (existingLogFiles.length === 0) {
+        add(
+            results,
+            "info",
+            `No plugin log file yet; checked: ${logFiles.map((file) => file.path).join(", ")}`,
+        );
+    } else {
+        for (const file of existingLogFiles) {
+            add(results, "info", `Log file read: ${formatLogFileInspection(file)}`);
+        }
         // Sanitize before printing — a raw log line can carry a secret/path the
         // user then pastes into a public issue.
-        const lastLine = lines.at(-1);
+        const lastLine = readLogLines(existingLogFiles).at(-1);
         add(
             results,
             "info",
             `Last plugin log line: ${lastLine ? sanitizeDiagnosticText(lastLine) : "<empty log>"}`,
         );
-    } else {
-        add(results, "info", `No plugin log file yet at ${logPath}`);
     }
 
     // Historian dumps now live per-project under `<dir>/.cortexkit/magic-context/historian/`
@@ -1013,7 +1097,28 @@ async function runIssueFlow(options: {
     cwd: string;
     prompts: PromptIO;
     deps: DoctorDeps;
+    reportPath?: string;
 }): Promise<number> {
+    if (options.reportPath) {
+        try {
+            const report = await options.deps.collectDiagnostics(options.cwd);
+            const outputPath = isAbsolute(options.reportPath)
+                ? options.reportPath
+                : join(options.cwd, options.reportPath);
+            const bundled = await bundleIssueReport(
+                report,
+                "Generated non-interactively by `doctor --issue --report`.",
+                "Magic Context diagnostic report",
+                { cwd: options.cwd, now: options.deps.now(), outputPath },
+            );
+            options.prompts.log.info(`Report written to ${bundled.path}`);
+            return 0;
+        } catch (error) {
+            console.error(error instanceof Error ? error.message : String(error));
+            return 1;
+        }
+    }
+
     options.prompts.intro("Magic Context for Pi Issue Report");
     const title = await options.prompts.text("Issue title", {
         placeholder: "Short summary of the Pi problem",
@@ -1110,7 +1215,7 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
     const configMigrationWarnings = migrateConfigLocationsForCli(cwd, prompts.log);
 
     if (options.issue) {
-        return runIssueFlow({ cwd, prompts, deps });
+        return runIssueFlow({ cwd, prompts, deps, reportPath: options.report });
     }
 
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
@@ -1188,9 +1293,11 @@ function valueAfter(args: string[], flag: string): string | null {
 
 export function parseDoctorArgs(args: string[]): RunDoctorOptions {
     const rekeyV22DirIdentity = valueAfter(args, "--rekey-v22-dir-identity");
+    const report = valueAfter(args, "--report");
     return {
         force: args.includes("--force"),
-        issue: args.includes("--issue"),
+        issue: args.includes("--issue") || report !== null,
+        ...(report !== null ? { report } : {}),
         help: args.includes("--help") || args.includes("-h"),
         checkV22Backfill: args.includes("--check-v22-backfill"),
         retryV22Backfill: args.includes("--retry-v22-backfill"),

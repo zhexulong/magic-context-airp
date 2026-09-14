@@ -12,7 +12,6 @@
  * transform receives only the live tail.
  */
 
-import { join } from "node:path";
 import {
     closeCompactionMarkerDb,
     compareOpenCodeMessagesByCanonicalOrder,
@@ -23,7 +22,10 @@ import {
     removeCompactionMarker,
     removeForeignCompactionMarker,
 } from "../../features/magic-context/compaction-marker";
-import { getCompartmentsByEndMessageId } from "../../features/magic-context/compartment-storage";
+import {
+    getCompartments,
+    getCompartmentsByEndMessageId,
+} from "../../features/magic-context/compartment-storage";
 import {
     getPersistedCompactionMarkerState,
     type PendingCompactionMarker,
@@ -34,9 +36,13 @@ import {
     getTagNumberByMessageId,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
-import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { log, sessionLog } from "../../shared/logger";
+import {
+    claimOpenCodeDbDiagnosticOnce,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
 import type { Database } from "../../shared/sqlite";
 import { Database as SqliteDb } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -122,7 +128,22 @@ function validatePendingTarget(
     }
 
     // 2. SECONDARY: compartment row keyed by endMessageId.
-    const compartments = getCompartmentsByEndMessageId(db, sessionId, pending.endMessageId);
+    const exactCompartments = getCompartmentsByEndMessageId(db, sessionId, pending.endMessageId);
+    // Rust stores compartment anchors as flat block ids (`<mid>#<index>`), while
+    // OpenCode marker rows and the shared pending blob address the owning message.
+    // Accept that vocabulary only when the suffix is a canonical numeric block index.
+    const compartments =
+        exactCompartments.length > 0
+            ? exactCompartments
+            : getCompartments(db, sessionId).filter((compartment) => {
+                  const separator = compartment.endMessageId.lastIndexOf("#");
+                  if (separator < 1) return false;
+                  const blockIndex = compartment.endMessageId.slice(separator + 1);
+                  return (
+                      compartment.endMessageId.slice(0, separator) === pending.endMessageId &&
+                      /^\d+$/.test(blockIndex)
+                  );
+              });
     if (compartments.length === 0) {
         return "compartment-removed";
     }
@@ -227,17 +248,32 @@ function existingMarkerAlreadyCoversTarget(
  * absent, and injection uses deterministic IDs with exact-row upserts, so a
  * committed marker whose context-state write failed is reused rather than duplicated.
  */
+export interface TrustedMaterializedCompactionBoundary {
+    rowVersion: number;
+    ordinal: number;
+    endMessageId: string;
+}
+
 export function applyDeferredCompactionMarker(
     db: Database,
     sessionId: string,
     pending: PendingCompactionMarker,
     directory?: string,
+    trustedBoundary?: TrustedMaterializedCompactionBoundary,
 ): MarkerUpdateOutcome {
     try {
-        // Stale-target check FIRST — cheap and avoids any state mutation when
-        // the target is already gone. The check may throw on DB failure;
-        // outer catch turns that into retryable-failure.
-        const validation = validatePendingTarget(db, sessionId, pending);
+        // Rust may fence the target with the exact durable boundary returned by the
+        // materializing response. Other callers validate against local compartment rows.
+        // Validation failures happen before any marker state mutation.
+        const responseFencesTarget =
+            trustedBoundary !== undefined &&
+            Number.isSafeInteger(trustedBoundary.rowVersion) &&
+            trustedBoundary.rowVersion > 0 &&
+            trustedBoundary.ordinal === pending.ordinal &&
+            trustedBoundary.endMessageId === pending.endMessageId;
+        const validation = responseFencesTarget
+            ? "ok"
+            : validatePendingTarget(db, sessionId, pending);
         if (validation !== "ok") {
             sessionLog(
                 sessionId,
@@ -665,17 +701,24 @@ export function closeCompactionMarkerConnection(): void {
  *   moves the boundary forward and the new injection replaces the orphans by
  *   moving filterCompacted past them.
  *
- * This function scans all persisted marker states and, for each one, verifies
- * that the referenced rows still exist in opencode.db. If any referenced row
- * is missing, it treats the marker as inconsistent, attempts to remove
- * whatever rows ARE still present (best-effort cleanup of half-written
- * markers), and clears the persisted state so the next publication can
- * re-inject cleanly.
+ * This function only diagnoses missing rows. A discovered database path does
+ * not prove which store the server writes, and startup has no cache-busting
+ * permission. Retain state and surviving rows; the deferred publication drain
+ * performs replacement on a priced pass instead.
  *
  * Called once at plugin startup. Safe to call multiple times (idempotent).
  */
 export function checkCompactionMarkerConsistency(db: Database): void {
-    const opencodeDbPath = join(getDataDir(), "opencode", "opencode.db");
+    const resolution = resolveOpenCodeDbPath();
+    const opencodeDbPath = resolution.path;
+    if (!openCodeDbPathExists(resolution)) {
+        if (claimOpenCodeDbDiagnosticOnce("compaction-marker-consistency", resolution)) {
+            log(
+                `[magic-context] compaction-marker consistency check skipped: reason=opencode_db_missing path=${opencodeDbPath} source=${resolution.source}`,
+            );
+        }
+        return;
+    }
     let opencodeDb: SqliteDb;
     try {
         // Read-only + immutable-less: we only need read access for the existence
@@ -684,7 +727,7 @@ export function checkCompactionMarkerConsistency(db: Database): void {
     } catch (error) {
         // OpenCode DB missing or inaccessible — nothing to reconcile.
         log(
-            `[magic-context] compaction-marker consistency check skipped: ${error instanceof Error ? error.message : String(error)}`,
+            `[magic-context] compaction-marker consistency check SKIPPED retaining state path=${opencodeDbPath} source=${resolution.source} mode=readonly wal=aware: ${error instanceof Error ? error.message : String(error)}`,
         );
         return;
     }
@@ -698,16 +741,17 @@ export function checkCompactionMarkerConsistency(db: Database): void {
 
         if (persistedRows.length === 0) return;
 
+        log(
+            `[magic-context] compaction-marker consistency probe path=${opencodeDbPath} source=${resolution.source} mode=readonly wal=aware sessions=${persistedRows.length}; diagnostic-only, no startup bust permission`,
+        );
         const checkMessage = opencodeDb.prepare("SELECT 1 FROM message WHERE id = ? LIMIT 1");
         const checkPart = opencodeDb.prepare("SELECT 1 FROM part WHERE id = ? LIMIT 1");
-
-        let reconciledCount = 0;
 
         for (const row of persistedRows) {
             const state = getPersistedCompactionMarkerState(db, row.session_id);
             if (!state) continue;
 
-            // Check all 3 referenced rows. Use `!= null` (not `!== null`):
+            // Check all 4 referenced rows. Use `!= null` (not `!== null`):
             // bun:sqlite's .get() returns `undefined` for a missing row, so a
             // strict `!== null` is always true and a deleted OpenCode row would
             // be treated as present — leaving stale marker state never reconciled.
@@ -721,53 +765,18 @@ export function checkCompactionMarkerConsistency(db: Database): void {
 
             if (allPresent) continue;
 
-            // Inconsistent — best-effort clean up any surviving half-written rows,
-            // then clear persisted state so next publication can re-inject.
-            //
-            // Only clear persisted state after verified successful cleanup.
-            // If `removeCompactionMarker` fails (DB locked, IO error), keeping
-            // persisted state lets a retry on the
-            // next startup try again; clearing would leave orphaned rows in
-            // OpenCode's DB that filterCompacted still respects. The natural
-            // healing path via the next historian publication still exists as
-            // a backup when the state IS cleared after a success.
-            let removedOk = false;
-            try {
-                removedOk = removeCompactionMarker(state);
-            } catch (error) {
-                // Partial failure during half-written cleanup is expected and
-                // not worth warning about — we just want to get the DBs back
-                // into a consistent state.
-                sessionLog(
-                    row.session_id,
-                    "compaction-marker consistency: partial cleanup of half-written marker failed:",
-                    error,
-                );
-            }
-
-            if (removedOk) {
-                setPersistedCompactionMarkerState(db, row.session_id, null);
-                sessionLog(
-                    row.session_id,
-                    `compaction-marker consistency: cleared orphaned state (boundary=${boundaryExists} summary=${summaryMessageExists} cPart=${compactionPartExists} sPart=${summaryPartExists}); next publication will re-inject`,
-                );
-                reconciledCount++;
-            } else {
-                sessionLog(
-                    row.session_id,
-                    `compaction-marker consistency: cleanup failed for orphaned state (boundary=${boundaryExists} summary=${summaryMessageExists} cPart=${compactionPartExists} sPart=${summaryPartExists}); will retry on next startup`,
-                );
-            }
-        }
-
-        if (reconciledCount > 0) {
-            log(
-                `[magic-context] compaction-marker consistency: reconciled ${reconciledCount} session(s) with orphaned marker state at startup`,
+            // Discovery identifies the plugin's read store, not the server's writer.
+            // Even an error-free absence is therefore not authority to delete rows.
+            // Startup also has no cache-bust permission: retain the marker and let
+            // the deferred publication drain replace it on a priced transform.
+            sessionLog(
+                row.session_id,
+                `compaction-marker consistency: SKIPPED destructive reconciliation reason=unproven_writer_and_no_bust_permission path=${opencodeDbPath} source=${resolution.source} mode=readonly wal=aware boundary=${boundaryExists} summary=${summaryMessageExists} cPart=${compactionPartExists} sPart=${summaryPartExists}; retaining state until priced publication`,
             );
         }
     } catch (error) {
         log(
-            `[magic-context] compaction-marker consistency check failed: ${error instanceof Error ? error.message : String(error)}`,
+            `[magic-context] compaction-marker consistency check SKIPPED retaining state path=${opencodeDbPath} source=${resolution.source} mode=readonly wal=aware: ${error instanceof Error ? error.message : String(error)}`,
         );
     } finally {
         try {

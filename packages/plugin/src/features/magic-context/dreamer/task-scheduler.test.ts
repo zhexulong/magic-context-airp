@@ -607,6 +607,24 @@ describe("task-scheduler — runManualDream", () => {
         expect(result.ran).toEqual(["verify"]);
     });
 
+    it("returns successful task detail for the manual command", async () => {
+        db = freshDb();
+        const tasks = [cfg("curate", "")];
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "completed",
+            detail: "curate: 2 memory operations applied (merge, archive)",
+        });
+        const result = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            task: "curate",
+        });
+
+        expect(result.details).toEqual(["curate: 2 memory operations applied (merge, archive)"]);
+    });
+
     it("a single DISABLED task can still be force-run by name", async () => {
         db = freshDb();
         const tasks = [cfg("maintain-docs", "")]; // disabled
@@ -634,6 +652,28 @@ describe("task-scheduler — runManualDream", () => {
         const result = await runManualDream({ db, projectIdentity: PROJECT, tasks, executor });
         expect(result.ran).toEqual([]);
         expect(result.skippedNoWork).toEqual(["verify"]);
+    });
+
+    it("reports structured failure detail while preserving the legacy scheduler error", async () => {
+        db = freshDb();
+        const tasks = [cfg("verify", "0 3 * * *")];
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "failed",
+            transient: true,
+            error: "verify returned no output",
+            failureDetail: "empty_completion · model: provider/model",
+        });
+        const result = await runManualDream({
+            db,
+            projectIdentity: PROJECT,
+            tasks,
+            executor,
+            task: "verify",
+        });
+        expect(result.failureDetails).toEqual(["verify: empty_completion · model: provider/model"]);
+        expect(getTaskScheduleState(db, PROJECT, "verify")?.lastError).toBe(
+            "verify returned no output",
+        );
     });
 
     it("an unknown forced task name is a no-op", async () => {

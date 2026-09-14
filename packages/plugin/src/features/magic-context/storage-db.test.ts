@@ -32,6 +32,7 @@ import {
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
     formatInconclusiveOpenCodeMigrationWarning,
+    formatInconclusivePiMigrationWarning,
     formatLiveProcessMigrationRefusal,
     getDatabasePath,
     getLiveMigrationBlockingProcesses,
@@ -42,6 +43,7 @@ import {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
+    openDatabaseAsync,
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
@@ -51,6 +53,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalStorageDir = process.env.MAGIC_CONTEXT_STORAGE_DIR;
 const originalNodeEnv = process.env.NODE_ENV;
+const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 
 function makeTempDir(prefix: string): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -110,11 +113,14 @@ afterEach(() => {
     __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
-    process.env.XDG_DATA_HOME = originalXdgDataHome;
+    if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = originalXdgDataHome;
     if (originalStorageDir === undefined) delete process.env.MAGIC_CONTEXT_STORAGE_DIR;
     else process.env.MAGIC_CONTEXT_STORAGE_DIR = originalStorageDir;
     if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = originalNodeEnv;
+    if (originalTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+    else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = originalTestDataDir;
 
     for (const dir of tempDirs) {
         try {
@@ -229,6 +235,65 @@ describe("explicit shared storage resolution", () => {
         const db = openDatabase();
         expect(db).not.toBeNull();
         expect(getDatabasePath(db!)).toBe(resolved.dbPath);
+        closeDatabase();
+    });
+
+    it("reports the same finite boot busy timeout installed before the first schema read", async () => {
+        useTempDataHome("storage-db-boot-busy-timeout-");
+        const diagnostics: string[] = [];
+        const db = await openDatabaseAsync({
+            busyTimeoutMs: 0,
+            onBootBusyTimeout: (message) => diagnostics.push(message),
+        });
+
+        expect(db).not.toBeNull();
+        const timeout = db!.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+        expect(timeout.timeout).toBe(0);
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0]).toContain(`timeout=${timeout.timeout}ms`);
+        expect(diagnostics[0]).toContain(`path=${getDatabasePath(db!)}`);
+        closeDatabase();
+    });
+
+    it("bounds the first schema read behind another connection's exclusive lock", async () => {
+        const dir = makeTempDir("storage-db-exclusive-lock-");
+        const dbPath = join(dir, "context.db");
+        expect(openDatabase(dbPath)).not.toBeNull();
+        closeDatabase();
+
+        const holder = new Database(dbPath);
+        holder.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE");
+        const startedAt = performance.now();
+        try {
+            const opened = await openDatabaseAsync({ dbPath, busyTimeoutMs: 35 });
+            const elapsedMs = performance.now() - startedAt;
+            expect(elapsedMs).toBeLessThan(1_000);
+            if (opened) {
+                const timeout = opened.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+                expect(timeout.timeout).toBe(35);
+            }
+        } finally {
+            holder.exec("ROLLBACK");
+            closeQuietly(holder);
+        }
+    });
+
+    it("reports bounded boot phase timings for an async open", async () => {
+        const dataHome = useTempDataHome("storage-db-boot-timing-");
+        let timings: { openMs: number; guardMs: number; migrateMs: number } | undefined;
+
+        const db = await openDatabaseAsync({
+            onBootTimings: (observed) => {
+                timings = observed;
+            },
+        });
+
+        expect(db).not.toBeNull();
+        expect(getDatabasePath(db!)).toBe(resolveDbPath(dataHome));
+        expect(timings).toBeDefined();
+        expect(timings!.openMs).toBeGreaterThanOrEqual(0);
+        expect(timings!.guardMs).toBeGreaterThanOrEqual(0);
+        expect(timings!.migrateMs).toBeGreaterThanOrEqual(0);
         closeDatabase();
     });
 
@@ -400,6 +465,21 @@ describe("storage-db", () => {
             expect(SESSION_SCOPED_TABLES.map((definition) => definition.table).sort()).toEqual(
                 schemaTables,
             );
+
+            // The orphan sweep derives candidates from this harness-provenanced
+            // subset. Tables without harness remain cleanup-only because their
+            // rows cannot safely be attributed to OpenCode instead of Pi.
+            const harnessScopedSchemaTables = schemaTables.filter((table) => {
+                const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+                    name: string;
+                }>;
+                return columns.some((column) => column.name === "harness");
+            });
+            expect(
+                SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
+                    .map((definition) => definition.table)
+                    .sort(),
+            ).toEqual(harnessScopedSchemaTables.sort());
         });
 
         it("#when clearSession runs #then every session-scoped table is emptied", () => {
@@ -674,6 +754,35 @@ describe("storage-db", () => {
                 serverPids: [process.pid],
             });
             expect(readPersistedVersion(dbPath)).toBe(0);
+        });
+
+        it("#when a Windows omp.exe command line has no Pi arc #then allows a pending migration", () => {
+            const dataHome = useTempDataHome("storage-db-inconclusive-omp-image-");
+            const dbPath = seedPendingMigration(dataHome);
+            __setRpcIdentityTestHooks({
+                platform: "win32",
+                processListExecFileSync: ((file: string | URL) => {
+                    if (String(file) !== "powershell") {
+                        throw new Error(`${String(file)} must not run when CIM succeeds`);
+                    }
+                    return JSON.stringify({
+                        ProcessId: 41001,
+                        ParentProcessId: 8,
+                        CommandLine: "C:\\Users\\qiiks\\.bun\\bin\\omp.exe",
+                        CreationDate: "20260101120000.000000+000",
+                    });
+                }) as typeof execFileSync,
+            });
+
+            expect(openDatabase()).not.toBeNull();
+            expect(readPersistedVersion(dbPath)).toBe(LATEST_SUPPORTED_VERSION);
+            expect(getMigrationOnOpenRefusal()).toBeNull();
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "continuing migration",
+            );
+            expect(formatInconclusivePiMigrationWarning(dbPath, [41001])).toContain(
+                "Pi/OMP PID 41001",
+            );
         });
 
         it("#when sandbox policy prevents the Pi process-list probe #then allows a pending migration", () => {
@@ -1180,7 +1289,8 @@ describe("storage-db", () => {
                 expect(dbPath.startsWith(realStorageRoot)).toBe(false);
                 expect(dbPath.includes("mc-test-db-backstop-")).toBe(true);
             } finally {
-                if (savedXdg !== undefined) process.env.XDG_DATA_HOME = savedXdg;
+                if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = savedXdg;
                 if (savedTestDir !== undefined)
                     process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
             }

@@ -22,7 +22,6 @@ import {
 } from "./features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
-import { SIDEKICK_SYSTEM_PROMPT } from "./features/magic-context/sidekick/agent";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
     getSchemaFenceRejection,
@@ -42,6 +41,13 @@ import { createLiveSessionState } from "./hooks/magic-context/live-session-state
 import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
+import {
+    createBootBudget,
+    emitBootEnteringBreadcrumb,
+    formatBootPhaseDiagnostics,
+    remainingBootBudgetMs,
+    runBootPhaseWithinBudget,
+} from "./plugin/boot-deadline";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
@@ -51,8 +57,10 @@ import { createEventHandler } from "./plugin/event";
 import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
 import { isDisposedInstanceDirectory } from "./plugin/instance-disposal";
 import { createMessagesTransformHandler } from "./plugin/messages-transform";
-import { registerRpcHandlers } from "./plugin/rpc-handlers";
+import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
 import { createToolRegistry } from "./plugin/tool-registry";
+import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
+import { buildOpenCodeConfigWarningBanner } from "./shared/config-warning-surface";
 import {
     type ConflictResult,
     detectConflicts,
@@ -61,19 +69,45 @@ import {
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setKeepSubagents } from "./shared/keep-subagents";
-import { log } from "./shared/logger";
+import { flushLogger, log } from "./shared/logger";
 import {
     resolveHistorianAgentOverrides,
     resolveHistorianModel,
     resolveOpenCodeAgentOverrides,
 } from "./shared/model-resolution";
 import { refreshModelLimitsFromApi } from "./shared/models-dev-cache";
+import {
+    claimOpenCodeDbDiagnosticOnce,
+    formatOpenCodeDbMissingBanner,
+    openCodeDbPathExists,
+    resolveOpenCodeDbPath,
+} from "./shared/opencode-db-path";
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
+import { reloadWindowOverlay } from "./shared/window-geometry";
+import { setup } from "./v2/server";
+
+const BOOT_SERVER_DEADLINE_MS = 15_000;
+const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
 
 const server: Plugin = async (ctx) => {
+    const bootStartedAt = performance.now();
+    const bootBudget = createBootBudget(BOOT_SERVER_DEADLINE_MS, bootStartedAt);
+    const storageBootTimings = { openMs: 0, guardMs: 0, migrateMs: 0 };
+    let configMs = 0;
+    let conflictMs = 0;
+    let rpcMs = 0;
+    let hooksDeadlineReason: string | null = null;
+    let deadlinePhase: string | null = null;
+
+    // Flush the first breadcrumb synchronously. The regular logger batches for
+    // 500ms; a synchronous filesystem or SQLite stall before that timer fires
+    // otherwise recreates the reporter's "no Magic Context lines" symptom.
+    emitBootEnteringBreadcrumb(process.pid, ctx.directory, log, flushLogger);
+
+    const configStartedAt = performance.now();
     beginBootQuietPeriod();
     // Move config from the legacy per-harness locations to the shared CortexKit
     // location BEFORE loading (hard cutover: the loader reads only CortexKit).
@@ -85,6 +119,7 @@ const server: Plugin = async (ctx) => {
     });
     const loadedPluginConfig = loadPluginConfigDetailed(ctx.directory);
     const pluginConfig = loadedPluginConfig.config;
+    reloadWindowOverlay(pluginConfig.models?.window_overlay_path);
     const promptSurfaceRuntime = createPromptSurfaceRuntime({
         harness: "opencode",
         directory: ctx.directory,
@@ -105,7 +140,7 @@ const server: Plugin = async (ctx) => {
         mmapSizeMb: pluginConfig.sqlite.mmap_size_mb,
     });
     // Debug data-collection toggle: when on, keep subagent child sessions
-    // (historian/dreamer/sidekick/migration) instead of deleting on success.
+    // (historian/dreamer/migration) instead of deleting on success.
     setKeepSubagents(pluginConfig.keep_subagents === true);
     const autoUpdateAbort = new AbortController();
     // Abort on process exit via the shared single-listener registry. Registering
@@ -113,33 +148,70 @@ const server: Plugin = async (ctx) => {
     // instance, and OpenCode Desktop runs many in one process (Node warns past 10).
     registerExitAbort(autoUpdateAbort);
 
-    // Surface config validation warnings to user and log
+    // Surface config validation warnings to user and log. Parse failures are
+    // claimed process-wide because OpenCode may initialize one server per project.
     if (pluginConfig.configWarnings?.length) {
         for (const w of pluginConfig.configWarnings) {
             log(`[magic-context] config warning: ${w}`);
         }
-        // Send warning to user via startup notification (after a short delay so session is ready)
-        const warningText = [
-            "## ⚠️ Magic Context Config Warning",
-            "",
-            "Some configuration values are invalid and were replaced with defaults:",
-            "",
-            ...pluginConfig.configWarnings.map((w) => `- ${w}`),
-            "",
-            "Check your `magic-context.jsonc` to fix these values.",
-        ].join("\n");
+        const allParseFailures = loadedPluginConfig.configParseFailures;
+        const parseFailuresToShow = claimConfigParseFailuresOnce("opencode", allParseFailures);
+        const warningText = buildOpenCodeConfigWarningBanner(
+            pluginConfig.configWarnings,
+            parseFailuresToShow,
+            allParseFailures,
+        );
+        const hasBannerEntries =
+            parseFailuresToShow.length > 0 ||
+            pluginConfig.configWarnings.some(
+                (warning) => !allParseFailures.some((failure) => warning.includes(failure.warning)),
+            );
 
+        if (hasBannerEntries)
+            setTimeout(async () => {
+                try {
+                    const { sendStatusNotification } = await import(
+                        "./hooks/magic-context/send-session-notification"
+                    );
+                    // Route the RPC warning to the first active session; never append a chat row.
+                    // SDK types don't expose `session.list()`'s actual response shape (the
+                    // client surface has been through multiple revisions; some versions
+                    // return `{ data: [...] }`, others return the array directly), so we
+                    // probe both shapes defensively at runtime.
+                    type SessionListFn = () => Promise<
+                        { data?: Array<{ id?: string }> } | Array<{ id?: string }>
+                    >;
+                    const clientWithSessions = ctx.client as unknown as {
+                        session?: { list?: SessionListFn };
+                    };
+                    const sessions = await Promise.resolve(
+                        clientWithSessions.session?.list?.(),
+                    ).catch(() => null);
+                    const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
+                    const sessionId = sessionList?.[0]?.id;
+                    if (sessionId) {
+                        await sendStatusNotification(ctx.client, sessionId, warningText, {});
+                    }
+                } catch {
+                    // Intentional: config warning delivery must not crash startup
+                }
+            }, 3000);
+    }
+
+    const openCodeDbResolution = resolveOpenCodeDbPath();
+    if (
+        !openCodeDbPathExists(openCodeDbResolution) &&
+        claimOpenCodeDbDiagnosticOnce("boot-banner", openCodeDbResolution)
+    ) {
+        const missingDbBanner = formatOpenCodeDbMissingBanner(openCodeDbResolution);
+        log(
+            `[magic-context] opencode_db_missing path=${openCodeDbResolution.path} source=${openCodeDbResolution.source}`,
+        );
         setTimeout(async () => {
             try {
-                const { sendIgnoredMessage } = await import(
+                const { sendStatusNotification } = await import(
                     "./hooks/magic-context/send-session-notification"
                 );
-                // sendIgnoredMessage already handles TUI (toast) vs Desktop (ignored message)
-                // via isTuiConnected(). We need a session ID — use the first active session.
-                // SDK types don't expose `session.list()`'s actual response shape (the
-                // client surface has been through multiple revisions; some versions
-                // return `{ data: [...] }`, others return the array directly), so we
-                // probe both shapes defensively at runtime.
                 type SessionListFn = () => Promise<
                     { data?: Array<{ id?: string }> } | Array<{ id?: string }>
                 >;
@@ -151,22 +223,15 @@ const server: Plugin = async (ctx) => {
                 );
                 const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
                 const sessionId = sessionList?.[0]?.id;
-                if (sessionId) {
-                    // Pin the session's last real turn (agent + model + variant)
-                    // onto the warning. Passing nothing makes OpenCode record the
-                    // DEFAULT agent/model on this ignored message — which both
-                    // mis-attributes the notice (shows the default agent, not the
-                    // session's) AND switches the model on the user's next turn,
-                    // busting the prefix cache. resolvePromptContext reads from
-                    // real session messages and returns null on a fresh/empty
-                    // session, so this degrades safely there.
-                    await sendIgnoredMessage(ctx.client, sessionId, warningText, {});
-                }
+                if (sessionId)
+                    await sendStatusNotification(ctx.client, sessionId, missingDbBanner, {});
             } catch {
-                // Intentional: config warning delivery must not crash startup
+                // A diagnostic banner must never make plugin startup fail.
             }
         }, 3000);
     }
+
+    configMs = performance.now() - configStartedAt;
 
     // Detect conflicts that prevent magic-context from operating correctly.
     // The resolved MC compaction mode is threaded in explicitly — the detector
@@ -182,8 +247,16 @@ const server: Plugin = async (ctx) => {
     // we cannot see). If the resolved fetch fails or times out, we fall back to
     // the file-based check unchanged and log one line naming the fallback.
     let conflictResult: ConflictResult | null = null;
+    const conflictStartedAt = performance.now();
     if (pluginConfig.enabled) {
-        const resolvedCompaction = await resolveCompactionForBoot(ctx.client);
+        const resolvedConfigTimeoutMs = Math.min(
+            RESOLVED_CONFIG_TIMEOUT_MS,
+            remainingBootBudgetMs(bootBudget),
+        );
+        const resolvedCompaction =
+            resolvedConfigTimeoutMs > 0
+                ? await resolveCompactionForBoot(ctx.client, resolvedConfigTimeoutMs)
+                : null;
         if (resolvedCompaction === null) {
             log(
                 "[magic-context] resolved-config fetch failed; using file-based compaction detection (the running server's resolved config may differ — `opencode debug config` is authoritative)",
@@ -200,20 +273,43 @@ const server: Plugin = async (ctx) => {
             log("[magic-context] no conflicts detected, plugin enabled");
         }
     }
+    conflictMs = performance.now() - conflictStartedAt;
 
     const liveSessionState = createLiveSessionState();
-    const rustModeModuleClient: RustModeModuleClient | undefined =
+    const rustModeModuleTransport =
         pluginConfig.transform_mode === "rust"
             ? new SubcModuleTransport(pluginConfig.subc?.connection_file)
             : undefined;
+    const rustModeModuleClient: RustModeModuleClient | undefined = rustModeModuleTransport;
+    // A durable Rust-deletion retry can outlive a config flip back to TypeScript,
+    // so cleanup keeps a lazy transport even when new transforms no longer use Rust.
+    const sessionCleanupModuleClient = pluginConfig.enabled
+        ? (rustModeModuleTransport ?? new SubcModuleTransport(pluginConfig.subc?.connection_file))
+        : undefined;
 
-    const hooks = await createSessionHooksAsync({
-        ctx,
-        pluginConfig,
-        liveSessionState,
-        rustModeModuleClient,
-        promptSurfaceRuntime,
-    });
+    const hooksPhase = await runBootPhaseWithinBudget(
+        bootBudget,
+        "hooks",
+        () =>
+            createSessionHooksAsync({
+                ctx,
+                pluginConfig,
+                liveSessionState,
+                rustModeModuleClient,
+                promptSurfaceRuntime,
+                onStorageBootTimings: (timings) => Object.assign(storageBootTimings, timings),
+            }),
+        log,
+    );
+    const hooks =
+        hooksPhase.status === "completed"
+            ? hooksPhase.value
+            : { magicContext: null, rustToolBackends: undefined };
+    if (hooksPhase.status === "timed_out") {
+        deadlinePhase = "hooks";
+        hooksDeadlineReason = `boot hooks phase exhausted the whole-server ${BOOT_SERVER_DEADLINE_MS}ms budget`;
+    }
+    const postStartedAt = performance.now();
 
     // Mutable holder so a healed storage reopen can install real hooks without
     // rebuilding the outer messages-transform wrapper.
@@ -233,12 +329,34 @@ const server: Plugin = async (ctx) => {
         pluginConfig.enabled === true && pluginConfig.fail_closed_blocking !== false;
     if (pluginConfig.enabled === true && !magicContextRuntime.magicContext) {
         const initFailure = getLastHookInitFailure();
-        if (initFailure?.type === "storage") {
-            failClosed.arm(initFailure.reason);
+        const storageFailureReason = hooksDeadlineReason
+            ? ({ kind: "storage_failure", cause: hooksDeadlineReason } as const)
+            : initFailure?.type === "storage"
+              ? initFailure.reason
+              : null;
+        if (storageFailureReason) {
+            failClosed.arm(storageFailureReason);
             log(
-                `[magic-context] fail-closed blocking armed (${initFailure.reason.kind}); primary sessions will error until storage recovers or the build is upgraded`,
+                `[magic-context] fail-closed blocking armed (${storageFailureReason.kind}); primary sessions will error until storage recovers or the build is upgraded`,
             );
         }
+    }
+
+    // A hooks phase that merely ran long (a contended migration lock can take
+    // ~60s on a loaded box) still finishes with real hooks; adopt them the moment
+    // they settle instead of leaving every primary session fail-closed until a
+    // re-probe happens to run — and never open storage a second time while the
+    // first open is still in flight.
+    if (hooksPhase.status === "timed_out") {
+        void hooksPhase.pending.then((late) => {
+            if (magicContextRuntime.magicContext || !late.magicContext) return;
+            magicContextRuntime.magicContext = late.magicContext;
+            magicContextRuntime.rustToolBackends = late.rustToolBackends;
+            failClosed.clear();
+            log(
+                "[magic-context] boot hooks phase settled after its deadline; Magic Context runtime installed and fail-closed cleared",
+            );
+        });
     }
 
     const tryReopenStorage = async (): Promise<boolean> => {
@@ -413,21 +531,22 @@ const server: Plugin = async (ctx) => {
                     }
                 },
                 moduleClient: classifyModuleClient,
+                sessionCleanupModuleClient,
             };
-            // Fail OPEN: the dream timer is best-effort background maintenance and must
-            // never abort the plugin load. This block is awaited and runs BEFORE the
-            // hooks are returned, so an unguarded throw here (e.g. a fatal DB open, or
-            // ensureRegistered failing) would escape server() and leave the transform /
-            // compaction pipeline unregistered — ballooning every session's context.
-            // openTimerDatabaseOrNull already degrades a fatal open to null, but we wrap
-            // the whole registration as defense in depth against any other throw path.
-            try {
-                stopDreamTimerRegistration = await startDreamScheduleTimer(timerRegistration);
-            } catch (err) {
-                log(
-                    `[magic-context] dream timer registration failed (continuing without it): ${err}`,
-                );
-            }
+            // Best-effort background maintenance must not hold plugin startup. The
+            // registration is observed so a late failure is visible, while the host
+            // receives the core transform hooks without waiting for it.
+            setTimeout(() => {
+                void startDreamScheduleTimer(timerRegistration)
+                    .then((stop) => {
+                        stopDreamTimerRegistration = stop;
+                    })
+                    .catch((err) => {
+                        log(
+                            `[magic-context] dream timer registration failed (continuing without it): ${err}`,
+                        );
+                    });
+            }, 0);
         }
 
         // Start RPC server for TUI↔server communication (replaces SQLite plugin_messages bus).
@@ -439,10 +558,28 @@ const server: Plugin = async (ctx) => {
             client: ctx.client,
             liveSessionState,
             rustModeModuleClient,
+            storageDir,
+            getDebugMemoryHolders: () =>
+                magicContextRuntime.magicContext?.getDebugMemoryHolders?.(),
         });
-        rpcServer.start().catch((err) => {
-            log(`[magic-context] RPC server failed to start: ${err}`);
-        });
+        const rpcScheduledAt = performance.now();
+        // MagicContextRpcServer.start() is async but its Bun.serve + discovery-file
+        // prefix is synchronous. Invoke it in the next task so those filesystem
+        // calls are not part of the host's deadline-bound plugin construction.
+        setTimeout(() => {
+            const rpcStartedAt = performance.now();
+            rpcServer
+                ?.start()
+                .then(() => {
+                    log(
+                        `[magic-context] boot deferred phase: rpc=${Math.round(performance.now() - rpcStartedAt)}ms`,
+                    );
+                })
+                .catch((err) => {
+                    log(`[magic-context] RPC server failed to start: ${err}`);
+                });
+        }, 0);
+        rpcMs = performance.now() - rpcScheduledAt;
 
         // Warm the model-context-limit cache from OpenCode's SDK once at startup.
         // The API response matches OpenCode's internal resolution (live models.dev
@@ -464,14 +601,34 @@ const server: Plugin = async (ctx) => {
         // smaller/wrong limit and silently break an in-progress session. The
         // event handler may still retry this refresh once when it detects an
         // obviously bad cache value, but normal operation is one-shot.
-        void refreshModelLimitsFromApi(ctx.client, { retries: 3, retryDelayMs: 1000 });
+        setTimeout(() => {
+            void refreshModelLimitsFromApi(ctx.client, { retries: 3, retryDelayMs: 1000 });
+        }, 0);
+    }
+
+    // An explicitly enabled debug RPC remains available when the MC hooks are
+    // disabled, allowing the hermetic A/B harness to sample the same host process.
+    if (!pluginConfig.enabled && isDebugRpcEnabled(pluginConfig)) {
+        rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
+        registerRpcHandlers(rpcServer, {
+            directory: ctx.directory,
+            config: pluginConfig,
+            client: ctx.client,
+            liveSessionState,
+            rustModeModuleClient,
+            storageDir,
+        });
+        setTimeout(() => {
+            rpcServer?.start().catch((err) => {
+                log(`[magic-context] debug-only RPC server failed to start: ${err}`);
+            });
+        }, 0);
     }
 
     // Schema-fence warning for Desktop mode. If openDatabase() fail-closed
     // because the shared DB is newer than this build supports (cross-harness
     // partial upgrade), the user otherwise sees Magic Context silently stop
-    // working. Surface a clear, actionable message. (TUI/Pi see the log line;
-    // Desktop has no dialog surface, so this ignored-message path covers it.)
+    // working. Enqueue actionable RPC status without creating a user turn.
     {
         const fence = getSchemaFenceRejection();
         if (fence) {
@@ -485,25 +642,40 @@ const server: Plugin = async (ctx) => {
         }
     }
 
+    const serverUrl = (ctx as Record<string, unknown>).serverUrl;
+    const serverUrlStr =
+        serverUrl instanceof URL
+            ? serverUrl.toString().replace(/\/$/, "")
+            : typeof serverUrl === "string"
+              ? serverUrl.replace(/\/$/, "")
+              : undefined;
+    void import("./hooks/magic-context/send-session-notification").then(
+        ({ setNotificationServerUrl }) => {
+            setNotificationServerUrl(serverUrlStr);
+        },
+    );
+
     // Conflict warning / cleanup for Desktop mode.
     // TUI handles this via a startup dialog; this covers Desktop where we can't show dialogs.
     if (conflictResult?.hasConflict) {
-        // Fire-and-forget: send warning to the last active session for this project
-        void sendConflictWarning(
-            ctx.client as unknown as Record<string, unknown>,
-            ctx.directory,
-            conflictResult,
-        );
+        // Defer host-client work until plugin construction has returned. Calling
+        // an async SDK helper here would still execute its synchronous prefix now.
+        setTimeout(() => {
+            void sendConflictWarning(
+                ctx.client as unknown as Record<string, unknown>,
+                ctx.directory,
+                conflictResult,
+            );
+        }, 0);
     } else if (pluginConfig.enabled) {
         // No conflicts — clean up any leftover warning messages from previous disabled runs
-        const serverUrl = (ctx as Record<string, unknown>).serverUrl;
-        const serverUrlStr =
-            serverUrl instanceof URL ? serverUrl.toString().replace(/\/$/, "") : undefined;
-        void cleanupConflictWarnings(
-            ctx.client as unknown as Record<string, unknown>,
-            ctx.directory,
-            serverUrlStr,
-        );
+        setTimeout(() => {
+            void cleanupConflictWarnings(
+                ctx.client as unknown as Record<string, unknown>,
+                ctx.directory,
+                serverUrlStr,
+            );
+        }, 0);
     }
 
     // The TUI sidebar entry in tui.json(c) is added ONLY by the setup wizard and
@@ -511,46 +683,45 @@ const server: Plugin = async (ctx) => {
     // every launch, so a user who deliberately removed the sidebar could never
     // keep it removed.
 
-    // Desktop-only startup announcement: post a one-shot ignored message
+    // Desktop-only startup announcement: enqueue a one-shot RPC notification
     // describing what's new in this release.
     //
     // TUI delivery is handled by the TUI plugin via the `get-announcement` /
     // `mark-announced` RPC handlers (registered above). Both surfaces share
     // the same `last_announced_version` persistence file so dismissal in
-    // either harness suppresses the dialog/message in the other.
+    // either harness suppresses the announcement in the other.
     //
     // Deferred 8s so the active session has stabilized; runs fire-and-forget
     // so a failure here can never block plugin startup.
     if (pluginConfig.enabled && !conflictResult?.hasConflict) {
-        try {
-            const {
-                shouldShowAnnouncement,
-                ANNOUNCEMENT_VERSION,
-                ANNOUNCEMENT_FEATURES,
-                ANNOUNCEMENT_FOOTER,
-                markAnnouncementSeen,
-            } = await import("./shared/announcement");
-            if (shouldShowAnnouncement()) {
-                setTimeout(() => {
-                    void import("./plugin/conflict-warning-hook")
-                        .then(({ sendStartupAnnouncement }) =>
-                            sendStartupAnnouncement(
-                                ctx.client as unknown as Record<string, unknown>,
-                                ctx.directory,
-                                ANNOUNCEMENT_VERSION,
-                                ANNOUNCEMENT_FEATURES,
-                                ANNOUNCEMENT_FOOTER,
-                                markAnnouncementSeen,
-                            ),
-                        )
-                        .catch(() => {
-                            // Best-effort — don't block startup
-                        });
-                }, 8000);
-            }
-        } catch {
-            // Best-effort — never block startup on announcement delivery
-        }
+        setTimeout(() => {
+            void import("./shared/announcement")
+                .then(
+                    ({
+                        shouldShowAnnouncement,
+                        ANNOUNCEMENT_VERSION,
+                        ANNOUNCEMENT_FEATURES,
+                        ANNOUNCEMENT_FOOTER,
+                        markAnnouncementSeen,
+                    }) => {
+                        if (!shouldShowAnnouncement()) return;
+                        return import("./plugin/conflict-warning-hook").then(
+                            ({ sendStartupAnnouncement }) =>
+                                sendStartupAnnouncement(
+                                    ctx.client as unknown as Record<string, unknown>,
+                                    ctx.directory,
+                                    ANNOUNCEMENT_VERSION,
+                                    ANNOUNCEMENT_FEATURES,
+                                    ANNOUNCEMENT_FOOTER,
+                                    markAnnouncementSeen,
+                                ),
+                        );
+                    },
+                )
+                .catch(() => {
+                    // Best-effort announcement delivery never affects startup.
+                });
+        }, 8000);
     }
 
     // Latch: remembers the {providerID, modelID, agentName} from the most
@@ -565,6 +736,27 @@ const server: Plugin = async (ctx) => {
     // example through symlinks or alternate checkout paths), so disposal must
     // match this concrete instance directory rather than the shared identity.
     const ownInstanceDirectory = ctx.directory;
+
+    const totalBootMs = performance.now() - bootStartedAt;
+    const measuredStorageMs =
+        storageBootTimings.openMs + storageBootTimings.guardMs + storageBootTimings.migrateMs;
+    const hooksMs = Math.max(0, hooksPhase.elapsedMs - measuredStorageMs);
+    const postMs = Math.max(0, performance.now() - postStartedAt - rpcMs);
+    log(
+        formatBootPhaseDiagnostics({
+            configMs,
+            conflictMs,
+            guardMs: storageBootTimings.guardMs,
+            openMs: storageBootTimings.openMs,
+            migrateMs: storageBootTimings.migrateMs,
+            hooksMs,
+            rpcMs,
+            postMs,
+            totalMs: totalBootMs,
+            budgetMs: BOOT_SERVER_DEADLINE_MS,
+            deadlinePhase,
+        }),
+    );
 
     return {
         tool: tools,
@@ -662,7 +854,7 @@ const server: Plugin = async (ctx) => {
         "tool.definition": async (input, output) => {
             // Attribute tool schema tokens to the most recent chat-message context.
             // If no chat.message has fired yet in this process (e.g. a subagent
-            // flight that reuses a historian/dreamer/sidekick agent whose
+            // flight that reuses a historian/dreamer agent whose
             // chat.message preceded plugin init), skip — the measurement will
             // land correctly on the next flight.
             if (!lastChatContext) return;
@@ -677,6 +869,9 @@ const server: Plugin = async (ctx) => {
                 typeof typedOutput.description === "string" ? typedOutput.description : "",
                 typedOutput.parameters,
             );
+        },
+        "tool.execute.before": async (input, output) => {
+            await magicContextRuntime.magicContext?.["tool.execute.before"]?.(input, output);
         },
         "tool.execute.after": async (input, output) => {
             await magicContextRuntime.magicContext?.["tool.execute.after"]?.(input, output);
@@ -715,17 +910,6 @@ const server: Plugin = async (ctx) => {
                               inject_docs: _injectDocs,
                               ...agentOverrides
                           } = resolveOpenCodeAgentOverrides(pluginConfig.dreamer);
-                          return agentOverrides;
-                      })()
-                    : undefined;
-                const sidekickAgentOverrides = pluginConfig.sidekick
-                    ? (() => {
-                          const {
-                              timeout_ms: _timeoutMs,
-                              system_prompt: _systemPrompt,
-                              thinking_level: _thinkingLevel,
-                              ...agentOverrides
-                          } = pluginConfig.sidekick;
                           return agentOverrides;
                       })()
                     : undefined;
@@ -772,10 +956,8 @@ const server: Plugin = async (ctx) => {
                         pluginConfig.language,
                         { preserveUserQuotes: true },
                     ),
-                    sidekickPrompt: SIDEKICK_SYSTEM_PROMPT,
                     dreamerOverrides: dreamerAgentOverrides,
                     historianOverrides: historianAgentOverrides,
-                    sidekickOverrides: sidekickAgentOverrides,
                     historianDisallowed: pluginConfig.historian?.disallowed_tools ?? [],
                 });
 
@@ -833,9 +1015,10 @@ const server: Plugin = async (ctx) => {
 // plugin load (this caused the 2026-06 hidden-agent load incident). The object
 // shape bypasses that scan entirely, eliminating the footgun class. The `./tui`
 // entry already uses this same `{ id, tui }` shape.
-const plugin: PluginModule = {
+const plugin: PluginModule & { setup: typeof setup } = {
     id: "opencode-magic-context",
     server,
+    setup,
 };
 
 export default plugin;

@@ -4,6 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
+import { formatEmbedStatusText } from "../../hooks/magic-context/format-embed-status";
+import {
+    buildCanonicalChunkTextFromFts,
+    chunkCanonicalText,
+    chunkEmbeddingWindowsAreCurrent,
+    replaceCompartmentChunkEmbeddings,
+} from "./compartment-chunk-embedding";
+import { appendCompartments, getCompartments } from "./compartment-storage";
 import type { GitCommit } from "./git-commits/git-log-reader";
 import {
     countEmbeddedCommits,
@@ -13,24 +21,35 @@ import { upsertCommits } from "./git-commits/storage-git-commits";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import { insertMemory } from "./memory/storage-memory";
 import { loadAllEmbeddings, saveEmbedding } from "./memory/storage-memory-embeddings";
+import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     _resetProjectEmbeddingRegistryForTests,
+    _setShadowBackfillNowForTests,
     _setTestProviderFactoryForProject,
+    embedUnembeddedCompartmentChunksForProject,
     flushShadowEmbeddingBacklog,
+    formatShadowBackfillStall,
+    getEmbeddingCoverageStatus,
     getProjectEmbeddingSnapshot,
     getShadowBackfillRemaining,
+    getShadowBackfillStopReason,
     getShadowEmbeddingMeasurementCohort,
+    listShadowBackfillStalls,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
     registerProjectShadowEmbedding,
     sweepStaleEmbeddingIdentitiesForProject,
 } from "./project-embedding-registry";
+import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
     readonly modelId: string;
 
-    constructor(modelId: string) {
+    constructor(
+        modelId: string,
+        private readonly embedBatchImpl?: (texts: string[]) => Array<Float32Array | null>,
+    ) {
         this.modelId = modelId;
     }
 
@@ -50,8 +69,10 @@ class FakeEmbeddingProvider implements EmbeddingProvider {
         texts: string[],
         _signal?: AbortSignal,
         _purpose?: EmbeddingPurpose,
-    ): Promise<Float32Array[]> {
-        return texts.map((text) => new Float32Array([text.length, 1]));
+    ): Promise<Array<Float32Array | null>> {
+        return (
+            this.embedBatchImpl?.(texts) ?? texts.map((text) => new Float32Array([text.length, 1]))
+        );
     }
 
     async dispose(): Promise<void> {}
@@ -61,8 +82,12 @@ class FakeEmbeddingProvider implements EmbeddingProvider {
     }
 }
 
-function localConfig(model: string): EmbeddingConfig {
-    return { provider: "local", model };
+function localConfig(model: string, maxInputTokens?: number): EmbeddingConfig {
+    return {
+        provider: "local",
+        model,
+        ...(maxInputTokens === undefined ? {} : { max_input_tokens: maxInputTokens }),
+    };
 }
 
 /** Two fingerprints yield two distinct Synapse shadow identities (modelIds). */
@@ -73,6 +98,7 @@ function synapseConfig(fingerprint: string): EmbeddingConfig {
         synapse_fingerprint: fingerprint,
         synapse_table_epoch: 1,
         synapse_dims: 8,
+        max_input_tokens: 8192,
     } as unknown as EmbeddingConfig;
 }
 
@@ -91,9 +117,17 @@ function primaryModelId(projectIdentity: string): string {
     return getProjectEmbeddingSnapshot(projectIdentity)?.modelId ?? "off";
 }
 
+function primaryChunkModelId(projectIdentity: string): string {
+    return getProjectEmbeddingSnapshot(projectIdentity)?.chunkModelId ?? "off";
+}
+
 /** The shadow lane's current modelId (a Synapse identity), distinct from primary. */
 function shadowModelId(projectIdentity: string): string {
     return getShadowEmbeddingMeasurementCohort(projectIdentity)?.modelId ?? "off";
+}
+
+function shadowChunkModelId(projectIdentity: string): string {
+    return getShadowEmbeddingMeasurementCohort(projectIdentity)?.chunkModelId ?? "off";
 }
 
 function countShadowMemoryRows(
@@ -118,7 +152,8 @@ describe("shadow embedding historical backfill", () => {
     afterEach(() => {
         _resetProjectEmbeddingRegistryForTests();
         closeDatabase();
-        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = originalXdgDataHome;
         for (const dir of tempDirs) {
             try {
                 rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -129,10 +164,15 @@ describe("shadow embedding historical backfill", () => {
         tempDirs.length = 0;
     });
 
-    function useFakeProviders() {
+    function useFakeProviders(
+        embedBatchImpl?: (config: EmbeddingConfig, texts: string[]) => Array<Float32Array | null>,
+    ) {
         _setTestProviderFactoryForProject(
             (config) =>
-                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "shadow"),
+                new FakeEmbeddingProvider(
+                    config.provider === "local" ? config.model : "shadow",
+                    embedBatchImpl ? (texts) => embedBatchImpl(config, texts) : undefined,
+                ),
         );
     }
 
@@ -452,5 +492,417 @@ describe("shadow embedding historical backfill", () => {
         // Old identity aged out; new identity (current shadow) is protected.
         expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(0);
         expect(countShadowMemoryRows(db, projectIdentity, shadowB)).toBe(3);
+    });
+
+    it("declares shadow chunks drained only after missing keys and stale hashes are repaired", async () => {
+        useFakeProviders();
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-hash-complete";
+        const sessionId = "ses-shadow-hash-complete";
+        const shadowConfig = synapseConfig("fp-hash-complete");
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-hash-complete",
+        );
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shadow-hash-complete",
+        );
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "u1",
+                endMessageId: "u1",
+                title: "Missing shadow window",
+                content: "missing",
+                p1: "missing",
+            },
+            {
+                sequence: 1,
+                startMessage: 2,
+                endMessage: 2,
+                startMessageId: "u2",
+                endMessageId: "u2",
+                title: "Stale shadow hash",
+                content: "stale",
+                p1: "stale",
+            },
+            {
+                sequence: 2,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "u3",
+                endMessageId: "u3",
+                title: "Clean shadow row",
+                content: "clean",
+                p1: "clean",
+            },
+        ]);
+        for (const [ordinal, content] of [
+            [1, "missing shadow transcript"],
+            [2, "stale shadow transcript"],
+            [3, "clean shadow transcript"],
+        ] as const) {
+            const result = db
+                .prepare(
+                    "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, 'user', ?)",
+                )
+                .run(sessionId, ordinal, `u${ordinal}`, content) as {
+                lastInsertRowid: number | bigint;
+            };
+            recordMessageFtsRowid(db, sessionId, ordinal, result.lastInsertRowid);
+        }
+
+        const compartments = getCompartments(db, sessionId);
+        const primaryChunk = primaryChunkModelId(projectIdentity);
+        const shadowChunk = shadowChunkModelId(projectIdentity);
+        const windows = new Map(
+            compartments.map((compartment) => [
+                compartment.id,
+                chunkCanonicalText(
+                    buildCanonicalChunkTextFromFts(
+                        db,
+                        sessionId,
+                        compartment.startMessage,
+                        compartment.endMessage,
+                    ) ?? "",
+                    compartment.startMessage,
+                    compartment.endMessage,
+                    10_000,
+                ),
+            ]),
+        );
+        const write = (
+            compartmentId: number,
+            modelId: string,
+            rows: ReturnType<typeof chunkCanonicalText>,
+        ) =>
+            replaceCompartmentChunkEmbeddings(
+                db,
+                rows.map((window) => ({
+                    compartmentId,
+                    sessionId,
+                    projectPath: projectIdentity,
+                    window,
+                    modelId,
+                    vector: new Float32Array([1, 0]),
+                })),
+            );
+        for (const compartment of compartments) {
+            write(compartment.id, primaryChunk, windows.get(compartment.id) ?? []);
+        }
+        const [missing, stale, clean] = compartments;
+        write(
+            stale.id,
+            shadowChunk,
+            (windows.get(stale.id) ?? []).map((window) => ({
+                ...window,
+                chunkHash: `old-${window.chunkHash}`,
+            })),
+        );
+        write(clean.id, shadowChunk, windows.get(clean.id) ?? []);
+
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(2);
+        expect(getShadowBackfillStopReason(projectIdentity, "chunk")).toBeUndefined();
+
+        // Verify both predicates independently: a stale hash remains outstanding
+        // after the missing row is repaired, and the missing row remains outstanding
+        // after the stale hash is repaired. An existence-only predicate would
+        // incorrectly report no remaining work in the stale-only state.
+        write(missing.id, shadowChunk, windows.get(missing.id) ?? []);
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(1);
+        db.prepare(
+            "DELETE FROM compartment_chunk_embeddings WHERE compartment_id = ? AND model_id = ?",
+        ).run(missing.id, shadowChunk);
+        write(stale.id, shadowChunk, windows.get(stale.id) ?? []);
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(1);
+
+        // Restore both defects, then verify that the normal bounded worker uses
+        // its rotation-aware selection to discover and replace both rows during
+        // routine backfill.
+        write(
+            stale.id,
+            shadowChunk,
+            (windows.get(stale.id) ?? []).map((window) => ({
+                ...window,
+                chunkHash: `old-again-${window.chunkHash}`,
+            })),
+        );
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shadow-hash-complete",
+        );
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(2);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(0);
+        expect(getShadowBackfillStopReason(projectIdentity, "chunk")).toBe("drained");
+        for (const compartment of compartments) {
+            expect(
+                chunkEmbeddingWindowsAreCurrent(
+                    db,
+                    compartment.id,
+                    shadowChunk,
+                    windows.get(compartment.id) ?? [],
+                    projectIdentity,
+                ),
+            ).toBe(true);
+        }
+    });
+
+    it("writes a production-seeded primary chunk through the shadow window contract", async () => {
+        let primaryCalls = 0;
+        let shadowCalls = 0;
+        useFakeProviders((config, texts) => {
+            if (config.provider === "synapse") shadowCalls += 1;
+            else primaryCalls += 1;
+            return texts.map((text) => new Float32Array([text.length, 1]));
+        });
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-production-chunk";
+        const sessionId = "ses-shadow-production-chunk";
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary", 512),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-production-chunk",
+        );
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "a1",
+                endMessageId: "a1",
+                title: "Production-sized chunk",
+                content: "large transcript",
+                p1: "large transcript",
+            },
+        ]);
+        const content = Array.from({ length: 2_000 }, (_, index) => `token-${index}`).join(" ");
+        const result = db
+            .prepare(
+                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, 1, 'a1', 'assistant', ?)",
+            )
+            .run(sessionId, content) as { lastInsertRowid: number | bigint };
+        recordMessageFtsRowid(db, sessionId, 1, result.lastInsertRowid);
+
+        expect(await embedUnembeddedCompartmentChunksForProject(db, projectIdentity, 8)).toBe(1);
+        expect(primaryCalls).toBeGreaterThan(0);
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseConfig("fp-production-chunk"),
+            "/tmp/shadow-production-chunk",
+        );
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(1);
+
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        const writes = (
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE project_path = ? AND model_id = ?",
+                )
+                .get(projectIdentity, shadowChunkModelId(projectIdentity)) as { count: number }
+        ).count;
+        expect(shadowCalls).toBe(1);
+        expect(writes).toBeGreaterThan(0);
+        expect(getShadowBackfillRemaining(db, projectIdentity).chunk).toBe(0);
+        expect(getShadowBackfillStopReason(projectIdentity, "chunk")).toBe("drained");
+    });
+
+    it("durably latches an unchanged no-progress batch across registrations", async () => {
+        let shadowCalls = 0;
+        const installProviders = () =>
+            useFakeProviders((config, texts) => {
+                if (config.provider === "synapse") {
+                    shadowCalls += 1;
+                    return texts.map(() => null);
+                }
+                return texts.map((text) => new Float32Array([text.length, 1]));
+            });
+        installProviders();
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-durable-stall";
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-durable-stall",
+        );
+        seedPrimaryMemories(db, projectIdentity, 1);
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseConfig("fp-durable-stall"),
+            "/tmp/shadow-durable-stall",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(shadowCalls).toBe(1);
+        expect(listShadowBackfillStalls(db, projectIdentity)).toMatchObject([
+            { scope: "memory", writeRefusalReason: "provider_returned_no_vectors" },
+        ]);
+        const status = formatEmbedStatusText(
+            getEmbeddingCoverageStatus(db, projectIdentity, "ses-no-history"),
+            { status: "idle" },
+        );
+        expect(status).toContain(
+            "Shadow memory: stalled_no_progress — the provider returned no vectors.",
+        );
+
+        _resetProjectEmbeddingRegistryForTests();
+        installProviders();
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-durable-stall",
+        );
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseConfig("fp-durable-stall"),
+            "/tmp/shadow-durable-stall",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(shadowCalls).toBe(1);
+        expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("stalled_no_progress");
+
+        const added = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "new corpus row changes the durable candidate signature",
+        });
+        saveEmbedding(db, added.id, new Float32Array([2, 1]), primaryModelId(projectIdentity));
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseConfig("fp-durable-stall"),
+            "/tmp/shadow-durable-stall",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(shadowCalls).toBe(2);
+    });
+
+    it("surfaces the write guard that rejected an otherwise valid vector", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-write-guard";
+        let mutated = false;
+        useFakeProviders((config, texts) => {
+            if (config.provider === "synapse" && !mutated) {
+                mutated = true;
+                db.prepare(
+                    "UPDATE memories SET normalized_hash = 'changed-in-flight' WHERE project_path = ?",
+                ).run(projectIdentity);
+            }
+            return texts.map((text) => new Float32Array([text.length, 1]));
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-primary"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-write-guard",
+        );
+        seedPrimaryMemories(db, projectIdentity, 1);
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseConfig("fp-write-guard"),
+            "/tmp/shadow-write-guard",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        const [stall] = listShadowBackfillStalls(db, projectIdentity);
+        expect(stall).toMatchObject({
+            scope: "memory",
+            writeRefusalReason: "memory_hash_guard_rejected",
+        });
+        expect(formatShadowBackfillStall(stall!)).toContain(
+            "memory normalized-hash guard rejected vectors",
+        );
+        expect(
+            formatEmbedStatusText(
+                getEmbeddingCoverageStatus(db, projectIdentity, "ses-no-history"),
+                { status: "idle" },
+            ),
+        ).toContain("the memory normalized-hash guard rejected vectors");
+    });
+
+    it("does not resubmit the same shadow bytes within one hour", async () => {
+        let now = Date.now();
+        let shadowCalls = 0;
+        const installProviders = () => {
+            _setShadowBackfillNowForTests(() => now);
+            useFakeProviders((config, texts) => {
+                if (config.provider === "synapse") {
+                    shadowCalls += 1;
+                    return texts.map(() => null);
+                }
+                return texts.map((text) => new Float32Array([text.length, 1]));
+            });
+        };
+        installProviders();
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-hourly-budget";
+        const register = (manualBackfill = false) => {
+            registerProjectEmbedding(
+                db,
+                projectIdentity,
+                localConfig("model-primary"),
+                { memoryEnabled: true, gitCommitEnabled: false },
+                "/tmp/shadow-hourly-budget",
+            );
+            registerProjectShadowEmbedding(
+                db,
+                projectIdentity,
+                synapseConfig("fp-hourly-budget"),
+                "/tmp/shadow-hourly-budget",
+                { manualBackfill },
+            );
+        };
+        register();
+        seedPrimaryMemories(db, projectIdentity, 1);
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseConfig("fp-hourly-budget"),
+            "/tmp/shadow-hourly-budget",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(shadowCalls).toBe(1);
+
+        _resetProjectEmbeddingRegistryForTests();
+        now += 30 * 60 * 1000;
+        installProviders();
+        register(true);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(shadowCalls).toBe(1);
+        expect(listShadowBackfillStalls(db, projectIdentity)).toMatchObject([
+            { scope: "memory", writeRefusalReason: "duplicate_submission_budget" },
+        ]);
+
+        _resetProjectEmbeddingRegistryForTests();
+        now += 31 * 60 * 1000;
+        installProviders();
+        register(true);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+        expect(shadowCalls).toBe(2);
     });
 });

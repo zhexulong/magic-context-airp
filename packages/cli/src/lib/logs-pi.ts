@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import {
     type PiDiagnosticReport,
@@ -7,6 +7,7 @@ import {
     sanitizeString,
 } from "./diagnostics-pi";
 import { capBodyToGithubLimit, extractRecentErrors } from "./issue-body";
+import { parseLogLine, readLogLines } from "./log-lines";
 
 export function sanitizeLogContent(content: string): string {
     return sanitizeString(content);
@@ -42,9 +43,12 @@ export interface BundledIssueReport {
  */
 function filterLogLinesBySession(lines: string[], sessionId: string | null): string[] {
     if (!sessionId) return lines;
-    const otherSessionPattern = /\bses_[A-Za-z0-9]{8,32}\b/g;
+    const otherSessionPattern = /\bses_[A-Za-z0-9]{3,64}\b/g;
     return lines.filter((line) => {
-        const matches = line.match(otherSessionPattern);
+        const parsed = parseLogLine(line);
+        if (parsed?.session && parsed.session !== sessionId) return false;
+        const matches =
+            parsed?.message.match(otherSessionPattern) ?? line.match(otherSessionPattern);
         if (!matches) return true;
         return matches.every((id) => id === sessionId);
     });
@@ -54,12 +58,15 @@ export async function bundleIssueReport(
     report: PiDiagnosticReport,
     description: string,
     title: string,
-    options: { cwd?: string; now?: Date; sessionFilter?: string | null } = {},
+    options: {
+        cwd?: string;
+        now?: Date;
+        sessionFilter?: string | null;
+        outputPath?: string;
+    } = {},
 ): Promise<BundledIssueReport> {
     const LOG_TAIL_LINES = 400;
-    const allLogLines = report.logFile.exists
-        ? readFileSync(report.logFile.path, "utf-8").split(/\r?\n/)
-        : [];
+    const allLogLines = readLogLines(report.logFiles ?? [report.logFile]);
     const logLines = filterLogLinesBySession(allLogLines, options.sessionFilter ?? null);
     const recentLog = sanitizeLogContent(logLines.slice(-LOG_TAIL_LINES).join("\n")).trim();
 
@@ -108,13 +115,16 @@ export async function bundleIssueReport(
 
     const cwd = options.cwd ?? process.cwd();
     const timestamp = formatTimestamp(options.now ?? new Date());
-    const path = join(cwd, `magic-context-pi-issue-${timestamp}.md`);
+    const path = options.outputPath ?? join(cwd, `magic-context-pi-issue-${timestamp}.md`);
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${bodyMarkdown}\n`);
 
     // Keep the complete sanitized report as a local attachment when the issue
     // body had to be reduced to fit GitHub's limit.
     const fullPath = truncated
-        ? join(cwd, `magic-context-pi-issue-${timestamp}-full.md`)
+        ? options.outputPath
+            ? `${options.outputPath}.full.md`
+            : join(cwd, `magic-context-pi-issue-${timestamp}-full.md`)
         : undefined;
     if (fullPath) writeFileSync(fullPath, `${rawBodyMarkdown}\n`);
 

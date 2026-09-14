@@ -112,21 +112,343 @@ mod storage_path_tests {
     }
 }
 
-pub fn resolve_opencode_db_path() -> Option<PathBuf> {
-    // OpenCode also uses XDG_DATA_HOME or ~/.local/share on all platforms.
-    let data_dir = std::env::var("XDG_DATA_HOME")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeDbResolution {
+    pub path: PathBuf,
+    pub source: &'static str,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedOpenCodeDbResolution {
+    key: String,
+    resolution: OpenCodeDbResolution,
+    existed: bool,
+}
+
+static OPENCODE_DB_RESOLUTION: OnceLock<RwLock<Option<CachedOpenCodeDbResolution>>> =
+    OnceLock::new();
+
+fn opencode_data_dir() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".local")
                 .join("share")
-        });
-    let db_path = data_dir.join("opencode").join("opencode.db");
-    if db_path.exists() {
-        Some(db_path)
+        })
+        .join("opencode")
+}
+
+fn opencode_resolution_key(data_dir: &Path) -> String {
+    [
+        data_dir.to_string_lossy().to_string(),
+        std::env::var("OPENCODE_DB").unwrap_or_default(),
+        std::env::var("OPENCODE_DISABLE_CHANNEL_DB").unwrap_or_default(),
+        std::env::var("OPENCODE_CHANNEL").unwrap_or_default(),
+    ]
+    .join("\0")
+}
+
+fn opencode_channel_path(data_dir: &Path, channel: &str) -> PathBuf {
+    if matches!(channel, "latest" | "beta" | "prod") {
+        data_dir.join("opencode.db")
     } else {
+        data_dir.join(format!("opencode-{channel}.db"))
+    }
+}
+
+fn opencode_candidate_names(data_dir: &Path) -> Vec<String> {
+    let mut names = vec![
+        "opencode.db".to_string(),
+        "opencode-local.db".to_string(),
+        "opencode-dev.db".to_string(),
+    ];
+    let mut discovered = std::fs::read_dir(data_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let dynamic = name.starts_with("opencode-") && name.ends_with(".db");
+            (dynamic && !names.contains(&name)).then_some(name)
+        })
+        .collect::<Vec<_>>();
+    discovered.sort();
+    names.extend(discovered);
+    names
+}
+
+fn discover_opencode_db(data_dir: &Path) -> OpenCodeDbResolution {
+    let mut selected: Option<(PathBuf, u128, usize)> = None;
+    for (order, name) in opencode_candidate_names(data_dir).into_iter().enumerate() {
+        let path = data_dir.join(&name);
+        let Some(modified) = std::fs::metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+        else {
+            continue;
+        };
+        let replace = selected
+            .as_ref()
+            .map_or(true, |(_, best_modified, best_order)| {
+                modified > *best_modified || (modified == *best_modified && order < *best_order)
+            });
+        if replace {
+            selected = Some((path, modified, order));
+        }
+    }
+
+    let Some((path, _, _)) = selected else {
+        return OpenCodeDbResolution {
+            path: data_dir.join("opencode.db"),
+            source: "default",
+            channel: None,
+        };
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let channel = if name == "opencode.db" {
         None
+    } else {
+        name.strip_prefix("opencode-")
+            .and_then(|value| value.strip_suffix(".db"))
+            .map(str::to_string)
+    };
+    OpenCodeDbResolution {
+        path,
+        source: "discovered",
+        channel,
+    }
+}
+
+fn resolve_opencode_db_fresh(
+    data_dir: &Path,
+    explicit: Option<&str>,
+    disable_channel_db: Option<&str>,
+    channel: Option<&str>,
+) -> OpenCodeDbResolution {
+    if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
+        let raw = PathBuf::from(explicit);
+        return OpenCodeDbResolution {
+            path: if explicit == ":memory:" || raw.is_absolute() {
+                raw
+            } else {
+                data_dir.join(raw)
+            },
+            source: "OPENCODE_DB",
+            channel: None,
+        };
+    }
+
+    if matches!(disable_channel_db, Some("1" | "true")) {
+        return OpenCodeDbResolution {
+            path: data_dir.join("opencode.db"),
+            source: "default",
+            channel: None,
+        };
+    }
+
+    if let Some(channel) = channel.filter(|value| !value.is_empty()) {
+        return OpenCodeDbResolution {
+            path: opencode_channel_path(data_dir, channel),
+            source: "channel",
+            channel: Some(channel.to_string()),
+        };
+    }
+
+    discover_opencode_db(data_dir)
+}
+
+pub fn resolve_opencode_db() -> OpenCodeDbResolution {
+    let data_dir = opencode_data_dir();
+    let key = opencode_resolution_key(&data_dir);
+    let cache = OPENCODE_DB_RESOLUTION.get_or_init(|| RwLock::new(None));
+    if let Ok(guard) = cache.read() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.key == key && cached.existed && cached.resolution.path.exists() {
+                return cached.resolution.clone();
+            }
+        }
+    }
+
+    let explicit = std::env::var("OPENCODE_DB").ok();
+    let disable_channel_db = std::env::var("OPENCODE_DISABLE_CHANNEL_DB").ok();
+    let channel = std::env::var("OPENCODE_CHANNEL").ok();
+    let resolution = resolve_opencode_db_fresh(
+        &data_dir,
+        explicit.as_deref(),
+        disable_channel_db.as_deref(),
+        channel.as_deref(),
+    );
+    let existed = resolution.path != Path::new(":memory:") && resolution.path.exists();
+    if let Ok(mut guard) = cache.write() {
+        *guard = Some(CachedOpenCodeDbResolution {
+            key,
+            resolution: resolution.clone(),
+            existed,
+        });
+    }
+    resolution
+}
+
+pub fn resolve_opencode_db_path() -> Option<PathBuf> {
+    let resolution = resolve_opencode_db();
+    (resolution.path != Path::new(":memory:") && resolution.path.exists())
+        .then_some(resolution.path)
+}
+
+fn opencode_db_probe_descriptions(resolution: &OpenCodeDbResolution) -> Vec<String> {
+    let channel_db_disabled = matches!(
+        std::env::var("OPENCODE_DISABLE_CHANNEL_DB").as_deref(),
+        Ok("1" | "true")
+    );
+    if resolution.source == "OPENCODE_DB" || resolution.source == "channel" || channel_db_disabled {
+        return vec![resolution.path.to_string_lossy().to_string()];
+    }
+    let data_dir = resolution
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(opencode_data_dir);
+    vec![
+        data_dir.join("opencode.db").to_string_lossy().to_string(),
+        data_dir
+            .join("opencode-local.db")
+            .to_string_lossy()
+            .to_string(),
+        data_dir
+            .join("opencode-dev.db")
+            .to_string_lossy()
+            .to_string(),
+        data_dir
+            .join("opencode-<channel>.db")
+            .to_string_lossy()
+            .to_string(),
+    ]
+}
+
+fn opencode_db_missing_message(resolution: &OpenCodeDbResolution) -> String {
+    format!(
+        "Magic Context cannot find OpenCode's session database (looked for {}). History compaction (historian) and the mid-turn valve are disabled until it is found; set OPENCODE_DB if OpenCode stores it elsewhere.",
+        opencode_db_probe_descriptions(resolution).join(", ")
+    )
+}
+
+#[cfg(test)]
+mod opencode_path_tests {
+    use super::*;
+    use std::fs;
+    use std::time::Duration;
+
+    fn data_dir() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("opencode");
+        fs::create_dir_all(&data_dir).unwrap();
+        (root, data_dir)
+    }
+
+    #[test]
+    fn explicit_override_disable_and_channel_follow_opencode_order() {
+        let (_root, data_dir) = data_dir();
+        let absolute = data_dir.join("absolute.db");
+        assert_eq!(
+            resolve_opencode_db_fresh(&data_dir, absolute.to_str(), Some("true"), Some("dev")),
+            OpenCodeDbResolution {
+                path: absolute,
+                source: "OPENCODE_DB",
+                channel: None,
+            }
+        );
+        assert_eq!(
+            resolve_opencode_db_fresh(&data_dir, Some("relative.db"), None, None).path,
+            data_dir.join("relative.db")
+        );
+        assert_eq!(
+            resolve_opencode_db_fresh(&data_dir, None, Some("1"), Some("dev")),
+            OpenCodeDbResolution {
+                path: data_dir.join("opencode.db"),
+                source: "default",
+                channel: None,
+            }
+        );
+        assert_eq!(
+            resolve_opencode_db_fresh(&data_dir, None, None, Some("dev")),
+            OpenCodeDbResolution {
+                path: data_dir.join("opencode-dev.db"),
+                source: "channel",
+                channel: Some("dev".to_string()),
+            }
+        );
+        assert_eq!(
+            resolve_opencode_db_fresh(&data_dir, Some(":memory:"), None, None).path,
+            PathBuf::from(":memory:")
+        );
+    }
+
+    #[test]
+    fn discovery_selects_each_candidate_when_it_is_newest() {
+        for selected in [
+            "opencode.db",
+            "opencode-local.db",
+            "opencode-dev.db",
+            "opencode-nightly.db",
+        ] {
+            let (_root, data_dir) = data_dir();
+            for name in [
+                "opencode.db",
+                "opencode-local.db",
+                "opencode-dev.db",
+                "opencode-nightly.db",
+            ] {
+                if name != selected {
+                    fs::write(data_dir.join(name), b"old").unwrap();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            fs::write(data_dir.join(selected), b"newest").unwrap();
+            let resolution = discover_opencode_db(&data_dir);
+            assert_eq!(resolution.path, data_dir.join(selected));
+            assert_eq!(resolution.source, "discovered");
+            assert_eq!(
+                resolution.channel,
+                (selected != "opencode.db")
+                    .then(|| selected["opencode-".len()..selected.len() - ".db".len()].to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn missing_opencode_store_has_the_named_condition_text() {
+        let (_root, data_dir) = data_dir();
+        let resolution = discover_opencode_db(&data_dir);
+        assert_eq!(
+            resolution,
+            OpenCodeDbResolution {
+                path: data_dir.join("opencode.db"),
+                source: "default",
+                channel: None,
+            }
+        );
+        let condition = opencode_db_missing_condition(&resolution);
+        assert_eq!(condition.code, "opencode_db_missing");
+        assert_eq!(
+            condition.message,
+            format!(
+                "Magic Context cannot find OpenCode's session database (looked for {}, {}, {}, {}). History compaction (historian) and the mid-turn valve are disabled until it is found; set OPENCODE_DB if OpenCode stores it elsewhere.",
+                data_dir.join("opencode.db").to_string_lossy(),
+                data_dir.join("opencode-local.db").to_string_lossy(),
+                data_dir.join("opencode-dev.db").to_string_lossy(),
+                data_dir.join("opencode-<channel>.db").to_string_lossy(),
+            )
+        );
     }
 }
 
@@ -317,6 +639,7 @@ pub struct SessionSummary {
 pub enum Harness {
     Opencode,
     Pi,
+    Omp,
     ClaudeCode,
     Codex,
 }
@@ -326,13 +649,14 @@ impl Harness {
         match self {
             Self::Opencode => "opencode",
             Self::Pi => "pi",
+            Self::Omp => "omp",
             Self::ClaudeCode => "claude_code",
             Self::Codex => "codex",
         }
     }
 
     fn has_magic_context_plugin_state(self) -> bool {
-        matches!(self, Self::Opencode | Self::Pi)
+        matches!(self, Self::Opencode | Self::Pi | Self::Omp)
     }
 
     fn uses_codex_no_write_cache_model(self) -> bool {
@@ -347,6 +671,7 @@ impl std::str::FromStr for Harness {
         match value.to_ascii_lowercase().as_str() {
             "opencode" => Ok(Self::Opencode),
             "pi" => Ok(Self::Pi),
+            "omp" => Ok(Self::Omp),
             "claude_code" | "claude-code" | "claudecode" | "cc" => Ok(Self::ClaudeCode),
             "codex" => Ok(Self::Codex),
             other => Err(format!("unknown harness: {other}")),
@@ -400,9 +725,16 @@ fn lookup_session_identity(
     harness: Harness,
     session_id: &str,
 ) -> String {
+    if let Some(identity) = identities.get(&(harness, session_id.to_string())) {
+        return identity.clone();
+    }
+
+    // A session recorded under the wrong compatible harness still needs its project
+    // on dashboard rows. Compare the complete ID so short-prefix collisions remain
+    // isolated by the persisted (harness, session_id) primary key.
     identities
-        .get(&(harness, session_id.to_string()))
-        .cloned()
+        .iter()
+        .find_map(|((_, stored_id), identity)| (stored_id == session_id).then(|| identity.clone()))
         .unwrap_or_default()
 }
 
@@ -430,11 +762,25 @@ pub struct SessionRow {
     pub is_subagent: bool,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct SessionScanCondition {
+    pub code: String,
+    pub message: String,
+}
+
+fn opencode_db_missing_condition(resolution: &OpenCodeDbResolution) -> SessionScanCondition {
+    SessionScanCondition {
+        code: "opencode_db_missing".to_string(),
+        message: opencode_db_missing_message(resolution),
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct PagedSessions {
     pub rows: Vec<SessionRow>,
     pub total: u32,
     pub has_more: bool,
+    pub conditions: Vec<SessionScanCondition>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -714,6 +1060,8 @@ pub struct DbCacheEvent {
     pub cause: Option<String>,
     pub agent: Option<String>,
     pub finish: Option<String>,
+    #[serde(skip)]
+    native_turn_id: Option<String>,
     pub turn_id: String,
     pub is_turn_start: bool,
     // The model's context window for this session (tokens), so the timeline can
@@ -764,6 +1112,9 @@ pub struct RawDbCacheEvent {
     total_tokens: i64,
     agent: Option<String>,
     finish: Option<String>,
+    /// OpenCode's native turn key. Every assistant step spawned by one user
+    /// message carries that user message's `parentID`.
+    native_turn_id: Option<String>,
     context_limit: Option<i64>,
 }
 
@@ -1022,6 +1373,7 @@ pub fn load_raw_db_cache_events(
                        COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0) AS total_tokens,
                        CAST(json_extract(m.data, '$.agent') AS TEXT) AS agent,
                        CAST(json_extract(m.data, '$.finish') AS TEXT) AS finish,
+                       CAST(json_extract(m.data, '$.parentID') AS TEXT) AS native_turn_id,
                        ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.time_created DESC) AS rn
                 FROM message m
                 WHERE json_extract(m.data, '$.role') = 'assistant'
@@ -1029,7 +1381,7 @@ pub fn load_raw_db_cache_events(
                   AND m.time_created > ?1
             )
             SELECT msg_id, session_id, time_created, input_tokens, cache_read,
-                   cache_write, total_tokens, agent, finish
+                   cache_write, total_tokens, agent, finish, native_turn_id
             FROM ranked
             WHERE rn <= ?2
             ORDER BY time_created DESC
@@ -1052,13 +1404,14 @@ pub fn load_raw_db_cache_events(
                        COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0) AS total_tokens,
                        CAST(json_extract(m.data, '$.agent') AS TEXT) AS agent,
                        CAST(json_extract(m.data, '$.finish') AS TEXT) AS finish,
+                       CAST(json_extract(m.data, '$.parentID') AS TEXT) AS native_turn_id,
                        ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.time_created DESC) AS rn
                 FROM message m
                 WHERE json_extract(m.data, '$.role') = 'assistant'
                   AND COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0) > 0
             )
             SELECT msg_id, session_id, time_created, input_tokens, cache_read,
-                   cache_write, total_tokens, agent, finish
+                   cache_write, total_tokens, agent, finish, native_turn_id
             FROM ranked
             WHERE rn <= ?1
             ORDER BY time_created DESC
@@ -1084,6 +1437,7 @@ pub fn load_raw_db_cache_events(
             total_tokens: row.get(6)?,
             agent: row.get(7)?,
             finish: row.get(8)?,
+            native_turn_id: row.get(9)?,
             context_limit: None,
         })
     })?;
@@ -1091,40 +1445,53 @@ pub fn load_raw_db_cache_events(
     rows.collect()
 }
 
-/// Load Pi cache events from JSONL session files. Mirrors the per-session
-/// windowing the OpenCode SQL path does so a single noisy Pi session cannot
-/// monopolize the global view, and emits the same `RawDbCacheEvent` shape as
-/// OpenCode so downstream `build_db_cache_events` works unchanged.
+/// Load Pi-compatible cache events from JSONL session files. Each native
+/// session root keeps its own harness identity while sharing the parser.
 pub fn load_raw_pi_cache_events(
     limit: usize,
     since_timestamp: Option<i64>,
 ) -> Vec<RawDbCacheEvent> {
-    let per_session_limit = limit;
-    let global_cap = limit.saturating_mul(10);
-    let mut all_rows: Vec<RawDbCacheEvent> = Vec::new();
+    let mut all_rows = load_raw_pi_compatible_cache_events(
+        Harness::Pi,
+        pi_sessions::scan_pi_session_dir(),
+        limit,
+        since_timestamp,
+    );
+    all_rows.extend(load_raw_pi_compatible_cache_events(
+        Harness::Omp,
+        pi_sessions::scan_omp_session_dir(),
+        limit,
+        since_timestamp,
+    ));
+    all_rows.sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+    all_rows.truncate(limit.saturating_mul(10));
+    all_rows
+}
 
-    for meta in pi_sessions::scan_pi_compatible_session_dir() {
+fn load_raw_pi_compatible_cache_events(
+    harness: Harness,
+    sessions: Vec<pi_sessions::PiSessionMeta>,
+    limit: usize,
+    since_timestamp: Option<i64>,
+) -> Vec<RawDbCacheEvent> {
+    let mut all_rows = Vec::new();
+    for meta in sessions {
         let Some(detail) = pi_sessions::read_pi_session_detail(&meta.jsonl_path) else {
             continue;
         };
-        // Pi message timestamps are ms-since-epoch; the OpenCode side uses ms too,
-        // so we keep them in the same unit and on the same time axis.
         let mut session_rows: Vec<RawDbCacheEvent> = detail
             .messages
             .iter()
             .filter(|message| message.role == "assistant")
             .filter_map(|message| {
                 let usage = message.usage.as_ref()?;
-                if usage.total == 0 {
+                if usage.total == 0
+                    || since_timestamp.is_some_and(|since| message.timestamp_ms <= since)
+                {
                     return None;
                 }
-                if let Some(since) = since_timestamp {
-                    if message.timestamp_ms <= since {
-                        return None;
-                    }
-                }
                 Some(RawDbCacheEvent {
-                    harness: Harness::Pi,
+                    harness,
                     message_id: message.entry_id.clone(),
                     session_id: meta.session_id.clone(),
                     timestamp: message.timestamp_ms,
@@ -1134,19 +1501,15 @@ pub fn load_raw_pi_cache_events(
                     total_tokens: usage.total as i64,
                     agent: None,
                     finish: message.stop_reason.clone(),
+                    native_turn_id: None,
                     context_limit: None,
                 })
             })
             .collect();
-        // Per-session newest-first window so a long Pi session still surfaces
-        // its latest events on the merged timeline.
-        session_rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
-        session_rows.truncate(per_session_limit);
+        session_rows.sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+        session_rows.truncate(limit);
         all_rows.extend(session_rows);
     }
-
-    all_rows.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
-    all_rows.truncate(global_cap);
     all_rows
 }
 
@@ -1234,6 +1597,7 @@ fn load_raw_external_cache_events(
                     total_tokens: event.total_tokens,
                     agent: event.model.clone(),
                     finish: event.finish.clone(),
+                    native_turn_id: None,
                     context_limit: event.context_limit,
                 })
             })
@@ -1418,6 +1782,10 @@ fn load_transform_failure_sessions_from_conn(
     out
 }
 
+fn finish_continues_turn(finish: &str) -> bool {
+    matches!(finish, "tool-calls" | "toolUse" | "tool_use")
+}
+
 fn build_db_cache_events(rows: Vec<RawDbCacheEvent>, enrich_causes: bool) -> Vec<DbCacheEvent> {
     build_db_cache_events_with_attribution(rows, enrich_causes, None, None)
 }
@@ -1492,26 +1860,27 @@ fn build_db_cache_events_with_attribution(
         }
     }
 
-    // Pi-side: a Pi session has its true-first assistant message in our window
-    // when our window-earliest timestamp for that Pi session is also the
-    // earliest assistant timestamp in the underlying JSONL file. Read each Pi
-    // session's first assistant timestamp once and compare.
+    // Pi and OMP use the same JSONL shape but remain separate cache lanes.
     let mut pi_true_first: HashSet<(Harness, String)> = HashSet::new();
-    let pi_sessions_in_window: Vec<String> = earliest_ts_in_window
+    let pi_sessions_in_window: Vec<(Harness, String)> = earliest_ts_in_window
         .iter()
-        .filter(|((h, _), _)| matches!(h, Harness::Pi))
-        .map(|((_, sid), _)| sid.clone())
+        .filter(|((h, _), _)| matches!(h, Harness::Pi | Harness::Omp))
+        .map(|((harness, sid), _)| (*harness, sid.clone()))
         .collect();
     if !pi_sessions_in_window.is_empty() {
-        // Build a lookup of Pi session_id -> jsonl path so we don't re-scan
-        // the directory per session.
-        let pi_meta_by_id: HashMap<String, std::path::PathBuf> =
-            pi_sessions::scan_pi_compatible_session_dir()
+        let pi_meta_by_id: HashMap<(Harness, String), std::path::PathBuf> =
+            pi_sessions::scan_pi_session_dir()
                 .into_iter()
-                .map(|m| (m.session_id, m.jsonl_path))
+                .map(|meta| ((Harness::Pi, meta.session_id), meta.jsonl_path))
+                .chain(
+                    pi_sessions::scan_omp_session_dir()
+                        .into_iter()
+                        .map(|meta| ((Harness::Omp, meta.session_id), meta.jsonl_path)),
+                )
                 .collect();
-        for sid in pi_sessions_in_window {
-            let Some(path) = pi_meta_by_id.get(&sid) else {
+        for (harness, sid) in pi_sessions_in_window {
+            let key = (harness, sid.clone());
+            let Some(path) = pi_meta_by_id.get(&key) else {
                 continue;
             };
             let Some(detail) = pi_sessions::read_pi_session_detail(path) else {
@@ -1520,17 +1889,17 @@ fn build_db_cache_events_with_attribution(
             let db_earliest = detail
                 .messages
                 .iter()
-                .filter(|m| {
-                    m.role == "assistant" && m.usage.as_ref().map(|u| u.total > 0).unwrap_or(false)
+                .filter(|message| {
+                    message.role == "assistant"
+                        && message.usage.as_ref().is_some_and(|usage| usage.total > 0)
                 })
-                .map(|m| m.timestamp_ms)
+                .map(|message| message.timestamp_ms)
                 .min();
-            if let (Some(db_earliest), Some(window_earliest)) = (
-                db_earliest,
-                earliest_ts_in_window.get(&(Harness::Pi, sid.clone())),
-            ) {
+            if let (Some(db_earliest), Some(window_earliest)) =
+                (db_earliest, earliest_ts_in_window.get(&key))
+            {
                 if *window_earliest <= db_earliest {
-                    pi_true_first.insert((Harness::Pi, sid));
+                    pi_true_first.insert(key);
                 }
             }
         }
@@ -1597,6 +1966,7 @@ fn build_db_cache_events_with_attribution(
             cause: None,
             agent: row.agent,
             finish: row.finish,
+            native_turn_id: row.native_turn_id,
             turn_id: String::new(),
             is_turn_start: false,
             context_limit: row.context_limit.unwrap_or(0),
@@ -1663,25 +2033,32 @@ fn build_db_cache_events_with_attribution(
             chronological[i].session_id.clone(),
         );
 
-        // Turn grouping: a new turn starts at the session's first event or when
-        // the previous event's finish != "tool-calls".
+        // OpenCode persists the native user→assistant relationship as `parentID`.
+        // It is authoritative even when an interrupted tool step is followed by a
+        // queued user message. JSONL harnesses lack that key, so they fall back to
+        // their provider-specific tool-continuation finish values.
+        let native_turn_id = chronological[i]
+            .native_turn_id
+            .as_deref()
+            .filter(|turn_id| !turn_id.is_empty());
         let prev_finish = last_finish_by_session.get(&session_key).cloned();
-        let is_new_turn = match prev_finish.as_deref() {
-            None => true,
-            Some("tool-calls") => false,
-            Some(_) => true,
-        };
+        let inferred_is_new_turn = prev_finish
+            .as_deref()
+            .map_or(true, |finish| !finish_continues_turn(finish));
+        let turn_id = native_turn_id.map(ToString::to_string).unwrap_or_else(|| {
+            if inferred_is_new_turn {
+                chronological[i].message_id.clone()
+            } else {
+                current_turn_id_by_session
+                    .get(&session_key)
+                    .cloned()
+                    .unwrap_or_else(|| chronological[i].message_id.clone())
+            }
+        });
+        let is_new_turn = current_turn_id_by_session.get(&session_key) != Some(&turn_id);
         chronological[i].is_turn_start = is_new_turn;
-        if is_new_turn {
-            chronological[i].turn_id = chronological[i].message_id.clone();
-            current_turn_id_by_session
-                .insert(session_key.clone(), chronological[i].message_id.clone());
-        } else {
-            chronological[i].turn_id = current_turn_id_by_session
-                .get(&session_key)
-                .cloned()
-                .unwrap_or_default();
-        }
+        chronological[i].turn_id = turn_id.clone();
+        current_turn_id_by_session.insert(session_key.clone(), turn_id);
 
         // Severity.
         let is_first_in_window = seen_sessions.insert(session_key.clone());
@@ -2231,10 +2608,15 @@ pub fn load_cache_session_titles(
         }
     }
 
-    for meta in pi_sessions::scan_pi_compatible_session_dir() {
-        let key = (Harness::Pi, meta.session_id.clone());
-        if keys.contains(&key) {
-            titles.insert(key, clean_pi_title(meta.session_name, &meta.first_message));
+    for (harness, sessions) in [
+        (Harness::Pi, pi_sessions::scan_pi_session_dir()),
+        (Harness::Omp, pi_sessions::scan_omp_session_dir()),
+    ] {
+        for meta in sessions {
+            let key = (harness, meta.session_id.clone());
+            if keys.contains(&key) {
+                titles.insert(key, clean_pi_title(meta.session_name, &meta.first_message));
+            }
         }
     }
     for meta in external_cache_sessions::scan_claude_code_session_dir() {
@@ -2257,7 +2639,7 @@ pub fn load_cache_subagent_flags(
     keys: &HashSet<(Harness, String)>,
 ) -> HashMap<(Harness, String), bool> {
     let mut out = HashMap::new();
-    for harness in [Harness::Opencode, Harness::Pi] {
+    for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
         if keys.iter().any(|(h, _)| *h == harness) {
             for (session_id, is_subagent) in load_subagent_map_for_harness(harness) {
                 let key = (harness, session_id);
@@ -2281,7 +2663,7 @@ pub fn get_session_cache_stats_from_db(
     // cards and chart, so the 1s reconcile never recomputes global aggregates.
     let mut pre_cap_subagent_flags = HashMap::new();
     if hide_subagents {
-        for harness in [Harness::Opencode, Harness::Pi] {
+        for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
             if harness_filter.map_or(true, |filter| filter == harness) {
                 pre_cap_subagent_flags.extend(
                     load_subagent_map_for_harness(harness)
@@ -2298,7 +2680,7 @@ pub fn get_session_cache_stats_from_db(
         .collect();
     let includes_harness = |harness| harness_filter.map_or(true, |filter| filter == harness);
 
-    let (mut sessions, pi_sessions, claude_sessions, codex_sessions) =
+    let (mut sessions, pi_sessions, omp_sessions, claude_sessions, codex_sessions) =
         std::thread::scope(|scope| {
             let opencode = scope.spawn(|| {
                 if includes_harness(Harness::Opencode) {
@@ -2309,7 +2691,14 @@ pub fn get_session_cache_stats_from_db(
             });
             let pi = scope.spawn(|| {
                 if includes_harness(Harness::Pi) {
-                    pi_sessions::scan_pi_compatible_cache_session_dir()
+                    pi_sessions::scan_pi_cache_session_dir()
+                } else {
+                    Vec::new()
+                }
+            });
+            let omp = scope.spawn(|| {
+                if includes_harness(Harness::Omp) {
+                    pi_sessions::scan_omp_cache_session_dir()
                 } else {
                     Vec::new()
                 }
@@ -2331,12 +2720,19 @@ pub fn get_session_cache_stats_from_db(
             (
                 opencode.join().unwrap_or_default(),
                 pi.join().unwrap_or_default(),
+                omp.join().unwrap_or_default(),
                 claude.join().unwrap_or_default(),
                 codex.join().unwrap_or_default(),
             )
         });
     sessions.extend(pi_sessions.into_iter().map(|meta| CacheSessionListEntry {
         harness: Harness::Pi,
+        session_id: meta.session_id,
+        last_activity_ms: meta.modified,
+        title: Some(clean_pi_title(meta.session_name, &meta.first_message)),
+    }));
+    sessions.extend(omp_sessions.into_iter().map(|meta| CacheSessionListEntry {
+        harness: Harness::Omp,
         session_id: meta.session_id,
         last_activity_ms: meta.modified,
         title: Some(clean_pi_title(meta.session_name, &meta.first_message)),
@@ -2438,7 +2834,9 @@ pub fn get_session_cache_events(
 ) -> Vec<DbCacheEvent> {
     match harness {
         Harness::Opencode => get_opencode_session_cache_events(session_id, limit, since_timestamp),
-        Harness::Pi => get_pi_session_cache_events(session_id, limit, since_timestamp),
+        Harness::Pi | Harness::Omp => {
+            get_pi_session_cache_events(harness, session_id, limit, since_timestamp)
+        }
         Harness::ClaudeCode => {
             get_claude_code_session_cache_events(session_id, limit, since_timestamp)
         }
@@ -2481,7 +2879,9 @@ pub fn get_session_cache_events_by_turn_count(
     let max_events = (target_turns * 50).max(200); // floor to existing limit
     let raw = match harness {
         Harness::Opencode => get_opencode_session_cache_events(session_id, Some(max_events), None),
-        Harness::Pi => get_pi_session_cache_events(session_id, Some(max_events), None),
+        Harness::Pi | Harness::Omp => {
+            get_pi_session_cache_events(harness, session_id, Some(max_events), None)
+        }
         Harness::ClaudeCode => {
             get_claude_code_session_cache_events(session_id, Some(max_events), None)
         }
@@ -2501,14 +2901,23 @@ fn get_opencode_session_cache_events(
     let Ok(conn) = open_readonly(&opencode_db_path) else {
         return Vec::new();
     };
+    get_opencode_session_cache_events_from_conn(&conn, session_id, limit, since_timestamp)
+}
 
+fn get_opencode_session_cache_events_from_conn(
+    conn: &Connection,
+    session_id: &str,
+    limit: Option<usize>,
+    since_timestamp: Option<i64>,
+) -> Vec<DbCacheEvent> {
     const COLS: &str = "SELECT CAST(id AS TEXT), session_id, time_created,
                 COALESCE(CAST(json_extract(data, '$.tokens.input') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.cache.read') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.cache.write') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0),
                 CAST(json_extract(data, '$.agent') AS TEXT),
-                CAST(json_extract(data, '$.finish') AS TEXT)
+                 CAST(json_extract(data, '$.finish') AS TEXT),
+                 CAST(json_extract(data, '$.parentID') AS TEXT)
          FROM message
          WHERE session_id = ?1
            AND json_extract(data, '$.role') = 'assistant'
@@ -2557,6 +2966,7 @@ fn get_opencode_session_cache_events(
             total_tokens: row.get(6)?,
             agent: row.get(7)?,
             finish: row.get(8)?,
+            native_turn_id: row.get(9)?,
             context_limit: None,
         })
     }) else {
@@ -2566,11 +2976,12 @@ fn get_opencode_session_cache_events(
 }
 
 fn get_pi_session_cache_events(
+    harness: Harness,
     session_id: &str,
     limit: Option<usize>,
     since_timestamp: Option<i64>,
 ) -> Vec<DbCacheEvent> {
-    let Some(path) = pi_sessions::find_pi_session_path(session_id) else {
+    let Some(path) = find_pi_session_path_for_harness(harness, session_id) else {
         return Vec::new();
     };
     let Some(detail) = pi_sessions::read_pi_session_detail(&path) else {
@@ -2583,7 +2994,7 @@ fn get_pi_session_cache_events(
         .filter_map(|message| {
             let usage = message.usage?;
             (usage.total > 0).then_some(RawDbCacheEvent {
-                harness: Harness::Pi,
+                harness,
                 message_id: message.entry_id,
                 session_id: session_id.to_string(),
                 timestamp: message.timestamp_ms,
@@ -2593,6 +3004,7 @@ fn get_pi_session_cache_events(
                 total_tokens: usage.total as i64,
                 agent: None,
                 finish: message.stop_reason,
+                native_turn_id: None,
                 context_limit: None,
             })
         })
@@ -2681,6 +3093,7 @@ fn get_external_session_cache_events(
             total_tokens: event.total_tokens,
             agent: event.model.clone(),
             finish: event.finish.clone(),
+            native_turn_id: None,
             context_limit: event.context_limit,
         })
         .collect();
@@ -2867,13 +3280,18 @@ fn mapped_session_directories(identities: &SessionIdentityMap) -> Vec<(String, S
         }
     }
 
-    for meta in pi_sessions::scan_pi_compatible_session_dir() {
-        if meta.cwd.is_empty() {
-            continue;
-        }
-        let identity = lookup_session_identity(identities, Harness::Pi, &meta.session_id);
-        if !identity.is_empty() {
-            dirs.push((identity, meta.cwd));
+    for (harness, sessions) in [
+        (Harness::Pi, pi_sessions::scan_pi_session_dir()),
+        (Harness::Omp, pi_sessions::scan_omp_session_dir()),
+    ] {
+        for meta in sessions {
+            if meta.cwd.is_empty() {
+                continue;
+            }
+            let identity = lookup_session_identity(identities, harness, &meta.session_id);
+            if !identity.is_empty() {
+                dirs.push((identity, meta.cwd));
+            }
         }
     }
 
@@ -2982,19 +3400,26 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
         }
     }
 
-    let mut pi_counts: HashMap<String, (String, u32)> = HashMap::new();
-    for meta in pi_sessions::scan_pi_compatible_session_dir() {
-        if let Some(allowed_paths) = project_paths_filter {
-            if !allowed_paths.contains(&meta.cwd) {
+    let mut pi_counts: HashMap<(Harness, String), (String, u32)> = HashMap::new();
+    for (harness, sessions) in [
+        (Harness::Pi, pi_sessions::scan_pi_session_dir()),
+        (Harness::Omp, pi_sessions::scan_omp_session_dir()),
+    ] {
+        for meta in sessions {
+            if let Some(allowed_paths) = project_paths_filter {
+                if !allowed_paths.contains(&meta.cwd) {
+                    continue;
+                }
+            }
+            let identity = lookup_session_identity(&session_identities, harness, &meta.session_id);
+            if identity.is_empty() {
                 continue;
             }
+            let entry = pi_counts
+                .entry((harness, identity))
+                .or_insert((meta.cwd, 0));
+            entry.1 = entry.1.saturating_add(1);
         }
-        let identity = lookup_session_identity(&session_identities, Harness::Pi, &meta.session_id);
-        if identity.is_empty() {
-            continue;
-        }
-        let entry = pi_counts.entry(identity).or_insert((meta.cwd, 0));
-        entry.1 = entry.1.saturating_add(1);
     }
     if let Some(allowed_paths) = project_paths_filter {
         for project_path in allowed_paths {
@@ -3008,10 +3433,10 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
         }
     }
 
-    for (identity, (cwd, count)) in pi_counts {
+    for ((harness, identity), (cwd, count)) in pi_counts {
         let entry = groups.entry(identity).or_default();
         entry.pi_path = Some(cwd);
-        entry.harnesses.insert(Harness::Pi);
+        entry.harnesses.insert(harness);
         entry.session_count = entry.session_count.saturating_add(count);
     }
 
@@ -3043,7 +3468,7 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
 }
 
 /// Build the Projects card grid. One pass over the session truth
-/// (`list_all_sessions`, both harnesses) grouped by project identity, enriched
+/// (`list_all_sessions`, all harnesses) grouped by project identity, enriched
 /// per group with its active-memory count and workspace name. Primary sessions
 /// only count toward `session_count`/`last_activity_ms` (subagents are an
 /// implementation detail, not a project the user navigates), but a project that
@@ -4712,20 +5137,24 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
     .unwrap_or_default()
 }
 
-pub fn list_pi_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
-    if filter.harness.is_some_and(|h| h != Harness::Pi) {
+fn list_pi_compatible_sessions(
+    filter: &SessionFilter,
+    harness: Harness,
+    sessions: Vec<pi_sessions::PiSessionMeta>,
+) -> Vec<SessionRow> {
+    if filter.harness.is_some_and(|wanted| wanted != harness) {
         return Vec::new();
     }
-    let subagent_map = load_subagent_map_for_harness(Harness::Pi);
+    let subagent_map = load_subagent_map_for_harness(harness);
     let session_identities = load_session_identity_map();
-    pi_sessions::scan_pi_compatible_session_dir()
+    sessions
         .into_iter()
         .map(|meta| {
             let project_identity =
-                lookup_session_identity(&session_identities, Harness::Pi, &meta.session_id);
+                lookup_session_identity(&session_identities, harness, &meta.session_id);
             let is_subagent = subagent_map.get(&meta.session_id).copied().unwrap_or(false);
             SessionRow {
-                harness: Harness::Pi,
+                harness,
                 session_id: meta.session_id,
                 title: clean_pi_title(meta.session_name, &meta.first_message),
                 project_identity,
@@ -4738,17 +5167,37 @@ pub fn list_pi_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
         .collect()
 }
 
+pub fn list_pi_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
+    list_pi_compatible_sessions(filter, Harness::Pi, pi_sessions::scan_pi_session_dir())
+}
+
+pub fn list_omp_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
+    list_pi_compatible_sessions(filter, Harness::Omp, pi_sessions::scan_omp_session_dir())
+}
+
 pub fn list_all_sessions(filter: SessionFilter) -> Vec<SessionRow> {
     let mut rows = Vec::new();
     rows.extend(list_opencode_sessions(&filter));
     rows.extend(list_pi_sessions(&filter));
+    rows.extend(list_omp_sessions(&filter));
     rows.sort_by_key(|row| std::cmp::Reverse(row.last_activity_ms));
     rows
 }
 
 pub fn list_sessions_paged(filter: SessionFilter) -> PagedSessions {
+    let include_opencode = filter
+        .harness
+        .map_or(true, |harness| harness == Harness::Opencode);
     let rows = list_all_sessions(filter.clone());
-    page_session_rows(rows, filter.offset, filter.limit)
+    let mut page = page_session_rows(rows, filter.offset, filter.limit);
+    if include_opencode {
+        let resolution = resolve_opencode_db();
+        if resolution.path == Path::new(":memory:") || !resolution.path.exists() {
+            page.conditions
+                .push(opencode_db_missing_condition(&resolution));
+        }
+    }
+    page
 }
 
 fn page_session_rows(
@@ -4770,6 +5219,7 @@ fn page_session_rows(
         rows: paged_rows,
         total: total_usize as u32,
         has_more: consumed < total_usize,
+        conditions: Vec::new(),
     }
 }
 
@@ -4842,7 +5292,7 @@ pub fn get_session_detail(
 ) -> Result<Option<SessionDetail>, rusqlite::Error> {
     match harness {
         Harness::Opencode => get_opencode_session_detail(conn, session_id),
-        Harness::Pi => Ok(get_pi_session_detail(conn, session_id)),
+        Harness::Pi | Harness::Omp => Ok(get_pi_session_detail(conn, harness, session_id)),
         Harness::ClaudeCode | Harness::Codex => Ok(None),
     }
 }
@@ -4864,8 +5314,8 @@ pub fn get_session_messages(
             let conn = open_readonly(&opencode_db_path)?;
             load_opencode_messages(&conn, session_id)
         }
-        Harness::Pi => {
-            let Some(path) = pi_sessions::find_pi_session_path(session_id) else {
+        Harness::Pi | Harness::Omp => {
+            let Some(path) = find_pi_session_path_for_harness(harness, session_id) else {
                 return Ok(Vec::new());
             };
             let Some(detail) = pi_sessions::read_pi_session_detail(&path) else {
@@ -5096,8 +5546,27 @@ fn normalize_preview(text: &str) -> String {
         .collect()
 }
 
-pub fn get_pi_session_detail(conn: Option<&Connection>, session_id: &str) -> Option<SessionDetail> {
-    let path = pi_sessions::find_pi_session_path(session_id)?;
+fn find_pi_session_path_for_harness(
+    harness: Harness,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let sessions = match harness {
+        Harness::Pi => pi_sessions::scan_pi_session_dir(),
+        Harness::Omp => pi_sessions::scan_omp_session_dir(),
+        _ => return None,
+    };
+    sessions
+        .into_iter()
+        .find(|meta| meta.session_id == session_id)
+        .map(|meta| meta.jsonl_path)
+}
+
+pub fn get_pi_session_detail(
+    conn: Option<&Connection>,
+    harness: Harness,
+    session_id: &str,
+) -> Option<SessionDetail> {
+    let path = find_pi_session_path_for_harness(harness, session_id)?;
     let detail = pi_sessions::read_pi_session_detail(&path)?;
     let title = clean_pi_title(detail.meta.session_name.clone(), &detail.meta.first_message);
 
@@ -5128,9 +5597,9 @@ pub fn get_pi_session_detail(conn: Option<&Connection>, session_id: &str) -> Opt
         .and_then(|c| get_context_token_breakdown(c, session_id).ok())
         .flatten();
     let session_identities = load_session_identity_map();
-    let project_identity = lookup_session_identity(&session_identities, Harness::Pi, session_id);
+    let project_identity = lookup_session_identity(&session_identities, harness, session_id);
     Some(SessionDetail {
-        harness: Harness::Pi,
+        harness,
         session_id: detail.meta.session_id.clone(),
         title,
         project_identity,
@@ -6706,6 +7175,7 @@ mod session_identity_map_tests {
             let conn = create_context_db(data_home, true);
             insert_session_project(&conn, "oc-1", "opencode", "git:oc-root");
             insert_session_project(&conn, "pi-1", "pi", "dir:pi-root");
+            insert_session_project(&conn, "omp-1", "omp", "dir:omp-root");
             insert_session_project(&conn, "weird-1", "future", "git:future-root");
             drop(conn);
 
@@ -6718,7 +7188,11 @@ mod session_identity_map_tests {
                 map.get(&(Harness::Pi, "pi-1".to_string())),
                 Some(&"dir:pi-root".to_string())
             );
-            assert_eq!(map.len(), 2, "unknown harness rows must be skipped");
+            assert_eq!(
+                map.get(&(Harness::Omp, "omp-1".to_string())),
+                Some(&"dir:omp-root".to_string())
+            );
+            assert_eq!(map.len(), 3, "unknown harness rows must be skipped");
         });
     }
 
@@ -6770,6 +7244,52 @@ mod session_identity_map_tests {
                 .find(|row| row.session_id == "unmapped")
                 .expect("unmapped row");
             assert_eq!(unmapped.project_identity, "");
+        });
+    }
+
+    #[test]
+    fn omp_session_display_falls_back_to_exact_pi_identity_without_prefix_matching() {
+        with_temp_data_home(|data_home| {
+            const MATCHED_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+            const UNMATCHED_ID: &str = "123e4567-e89b-12d3-a456-426614174001";
+            const PROJECT_IDENTITY: &str = "git:omp-project";
+
+            let context = create_context_db(data_home, true);
+            insert_session_project(&context, MATCHED_ID, "pi", PROJECT_IDENTITY);
+            insert_session_project(&context, "123e4567", "pi", PROJECT_IDENTITY);
+            drop(context);
+
+            let omp_root = tempfile::tempdir().expect("OMP sessions");
+            let project_dir = omp_root.path().join("omp-project");
+            std::fs::create_dir_all(&project_dir).expect("OMP project session dir");
+            for (session_id, file_name) in [
+                (MATCHED_ID, "matched.jsonl"),
+                (UNMATCHED_ID, "prefix-only.jsonl"),
+            ] {
+                std::fs::write(
+                    project_dir.join(file_name),
+                    format!(
+                        "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/tmp/omp-project\"}}\n{{\"type\":\"message\",\"id\":\"u1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello from OMP\"}}}}\n"
+                    ),
+                )
+                .expect("write OMP session");
+            }
+
+            let sessions = crate::pi_sessions::scan_pi_session_dir_at(omp_root.path());
+            assert_eq!(sessions.len(), 2, "the OMP fixture must be scanned");
+            let rows = list_pi_compatible_sessions(
+                &SessionFilter {
+                    project_identity: Some(PROJECT_IDENTITY.to_string()),
+                    ..SessionFilter::default()
+                },
+                Harness::Omp,
+                sessions,
+            );
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].harness, Harness::Omp);
+            assert_eq!(rows[0].session_id, MATCHED_ID);
+            assert_eq!(rows[0].project_identity, PROJECT_IDENTITY);
         });
     }
 
@@ -7268,8 +7788,14 @@ mod cache_turn_tests {
             total_tokens: total,
             agent: None,
             finish: finish.map(|s| s.to_string()),
+            native_turn_id: None,
             context_limit: None,
         }
+    }
+
+    fn with_native_turn(mut event: RawDbCacheEvent, turn_id: &str) -> RawDbCacheEvent {
+        event.native_turn_id = Some(turn_id.to_string());
+        event
     }
 
     fn turn_summary_event(events: &[DbCacheEvent]) -> Option<&DbCacheEvent> {
@@ -7315,6 +7841,142 @@ mod cache_turn_tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].is_turn_start);
         assert_eq!(events[0].turn_id, "m1");
+    }
+
+    #[test]
+    fn opencode_session_query_uses_parent_id_as_the_native_turn() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (message_id, timestamp) in [("assistant-1", 100), ("assistant-2", 200)] {
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    message_id,
+                    "s1",
+                    timestamp,
+                    serde_json::json!({
+                        "role": "assistant",
+                        "parentID": "user-1",
+                        "finish": "stop",
+                        "tokens": { "input": 10, "cache": { "read": 80, "write": 10 }, "total": 100 }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        let events = get_opencode_session_cache_events_from_conn(&conn, "s1", Some(10), None);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_turn_start);
+        assert!(!events[1].is_turn_start);
+        assert!(events.iter().all(|event| event.turn_id == "user-1"));
+    }
+
+    #[test]
+    fn native_opencode_parent_id_overrides_finish_heuristics() {
+        let rows = vec![
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-1",
+                    "s1",
+                    100,
+                    10,
+                    80,
+                    10,
+                    100,
+                    Some("tool-calls"),
+                ),
+                "user-1",
+            ),
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-2",
+                    "s1",
+                    100,
+                    10,
+                    85,
+                    5,
+                    100,
+                    Some("tool-calls"),
+                ),
+                "user-2",
+            ),
+        ];
+
+        let events = build_db_cache_events(rows, false);
+        assert_eq!(events.iter().filter(|event| event.is_turn_start).count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.turn_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["user-1", "user-2"]),
+            "queued users with colliding timestamps remain distinct native turns"
+        );
+    }
+
+    #[test]
+    fn native_opencode_parent_groups_every_request_in_a_multi_step_turn() {
+        let rows = vec![
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-1",
+                    "s1",
+                    100,
+                    10,
+                    80,
+                    10,
+                    100,
+                    Some("stop"),
+                ),
+                "user-1",
+            ),
+            with_native_turn(
+                raw(
+                    Harness::Opencode,
+                    "assistant-2",
+                    "s1",
+                    200,
+                    10,
+                    85,
+                    5,
+                    100,
+                    Some("stop"),
+                ),
+                "user-1",
+            ),
+        ];
+
+        let events = build_db_cache_events(rows, false);
+        assert!(events[0].is_turn_start);
+        assert!(!events[1].is_turn_start);
+        assert!(events.iter().all(|event| event.turn_id == "user-1"));
+    }
+
+    #[test]
+    fn jsonl_tool_continuation_finish_values_group_requests() {
+        for (harness, finish) in [(Harness::Pi, "toolUse"), (Harness::ClaudeCode, "tool_use")] {
+            let rows = vec![
+                raw(harness, "m1", "s1", 100, 10, 80, 10, 100, Some(finish)),
+                raw(harness, "m2", "s1", 200, 10, 85, 5, 100, Some("stop")),
+            ];
+            let events = build_db_cache_events(rows, false);
+            assert!(events[0].is_turn_start, "{harness:?}");
+            assert!(!events[1].is_turn_start, "{harness:?}");
+            assert_eq!(events[0].turn_id, events[1].turn_id, "{harness:?}");
+        }
     }
 
     #[test]
@@ -8339,6 +9001,7 @@ mod get_session_cache_events_by_turn_count_tests {
             cause: None,
             agent: None,
             finish: Some("stop".to_string()),
+            native_turn_id: None,
             turn_id: String::new(),
             is_turn_start,
             context_limit: 0,

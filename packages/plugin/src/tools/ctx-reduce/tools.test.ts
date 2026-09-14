@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { markWhitespaceAssistantTagInert } from "../../features/magic-context/storage-tags";
 import { Database } from "../../shared/sqlite";
 import { createCtxReduceTools } from "./tools";
 
@@ -19,7 +20,9 @@ function createTestDb(): Database {
       reasoning_byte_size INTEGER NOT NULL DEFAULT 0,
       caveman_depth INTEGER NOT NULL DEFAULT 0,
       harness TEXT NOT NULL DEFAULT 'opencode',
-      tool_owner_message_id TEXT DEFAULT NULL
+      tool_owner_message_id TEXT DEFAULT NULL,
+      token_count INTEGER DEFAULT NULL,
+      entry_fingerprint TEXT DEFAULT NULL
     );
     CREATE TABLE pending_ops (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,7 +107,7 @@ describe("createCtxReduceTools", () => {
 
     beforeEach(() => {
         db = createTestDb();
-        tools = createCtxReduceTools({ db, protectedTags: 3 });
+        tools = createCtxReduceTools({ db });
     });
 
     describe("ctx_reduce", () => {
@@ -116,7 +119,14 @@ describe("createCtxReduceTools", () => {
         });
 
         it("accepts reduced compatibility fields alongside a real drop", async () => {
-            seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
+            seedTags(db, [
+                { id: 1, sessionId: "ses-1" },
+                { id: 2, sessionId: "ses-1" },
+                { id: 3, sessionId: "ses-1" },
+                { id: 8, sessionId: "ses-1" },
+                { id: 9, sessionId: "ses-1" },
+                { id: 10, sessionId: "ses-1" },
+            ]);
 
             const result = await tools.ctx_reduce.execute(
                 {
@@ -170,39 +180,50 @@ describe("createCtxReduceTools", () => {
             expect(getLastNudgeTokens(db, "ses-1")).toBe(125_000);
         });
 
-        it("queues protected tags as deferred when nothing else can be queued", async () => {
+        it("queues protected tags as deferred with verbatim held copy for single and plural", async () => {
             seedTags(db, [
                 { id: 1, sessionId: "ses-1" },
-                { id: 8, sessionId: "ses-1" },
-                { id: 9, sessionId: "ses-1" },
-                { id: 10, sessionId: "ses-1" },
+                { id: 8, sessionId: "ses-1", type: "tool" },
+                { id: 9, sessionId: "ses-1", type: "tool" },
+                { id: 10, sessionId: "ses-1", type: "tool" },
             ]);
 
-            const result = await tools.ctx_reduce.execute({ drop: "9,10" }, toolContext());
+            // Plural held copy
+            const resultPlural = await tools.ctx_reduce.execute({ drop: "9,10" }, toolContext());
+            expect(resultPlural).toBe(
+                "Held: §9, §10 are inside the protected working set; they apply once newer work displaces them.",
+            );
 
-            expect(result).toContain("Queued");
-            expect(result).toContain("deferred drop §9§, §10§");
-            expect(result).not.toContain("leave the last 3 active tags");
-            expect(getPendingOps(db, "ses-1")).toEqual([
-                expect.objectContaining({ tag_id: 9, operation: "drop" }),
-                expect.objectContaining({ tag_id: 10, operation: "drop" }),
+            // Single held copy on fresh session
+            seedTags(db, [
+                { id: 101, sessionId: "ses-2" },
+                { id: 108, sessionId: "ses-2", type: "tool" },
+                { id: 109, sessionId: "ses-2", type: "tool" },
+                { id: 110, sessionId: "ses-2", type: "tool" },
             ]);
+            const singleTools = createCtxReduceTools({ db });
+            const resultSingle = await singleTools.ctx_reduce.execute(
+                { drop: "110" },
+                { ...toolContext(), sessionID: "ses-2" },
+            );
+            expect(resultSingle).toBe(
+                "Held: §110 is inside the protected working set; it applies once newer work displaces it.",
+            );
         });
 
-        it("queues protected tags alongside immediate drops", async () => {
+        it("queues protected tags alongside immediate drops with queued sentence first then held sentence", async () => {
             seedTags(db, [
                 { id: 1, sessionId: "ses-1" },
-                { id: 8, sessionId: "ses-1" },
-                { id: 9, sessionId: "ses-1" },
-                { id: 10, sessionId: "ses-1" },
+                { id: 8, sessionId: "ses-1", type: "tool" },
+                { id: 9, sessionId: "ses-1", type: "tool" },
+                { id: 10, sessionId: "ses-1", type: "tool" },
             ]);
 
             const result = await tools.ctx_reduce.execute({ drop: "1,9,10" }, toolContext());
 
-            expect(result).toContain("Queued");
-            expect(result).toContain("drop §1§");
-            expect(result).toContain("deferred drop §9§, §10§");
-            expect(result).not.toContain("Immediate drops will execute at optimal time");
+            expect(result).toBe(
+                "Queued: drop §1§. Held: §9, §10 are inside the protected working set; they apply once newer work displaces them.",
+            );
             expect(getPendingOps(db, "ses-1")).toEqual([
                 expect.objectContaining({ tag_id: 1, operation: "drop" }),
                 expect.objectContaining({ tag_id: 9, operation: "drop" }),
@@ -237,6 +258,36 @@ describe("createCtxReduceTools", () => {
 
             expect(result).toContain("Conflicting");
             expect(result).toContain("from before compaction");
+        });
+
+        it("acknowledges an inert whitespace tag without queueing it", async () => {
+            seedTags(db, [{ id: 7, sessionId: "ses-1" }]);
+            markWhitespaceAssistantTagInert(db, "ses-1", 7, "assistant:p0");
+
+            const result = await tools.ctx_reduce.execute({ drop: "7" }, toolContext());
+
+            expect(result).toContain("§7§ is provider framing, nothing to reclaim");
+            expect(result).not.toContain("Error:");
+            expect(getPendingOps(db, "ses-1")).toEqual([]);
+        });
+
+        it("skips inert whitespace inside a range while queueing every live tag", async () => {
+            seedTags(db, [
+                { id: 6, sessionId: "ses-1" },
+                { id: 7, sessionId: "ses-1" },
+                { id: 8, sessionId: "ses-1" },
+                { id: 10, sessionId: "ses-1" },
+                { id: 11, sessionId: "ses-1" },
+                { id: 12, sessionId: "ses-1" },
+            ]);
+            markWhitespaceAssistantTagInert(db, "ses-1", 7, "assistant:p0");
+
+            const result = await tools.ctx_reduce.execute({ drop: "6-8" }, toolContext());
+
+            expect(result).toContain("drop §6§, §8§");
+            expect(result).toContain("§7§ is provider framing, nothing to reclaim");
+            expect(result).not.toContain("Error:");
+            expect(getPendingOps(db, "ses-1").map((op) => op.tag_id)).toEqual([6, 8]);
         });
 
         it("skips duplicate drop requests", async () => {
@@ -284,7 +335,7 @@ describe("createCtxReduceTools", () => {
             const calls: Array<{ drop: string; commandId: string; projectRoot: string }> = [];
             const rustTools = createCtxReduceTools({
                 db,
-                protectedTags: 0,
+                protectedSet: new Set(),
                 rustToolBackends: {
                     reduce: async (input) => {
                         calls.push(input);
@@ -301,7 +352,7 @@ describe("createCtxReduceTools", () => {
             const rustResult = await rustTools.ctx_reduce.execute({ drop: "3" }, rustContext);
             const tsResult = await createCtxReduceTools({
                 db,
-                protectedTags: 0,
+                protectedSet: new Set(),
             }).ctx_reduce.execute({ drop: "3" }, toolContext());
 
             expect(rustResult).toBe(tsResult);
@@ -321,10 +372,10 @@ describe("createCtxReduceTools", () => {
             expect(calls[2]?.commandId).not.toBe(calls[0]?.commandId);
         });
 
-        it("returns the existing failure wording when the rust module rejects a drop", async () => {
+        it("returns capability copy when the engine rejects a drop", async () => {
             const tools = createCtxReduceTools({
                 db,
-                protectedTags: 0,
+                protectedSet: new Set(),
                 rustToolBackends: {
                     reduce: async () => {
                         throw new Error("module unavailable");
@@ -333,17 +384,17 @@ describe("createCtxReduceTools", () => {
             });
 
             await expect(tools.ctx_reduce.execute({ drop: "3-5" }, toolContext())).resolves.toBe(
-                "Error: Failed to queue ctx_reduce operations. module unavailable",
+                "Context cleanup is paused while the engine syncs. Retry in a moment. (MC-C05)",
             );
         });
 
         it("keeps the TypeScript path when no rust backend is registered", async () => {
             seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
 
-            const result = await createCtxReduceTools({ db, protectedTags: 0 }).ctx_reduce.execute(
-                { drop: "3" },
-                toolContext(),
-            );
+            const result = await createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+            }).ctx_reduce.execute({ drop: "3" }, toolContext());
 
             expect(result).toBe("Queued: drop §3§.");
             expect(getPendingOps(db, "ses-1")).toHaveLength(1);

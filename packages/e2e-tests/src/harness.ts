@@ -18,6 +18,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { assertHistorianMockRouting } from "./mock-routing";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
 
@@ -30,6 +31,8 @@ export interface TestHarnessOptions {
     modelContextLimit?: number;
     /** Set false only when the test intentionally verifies conflict-based self-disable behavior. */
     expectMagicContext?: boolean;
+    /** Debug harnesses may boot the plugin with hooks configured off while retaining diagnostics. */
+    expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
     /**
      * Default response used when the mock queue is empty. Lets tests send extra
      * prompts without worrying about scripting every one.
@@ -66,25 +69,38 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
 
 export class TestHarness {
     readonly mock: MockProvider;
-    readonly opencode: SpawnedOpencode;
-    readonly client: SdkClient;
-    /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
-    readonly rustStack: SpawnedOpencode["rustStack"];
 
+    private opencodeInstance: SpawnedOpencode;
+    private clientInstance: SdkClient;
     private contextDbCached: Database | null = null;
     private readonly expectMagicContext: boolean;
+    private readonly spawnOptions: SpawnOptions;
 
     private constructor(
         mock: MockProvider,
         opencode: SpawnedOpencode,
         client: SdkClient,
         expectMagicContext: boolean,
+        spawnOptions: SpawnOptions,
     ) {
         this.mock = mock;
-        this.opencode = opencode;
-        this.client = client;
-        this.rustStack = opencode.rustStack;
+        this.opencodeInstance = opencode;
+        this.clientInstance = client;
         this.expectMagicContext = expectMagicContext;
+        this.spawnOptions = spawnOptions;
+    }
+
+    get opencode(): SpawnedOpencode {
+        return this.opencodeInstance;
+    }
+
+    get client(): SdkClient {
+        return this.clientInstance;
+    }
+
+    /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
+    get rustStack(): SpawnedOpencode["rustStack"] {
+        return this.opencodeInstance.rustStack;
     }
 
     static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {
@@ -94,25 +110,50 @@ export class TestHarness {
         // Always install a default so unexpected extra requests don't 500.
         mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
 
-        const expectMagicContext = options.expectMagicContext !== false;
+        const expectedMagicContextState =
+            options.expectedMagicContextState ??
+            (options.expectMagicContext === false ? "conflict-disabled" : "enabled");
+        const expectMagicContext = expectedMagicContextState === "enabled";
         const spawnOpts: SpawnOptions = {
             mockProviderURL: baseURL,
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
             prepareContextDatabase: expectMagicContext,
-            expectedMagicContextState: expectMagicContext ? "enabled" : "conflict-disabled",
+            expectedMagicContextState,
         };
         let opencode: SpawnedOpencode | undefined;
         try {
             opencode = await spawnOpencode(spawnOpts);
             const sdk = await import("@opencode-ai/sdk");
             const client = sdk.createOpencodeClient({ baseUrl: opencode.url }) as unknown as SdkClient;
-            return new TestHarness(mock, opencode, client, expectMagicContext);
+            return new TestHarness(mock, opencode, client, expectMagicContext, spawnOpts);
         } catch (error) {
             await Promise.allSettled([opencode?.kill() ?? Promise.resolve(), mock.stop()]);
             throw error;
         }
+    }
+
+    /** Restart OpenCode with the same isolated files and user config. */
+    async restart(): Promise<void> {
+        if (this.contextDbCached) {
+            try {
+                this.contextDbCached.close();
+            } catch {
+                // ignore close errors in test helpers
+            }
+            this.contextDbCached = null;
+        }
+        const env = this.opencodeInstance.env;
+        await this.opencodeInstance.kill();
+        this.opencodeInstance = await spawnOpencode({
+            ...this.spawnOptions,
+            existingEnv: env,
+        });
+        const sdk = await import("@opencode-ai/sdk");
+        this.clientInstance = sdk.createOpencodeClient({
+            baseUrl: this.opencodeInstance.url,
+        }) as unknown as SdkClient;
     }
 
     /** Create a session bound to the isolated workdir. Throws on failure. */
@@ -275,8 +316,11 @@ export class TestHarness {
                 ...(options.agent ? { agent: options.agent } : {}),
             },
         });
-        const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
-        const result = await Promise.race([promptPromise, timeout]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), timeoutMs);
+        });
+        const result = await Promise.race([promptPromise, timeout]).finally(() => clearTimeout(timer));
         if (result === null) {
             throw new Error(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencode.stderr().slice(-2000)}`,
@@ -288,6 +332,12 @@ export class TestHarness {
                     `stdout:\n${this.opencode.stdout().slice(-2000)}\n` +
                     `stderr:\n${this.opencode.stderr().slice(-2000)}`,
             );
+        }
+        // OpenCode returns provider failures inside a successful HTTP/SDK envelope.
+        // Presence of session data does not prove that the assistant answered.
+        const assistant = result.data as { info?: { error?: unknown } } | null;
+        if (assistant?.info?.error) {
+            throw new Error(`sendPrompt assistant error: ${JSON.stringify(assistant.info.error)}`);
         }
         this.assertMagicContextProcessed(sessionId);
         return result;
@@ -429,16 +479,26 @@ export class TestHarness {
         return this.mock.requests();
     }
 
-    async dispose(): Promise<void> {
-        if (this.contextDbCached) {
-            try {
-                this.contextDbCached.close();
-            } catch {
-                // ignore close errors
-            }
-            this.contextDbCached = null;
+    assertHistorianRequestsUseMock(): void {
+        if (this.expectMagicContext && this.hasContextDb()) {
+            assertHistorianMockRouting(this.contextDb(), "opencode", "mock-anthropic/mock-sonnet");
         }
-        await this.opencode.kill();
-        await this.mock.stop();
+    }
+
+    async dispose(): Promise<void> {
+        try {
+            this.assertHistorianRequestsUseMock();
+        } finally {
+            if (this.contextDbCached) {
+                try {
+                    this.contextDbCached.close();
+                } catch {
+                    // The child still needs cleanup if a cached reader was already closed.
+                }
+                this.contextDbCached = null;
+            }
+            await this.opencode.kill();
+            await this.mock.stop();
+        }
     }
 }

@@ -39,10 +39,12 @@ pub mod memory_render;
 pub mod memory_tool;
 pub mod project_docs;
 pub mod prompt_surface;
+pub mod protection_window;
 mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+mod state_sync_timing;
 mod tail_hygiene;
 pub mod transform;
 
@@ -66,11 +68,12 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use mc_store::TagNumberRow;
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
-    FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
-    ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
+    FacadeMutationOutcome, HistorianChunkRange, HistorianDecision, HistorianPhase,
+    HistorianRecentDecision, InsertMemoryInput, LoadedState, MappingUpdate, McStore, McStoreError,
+    McTagRow, ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
     ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
-    PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
+    NoteCasOutcome, NoteDismissOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed,
+    NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
     RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
     StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
     TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
@@ -92,7 +95,10 @@ use classify::{
 };
 use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
-use historian::{reattach_historian_producer, run_historian_firing, HistorianProducerDriver};
+use historian::{
+    reattach_historian_producer, run_historian_firing_with_model_cache,
+    HistorianModelUnresolvableCache, HistorianNoFireCause, HistorianProducerDriver,
+};
 use historian_chunk::{
     assemble_historian_firing, AssembleHistorianFiringOutcome, AssembledHistorianFiring,
     HistorianAssemblerConfig,
@@ -109,10 +115,7 @@ use session_resolver::{
 #[cfg(test)]
 use subc_protocol::manifest::ExecutionMode;
 use subc_protocol::{
-    manifest::{
-        Bindings, Concurrency, ConsumerRole, IdentityBinding, IdentityScope, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
-    },
+    manifest::{Concurrency, ConsumerRole, IdentityScope, ModuleManifest, ProviderRole, TrustTier},
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
 #[cfg(test)]
@@ -225,7 +228,11 @@ pub enum BindingError {
 pub const DEFAULT_MODULE_ID: &str = "magic-context";
 
 const TRANSFORM_HEALTH_LANE: &str = "transform";
-const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 120_000;
+// Emergency historian work continues in its spawned task, but a transform may wait only long
+// enough to finish before the caller's transport deadline. Sharing one budget across the busy
+// join and inline-refire arms prevents their individual deadlines from stacking.
+const TRANSFORM_HISTORIAN_FOLLOWUP_BUDGET: Duration = Duration::from_secs(20);
+const TRANSFORM_WEDGE_THRESHOLD_MS: u64 = 30_000;
 const STORE_OPEN_IDLE: u8 = 0;
 const STORE_OPENING: u8 = 1;
 const STORE_OPEN_WAITING: u8 = 2;
@@ -333,15 +340,25 @@ fn store_open_error_is_live_lease(error: &McStoreError) -> bool {
     )
 }
 
-/// The transform heartbeat is deliberately process-wide: the SDK health callback runs on
-/// the channel-0 control path and must be able to observe the data-plane lane without
-/// borrowing a handler lock or touching the store.
+/// The process-wide transform heartbeat observes the data-plane lane from the SDK's channel-0
+/// control path without touching the store. Route lifecycle and the last historian outcome use
+/// short in-memory locks so health reporting never waits on SQLite.
+#[derive(Default)]
+struct DispatchRegistry {
+    next_id: u64,
+    active: HashMap<u64, u16>,
+    closed_channels: HashSet<u16>,
+}
+
 struct DispatchHealth {
     last_dispatch_started_at_ms: AtomicU64,
     last_dispatch_completed_at_ms: AtomicU64,
     in_flight_count: AtomicU64,
     oldest_queued_at_ms: AtomicU64,
     consecutive_error_count: AtomicU64,
+    registry: OnceLock<Mutex<DispatchRegistry>>,
+    last_historian_outcome: OnceLock<Mutex<Option<String>>>,
+    historian_recent_decisions_count: AtomicU64,
 }
 
 impl DispatchHealth {
@@ -352,7 +369,91 @@ impl DispatchHealth {
             in_flight_count: AtomicU64::new(0),
             oldest_queued_at_ms: AtomicU64::new(0),
             consecutive_error_count: AtomicU64::new(0),
+            registry: OnceLock::new(),
+            last_historian_outcome: OnceLock::new(),
+            historian_recent_decisions_count: AtomicU64::new(0),
         }
+    }
+
+    fn registry(&self) -> &Mutex<DispatchRegistry> {
+        self.registry
+            .get_or_init(|| Mutex::new(DispatchRegistry::default()))
+    }
+
+    fn record_historian_outcome(&self, outcome: String, recent_decisions_count: usize) {
+        *self
+            .last_historian_outcome
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+        self.historian_recent_decisions_count
+            .store(recent_decisions_count as u64, Ordering::Relaxed);
+    }
+
+    fn route_open(&self, channel: u16) {
+        self.registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed_channels
+            .remove(&channel);
+    }
+
+    fn route_gone(&self, channel: u16) {
+        let released = {
+            let mut registry = self
+                .registry()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.closed_channels.insert(channel);
+            let before = registry.active.len();
+            registry
+                .active
+                .retain(|_, active_channel| *active_channel != channel);
+            before.saturating_sub(registry.active.len()) as u64
+        };
+        if released > 0 {
+            let _ =
+                self.in_flight_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        Some(count.saturating_sub(released))
+                    });
+        }
+    }
+
+    fn accept(&self, channel: u16) -> Option<u64> {
+        let mut registry = self
+            .registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.closed_channels.contains(&channel) {
+            return None;
+        }
+        registry.next_id = registry.next_id.wrapping_add(1).max(1);
+        let id = registry.next_id;
+        registry.active.insert(id, channel);
+        self.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        Some(id)
+    }
+
+    fn release(&self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        let removed = self
+            .registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .remove(&id)
+            .is_some();
+        if removed {
+            let _ =
+                self.in_flight_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        Some(count.saturating_sub(1))
+                    });
+        }
+        removed
     }
 
     fn report(&self, now_ms: u64) -> HealthReport {
@@ -361,6 +462,15 @@ impl DispatchHealth {
         let in_flight = self.in_flight_count.load(Ordering::Relaxed);
         let oldest_queued = self.oldest_queued_at_ms.load(Ordering::Relaxed);
         let consecutive_errors = self.consecutive_error_count.load(Ordering::Relaxed);
+        let historian_recent_decisions_count = self
+            .historian_recent_decisions_count
+            .load(Ordering::Relaxed);
+        let last_historian_outcome = self
+            .last_historian_outcome
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let completion_lag_ms = started.saturating_sub(completed);
         let heartbeat_age_ms = if started == 0 {
             0
@@ -391,14 +501,15 @@ impl DispatchHealth {
         } else {
             HealthStatus::Ok
         };
-        let detail = if stale {
+        let state = if stale { "stuck" } else { "advancing" };
+        let mut detail = if stale {
             if queue_stale && !heartbeat_stale {
                 format!(
-                    "{TRANSFORM_HEALTH_LANE} lane queue stale; oldest queued item is {stale_age_ms}ms old; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+                    "{TRANSFORM_HEALTH_LANE} lane stuck: queue stale; oldest queued item is {stale_age_ms}ms old; in-flight={in_flight}; consecutive errors={consecutive_errors}"
                 )
             } else {
                 format!(
-                    "{TRANSFORM_HEALTH_LANE} lane heartbeat stale by {stale_age_ms}ms; in-flight={in_flight}; consecutive errors={consecutive_errors}"
+                    "{TRANSFORM_HEALTH_LANE} lane stuck: heartbeat stale by {stale_age_ms}ms; in-flight={in_flight}; consecutive errors={consecutive_errors}"
                 )
             }
         } else if consecutive_errors > 0 {
@@ -410,11 +521,17 @@ impl DispatchHealth {
         } else {
             format!("{TRANSFORM_HEALTH_LANE} lane advancing; in-flight={in_flight}")
         };
+        if let Some(historian) = last_historian_outcome.as_deref() {
+            detail.push_str("; last historian: ");
+            detail.push_str(historian);
+        }
         HealthReport {
             status,
             detail: Some(detail),
             metrics: Some(json!({
                 "lane": TRANSFORM_HEALTH_LANE,
+                "state": state,
+                "stuck": stale,
                 "last_dispatch_started_at_ms": started,
                 "last_dispatch_completed_at_ms": completed,
                 "in_flight_count": in_flight,
@@ -426,6 +543,8 @@ impl DispatchHealth {
                 "queue_stale": queue_stale,
                 "stale": stale,
                 "stale_age_ms": stale_age_ms,
+                "last_historian_outcome": last_historian_outcome,
+                "historian_recent_decisions_count": historian_recent_decisions_count,
             })),
         }
     }
@@ -435,14 +554,18 @@ static DISPATCH_HEALTH: DispatchHealth = DispatchHealth::new();
 
 struct TransformDispatchTicket<'a> {
     health: &'a DispatchHealth,
+    channel: u16,
+    dispatch_id: AtomicU64,
     accepted: AtomicBool,
     finished: AtomicBool,
 }
 
 impl<'a> TransformDispatchTicket<'a> {
-    fn new(health: &'a DispatchHealth) -> Self {
+    fn new(health: &'a DispatchHealth, channel: u16) -> Self {
         Self {
             health,
+            channel,
+            dispatch_id: AtomicU64::new(0),
             accepted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         }
@@ -452,7 +575,10 @@ impl<'a> TransformDispatchTicket<'a> {
         if self.accepted.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.health.in_flight_count.fetch_add(1, Ordering::Relaxed);
+        let Some(id) = self.health.accept(self.channel) else {
+            return;
+        };
+        self.dispatch_id.store(id, Ordering::Release);
         self.health
             .last_dispatch_started_at_ms
             .store(now_ms().max(0) as u64, Ordering::Relaxed);
@@ -460,6 +586,10 @@ impl<'a> TransformDispatchTicket<'a> {
 
     fn finish(&self, errored: bool) {
         if !self.accepted.load(Ordering::Acquire) || self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let id = self.dispatch_id.load(Ordering::Acquire);
+        if !self.health.release(id) {
             return;
         }
         // This is the completion point, after the handler has produced its outcome. A panic
@@ -476,7 +606,6 @@ impl<'a> TransformDispatchTicket<'a> {
                 .consecutive_error_count
                 .store(0, Ordering::Relaxed);
         }
-        self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -486,9 +615,10 @@ impl Drop for TransformDispatchTicket<'_> {
             && !self.finished.load(Ordering::Acquire)
             && self.accepted.swap(false, Ordering::AcqRel)
         {
-            // A panic unwinds through this guard. Decrement the count, but do not stamp a
-            // completion: a panicking dispatch did not prove that the lane advanced.
-            self.health.in_flight_count.fetch_sub(1, Ordering::Relaxed);
+            // A panic unwinds through this guard. Release the accepted ticket, but do not stamp
+            // a completion: a panicking dispatch did not prove that the lane advanced.
+            self.health
+                .release(self.dispatch_id.load(Ordering::Acquire));
         }
     }
 }
@@ -509,30 +639,40 @@ pub const MEMORY_RENDER_FORMAT_EPOCH: u32 = 2;
 /// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
 /// historian-authored titles before placing them inside the session-history wrapper.
 pub const COMPARTMENT_RENDER_FORMAT_EPOCH: u32 = 2;
-/// Bumps when the rendered m0 prefix format changes for the claude-code-anthropic
-/// profile; epoch 1 includes covered system messages in m0 instead of sending them as
+/// Bumps for provider-visible byte changes local to the claude-code-anthropic profile,
+/// without invalidating other profiles. Epoch 1 includes covered system messages in m0 instead of sending them as
 /// separate system-role messages. Epoch 2 flips the profile to full-array tail reclaim
 /// (the Thalamus peer retired the byte-splice at U0), so tool-absent sessions gain the
 /// age/pressure tail reclaim they never had; the bump forces one self-coordinated HARD
-/// fold on the first pass under the new binary, per the epoch contract above.
-pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 2;
-/// Bumps when any active tag overlay changes provider-visible bytes. Epoch 3 freezes
-/// temporal-marker decisions in durable rows instead of deriving them from each request array.
-/// Every change requires one cache-breaking fold before the new overlay can render. Inactive
-/// requests omit the component and retain their identity.
-pub const TAGGER_FEATURE_EPOCH: u32 = 3;
+/// fold on the first pass under the new binary, per the epoch contract above. Epoch 3 tags
+/// completed assistant text on first sight even when protected from other mutations.
+pub const PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC: u32 = 3;
+/// Bumps for provider-visible byte changes local to OpenCode's AI SDK codec. Epoch 1
+/// promotes valid text attachments from opaque to text and demotes malformed media-shaped
+/// attachments to opaque so their retained ingress representation is replayed verbatim.
+pub const PROFILE_EPOCH_OPENCODE_AI_SDK: u32 = 1;
+/// Bumps for provider-visible byte changes local to Pi's codec. Epoch 1 demotes malformed
+/// text, image, and file result children to opaque so their retained ingress representation
+/// is replayed verbatim.
+pub const PROFILE_EPOCH_PI: u32 = 1;
+/// Bumps for tagger-wide provider-visible byte changes across active tagging surfaces.
+/// Profile-local changes belong in that profile's render epoch instead, so unchanged
+/// profiles do not pay a collateral HARD. Epoch 3 freezes temporal-marker decisions in
+/// durable rows. Epoch 4 is global on purpose: every profile's skeleton input bytes change
+/// from clamped real arguments to the inert dropped marker. Every bump requires a
+/// cache-breaking fold; inactive requests omit this component and retain their identity.
+pub const TAGGER_FEATURE_EPOCH: u32 = 4;
 
 /// The module-owned rendered-prefix format epoch for a serializer profile.
 ///
-/// Future profile-specific m0 format epochs slot in here so the module folds them into
+/// Profile-local rendered-byte epochs slot in here so the module folds them into
 /// its effective render_config even when a consumer sends a static base render_config.
 pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
     match profile {
         SerializerProfile::ClaudeCodeAnthropic => PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
-        SerializerProfile::OwnedLlmRunner
-        | SerializerProfile::OwnedBroca
-        | SerializerProfile::OpencodeAiSdk
-        | SerializerProfile::Pi => 0,
+        SerializerProfile::OpencodeAiSdk => PROFILE_EPOCH_OPENCODE_AI_SDK,
+        SerializerProfile::Pi => PROFILE_EPOCH_PI,
+        SerializerProfile::OwnedLlmRunner | SerializerProfile::OwnedBroca => 0,
     }
 }
 
@@ -571,7 +711,6 @@ const GUIDANCE_TEXT: &str = prompt_surface::GUIDANCE_FULL_PRIMARY;
 /// Matches the default OpenCode protected tag window. The Claude Code facade has no
 /// request-local transform config, so acknowledgement validation uses the durable tag
 /// ordering with the same default recency window as an omitted transform field.
-const DEFAULT_PROTECTED_TAGS: usize = 20;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.enabled default.
 const DEFAULT_COMMIT_CLUSTER_TRIGGER_ENABLED: bool = true;
 /// Mirrors packages/plugin/src/config/schema/magic-context.ts commit_cluster_trigger.min_clusters default.
@@ -598,8 +737,10 @@ const STATE_SYNC_SEED_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_SYNC_SEED_COLLECTOR_TTL: Duration = Duration::from_secs(10 * 60);
 // These bounds apply to every live transform page so no session can bypass the
 // handler-wide staging budget.
-const TRANSFORM_PAGE_MAX_BYTES: usize = 512 * 1024;
-const TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 128 * 1024 * 1024;
+const SUBC_FRAME_BODY_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
+const TRANSFORM_PAGE_MAX_BYTES: usize =
+    subc_protocol::MAX_FRAME_BODY_LEN as usize - SUBC_FRAME_BODY_HEADROOM_BYTES;
+const TRANSFORM_PAGE_MAX_STAGED_BYTES: usize = 256 * 1024 * 1024;
 const TRANSFORM_PAGE_MAX_PENDING: usize = 64;
 const TRANSFORM_PAGE_MAX_ID_BYTES: usize = 128;
 const ITEM_CONTINUATION_KEY: &str = "__shadow_item_continuation";
@@ -619,6 +760,7 @@ const TRANSFORM_PAGE_ARRAY_FIELDS: [&str; 6] = [
     "ts_ck_messages",
     "normalizations",
 ];
+const TRANSFORM_PAGE_MAP_FIELDS: [&str; 1] = ["tool_input_key_orders"];
 const STATE_IMPORT_MAX_ID_BYTES: usize = 128;
 const STATE_IMPORT_MAX_STAGED_BYTES: usize = 32 * 1024 * 1024;
 const STATE_IMPORT_MAX_PENDING: usize = 64;
@@ -2354,6 +2496,49 @@ impl BoundaryTokenCache {
         }
     }
 
+    fn prime_from_persisted_tags(&mut self, session_id: &str, tags: &[mc_store::McTagRow]) {
+        if self.sessions.contains_key(session_id) || tags.is_empty() {
+            return;
+        }
+        let entries = tags
+            .iter()
+            .filter_map(|tag| {
+                usize::try_from(tag.token_count).ok().map(|token_count| {
+                    (
+                        tag.block_id.clone(),
+                        BoundaryTokenCacheEntry {
+                            byte_size: tag.source_bytes.len(),
+                            content_hash: Sha256::digest(&tag.source_bytes).into(),
+                            token_count,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let retained_bytes = boundary_token_maps_retained_bytes(entries.iter(), 0);
+        if entries.is_empty() || retained_bytes > self.max_retained_bytes {
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.sessions.insert(
+            session_id.to_string(),
+            BoundaryTokenCacheSession {
+                retained_bytes,
+                entries: Arc::new(entries),
+                formatted_tokens: Arc::default(),
+            },
+        );
+        self.lru.push_back(session_id.to_string());
+        while self.retained_bytes > self.max_retained_bytes {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(session) = self.sessions.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+            }
+        }
+    }
+
     fn remove(&mut self, session_id: &str) {
         if let Some(session) = self.sessions.remove(session_id) {
             self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
@@ -2989,6 +3174,13 @@ impl ProjectionCache {
     }
 }
 
+#[derive(Clone)]
+struct RuntimeStoreError {
+    code: String,
+    message: String,
+    at_ms: i64,
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -2997,6 +3189,7 @@ pub struct McHandler {
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
     config: Mutex<ConfigCache>,
+    historian_model_unresolvable: Arc<HistorianModelUnresolvableCache>,
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
@@ -3021,6 +3214,8 @@ pub struct McHandler {
     #[cfg(test)]
     between_transform_and_prepare: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    transform_historian_followup_budget: Mutex<Option<Duration>>,
+    #[cfg(test)]
     wrapup_operation_budget: Mutex<Option<Duration>>,
     #[cfg(test)]
     unknown_module_retry_delay: Mutex<Option<Duration>>,
@@ -3043,6 +3238,7 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
+    threshold_logged_routes: Mutex<HashSet<u16>>,
     /// Per-project evaluator capability asserted by the host's state-sync payload. Absence is
     /// fail-closed so a Rust-authority smart note cannot become permanently pending.
     note_evaluation_capabilities: Mutex<HashMap<String, bool>>,
@@ -3056,6 +3252,8 @@ pub struct McHandler {
     transform_pages: Mutex<TransformPageCoordinator>,
     #[cfg(test)]
     transform_page_discard_logs: Mutex<Vec<String>>,
+    #[cfg(test)]
+    todo_verdict_diagnostic_logs: Mutex<Vec<String>>,
     state_imports: Mutex<StateImportCoordinator>,
     /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
     /// only registered ids may bypass transform after route validation.
@@ -3063,6 +3261,7 @@ pub struct McHandler {
     /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
+    runtime_store_errors: Mutex<HashMap<String, RuntimeStoreError>>,
 }
 
 #[async_trait]
@@ -3165,6 +3364,56 @@ struct PreparedHistorianFiring {
     task: HistorianFiringTask,
 }
 
+fn historian_no_fire_detail(
+    kind: &str,
+    cause: HistorianNoFireCause,
+    extra: Option<&str>,
+) -> String {
+    let suffix = extra
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(",{value}"))
+        .unwrap_or_default();
+    format!(
+        "{kind}{{raw_cause={},canonical_cause={}{suffix}}}",
+        cause.raw_cause(),
+        cause.canonical_cause(),
+    )
+}
+
+struct NoFireDiagnosticsInput<'a> {
+    no_fire: String,
+    detail_kind: &'a str,
+    cause: HistorianNoFireCause,
+    extra: Option<&'a str>,
+    reason: Option<String>,
+    state: String,
+    progress: Option<transform::HistorianTriggerProgress>,
+    last_failure: Option<String>,
+}
+
+fn historian_no_fire_diagnostics(input: NoFireDiagnosticsInput<'_>) -> HistorianDiagnostics {
+    let NoFireDiagnosticsInput {
+        no_fire,
+        detail_kind,
+        cause,
+        extra,
+        reason,
+        state,
+        progress,
+        last_failure,
+    } = input;
+    HistorianDiagnostics {
+        fired: false,
+        reason,
+        no_fire: Some(no_fire),
+        no_fire_detail: Some(historian_no_fire_detail(detail_kind, cause, extra)),
+        canonical_cause: Some(cause.canonical_cause().to_string()),
+        state,
+        progress,
+        last_failure,
+    }
+}
+
 enum PreparedHistorianAction {
     Complete(HistorianDiagnostics),
     Busy {
@@ -3174,9 +3423,98 @@ enum PreparedHistorianAction {
     FireReady(Box<PreparedHistorianFiring>),
 }
 
+#[derive(Clone)]
+struct HistorianDecisionContext {
+    at_ms: i64,
+    request_observed_at_ms: i64,
+    pressure_pct: u16,
+    drain_latch: bool,
+    chunk_range: Option<HistorianChunkRange>,
+    eligible_tokens: Option<u64>,
+    bar_tokens: Option<u64>,
+}
+
+impl HistorianDecisionContext {
+    fn from_request(
+        parsed: &TransformRequest,
+        loaded: &LoadedState,
+        now: i64,
+        pressure: f64,
+    ) -> Self {
+        Self {
+            at_ms: now,
+            request_observed_at_ms: parsed
+                .request_observed_at_ms
+                .and_then(|observed| i64::try_from(observed).ok())
+                .unwrap_or(now),
+            pressure_pct: quantize_pressure_pct(pressure),
+            drain_latch: loaded.meta.emergency_drain_active,
+            chunk_range: None,
+            eligible_tokens: None,
+            bar_tokens: None,
+        }
+    }
+
+    fn recent_decision(
+        &self,
+        decision: HistorianDecision,
+        cause: String,
+        progress: Option<&transform::HistorianTriggerProgress>,
+    ) -> HistorianRecentDecision {
+        HistorianRecentDecision {
+            at_ms: self.at_ms,
+            request_observed_at_ms: self.request_observed_at_ms,
+            decision,
+            cause,
+            eligible_tokens: self.eligible_tokens.unwrap_or_else(|| {
+                progress.map_or(0, |progress| {
+                    quantize_tokens(progress.eligible_chunk_tokens)
+                })
+            }),
+            bar_tokens: self.bar_tokens.unwrap_or_else(|| {
+                progress.map_or(0, |progress| quantize_tokens(progress.tail_size_bar))
+            }),
+            pressure_pct: self.pressure_pct,
+            drain_latch: self.drain_latch,
+            chunk_range: self.chunk_range.clone(),
+            producer_model: None,
+            completed_at_ms: None,
+            apply_row_version: None,
+        }
+    }
+}
+
+fn quantize_tokens(tokens: f64) -> u64 {
+    if tokens.is_finite() && tokens > 0.0 {
+        tokens.round().min(u64::MAX as f64) as u64
+    } else {
+        0
+    }
+}
+
+fn quantize_pressure_pct(pressure: f64) -> u16 {
+    if pressure.is_finite() && pressure > 0.0 {
+        pressure.round().min(u16::MAX as f64) as u16
+    } else {
+        0
+    }
+}
+
+fn historian_trigger_rule(reason: boundary::TriggerReason) -> &'static str {
+    match reason {
+        boundary::TriggerReason::TailSize => "tail_size",
+        boundary::TriggerReason::ProjectedHeadroom => "pressure",
+        boundary::TriggerReason::CommitClusters => "commit_cluster",
+        boundary::TriggerReason::ForceBand => "emergency",
+    }
+}
+
 struct HistorianPrepareContext<'a> {
     now: i64,
     snapshot_generation: u64,
+    /// Final immutable tag rows validated by the transform's generation/count/max identity.
+    /// Early pass-through paths leave this absent and retain the legacy store fallback.
+    tag_snapshot: Option<Arc<Vec<McTagRow>>>,
     timings: &'a mut HistorianTriggerTimings,
 }
 
@@ -3244,6 +3582,7 @@ impl Drop for WrapupSessionGuard {
 }
 
 enum PreparedWrapupAction {
+    FilteredNoiseSkipped,
     Busy(LiveHistorianCompletionWait),
     Nothing(String),
     FireReady(Box<HistorianFiringTask>),
@@ -3386,10 +3725,13 @@ struct HistorianFiringTask {
     store: Arc<McStore>,
     session_id: String,
     language: Option<String>,
+    historian_temperature: Option<f64>,
     project_path: String,
     project_root: PathBuf,
     project_slug: String,
     firing: AssembledHistorianFiring,
+    model_chain_generation: u64,
+    model_unresolvable_cache: Arc<HistorianModelUnresolvableCache>,
     live_guard: SessionSetGuard,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
@@ -3435,6 +3777,7 @@ impl McHandler {
             producer_factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
+            historian_model_unresolvable: Arc::new(HistorianModelUnresolvableCache::default()),
             #[cfg(test)]
             fixed_config: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -3458,6 +3801,8 @@ impl McHandler {
             #[cfg(test)]
             between_transform_and_prepare: Mutex::new(None),
             #[cfg(test)]
+            transform_historian_followup_budget: Mutex::new(None),
+            #[cfg(test)]
             wrapup_operation_budget: Mutex::new(None),
             #[cfg(test)]
             unknown_module_retry_delay: Mutex::new(None),
@@ -3473,6 +3818,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            threshold_logged_routes: Mutex::new(HashSet::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
             transform_session_roots: Mutex::new(HashMap::new()),
@@ -3480,9 +3826,12 @@ impl McHandler {
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             #[cfg(test)]
             transform_page_discard_logs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            todo_verdict_diagnostic_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
+            runtime_store_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3656,8 +4005,14 @@ impl McHandler {
             McModuleConfig {
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 model_chain: vec!["test/model".to_string()],
+                historian_temperature: None,
                 language: None,
                 execute_threshold_percentage: 65.0,
+                execute_threshold_user_config: None,
+                execute_threshold_user_configured: false,
+                execute_threshold_project_config: None,
+                protected_tokens_user: None,
+                protected_tokens_project: None,
                 compaction_enabled: true,
                 memory_enabled: true,
                 auto_search: crate::config::AutoSearchConfig::default(),
@@ -3665,6 +4020,7 @@ impl McHandler {
                 auto_promote: true,
                 user_memory_collection_enabled: false,
                 historian_context_limit_tokens: 128_000,
+                historian_context_limit_known: false,
                 memory_budget_tokens: 4_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
@@ -3700,6 +4056,7 @@ impl McHandler {
             producer_factory: factory,
             session_resolver,
             config: Mutex::new(ConfigCache::default()),
+            historian_model_unresolvable: Arc::new(HistorianModelUnresolvableCache::default()),
             fixed_config: Some(config),
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -3718,6 +4075,7 @@ impl McHandler {
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
+            transform_historian_followup_budget: Mutex::new(None),
             wrapup_operation_budget: Mutex::new(None),
             unknown_module_retry_delay: Mutex::new(None),
             status_snapshot_hook: Mutex::new(None),
@@ -3728,6 +4086,7 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
+            threshold_logged_routes: Mutex::new(HashSet::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
             transform_session_roots: Mutex::new(HashMap::new()),
@@ -3735,9 +4094,12 @@ impl McHandler {
             transform_pages: Mutex::new(TransformPageCoordinator::default()),
             #[cfg(test)]
             transform_page_discard_logs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            todo_verdict_diagnostic_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
+            runtime_store_errors: Mutex::new(HashMap::new()),
         }
     }
 
@@ -3745,6 +4107,11 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
+        DISPATCH_HEALTH.route_open(channel);
+        self.threshold_logged_routes
+            .lock()
+            .expect("threshold log mutex")
+            .remove(&channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -3863,6 +4230,25 @@ impl McHandler {
         self.transform_page_discard_logs
             .lock()
             .expect("transform page discard logs mutex")
+            .push(line);
+    }
+
+    fn log_unprobed_todo_bust(
+        &self,
+        session_id: &str,
+        possible_stale_mint: bool,
+        decision: &str,
+        reason: &str,
+    ) {
+        let line = format!(
+            "mc-todo-verdict session={session_id} unprobed_bust=1 possible_stale_mint={} decision={decision} reason={reason}",
+            u8::from(possible_stale_mint)
+        );
+        eprintln!("{line}");
+        #[cfg(test)]
+        self.todo_verdict_diagnostic_logs
+            .lock()
+            .expect("todo verdict diagnostic logs mutex")
             .push(line);
     }
 
@@ -4093,6 +4479,11 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        self.threshold_logged_routes
+            .lock()
+            .expect("threshold log mutex")
+            .remove(&channel);
+        DISPATCH_HEALTH.route_gone(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -4121,6 +4512,10 @@ impl McHandler {
             self.scheduler_observations
                 .lock()
                 .expect("scheduler observations mutex")
+                .remove(&session);
+            self.runtime_store_errors
+                .lock()
+                .expect("runtime store errors mutex")
                 .remove(&session);
             self.state_sync_seeds
                 .lock()
@@ -4297,7 +4692,22 @@ impl McHandler {
             .effective_for_project(project_root)
     }
 
-    fn historian_active(&self, store: &McStore, session_id: &str) -> bool {
+    fn handler_entry_state<'a>(
+        store: &McStore,
+        session_id: &str,
+        snapshot: &'a OnceLock<Option<LoadedState>>,
+    ) -> Option<&'a LoadedState> {
+        snapshot
+            .get_or_init(|| store.load(session_id).ok())
+            .as_ref()
+    }
+
+    fn historian_active(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        entry_snapshot: &OnceLock<Option<LoadedState>>,
+    ) -> bool {
         if self
             .live_historian_sessions
             .lock()
@@ -4306,10 +4716,8 @@ impl McHandler {
         {
             return true;
         }
-        store
-            .load(session_id)
-            .map(|state| state.meta.historian.state != HistorianPhase::Idle)
-            .unwrap_or(false)
+        Self::handler_entry_state(store, session_id, entry_snapshot)
+            .is_some_and(|state| state.meta.historian.state != HistorianPhase::Idle)
     }
 
     fn wrapup_active(&self, session_id: &str) -> bool {
@@ -4319,7 +4727,12 @@ impl McHandler {
             .contains_key(session_id)
     }
 
-    fn observed_last_response_at_ms(&self, store: &McStore, session_id: &str) -> Option<i64> {
+    fn observed_last_response_at_ms(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        entry_snapshot: &OnceLock<Option<LoadedState>>,
+    ) -> Option<i64> {
         let mut observations = self
             .scheduler_observations
             .lock()
@@ -4329,9 +4742,7 @@ impl McHandler {
                 .observed_in_process
                 .then_some(observation.last_response_at_ms);
         }
-        let anchor = store
-            .load(session_id)
-            .ok()
+        let anchor = Self::handler_entry_state(store, session_id, entry_snapshot)
             .map(|state| state.meta.last_committed_pass_at_ms)
             .unwrap_or(0);
         observations.insert(
@@ -4657,6 +5068,7 @@ impl McHandler {
         let HistorianPrepareContext {
             now,
             snapshot_generation,
+            tag_snapshot,
             timings,
         } = prepare;
         let trigger_timer = HistorianTriggerTimer {
@@ -4666,38 +5078,66 @@ impl McHandler {
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
             Err(e) => {
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some(format!("state_load_failed:{e}")),
-                    state: "unknown".to_string(),
-                    progress: None,
-                    last_failure: None,
-                });
+                return PreparedHistorianAction::Complete(historian_no_fire_diagnostics(
+                    NoFireDiagnosticsInput {
+                        no_fire: format!("state_load_failed:{e}"),
+                        detail_kind: "state_load_failed",
+                        cause: HistorianNoFireCause::StateLoadFailed,
+                        extra: None,
+                        reason: None,
+                        state: "unknown".to_string(),
+                        progress: None,
+                        last_failure: None,
+                    },
+                ));
             }
         };
         let state = loaded.meta.historian.state.as_str().to_string();
         let last_failure = loaded.meta.historian.last_failure.clone();
+        let (context_limit, input_tokens, usage_percentage) =
+            usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
+        let mut decision_context =
+            HistorianDecisionContext::from_request(parsed, &loaded, now, usage_percentage);
         if loaded.meta.pending_rewrite.is_some() {
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "pending_rewrite".into(),
+                detail_kind: "pending_rewrite",
+                cause: HistorianNoFireCause::PendingRewrite,
+                extra: None,
                 reason: None,
-                no_fire: Some("pending_rewrite".to_string()),
                 state,
                 progress: None,
                 last_failure,
             });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         if let Some(completion) = self.live_historian_completion_wait(&parsed.session_id) {
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "busy".into(),
+                detail_kind: "busy",
+                cause: HistorianNoFireCause::LiveHistorianClaimBusy,
+                extra: None,
+                reason: None,
+                state,
+                progress: None,
+                last_failure,
+            });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
             return PreparedHistorianAction::Busy {
-                diagnostics: HistorianDiagnostics {
-                    fired: false,
-                    reason: None,
-                    no_fire: Some("busy".to_string()),
-                    state,
-                    progress: None,
-                    last_failure,
-                },
+                diagnostics,
                 completion,
             };
         }
@@ -4713,16 +5153,39 @@ impl McHandler {
                     now,
                 )
                 .unwrap_or("busy");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: no_fire.to_string(),
+                detail_kind: "restart_recovery",
+                cause: HistorianNoFireCause::RestartRecoveryInProgress,
+                extra: None,
                 reason: None,
-                no_fire: Some(no_fire.to_string()),
                 state,
                 progress: None,
                 last_failure,
             });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let boundary_build_started_at = Instant::now();
+        if let Some(tags) = tag_snapshot {
+            self.boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex")
+                .prime_from_persisted_tags(&parsed.session_id, tags.as_slice());
+        } else if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+            // Malformed-lineage and compaction-off paths return before normal tag hydration.
+            // Preserve their fail-open tokenization behavior rather than treating absence as empty.
+            self.boundary_tokens
+                .lock()
+                .expect("boundary token cache mutex")
+                .prime_from_persisted_tags(&parsed.session_id, &tags);
+        }
         let CachedBoundaryMessages {
             messages: boundary_messages,
             token_cache_hits,
@@ -4748,20 +5211,27 @@ impl McHandler {
                     "mc-module: aborting historian trigger for {}: {detail}",
                     parsed.session_id
                 );
-                self.record_no_fire(&store, &parsed.session_id, &loaded, detail);
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
+                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: detail.into(),
+                    detail_kind: detail,
+                    cause: HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
+                    extra: None,
                     reason: None,
-                    no_fire: Some(detail.to_string()),
                     state,
                     progress: None,
                     last_failure,
                 });
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    &diagnostics,
+                    &decision_context,
+                );
+                return PreparedHistorianAction::Complete(diagnostics);
             }
             Ok(_) | Err(_) => None,
         };
-        let (context_limit, input_tokens, usage_percentage) =
-            usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
         let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
@@ -4786,8 +5256,10 @@ impl McHandler {
                         context_limit,
                         // Historian preparation reloads module config independently, but a host-
                         // resolved request threshold is still authoritative for this pass.
-                        execute_threshold_percentage: parsed
-                            .execute_threshold_or(cfg.execute_threshold_percentage),
+                        execute_threshold_percentage: parsed.execute_threshold_or(
+                            cfg.resolve_execute_threshold(parsed.model_key.as_deref())
+                                .percentage,
+                        ),
                         usage_percentage,
                         usage_input_tokens: input_tokens,
                         last_compartment_end_ordinal,
@@ -4814,6 +5286,14 @@ impl McHandler {
             .replace(&parsed.session_id, token_cache_snapshot);
         trigger_timer.timings.cache_store_ms +=
             cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
+        decision_context.chunk_range = trigger.progress.as_ref().and_then(|progress| {
+            (progress.protected_start_ordinal > progress.eligible_start_ordinal).then(|| {
+                HistorianChunkRange {
+                    from_ordinal: progress.eligible_start_ordinal,
+                    to_ordinal: progress.protected_start_ordinal - 1,
+                }
+            })
+        });
         let progress = trigger
             .progress
             .as_ref()
@@ -4824,64 +5304,116 @@ impl McHandler {
                 protected_start_ordinal: p.protected_start_ordinal,
             });
         if !trigger.fire {
-            let reason = if loaded.meta.historian.state == HistorianPhase::Idle {
-                "trigger_false"
-            } else {
-                "busy"
-            };
-            if reason == "trigger_false" {
-                // Carry the measurement, not just the branch: a bare trigger_false is
-                // not actionable from a state dump (is the bar honestly uncrossed, or
-                // is eligible measuring zero against real content?). Sizes quantize to
-                // the nearest 1k so routine content growth keeps the change-gate
-                // effective instead of rewriting the row on every pass.
-                let detail = match trigger.progress.as_ref() {
-                    Some(p) => format!(
-                        "trigger_false{{eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}}}",
-                        (p.eligible_chunk_tokens / 1000.0).round(),
-                        (p.tail_size_bar / 1000.0).round(),
-                        (p.n_tokens / 1000.0).round(),
-                        context_limit,
-                    ),
-                    None => "trigger_false".to_string(),
-                };
-                self.record_no_fire(&store, &parsed.session_id, &loaded, &detail);
-            }
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
+            let cause = trigger
+                .no_fire_cause
+                .expect("a false historian trigger carries its concrete cause");
+            // Quantized measurements keep the durable change gate effective while the raw and
+            // canonical causes make each refusal branch independently diagnosable.
+            let extra = trigger.progress.as_ref().map(|p| {
+                format!(
+                    "eligible~{}k,bar~{}k,protected_n~{}k,ctx_limit={}",
+                    (p.eligible_chunk_tokens / 1000.0).round(),
+                    (p.tail_size_bar / 1000.0).round(),
+                    (p.n_tokens / 1000.0).round(),
+                    context_limit,
+                )
+            });
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "trigger_false".into(),
+                detail_kind: "trigger_false",
+                cause,
+                extra: extra.as_deref(),
                 reason: None,
-                no_fire: Some(reason.to_string()),
                 state,
                 progress,
                 last_failure,
             });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
-        let trigger_reason = trigger.reason.map(|r| r.as_str().to_string());
+        let trigger_rule = trigger
+            .reason
+            .expect("a true historian trigger carries its firing rule");
+        let trigger_reason = Some(trigger_rule.as_str().to_string());
         let model_chain = parsed
             .historian_model_chain
             .as_deref()
             .unwrap_or(&cfg.model_chain);
+        let model_chain_generation = self
+            .historian_model_unresolvable
+            .activate_chain(model_chain);
         if model_chain.is_empty() {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "no_models");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "no_models".into(),
+                detail_kind: "no_models",
+                cause: HistorianNoFireCause::NoModels,
+                extra: None,
                 reason: trigger_reason,
-                no_fire: Some("no_models".to_string()),
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
             });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
+        }
+        if self
+            .historian_model_unresolvable
+            .all_models_unresolvable(model_chain_generation, model_chain)
+        {
+            let failures = self
+                .historian_model_unresolvable
+                .cached_reasons(model_chain_generation, model_chain);
+            let detail = historian::model_unresolvable_detail(&failures, true);
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: detail.clone(),
+                detail_kind: "model_unresolvable",
+                cause: HistorianNoFireCause::ModelUnresolvable,
+                extra: Some(&detail),
+                reason: trigger_reason,
+                state,
+                progress,
+                last_failure,
+            });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let Some(boundary) = trigger.boundary.clone() else {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "missing_boundary");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "missing_boundary".into(),
+                detail_kind: "missing_boundary",
+                cause: HistorianNoFireCause::MissingBoundary,
+                extra: None,
                 reason: None,
-                no_fire: Some("missing_boundary".to_string()),
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
             });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         };
         if loaded
             .meta
@@ -4889,15 +5421,45 @@ impl McHandler {
             .failure_backoff_at_ms
             .is_some_and(|backoff_at_ms| now < backoff_at_ms)
         {
-            self.record_no_fire(&store, &parsed.session_id, &loaded, "backoff");
-            return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                fired: false,
-                reason: trigger_reason,
-                no_fire: Some("backoff".to_string()),
+            let failure_detail = last_failure.clone();
+            let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: if last_failure
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("chain_exhausted"))
+                {
+                    "chain_exhausted"
+                } else {
+                    "backoff"
+                }
+                .into(),
+                detail_kind: "backoff",
+                cause: if last_failure
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("chain_exhausted"))
+                {
+                    HistorianNoFireCause::ChainExhausted
+                } else if last_failure
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("validate rejected:"))
+                {
+                    HistorianNoFireCause::ValidationRejected
+                } else {
+                    HistorianNoFireCause::FailureBackoff
+                },
+                extra: failure_detail.as_deref(),
+                reason: failure_detail.clone().or(trigger_reason),
                 state,
-                progress: progress.clone(),
+                progress,
                 last_failure,
             });
+            self.record_no_fire(
+                &store,
+                &parsed.session_id,
+                &loaded,
+                &diagnostics,
+                &decision_context,
+            );
+            return PreparedHistorianAction::Complete(diagnostics);
         }
         let live: Vec<_> = projection
             .blocks
@@ -4929,6 +5491,10 @@ impl McHandler {
                 project_slug: project_slug.clone(),
                 model_chain: model_chain.to_vec(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+                historian_context_limit_tokens: cfg
+                    .historian_context_limit_known
+                    .then_some(cfg.historian_context_limit_tokens),
+                max_output_tokens: historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
                 boundary,
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
@@ -4942,45 +5508,68 @@ impl McHandler {
             },
             now,
         );
-        let firing = match assemble {
+        let mut firing = match assemble {
             Ok(AssembleHistorianFiringOutcome::Fire(firing)) => *firing,
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                let raw_no_fire = format!("assemble:{reason:?}");
+                let raw_detail = format!("detail={reason:?}");
+                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: raw_no_fire,
+                    detail_kind: "assemble",
+                    cause: reason.cause(),
+                    extra: Some(&raw_detail),
+                    reason: trigger_reason,
+                    state,
+                    progress,
+                    last_failure,
+                });
+                let mut no_fire_context = decision_context.clone();
+                if let historian_chunk::HistorianNoFireReason::BelowBudget {
+                    token_estimate,
+                    minimum,
+                } = reason
+                {
+                    no_fire_context.eligible_tokens = Some(token_estimate as u64);
+                    no_fire_context.bar_tokens = Some(minimum as u64);
+                }
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
                     &loaded,
-                    &format!("assemble:{reason:?}"),
+                    &diagnostics,
+                    &no_fire_context,
                 );
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger_reason,
-                    no_fire: Some(format!("assemble:{reason:?}")),
-                    state,
-                    progress: progress.clone(),
-                    last_failure,
-                });
+                return PreparedHistorianAction::Complete(diagnostics);
             }
             Err(e) => {
+                let raw_no_fire = format!("assemble_failed:{e}");
+                let raw_detail = format!("error={e}");
+                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: raw_no_fire,
+                    detail_kind: "assemble_failed",
+                    cause: HistorianNoFireCause::AssemblyFailed,
+                    extra: Some(&raw_detail),
+                    reason: trigger_reason,
+                    state,
+                    progress,
+                    last_failure,
+                });
                 self.record_no_fire(
                     &store,
                     &parsed.session_id,
                     &loaded,
-                    &format!("assemble_failed:{e}"),
+                    &diagnostics,
+                    &decision_context,
                 );
-                return PreparedHistorianAction::Complete(HistorianDiagnostics {
-                    fired: false,
-                    reason: trigger_reason,
-                    no_fire: Some(format!("assemble_failed:{e}")),
-                    state,
-                    progress: progress.clone(),
-                    last_failure,
-                });
+                return PreparedHistorianAction::Complete(diagnostics);
             }
         };
         let diagnostics = HistorianDiagnostics {
             fired: true,
             reason: trigger_reason,
             no_fire: None,
+            no_fire_detail: None,
+            canonical_cause: None,
             state: state.clone(),
             progress: progress.clone(),
             last_failure: last_failure.clone(),
@@ -4988,29 +5577,54 @@ impl McHandler {
         let live_guard = match self.try_claim_live_historian_session(&parsed.session_id) {
             LiveHistorianSessionClaim::Acquired(live_guard) => live_guard,
             LiveHistorianSessionClaim::Busy(completion) => {
+                let busy_diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                    no_fire: "busy".into(),
+                    detail_kind: "busy",
+                    cause: HistorianNoFireCause::LiveHistorianClaimBusy,
+                    extra: None,
+                    reason: diagnostics.reason,
+                    state,
+                    progress,
+                    last_failure,
+                });
+                self.record_no_fire(
+                    &store,
+                    &parsed.session_id,
+                    &loaded,
+                    &busy_diagnostics,
+                    &decision_context,
+                );
                 return PreparedHistorianAction::Busy {
-                    diagnostics: HistorianDiagnostics {
-                        fired: false,
-                        reason: diagnostics.reason,
-                        no_fire: Some("busy".to_string()),
-                        state,
-                        progress,
-                        last_failure,
-                    },
+                    diagnostics: busy_diagnostics,
                     completion,
                 };
             }
         };
+        decision_context.chunk_range = Some(HistorianChunkRange {
+            from_ordinal: firing.from_ordinal,
+            to_ordinal: firing.to_ordinal,
+        });
+        let mut fire_decision = decision_context.recent_decision(
+            HistorianDecision::Fired,
+            format!("trigger_true:{}", historian_trigger_rule(trigger_rule)),
+            diagnostics.progress.as_ref(),
+        );
+        fire_decision.producer_model = model_chain.first().cloned();
+        self.record_fire_decision(&store, &parsed.session_id, &loaded, &fire_decision);
+        firing.recent_decision = Some(fire_decision);
         PreparedHistorianAction::FireReady(Box::new(PreparedHistorianFiring {
             diagnostics,
             task: HistorianFiringTask {
                 store,
                 session_id: parsed.session_id.clone(),
                 language: cfg.language.clone(),
+                historian_temperature: cfg.historian_temperature,
                 project_path: project_path.to_string(),
                 project_root: binding.project_root.clone(),
                 project_slug,
                 firing,
+                model_chain_generation,
+                model_unresolvable_cache: Arc::clone(&self.historian_model_unresolvable),
                 live_guard,
                 connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
                 // Organic pressure firings assemble and publish in one continuous drive
@@ -5065,8 +5679,22 @@ impl McHandler {
         }
 
         let cfg = self.effective_config(&binding.project_root);
+        let model_chain_generation = self
+            .historian_model_unresolvable
+            .activate_chain(&cfg.model_chain);
         if cfg.model_chain.is_empty() {
             return PreparedWrapupAction::Failed("no historian models are configured".to_string());
+        }
+        if self
+            .historian_model_unresolvable
+            .all_models_unresolvable(model_chain_generation, &cfg.model_chain)
+        {
+            let failures = self
+                .historian_model_unresolvable
+                .cached_reasons(model_chain_generation, &cfg.model_chain);
+            return PreparedWrapupAction::Failed(historian::model_unresolvable_detail(
+                &failures, true,
+            ));
         }
         let live = projection
             .blocks
@@ -5087,6 +5715,10 @@ impl McHandler {
                 project_slug: project_slug.clone(),
                 model_chain: cfg.model_chain,
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+                historian_context_limit_tokens: cfg
+                    .historian_context_limit_known
+                    .then_some(cfg.historian_context_limit_tokens),
+                max_output_tokens: historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
                 boundary: boundary.clone(),
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
@@ -5110,6 +5742,11 @@ impl McHandler {
                 firing.validate_options.force_keep_last_compartment = !firing.chunk.has_more;
                 firing
             }
+            Ok(AssembleHistorianFiringOutcome::NoFire(
+                historian_chunk::HistorianNoFireReason::FilteredNoiseSkipped { .. },
+            )) => {
+                return PreparedWrapupAction::FilteredNoiseSkipped;
+            }
             Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
                 return PreparedWrapupAction::Nothing(format!("{reason:?}"));
             }
@@ -5125,10 +5762,13 @@ impl McHandler {
             store,
             session_id: parsed.session_id.clone(),
             language,
+            historian_temperature: binding.config.historian_temperature,
             project_path,
             project_root: binding.project_root.clone(),
             project_slug,
             firing,
+            model_chain_generation,
+            model_unresolvable_cache: Arc::clone(&self.historian_model_unresolvable),
             live_guard,
             connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
             publication_fence: None,
@@ -5148,24 +5788,67 @@ impl McHandler {
         diagnostics
     }
 
-    /// Persist the skip-branch discriminant so a supervised rig can read WHY the
-    /// historian declined to fire from the state dump (the transform response's
-    /// diagnostics block never reaches disk). Change-gated: steady-state passes that
-    /// skip for the same reason write nothing, so this stays off the hot path. A CAS
-    /// conflict just drops the diagnostic; it must never fail a pass.
+    /// Persist a trigger-true decision before handing the firing to an asynchronous worker.
+    /// The state transition fills in the producer model without appending the same decision again.
+    fn record_fire_decision(
+        &self,
+        store: &McStore,
+        session_id: &str,
+        loaded: &LoadedState,
+        decision: &HistorianRecentDecision,
+    ) {
+        let mut meta = loaded.meta.clone();
+        meta.historian.record_recent_decision(decision.clone());
+        if store
+            .commit(session_id, loaded.row_version, &loaded.core, &meta)
+            .is_ok()
+        {
+            DISPATCH_HEALTH.historian_recent_decisions_count.store(
+                meta.historian.recent_decisions.len() as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Persist skip evidence without changing the transform result. Equivalent quantized
+    /// no-fire observations leave the row untouched; a CAS loser simply yields to the newer pass.
     fn record_no_fire(
         &self,
         store: &McStore,
         session_id: &str,
         loaded: &mc_store::LoadedState,
-        reason: &str,
+        diagnostics: &HistorianDiagnostics,
+        context: &HistorianDecisionContext,
     ) {
-        if loaded.meta.historian.last_no_fire.as_deref() == Some(reason) {
+        let reason = diagnostics
+            .no_fire_detail
+            .as_deref()
+            .expect("no-fire diagnostics carry durable detail");
+        let cause = diagnostics
+            .canonical_cause
+            .clone()
+            .expect("no-fire diagnostics carry a canonical cause");
+        let mut meta = loaded.meta.clone();
+        let decision_changed = meta
+            .historian
+            .record_recent_decision(context.recent_decision(
+                HistorianDecision::NoFire,
+                cause,
+                diagnostics.progress.as_ref(),
+            ));
+        if !decision_changed && meta.historian.last_no_fire.as_deref() == Some(reason) {
             return;
         }
-        let mut meta = loaded.meta.clone();
         meta.historian.last_no_fire = Some(reason.to_string());
-        let _ = store.commit(session_id, loaded.row_version, &loaded.core, &meta);
+        if store
+            .commit(session_id, loaded.row_version, &loaded.core, &meta)
+            .is_ok()
+        {
+            DISPATCH_HEALTH.historian_recent_decisions_count.store(
+                meta.historian.recent_decisions.len() as u64,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     async fn execute_historian_firing_task(
@@ -5176,10 +5859,13 @@ impl McHandler {
             store,
             session_id,
             language,
+            historian_temperature,
             project_path,
             project_root,
             project_slug,
             firing,
+            model_chain_generation,
+            model_unresolvable_cache,
             live_guard,
             connect_failure_commit_hook,
             publication_fence,
@@ -5187,7 +5873,7 @@ impl McHandler {
         let _guard = live_guard;
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
-        match factory.connect(&project_root).await {
+        let result = match factory.connect(&project_root).await {
             Ok(mut producer) => {
                 let mut request = firing.as_fire_request(
                     &store,
@@ -5196,8 +5882,15 @@ impl McHandler {
                     &project_slug,
                     language.as_deref(),
                 );
+                request.temperature = historian_temperature;
                 request.publication_fence = publication_fence.as_deref();
-                run_historian_firing(&mut *producer, request).await
+                run_historian_firing_with_model_cache(
+                    &mut *producer,
+                    request,
+                    Some(model_unresolvable_cache.as_ref()),
+                    model_chain_generation,
+                )
+                .await
             }
             Err(err) => {
                 let failure_backoff_at_ms = historian::completion_failure_backoff_at_ms(
@@ -5219,10 +5912,29 @@ impl McHandler {
                     backoff_error,
                 })
             }
+        };
+        if let Ok(loaded) = store.load(&session_id) {
+            DISPATCH_HEALTH.record_historian_outcome(
+                historian_status_summary(&loaded.meta.historian),
+                loaded.meta.historian.recent_decisions.len(),
+            );
         }
+        result
     }
 
-    /// Drive a firing for an emergency pass, bounded by the completion-wait budget.
+    fn transform_historian_followup_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self
+            .transform_historian_followup_budget
+            .lock()
+            .expect("transform historian follow-up budget mutex")
+        {
+            return budget;
+        }
+        TRANSFORM_HISTORIAN_FOLLOWUP_BUDGET
+    }
+
+    /// Drive a firing for an emergency pass within the transform's remaining follow-up budget.
     ///
     /// The firing runs as a SPAWNED task and this method awaits its JoinHandle with a
     /// timeout, for two reasons:
@@ -5236,11 +5948,24 @@ impl McHandler {
     ///   would instead strand durable state for crash recovery to repair.
     async fn run_historian_firing_inline(
         &self,
+        session_id: &str,
         task: HistorianFiringTask,
+        wait_budget: Duration,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         let factory = Arc::clone(&self.producer_factory);
         let handle = tokio::spawn(Self::execute_historian_firing_task(factory, task));
-        match tokio::time::timeout(historian::completion_wait_budget(), handle).await {
+        let wait_started_at = Instant::now();
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_inline_wait event=begin budget_ms={}",
+            wait_budget.as_millis()
+        );
+        let waited = tokio::time::timeout(wait_budget, handle).await;
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_inline_wait event=end outcome={} elapsed_ms={:.1}",
+            if waited.is_ok() { "completed" } else { "timed_out" },
+            wait_started_at.elapsed().as_secs_f64() * 1_000.0
+        );
+        match waited {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(join_err)) => Err(historian::HistorianDriveError::Producer(
                 HistorianProducerError::RunFailed {
@@ -5258,11 +5983,22 @@ impl McHandler {
 
     async fn await_live_historian_completion(
         &self,
+        session_id: &str,
         completion: LiveHistorianCompletionWait,
+        wait_budget: Duration,
     ) -> bool {
-        tokio::time::timeout(historian::completion_wait_budget(), completion)
-            .await
-            .is_ok()
+        let wait_started_at = Instant::now();
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_busy_wait event=begin budget_ms={}",
+            wait_budget.as_millis()
+        );
+        let completed = tokio::time::timeout(wait_budget, completion).await.is_ok();
+        eprintln!(
+            "mc-pass-stage session={session_id} stage=historian_busy_wait event=end outcome={} elapsed_ms={:.1}",
+            if completed { "completed" } else { "timed_out" },
+            wait_started_at.elapsed().as_secs_f64() * 1_000.0
+        );
+        completed
     }
 
     fn wrapup_operation_budget(&self) -> Duration {
@@ -5931,6 +6667,21 @@ impl McHandler {
         }
     }
 
+    fn runtime_store_error_value(&self, session_id: &str) -> Value {
+        self.runtime_store_errors
+            .lock()
+            .expect("runtime store errors mutex")
+            .get(session_id)
+            .map(|error| {
+                json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "at_ms": error.at_ms,
+                })
+            })
+            .unwrap_or(Value::Null)
+    }
+
     fn handle_session_delete_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (session_id, binding) =
             match self.management_binding(channel, request, "session.delete") {
@@ -5943,6 +6694,10 @@ impl McHandler {
         };
         match store.delete_session(&session_id, &binding.project_root.to_string_lossy()) {
             Ok(deleted_rows) => {
+                self.runtime_store_errors
+                    .lock()
+                    .expect("runtime store errors mutex")
+                    .remove(&session_id);
                 self.reattaching_sessions
                     .lock()
                     .expect("reattaching sessions mutex")
@@ -5974,6 +6729,67 @@ impl McHandler {
             Some(store) => store,
             None => return store_unavailable_error(),
         };
+        if request.get("state_sync_inventory").and_then(Value::as_bool) == Some(true) {
+            let (meta, boundary, sequence) =
+                match store.load_state_sync_inventory(&session_id, true) {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        return HandlerOutcome::Error {
+                            code: "store_load_failed".into(),
+                            message: error.to_string(),
+                        }
+                    }
+                };
+            return respond(json!({ "state_sync_inventory": {
+                "generation": meta.shadow_generation,
+                "max_compartment_sequence": if meta.initialized { sequence } else { -1 },
+                "boundary_id": if meta.initialized && !boundary.is_empty() { Some(boundary) } else { None },
+            }}));
+        }
+        if let Some(seed_id) = request.get("state_sync_seed_id").and_then(Value::as_str) {
+            let (meta, _, _) = match store.load_state_sync_inventory(&session_id, false) {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    return HandlerOutcome::Error {
+                        code: "store_load_failed".into(),
+                        message: error.to_string(),
+                    }
+                }
+            };
+            let receipt = &meta.shadow_acked_watermarks;
+            if receipt.get("_state_sync_seed_id").and_then(Value::as_str) == Some(seed_id)
+                && receipt
+                    .get("_state_sync_seed_generation")
+                    .and_then(Value::as_u64)
+                    == Some(meta.shadow_generation)
+            {
+                return respond(json!({ "state_sync": {
+                    "seed_id": seed_id, "generation": meta.shadow_generation,
+                    "shadow_seq": meta.shadow_seq, "completed": true,
+                }}));
+            }
+            let mut seeds = self.state_sync_seeds.lock().expect("state sync seed mutex");
+            seeds.evict_stale_collectors(self.state_sync_seed_now());
+            let status = match seeds.sessions.get(&session_id).map(|state| &state.phase) {
+                Some(StateSyncSeedPhase::Collecting(pending))
+                    if pending.seed_id == seed_id
+                        && pending.generation == meta.shadow_generation
+                        && pending.expected_seq == meta.shadow_seq =>
+                {
+                    json!({
+                        "seed_id": seed_id, "generation": pending.generation, "shadow_seq": pending.expected_seq,
+                        "next_expected_index": pending.next_index, "completed": false,
+                    })
+                }
+                Some(StateSyncSeedPhase::Applying {
+                    seed_id: applying, ..
+                }) if applying == seed_id => json!({
+                    "seed_id": seed_id, "generation": meta.shadow_generation, "applying": true,
+                }),
+                _ => Value::Null,
+            };
+            return respond(json!({ "state_sync": status }));
+        }
         let include_compartments_after_seq = match request.get("include_compartments_after_seq") {
             Some(value) => {
                 let Some(after_sequence) = value.as_i64().filter(|value| *value >= -1) else {
@@ -6123,6 +6939,7 @@ impl McHandler {
                 "generation_invalidated": baseline.generation_invalidated,
                 "baseline_generation": baseline.baseline_generation,
                 "computed_at_ms": baseline.computed_at_ms,
+                "reclaimable_tool_output_count": crate::transform::reclaimable_tool_output_count(Some(baseline)),
             })
         });
         let summary = sanitize_status_text(
@@ -6158,10 +6975,13 @@ impl McHandler {
             "historian": {
                 "consecutive_publish_failures": consecutive_publish_failures,
                 "publish_health_degraded": consecutive_publish_failures >= 3,
+                "last_outcome": historian,
+                "recent_decisions": &loaded.meta.historian.recent_decisions,
             },
             // Keep the current-pass attribution separate from the explicitly historical
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
+            "runtime_store_error": self.runtime_store_error_value(&session_id),
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
                 "compaction_seen": descent_counters.compaction_seen,
@@ -6188,6 +7008,7 @@ impl McHandler {
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
+                "state_sync_resume": true,
             },
             "usage": {
                 "current_total_input_tokens": loaded.meta.last_usage.as_ref().map_or(0, |usage| usage.current_total_input_tokens),
@@ -6568,7 +7389,11 @@ impl McHandler {
         let wrapup_cfg = self.effective_config(&binding.project_root);
         let (wrapup_context_limit, _, _) =
             usage_numbers(parsed.usage.as_ref(), parsed.geometry.as_ref());
-        let wrapup_threshold = parsed.execute_threshold_or(wrapup_cfg.execute_threshold_percentage);
+        let wrapup_threshold = parsed.execute_threshold_or(
+            wrapup_cfg
+                .resolve_execute_threshold(parsed.model_key.as_deref())
+                .percentage,
+        );
         let plan = boundary::resolve_wrapup_boundary(
             &boundary_messages,
             initial_end,
@@ -6725,6 +7550,7 @@ impl McHandler {
                 break;
             }
             match prepared {
+                PreparedWrapupAction::FilteredNoiseSkipped => continue,
                 PreparedWrapupAction::Busy(completion) => {
                     if let Err(reason) = self
                         .await_wrapup_historian_completion(completion, deadline)
@@ -7696,6 +8522,7 @@ impl McHandler {
                         "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                         "tagger_epoch": TAGGER_FEATURE_EPOCH,
                         "state_sync_deltas": true,
+                        "state_sync_resume": true,
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
@@ -7755,12 +8582,14 @@ impl McHandler {
             "publication_floor_ordinal": loaded.meta.publication_floor_ordinal,
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "pass_trace": pass_trace,
+            "runtime_store_error": self.runtime_store_error_value(session_id),
             "epochs": {
                 "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
                 "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
                 "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
                 "tagger_epoch": TAGGER_FEATURE_EPOCH,
                 "state_sync_deltas": true,
+                "state_sync_resume": true,
             },
             "storage_versions": storage_versions_block(&store),
         }))
@@ -7772,7 +8601,7 @@ impl McHandler {
         request: Value,
         inbound_bytes: Option<usize>,
     ) -> HandlerOutcome {
-        let ticket = TransformDispatchTicket::new(&DISPATCH_HEALTH);
+        let ticket = TransformDispatchTicket::new(&DISPATCH_HEALTH, channel);
         let outcome = if has_transform_page_fields(&request) {
             self.handle_transform_page_value(channel, request, TransformLane::Authority, &ticket)
                 .await
@@ -7804,6 +8633,7 @@ impl McHandler {
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let handler_started_at = Instant::now();
+        let request_decode_started_at = Instant::now();
         let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
         let request_observed_to_handler = request
@@ -7812,6 +8642,7 @@ impl McHandler {
             .and_then(|observed| i64::try_from(observed).ok())
             .map(|observed| now_ms().saturating_sub(observed) as f64)
             .unwrap_or(0.0);
+        let todo_verdict_probed = request.get("todo_verdict_probed").and_then(Value::as_bool);
         let mut parsed: TransformRequest = match serde_json::from_value(request) {
             Ok(req) => req,
             Err(e) => {
@@ -7821,6 +8652,8 @@ impl McHandler {
                 };
             }
         };
+        let request_decode_ms = request_decode_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let handler_prepare_started_at = Instant::now();
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
         if serializer_profile.is_none() {
             return unknown_serializer_profile_error();
@@ -8052,6 +8885,59 @@ impl McHandler {
         let trace_received_started_at = Instant::now();
         let _ = store.trace_pass_received(&parsed.session_id, pass_now);
         let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let hostless_usable_soft = parsed
+            .geometry
+            .as_ref()
+            .map(|geometry| geometry.usable_soft)
+            .or_else(|| {
+                parsed
+                    .usage
+                    .as_ref()
+                    .map(|usage| usage.context_limit_tokens)
+                    .filter(|limit| *limit >= scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT)
+            })
+            .unwrap_or(200_000);
+        let resolved_protected_tokens = binding
+            .config
+            .resolve_protected_tokens(hostless_usable_soft);
+        // Bind frames have no model identity. Emit resolved policy once on the first transform for
+        // this binding, when the host's model and optional overrides are available.
+        if self
+            .threshold_logged_routes
+            .lock()
+            .expect("threshold log mutex")
+            .insert(channel)
+        {
+            let resolved = binding
+                .config
+                .resolve_execute_threshold(parsed.model_key.as_deref());
+            eprintln!(
+                "mc-module: execute_threshold channel={channel} model={} configured={} provenance={} effective={} source={}",
+                parsed.model_key.as_deref().unwrap_or("default"),
+                resolved.percentage,
+                resolved.provenance,
+                parsed.execute_threshold_or(resolved.percentage),
+                if parsed.effective_execute_threshold.is_some() { "host" } else { "config" },
+            );
+            if let Some(warning) = &resolved_protected_tokens.warning {
+                eprintln!("mc-module: config warning: {warning}");
+            }
+            eprintln!(
+                "mc-module: protected_tokens channel={channel} provenance={} effective={} source={}",
+                resolved_protected_tokens.provenance,
+                parsed
+                    .protected_tokens_effective
+                    .unwrap_or(resolved_protected_tokens.floor),
+                if parsed.protected_tokens_effective.is_some() {
+                    "host"
+                } else {
+                    "config"
+                },
+            );
+        }
+        // Scheduler anchoring and durable historian activity read one lazy state snapshot for this
+        // handler entry. The snapshot is initialized only if neither in-memory fast path answers.
+        let handler_entry_state = OnceLock::new();
         let run_transform = || {
             let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
                 || {
@@ -8084,9 +8970,19 @@ impl McHandler {
                 user_profile_budget_tokens: binding.config.user_profile_budget_tokens,
                 now_ms: pass_now,
                 // The host resolves per-model/token thresholds against this pass's usable window.
-                // Bind-time scalar config is only the old-host compatibility fallback.
-                execute_threshold_percentage: parsed
-                    .execute_threshold_or(binding.config.execute_threshold_percentage),
+                // Without a host override, resolve the bind-time config using this request's model.
+                execute_threshold_percentage: parsed.execute_threshold_or(
+                    binding
+                        .config
+                        .resolve_execute_threshold(parsed.model_key.as_deref())
+                        .percentage,
+                ),
+                protected_tokens_floor: resolved_protected_tokens.floor,
+                protected_tokens_provenance: if resolved_protected_tokens.provenance == "derived" {
+                    "derived"
+                } else {
+                    "absolute"
+                },
                 // Route-bound configuration selects either the full pipeline or the
                 // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
@@ -8096,10 +8992,17 @@ impl McHandler {
                 cache_ttl: resolved_cache_ttl.value,
                 cache_ttl_provenance: resolved_cache_ttl.provenance,
                 model_key: binding.model_key.clone(),
-                observed_last_response_at_ms: self
-                    .observed_last_response_at_ms(&store, &parsed.session_id),
+                observed_last_response_at_ms: self.observed_last_response_at_ms(
+                    &store,
+                    &parsed.session_id,
+                    &handler_entry_state,
+                ),
                 guidance_date: Some(self.guidance_date_for_transform(&parsed.session_id, pass_now)),
-                historian_active: self.historian_active(&store, &parsed.session_id),
+                historian_active: self.historian_active(
+                    &store,
+                    &parsed.session_id,
+                    &handler_entry_state,
+                ),
                 wrapup_active: self.wrapup_active(&parsed.session_id),
                 #[cfg(test)]
                 injected_reductions: self
@@ -8124,25 +9027,43 @@ impl McHandler {
                 "transform_failed"
             };
             let message = e.to_string();
+            if matches!(&e, crate::transform::TransformError::Store(_)) {
+                self.runtime_store_errors
+                    .lock()
+                    .expect("runtime store errors mutex")
+                    .insert(
+                        parsed.session_id.clone(),
+                        RuntimeStoreError {
+                            code: code.to_string(),
+                            message: message.clone(),
+                            at_ms: now_ms(),
+                        },
+                    );
+            }
             let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
             HandlerOutcome::Error {
                 code: code.to_string(),
                 message,
             }
         };
+        let handler_prepare_ms = handler_prepare_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let transform_execute_started_at = Instant::now();
         let mut result = match run_transform() {
-            Ok(result) => result,
+            Ok(result) => {
+                self.runtime_store_errors
+                    .lock()
+                    .expect("runtime store errors mutex")
+                    .remove(&parsed.session_id);
+                result
+            }
             Err(e) => return reject_transform(e),
         };
-        let mut emergency_pre_floor =
-            if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
-                store
-                    .load(&parsed.session_id)
-                    .map(|state| state.meta.publication_floor_ordinal)
-                    .unwrap_or(None)
-            } else {
-                None
-            };
+        let transform_execute_ms = transform_execute_started_at.elapsed().as_secs_f64() * 1_000.0;
+        let handler_followup_started_at = Instant::now();
+        let mut emergency_pre_floor = (result.scheduler_pass
+            == scheduler::PassDecision::Emergency95)
+            .then_some(result.publication_floor_ordinal)
+            .flatten();
         #[cfg(test)]
         if let Some(hook) = self
             .between_transform_and_prepare
@@ -8152,16 +9073,25 @@ impl McHandler {
         {
             hook();
         }
+        let transform_followup_deadline =
+            handler_started_at + self.transform_historian_followup_budget();
+        let remaining_followup_budget = || {
+            transform_followup_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+        };
         let mut trigger_timings = HistorianTriggerTimings::default();
         let diagnostics = if parsed.is_subagent {
-            HistorianDiagnostics {
-                fired: false,
+            historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                no_fire: "subagent_session".into(),
+                detail_kind: "subagent_session",
+                cause: HistorianNoFireCause::SubagentSession,
+                extra: None,
                 reason: Some("subagent_session".to_string()),
-                no_fire: Some("subagent_session".to_string()),
                 state: "disabled".to_string(),
                 progress: None,
                 last_failure: None,
-            }
+            })
         } else if result.scheduler_pass == scheduler::PassDecision::Emergency95 {
             match self.prepare_historian_fire(
                 Arc::clone(&store),
@@ -8172,6 +9102,7 @@ impl McHandler {
                 HistorianPrepareContext {
                     now: pass_now,
                     snapshot_generation,
+                    tag_snapshot: result.historian_tags.clone(),
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -8180,15 +9111,19 @@ impl McHandler {
                     diagnostics,
                     completion,
                 } => {
-                    if self.await_live_historian_completion(completion).await {
+                    if self
+                        .await_live_historian_completion(
+                            &parsed.session_id,
+                            completion,
+                            remaining_followup_budget(),
+                        )
+                        .await
+                    {
                         result = match run_transform() {
                             Ok(result) => result,
                             Err(e) => return reject_transform(e),
                         };
-                        emergency_pre_floor = store
-                            .load(&parsed.session_id)
-                            .map(|state| state.meta.publication_floor_ordinal)
-                            .unwrap_or(None);
+                        emergency_pre_floor = result.publication_floor_ordinal;
                         match self.prepare_historian_fire(
                             Arc::clone(&store),
                             &parsed,
@@ -8198,6 +9133,7 @@ impl McHandler {
                             HistorianPrepareContext {
                                 now: pass_now,
                                 snapshot_generation,
+                                tag_snapshot: result.historian_tags.clone(),
                                 timings: &mut trigger_timings,
                             },
                         ) {
@@ -8205,16 +9141,20 @@ impl McHandler {
                             PreparedHistorianAction::Busy { diagnostics, .. } => diagnostics,
                             PreparedHistorianAction::FireReady(prepared) => {
                                 let diagnostics = prepared.diagnostics.clone();
-                                match self.run_historian_firing_inline(prepared.task).await {
+                                match self
+                                    .run_historian_firing_inline(
+                                        &parsed.session_id,
+                                        prepared.task,
+                                        remaining_followup_budget(),
+                                    )
+                                    .await
+                                {
                                     Ok(_) => {
                                         result = match run_transform() {
                                             Ok(result) => result,
                                             Err(e) => return reject_transform(e),
                                         };
-                                        emergency_pre_floor = store
-                                            .load(&parsed.session_id)
-                                            .map(|state| state.meta.publication_floor_ordinal)
-                                            .unwrap_or(None);
+                                        emergency_pre_floor = result.publication_floor_ordinal;
                                         diagnostics
                                     }
                                     Err(_) => self.refresh_historian_diagnostics(
@@ -8231,16 +9171,20 @@ impl McHandler {
                 }
                 PreparedHistorianAction::FireReady(prepared) => {
                     let diagnostics = prepared.diagnostics.clone();
-                    match self.run_historian_firing_inline(prepared.task).await {
+                    match self
+                        .run_historian_firing_inline(
+                            &parsed.session_id,
+                            prepared.task,
+                            remaining_followup_budget(),
+                        )
+                        .await
+                    {
                         Ok(_) => {
                             result = match run_transform() {
                                 Ok(result) => result,
                                 Err(e) => return reject_transform(e),
                             };
-                            emergency_pre_floor = store
-                                .load(&parsed.session_id)
-                                .map(|state| state.meta.publication_floor_ordinal)
-                                .unwrap_or(None);
+                            emergency_pre_floor = result.publication_floor_ordinal;
                             diagnostics
                         }
                         Err(_) => self.refresh_historian_diagnostics(
@@ -8261,6 +9205,7 @@ impl McHandler {
                 HistorianPrepareContext {
                     now: pass_now,
                     snapshot_generation,
+                    tag_snapshot: result.historian_tags.clone(),
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -8294,9 +9239,10 @@ impl McHandler {
                 };
             }
         }
+        let handler_followup_ms = handler_followup_started_at.elapsed().as_secs_f64() * 1_000.0;
         let post_attach_started_at = Instant::now();
         let revert_epoch = result.revert_epoch;
-        let reasoning_watermark = result.reasoning_watermark;
+        let reasoning_clear_units = &result.reasoning_clear_units;
         let transition_consumed = result.transition_consumed;
         let mutation_exempt_mid = result.mutation_exempt_mid;
         let lineage_anchor_mid = result.lineage_anchor_mid;
@@ -8314,6 +9260,17 @@ impl McHandler {
         let projection_cache_store_ms =
             projection_cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         let mut response = result.response;
+        if unprobed_todo_bust(todo_verdict_probed, &response.decision) {
+            // A local host predictor can miss module-owned repair decisions. Report
+            // every unprobed bust, even when no todo pair was emitted, so a stale
+            // permission verdict can never be consumed without an audit signal.
+            self.log_unprobed_todo_bust(
+                &parsed.session_id,
+                parsed.todo_tool_present == Some(true),
+                &response.decision,
+                response.materialize_reason.as_deref().unwrap_or("unknown"),
+            );
+        }
         if response.committed {
             self.guidance_dates
                 .lock()
@@ -8326,7 +9283,7 @@ impl McHandler {
             attach_native_messages_incremental(
                 &mut response,
                 &parsed,
-                reasoning_watermark,
+                reasoning_clear_units,
                 &tag_numbers,
                 mutation_exempt_mid.as_deref(),
                 lineage_anchor_mid.as_deref(),
@@ -8339,10 +9296,22 @@ impl McHandler {
         } else {
             NativeAttachmentCacheStats::default()
         };
+        if let Err(error) = record_reasoning_native_evidence(
+            &store,
+            &mut response,
+            &parsed,
+            reasoning_clear_units,
+            &tag_numbers,
+            mutation_exempt_mid.as_deref(),
+            lineage_anchor_mid.as_deref(),
+            transition_consumed,
+        ) {
+            eprintln!("mc-module: native reasoning replay proof not recorded: {error}");
+        }
         finalize_native_messages_response(
             &mut response,
             &parsed,
-            reasoning_watermark,
+            reasoning_clear_units,
             &tag_numbers,
             mutation_exempt_mid.as_deref(),
             lineage_anchor_mid.as_deref(),
@@ -8382,6 +9351,10 @@ impl McHandler {
         let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
+            timings.request_decode = request_decode_ms;
+            timings.handler_prepare = handler_prepare_ms;
+            timings.transform_execute = transform_execute_ms;
+            timings.handler_followup = handler_followup_ms;
             timings.request_observed_to_handler = request_observed_to_handler;
             timings.delta_expand = delta_expand_ms;
             timings.side_channel_drain = side_channel_drain_ms;
@@ -8442,6 +9415,36 @@ impl McHandler {
     }
 
     fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
+        let started = Instant::now();
+        let mut timing = state_sync_timing::StateSyncTiming {
+            session: request
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("bound")
+                .to_string(),
+            page: request
+                .get("seed_batch_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            pages: request
+                .get("seed_batch_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+            compartments: request
+                .get("compartments")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            tags: request
+                .get("drop_seeds")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            bytes: 0,
+            decode_ms: 0.0,
+            stage_page_ms: 0.0,
+            assemble_series_ms: 0.0,
+            import_ms: 0.0,
+            ack_started: None,
+        };
         const ENVELOPE_FIELDS: [&str; 5] = [
             "seed_id",
             "seed_generation",
@@ -8464,10 +9467,13 @@ impl McHandler {
                 return invalid_params_error(error.to_string());
             }
         };
+        timing.decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let staging_started = Instant::now();
         let binding = match self.state_sync_binding(channel, parsed.session_id.as_deref()) {
             Ok(binding) => binding,
             Err(outcome) => return outcome,
         };
+        timing.session = binding.session.clone();
         let store = match self.store.get() {
             Some(store) => Arc::clone(store),
             None => return store_unavailable_error(),
@@ -8496,7 +9502,12 @@ impl McHandler {
                     Some(StateSyncSeedPhase::Idle) | None => None,
                 }
             };
+            timing.bytes = serde_json::to_vec(&request).map_or(0, |bytes| bytes.len());
+            timing.stage_page_ms = staging_started.elapsed().as_secs_f64() * 1000.0;
+            let import_started = Instant::now();
             let outcome = self.apply_state_sync_wire(&binding, &store, parsed);
+            timing.import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+            timing.ack_started = Some(Instant::now());
             if let Some((generation, expected_seq)) = awaiting_attempt {
                 let mut seeds = self.state_sync_seeds.lock().expect("state sync seed mutex");
                 let still_same_attempt =
@@ -8615,6 +9626,7 @@ impl McHandler {
                 return invalid_params_error(error.to_string());
             }
         };
+        timing.bytes = batch_bytes;
         // Batch zero is checked against durable metadata before the process-local state is
         // touched. A stale retry therefore cannot evict or allocate another live attempt.
         if batch_index == 0 {
@@ -8870,6 +9882,8 @@ impl McHandler {
             }
         };
 
+        timing.stage_page_ms = staging_started.elapsed().as_secs_f64() * 1000.0;
+        timing.ack_started = Some(Instant::now());
         match action {
             StageAction::Ack(next_expected_index) => respond(json!({
                 "ok": true,
@@ -8884,8 +9898,19 @@ impl McHandler {
                 expected_seq,
                 total,
             } => {
-                let assembled = assemble_state_sync_seed(batches, generation, expected_seq);
+                let assemble_started = Instant::now();
+                let mut assembled = assemble_state_sync_seed(batches, generation, expected_seq);
+                timing.assemble_series_ms = assemble_started.elapsed().as_secs_f64() * 1000.0;
+                // The receipt shares the import transaction through the existing watermark JSON.
+                // A lost final response or daemon restart cannot erase a committed series identity.
+                if let Some(Value::Object(watermarks)) = assembled.acked_watermarks.as_mut() {
+                    watermarks.insert("_state_sync_seed_id".into(), json!(seed_id));
+                    watermarks.insert("_state_sync_seed_generation".into(), json!(generation));
+                }
+                let import_started = Instant::now();
                 let outcome = self.apply_state_sync_wire(&binding, &store, assembled);
+                timing.import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+                timing.ack_started = Some(Instant::now());
                 let completed_result = match &outcome {
                     HandlerOutcome::Response(bytes) => Some(bytes.clone()),
                     HandlerOutcome::Error { .. }
@@ -9265,6 +10290,7 @@ impl McHandler {
                         .into_iter()
                         .chain(TRANSFORM_PAGE_FIELDS)
                         .chain(TRANSFORM_PAGE_ARRAY_FIELDS)
+                        .chain(TRANSFORM_PAGE_MAP_FIELDS)
                         .any(|allowed| allowed == key.as_str())
                 })
             })
@@ -9273,10 +10299,13 @@ impl McHandler {
             return transform_page_error(
                 lane,
                 "protocol_mismatch",
-                "non-final transform pages may carry only message arrays",
+                "non-final transform pages may carry only message arrays and pageable maps",
             );
         }
-        if transform_page_content_digest(&request) != page_digest {
+        let page_digest_started_at = Instant::now();
+        let digest_matches = transform_page_content_digest(&request) == page_digest;
+        let page_digest_ms = page_digest_started_at.elapsed().as_secs_f64() * 1_000.0;
+        if !digest_matches {
             self.discard_transform_pages(&binding.session);
             return transform_page_error(
                 lane,
@@ -9284,6 +10313,7 @@ impl McHandler {
                 "transform page content digest did not match the supplied digest",
             );
         }
+        let page_size_started_at = Instant::now();
         let page_bytes = match serde_json::to_vec(&request) {
             Ok(bytes) => bytes.len(),
             Err(error) => {
@@ -9291,6 +10321,7 @@ impl McHandler {
                 return invalid_params_error(error.to_string());
             }
         };
+        let page_size_encode_ms = page_size_started_at.elapsed().as_secs_f64() * 1_000.0;
         if page_bytes > TRANSFORM_PAGE_MAX_BYTES {
             self.discard_transform_pages(&binding.session);
             return transform_page_error(
@@ -9302,10 +10333,26 @@ impl McHandler {
         {
             let transforms = self.transform_pages.lock().expect("transform page mutex");
             if let Some(completed) = transforms.completed(&binding.session, &transform_id) {
-                if completed.generation == generation
-                    && page_complete
-                    && completed.final_digest == page_digest
-                {
+                if completed.generation != generation {
+                    return transform_page_error(
+                        lane,
+                        "digest_mismatch",
+                        "completed transform generation changed",
+                    );
+                }
+                if !page_complete {
+                    // Content-addressed attempt ids let a caller whose route disappeared
+                    // replay page admission cheaply. The final-page digest below remains
+                    // the response adoption fence; random ids from older adapters never
+                    // collide with a retained completion.
+                    return respond(json!({
+                        "ok": true,
+                        "staged": true,
+                        "next_expected_index": page_index + 1,
+                        "completed_replay": true,
+                    }));
+                }
+                if completed.final_digest == page_digest {
                     return HandlerOutcome::Response(completed.result.clone());
                 }
                 return transform_page_error(
@@ -9316,6 +10363,7 @@ impl McHandler {
             }
         }
         let queued_at_ms = now_ms().max(0) as u64;
+        let page_stage_started_at = Instant::now();
         let staged = {
             let mut transforms = self.transform_pages.lock().expect("transform page mutex");
             transforms.stage(
@@ -9331,7 +10379,18 @@ impl McHandler {
                 queued_at_ms,
             )
         };
+        let page_stage_ms = page_stage_started_at.elapsed().as_secs_f64() * 1_000.0;
         self.refresh_oldest_queued_at_ms();
+        eprintln!(
+            "mc-transform-page-timing session={} page={}/{} bytes={} digest={:.1} size_encode={:.1} stage={:.1}",
+            binding.session,
+            page_index + 1,
+            page_total,
+            page_bytes,
+            page_digest_ms,
+            page_size_encode_ms,
+            page_stage_ms,
+        );
         let action = match staged {
             Ok(action) => {
                 ticket.accept();
@@ -9374,13 +10433,27 @@ impl McHandler {
                 final_digest,
                 inbound_bytes,
             } => {
+                let page_assembly_started_at = Instant::now();
                 let assembled = match assemble_transform_pages(pages) {
                     Ok(assembled) => assembled,
-                    Err(message) => {
+                    Err(error) => {
                         self.discard_transform_pages(&binding.session);
-                        return transform_page_error(lane, "protocol_mismatch", message);
+                        let (suffix, message) = match error {
+                            TransformPageAssemblyError::ProtocolMismatch(message) => {
+                                ("protocol_mismatch", message)
+                            }
+                            TransformPageAssemblyError::DigestMismatch(message) => {
+                                ("digest_mismatch", message)
+                            }
+                        };
+                        return transform_page_error(lane, suffix, message);
                     }
                 };
+                let page_assembly_ms = page_assembly_started_at.elapsed().as_secs_f64() * 1_000.0;
+                eprintln!(
+                    "mc-transform-page-assembly session={} pages={} inbound_bytes={} assembly={:.1}",
+                    binding.session, page_total, inbound_bytes, page_assembly_ms,
+                );
                 let outcome = self
                     .handle_transform_unpaged_value(
                         channel,
@@ -10218,9 +11291,14 @@ impl McHandler {
         };
         let authority = store
             .facade_authority_for_project(requested_project, authority_domain)
-            .map_err(|error| HandlerOutcome::Error {
-                code: "authority_route_lookup_failed".to_string(),
-                message: error.to_string(),
+            .map_err(|error| {
+                eprintln!(
+                    "mc-module: {authority_domain} route lookup failed code=authority_route_lookup_failed: {error}"
+                );
+                HandlerOutcome::Error {
+                    code: "authority_route_lookup_failed".to_string(),
+                    message: capability_refusal_message(authority_domain).to_string(),
+                }
             })?;
         if let Some((context_store_uuid, project, state)) = authority {
             if state != "MODULE" {
@@ -10228,9 +11306,14 @@ impl McHandler {
             }
             store
                 .bind_authority_route(&context_store_uuid, &project, &route_project_root)
-                .map_err(|error| HandlerOutcome::Error {
-                    code: "authority_route_bind_failed".to_string(),
-                    message: error.to_string(),
+                .map_err(|error| {
+                    eprintln!(
+                        "mc-module: {authority_domain} route bind failed code=authority_route_bind_failed: {error}"
+                    );
+                    HandlerOutcome::Error {
+                        code: "authority_route_bind_failed".to_string(),
+                        message: capability_refusal_message(authority_domain).to_string(),
+                    }
                 })?;
         }
         Ok(())
@@ -10296,12 +11379,13 @@ impl McHandler {
             {
                 Ok(Some((authority_project, authority_state))) => {
                     if requested_project.is_some_and(|requested| requested != authority_project) {
+                        eprintln!(
+                            "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {authority_project}, received {}",
+                            requested_project.unwrap_or_default()
+                        );
                         return Err(HandlerOutcome::Error {
                             code: "facade_project_vocabulary_mismatch".to_string(),
-                            message: format!(
-                                "{authority_domain} facade route {route_project_root} is authority-managed as {authority_project}, but the request supplied {}",
-                                requested_project.unwrap_or_default()
-                            ),
+                            message: capability_refusal_message(authority_domain).to_string(),
                         });
                     }
                     if bind_authority_for_write && authority_state != "MODULE" {
@@ -10315,9 +11399,12 @@ impl McHandler {
                 // retryable errors: silently using the route could read or write the wrong owner.
                 Ok(None) => route_project_root.clone(),
                 Err(error) => {
+                    eprintln!(
+                        "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                    );
                     return Err(HandlerOutcome::Error {
                         code: "authority_project_resolution_failed".to_string(),
-                        message: error.to_string(),
+                        message: capability_refusal_message(authority_domain).to_string(),
                     });
                 }
             },
@@ -10409,22 +11496,28 @@ impl McHandler {
             ));
         }
 
-        let protected_start = tags
-            .len()
-            .checked_sub(DEFAULT_PROTECTED_TAGS)
-            .and_then(|index| tags.get(index))
-            .map(|tag| tag.tag_number as u64)
-            .unwrap_or(0);
-        let (deferred, immediate): (Vec<_>, Vec<_>) = queueable
-            .iter()
-            .copied()
-            .partition(|number| protected_start != 0 && *number >= protected_start);
+        let loaded = match store.load(session_id) {
+            Ok(loaded) => loaded,
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let floor = loaded
+            .meta
+            .protected_tokens_effective
+            .or_else(|| {
+                protection_window::pre_snapshot_floor(store.tag_cache_namespace(), session_id)
+            })
+            .unwrap_or_else(|| protection_window::derive_default_floor(200_000));
+        let window = protection_window::ProtectionWindow::from_persisted_rows(&tags, floor);
+        let (deferred, immediate): (Vec<_>, Vec<_>) =
+            queueable.iter().copied().partition(|number| {
+                window
+                    .tag_numbers
+                    .tag_numbers
+                    .contains(&protection_window::TagNumber(*number as i64))
+            });
         let mut details = Vec::new();
         if !immediate.is_empty() {
             details.push(format!("drop {}", format_tag_numbers(&immediate)));
-        }
-        if !deferred.is_empty() {
-            details.push(format!("deferred drop {}", format_tag_numbers(&deferred)));
         }
         let validation_detail = ctx_reduce_ack_details(&unknown, &already_queued);
         if !validation_detail.is_empty() {
@@ -10432,7 +11525,18 @@ impl McHandler {
         }
         // This acknowledgement validates the durable tag state but deliberately does not
         // mutate it. The response observer owns asynchronous delivery on this facade.
-        mcp_text_result(format!("Queued: {}.", details.join("; ")), false)
+        let mut reply = if details.is_empty() {
+            String::new()
+        } else {
+            format!("Queued: {}.", details.join("; "))
+        };
+        if !deferred.is_empty() {
+            if !reply.is_empty() {
+                reply.push(' ');
+            }
+            reply.push_str(&ctx_reduce_held_reply(&deferred));
+        }
+        mcp_text_result(reply, false)
     }
 
     async fn handle_ctx_memory_facade(&self, channel: u16, request: &Value) -> HandlerOutcome {
@@ -10541,6 +11645,11 @@ impl McHandler {
                 )
             }
             "update" => {
+                let category =
+                    match memory_tool::validate_update_category(string_arg(args, "category")) {
+                        Ok(category) => category,
+                        Err(error) => return tool_error_result(format!("Error: {error}.")),
+                    };
                 let Some(id) = single_memory_id(args, "update") else {
                     return tool_error_result(
                         "Error: provide exactly one memory id when action is 'update'.",
@@ -10562,7 +11671,13 @@ impl McHandler {
                         command_id.as_deref(),
                         |tx| {
                             let memory = tx
-                                .update_memory_content(memory_project, id, content, now_ms())
+                                .update_memory_content(
+                                    memory_project,
+                                    id,
+                                    content,
+                                    category,
+                                    now_ms(),
+                                )
                                 .map_err(|error| error.to_string())?
                                 .ok_or_else(|| format!("memory {id} was not found"))?;
                             facade_text_response(
@@ -10733,31 +11848,35 @@ impl McHandler {
 
         if include_memories {
             if let Some(ids) = parse_search_memory_ids(query) {
-                match memory_tool::resolve_memory_ids_for_search(
+                match memory_tool::resolve_memory_ids_for_search_with_diagnostics(
                     store,
                     memory_project,
                     &ids,
                     limit.max(ids.len()),
                     &visible_memory_ids,
                 ) {
-                    Ok(Some(results)) => {
+                    Ok(outcome)
+                        if outcome.results.is_some()
+                            || !outcome.diagnostics.suppressed_visible_memory_ids.is_empty() =>
+                    {
                         return mcp_text_result(
                             render_facade_search_results(
                                 query,
-                                &results,
+                                outcome.results.as_deref().unwrap_or_default(),
+                                &outcome.diagnostics,
                                 conversation_key,
                                 workspace_membership.as_ref(),
                             ),
                             false,
                         )
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(error) => return tool_error_result(format!("Error: {error}")),
                 }
             }
         }
 
-        match memory_tool::search_available_corpora_for_session(
+        match memory_tool::search_available_corpora_for_session_with_diagnostics(
             store,
             memory_project,
             conversation_key,
@@ -10770,10 +11889,11 @@ impl McHandler {
                 excluded_memory_ids: &visible_memory_ids,
             },
         ) {
-            Ok(results) => mcp_text_result(
+            Ok(outcome) => mcp_text_result(
                 render_facade_search_results(
                     query,
-                    &results,
+                    &outcome.results,
+                    &outcome.diagnostics,
                     conversation_key,
                     workspace_membership.as_ref(),
                 ),
@@ -11059,6 +12179,40 @@ impl McHandler {
         let action = string_arg(args, "action")
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
+        let has_note_id = args.contains_key("note_id");
+        let has_note_ids = args.contains_key("note_ids");
+        if has_note_id && has_note_ids {
+            return tool_error_result(
+                "Error: 'note_id' and 'note_ids' cannot be used together; provide one or the other.",
+            );
+        }
+        if has_note_ids && action != "dismiss" {
+            return tool_error_result("Error: 'note_ids' is only valid when action is 'dismiss'.");
+        }
+        let note_ids = if action == "dismiss" && has_note_ids {
+            let Some(values) = args.get("note_ids").and_then(Value::as_array) else {
+                return tool_error_result(
+                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
+                );
+            };
+            if !(1..=50).contains(&values.len()) {
+                return tool_error_result(
+                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
+                );
+            }
+            let mut parsed = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(note_id) = value.as_i64().filter(|id| *id > 0) else {
+                    return tool_error_result(
+                        "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
+                    );
+                };
+                parsed.push(note_id);
+            }
+            Some(parsed)
+        } else {
+            None
+        };
         let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "notes", is_mutation)
@@ -11114,7 +12268,7 @@ impl McHandler {
                     && !self.note_evaluation_capability(Path::new(&facade_scope.route_project_root))
                 {
                     return tool_error_result(
-                        "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.",
+                        "Conditional notes are not available in the current mode. Save a regular note without a condition. (MC-C08)",
                     );
                 }
                 if let Some(condition) = condition {
@@ -11312,6 +12466,10 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
+                                    string_arg(args, "compiled_provider"),
+                                    string_arg(args, "compiled_config"),
+                                    i64_arg(args, "compiled_at"),
+                                    string_arg(args, "compile_status"),
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?
@@ -11333,12 +12491,54 @@ impl McHandler {
                 )
             }
             "dismiss" => {
+                let resolution = string_arg(args, "content");
+                if let Some(note_ids) = note_ids.as_deref() {
+                    return facade_command_outcome(
+                        store.with_facade_command(
+                            facade_scope.route_project_root.as_str(),
+                            project,
+                            "notes",
+                            session,
+                            "ctx_note",
+                            action,
+                            command_id.as_deref(),
+                            |tx| {
+                                let outcomes = tx
+                                    .dismiss_notes(project, session, note_ids, resolution, now)
+                                    .map_err(|error| error.to_string())?;
+                                let dismissed_count = outcomes
+                                    .iter()
+                                    .filter(|(_, outcome)| {
+                                        *outcome == NoteDismissOutcome::Dismissed
+                                    })
+                                    .count();
+                                let details = outcomes
+                                    .iter()
+                                    .map(|(note_id, outcome)| {
+                                        format!(
+                                            "- Note #{note_id}: {}",
+                                            note_dismiss_outcome_text(*outcome)
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                facade_text_response(
+                                    format!(
+                                        "Dismissed {dismissed_count} of {} notes.\n{details}",
+                                        outcomes.len()
+                                    ),
+                                    false,
+                                )
+                            },
+                        ),
+                        "notes",
+                    );
+                }
                 let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
                     return tool_error_result(
                         "Error: 'note_id' is required when action is 'dismiss'.",
                     );
                 };
-                let resolution = string_arg(args, "content");
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -11618,13 +12818,13 @@ fn serve_native_unsupported_profile_error(profile: &str) -> HandlerOutcome {
 fn attach_native_messages(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
-    reasoning_watermark: u64,
+    reasoning_clear_units: &[mc_core::FrozenUnit],
     mutation_exempt_mid: Option<&str>,
 ) {
     attach_native_messages_with_tags(
         response,
         request,
-        reasoning_watermark,
+        reasoning_clear_units,
         &std::collections::BTreeMap::new(),
         mutation_exempt_mid,
         None,
@@ -11669,7 +12869,7 @@ enum ProjectionCacheKeyMode {
 fn attach_native_messages_with_tags(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
-    reasoning_watermark: u64,
+    reasoning_clear_units: &[mc_core::FrozenUnit],
     tag_numbers: &BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
@@ -11679,9 +12879,9 @@ fn attach_native_messages_with_tags(
         return;
     }
     let native_messages = encode_full_native_messages(
-        response.messages(),
+        response,
         request,
-        reasoning_watermark,
+        reasoning_clear_units,
         tag_numbers,
         mutation_exempt_mid,
         lineage_anchor_mid,
@@ -11843,35 +13043,37 @@ fn native_value_retained_bytes(value: &Value) -> usize {
 fn native_reasoning_should_clear(
     served: &transform::ServedMessage,
     request: &TransformRequest,
-    reasoning_watermark: u64,
+    ingress_ordinals: &HashMap<&str, u64>,
+    cleared_mids: &HashSet<&str>,
     tag_numbers: &BTreeMap<String, u64>,
-    newest_assistant_mid: Option<&str>,
 ) -> (u64, bool) {
     let Some(mid) = served.meta.harness_id.as_deref() else {
         return (0, false);
     };
-    let Some(ingress) = request.messages.iter().find(|message| message.mid == mid) else {
+    let Some(ordinal) = ingress_ordinals.get(mid).copied() else {
         return (0, false);
     };
-    let tag_number = tag_numbers.get(mid).copied().unwrap_or(ingress.ordinal);
+    let tag_number = tag_numbers.get(mid).copied().unwrap_or(ordinal);
     let should_clear = served.role == "assistant"
         && !served.meta.synthetic
-        && reasoning_watermark > 0
         && transform::request_accepts_empty_content(request)
-        && tag_number <= reasoning_watermark
-        && newest_assistant_mid != Some(mid);
+        && cleared_mids.contains(mid);
     (tag_number, should_clear)
 }
 
+include!("reasoning_native_evidence.rs");
+
 fn encode_full_native_messages(
-    served: &[transform::ServedMessage],
+    response: &transform::TransformResponse,
     request: &TransformRequest,
-    reasoning_watermark: u64,
+    reasoning_clear_units: &[mc_core::FrozenUnit],
     tag_numbers: &BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
     transition_consumed: bool,
 ) -> Vec<Value> {
+    let served = response.messages();
+    let native_reasoning_keep_mids = &response.native_reasoning_keep_mids;
     let sidecar = request
         .native_messages
         .as_deref()
@@ -11904,12 +13106,33 @@ fn encode_full_native_messages(
             &mut native_messages,
             &served_messages,
             &request.messages,
-            reasoning_watermark,
+            reasoning_clear_units,
             request.mid_turn,
             tag_numbers,
         );
     }
+    replay_native_reasoning_keeps(&mut native_messages, &sidecar, native_reasoning_keep_mids);
     native_messages
+}
+
+fn replay_native_reasoning_keeps(
+    messages: &mut [Value],
+    sidecar: &codec::DecodeSidecar,
+    keep_mids: &[String],
+) {
+    for message in messages {
+        let Some(mid) = message["info"]["id"].as_str() else {
+            continue;
+        };
+        if !keep_mids.iter().any(|keep| keep == mid) {
+            continue;
+        }
+        if let Some(meta) = sidecar.messages.get(mid) {
+            if let Some(parts) = meta.raw.get("parts") {
+                message["parts"] = parts.clone();
+            }
+        }
+    }
 }
 
 fn native_ingress_chunks(
@@ -11971,7 +13194,7 @@ fn native_attachment_differential_enabled() -> bool {
 fn attach_native_messages_incremental(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
-    reasoning_watermark: u64,
+    reasoning_clear_units: &[mc_core::FrozenUnit],
     tag_numbers: &BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
@@ -12026,6 +13249,11 @@ fn attach_native_messages_incremental(
         .collect::<Vec<_>>();
     let newest_assistant_mid =
         transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+    let ingress_ordinals = request
+        .messages
+        .iter()
+        .map(|message| (message.mid.as_str(), message.ordinal))
+        .collect::<HashMap<_, _>>();
 
     let mut sidecar_hashes = cached
         .as_mut()
@@ -12035,6 +13263,7 @@ fn attach_native_messages_incremental(
         .as_mut()
         .map(|snapshot| std::mem::take(&mut snapshot.sidecar_sizes))
         .unwrap_or_default();
+    let cleared_mids = transform::reasoning_native_clear_mids(reasoning_clear_units);
     let mut message_keys = Vec::with_capacity(response.messages().len());
     for (position, served) in response.messages().iter().enumerate() {
         let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
@@ -12070,14 +13299,20 @@ fn attach_native_messages_incremental(
             }
             Some(hash)
         });
-        let mutation_exempt = slot.is_some_and(|mid| mutation_exempt_mids.contains(&mid));
+        let mutation_exempt = slot.is_some_and(|mid| {
+            mutation_exempt_mids.contains(&mid)
+                || response
+                    .native_reasoning_keep_mids
+                    .iter()
+                    .any(|keep| keep == mid)
+        });
         let reasoning_exempt = slot.is_some_and(|mid| Some(mid) == newest_assistant_mid);
         let (tag_number, reasoning_should_clear) = native_reasoning_should_clear(
             served,
             request,
-            reasoning_watermark,
+            &ingress_ordinals,
+            &cleared_mids,
             tag_numbers,
-            newest_assistant_mid,
         );
         message_keys.push(native_message_key(
             served,
@@ -12178,11 +13413,16 @@ fn attach_native_messages_incremental(
             &mut suffix_values,
             response.messages(),
             &request.messages,
-            reasoning_watermark,
+            reasoning_clear_units,
             request.mid_turn,
             tag_numbers,
         );
     }
+    replay_native_reasoning_keeps(
+        &mut suffix_values,
+        &sidecar,
+        &response.native_reasoning_keep_mids,
+    );
     chunks.extend(
         encoded_suffix
             .into_iter()
@@ -12204,9 +13444,9 @@ fn attach_native_messages_incremental(
 
     if native_attachment_differential_enabled() {
         let full = encode_full_native_messages(
-            response.messages(),
+            response,
             request,
-            reasoning_watermark,
+            reasoning_clear_units,
             tag_numbers,
             mutation_exempt_mid,
             lineage_anchor_mid,
@@ -12270,7 +13510,7 @@ fn attach_native_messages_incremental(
 fn finalize_native_messages_response(
     response: &mut transform::TransformResponse,
     request: &TransformRequest,
-    reasoning_watermark: u64,
+    reasoning_clear_units: &[mc_core::FrozenUnit],
     tag_numbers: &BTreeMap<String, u64>,
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
@@ -12315,9 +13555,9 @@ fn finalize_native_messages_response(
         fallback_reason.get_or_insert(NativeDeltaFallbackReason::MissingNativeContent);
         response.native_messages = Some(
             encode_full_native_messages(
-                response.messages(),
+                response,
                 request,
-                reasoning_watermark,
+                reasoning_clear_units,
                 tag_numbers,
                 mutation_exempt_mid,
                 lineage_anchor_mid,
@@ -12358,7 +13598,7 @@ fn passthrough_transform_response(request: &TransformRequest) -> HandlerOutcome 
             .collect(),
         request.full_array_fingerprint.clone(),
     );
-    attach_native_messages(&mut response, request, 0, None);
+    attach_native_messages(&mut response, request, &[], None);
     respond_transform(request, response)
 }
 
@@ -12741,10 +13981,13 @@ fn canonical_object_fields(request: &Value, fields: &[&str]) -> String {
 }
 
 fn transform_page_content_digest(request: &Value) -> String {
-    // Keep the digest's canonical object shape while borrowing page arrays. The page is
-    // subsequently consumed by assembly, so cloning these values just to hash them would
-    // duplicate the largest allocation in the request.
-    sha256_hex(canonical_object_fields(request, &TRANSFORM_PAGE_ARRAY_FIELDS).as_bytes())
+    // Hash only pageable content: scalar fields arrive on the final page, while arrays
+    // and map slices must be protected independently as each page is staged.
+    let fields = TRANSFORM_PAGE_ARRAY_FIELDS
+        .into_iter()
+        .chain(TRANSFORM_PAGE_MAP_FIELDS)
+        .collect::<Vec<_>>();
+    sha256_hex(canonical_object_fields(request, &fields).as_bytes())
 }
 
 fn transform_continuation_chunk<'a>(
@@ -12847,12 +14090,28 @@ fn assemble_transform_page_field(field: &str, values: Vec<Value>) -> Result<Vec<
     Ok(assembled)
 }
 
-fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
-    let mut final_page = pages
-        .pop()
-        .ok_or_else(|| "transform page collection was empty".to_string())?;
+#[derive(Debug)]
+enum TransformPageAssemblyError {
+    ProtocolMismatch(String),
+    DigestMismatch(String),
+}
+
+impl From<String> for TransformPageAssemblyError {
+    fn from(message: String) -> Self {
+        Self::ProtocolMismatch(message)
+    }
+}
+
+fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, TransformPageAssemblyError> {
+    let mut final_page = pages.pop().ok_or_else(|| {
+        TransformPageAssemblyError::ProtocolMismatch(
+            "transform page collection was empty".to_string(),
+        )
+    })?;
     if !final_page.is_object() {
-        return Err("transform page was not an object".to_string());
+        return Err(TransformPageAssemblyError::ProtocolMismatch(
+            "transform page was not an object".to_string(),
+        ));
     }
     if let Some(object) = final_page.as_object_mut() {
         for field in [
@@ -12879,9 +14138,45 @@ fn assemble_transform_pages(mut pages: Vec<Value>) -> Result<Value, String> {
         if had_field || !values.is_empty() {
             let values = assemble_transform_page_field(field, values)?;
             let Some(object) = final_page.as_object_mut() else {
-                return Err("transform page was not an object".to_string());
+                return Err(TransformPageAssemblyError::ProtocolMismatch(
+                    "transform page was not an object".to_string(),
+                ));
             };
             object.insert(field.to_string(), Value::Array(values));
+        }
+    }
+    for field in TRANSFORM_PAGE_MAP_FIELDS {
+        let had_field = final_page.get(field).is_some();
+        let mut merged = serde_json::Map::new();
+        for page in pages.iter_mut().chain(std::iter::once(&mut final_page)) {
+            let Some(object) = page.as_object_mut() else {
+                return Err(TransformPageAssemblyError::ProtocolMismatch(
+                    "transform page was not an object".to_string(),
+                ));
+            };
+            let Some(value) = object.remove(field) else {
+                continue;
+            };
+            let Value::Object(entries) = value else {
+                return Err(TransformPageAssemblyError::ProtocolMismatch(format!(
+                    "transform pageable map field {field} was not an object"
+                )));
+            };
+            for (key, value) in entries {
+                if merged.insert(key.clone(), value).is_some() {
+                    return Err(TransformPageAssemblyError::DigestMismatch(format!(
+                        "transform pageable map field {field} repeated key {key} across pages"
+                    )));
+                }
+            }
+        }
+        if had_field || !merged.is_empty() {
+            let Some(object) = final_page.as_object_mut() else {
+                return Err(TransformPageAssemblyError::ProtocolMismatch(
+                    "transform page was not an object".to_string(),
+                ));
+            };
+            object.insert(field.to_string(), Value::Object(merged));
         }
     }
     Ok(final_page)
@@ -13002,10 +14297,20 @@ fn session_unresolved_error() -> HandlerOutcome {
     }
 }
 
+fn capability_refusal_message(domain: &str) -> &'static str {
+    match domain {
+        "memories" => {
+            "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)"
+        }
+        "notes" => "Note changes are paused while the engine syncs. Retry in a moment. (MC-C03)",
+        _ => "Magic Context is temporarily unavailable. Retry in a moment. (MC-C10)",
+    }
+}
+
 fn authority_draining_error(domain: &str) -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "authority_draining".to_string(),
-        message: format!("{domain} authority is draining; retry after the ownership transition"),
+        message: capability_refusal_message(domain).to_string(),
     }
 }
 
@@ -13033,16 +14338,14 @@ fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {
 fn store_unavailable_error() -> HandlerOutcome {
     HandlerOutcome::Error {
         code: "store_unavailable".to_string(),
-        message: "store not opened (no HELLO_ACK storage seam yet)".to_string(),
+        message: "Magic Context is temporarily unavailable. Retry in a moment. (MC-C10)"
+            .to_string(),
     }
 }
 
-const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
-/// Transform-class requests carry a session's full message array. The transport
-/// frame ceiling is 64 MiB; half that leaves headroom for envelope overhead while
-/// still admitting the largest observed live sessions (multi-MiB CK arrays with
-/// retained ingress bytes).
-const MAX_TRANSFORM_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FACADE_FRAME_BYTES: usize =
+    subc_protocol::MAX_FRAME_BODY_LEN as usize - SUBC_FRAME_BODY_HEADROOM_BYTES;
+const MAX_TRANSFORM_FRAME_BYTES: usize = MAX_FACADE_FRAME_BYTES;
 
 /// Minimal probe deserialized from an oversized body ONLY to pick the right byte
 /// cap. serde ignores every other field, so this stays cheap relative to a full
@@ -13081,10 +14384,12 @@ fn enforce_request_byte_cap(body: &[u8]) -> Result<(), HandlerOutcome> {
             return Ok(());
         }
         return Err(invalid_params_error(
-            "request body exceeds the 32 MiB transform limit",
+            "request body exceeds the 48 MiB transform limit",
         ));
     }
-    Err(invalid_params_error("request body exceeds the 1 MiB limit"))
+    Err(invalid_params_error(
+        "request body exceeds the 48 MiB limit",
+    ))
 }
 const MAX_AGENT_DROPS_COMMAND_ID_BYTES: usize = 128;
 const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
@@ -13274,16 +14579,26 @@ fn format_search_age(created_at_ms: i64) -> String {
 fn render_facade_search_results(
     query: &str,
     results: &[memory_tool::MemorySearchResult],
+    diagnostics: &memory_tool::MemorySearchDiagnostics,
     current_session_id: &str,
     workspace_membership: Option<&mc_store::WorkspaceMembership>,
 ) -> String {
+    let visible_ids = &diagnostics.suppressed_visible_memory_ids;
     if results.is_empty() {
+        if !visible_ids.is_empty() {
+            let count = visible_ids.len();
+            let noun = if count == 1 { "match" } else { "matches" };
+            return format!(
+                "No hidden results found for \"{query}\".\n\nMemories: {count} {noun} found, all already visible in your project-memory block (ids {}).",
+                join_i64s(visible_ids)
+            );
+        }
         return format!(
             "No results found for \"{query}\" across notes, memories, primers, git commits, or message history."
         );
     }
 
-    let mut body = Vec::with_capacity(results.len() + 2);
+    let mut body = Vec::with_capacity(results.len() + 3);
     for (index, result) in results.iter().enumerate() {
         let score = result.score_hundredths as f64 / 100.0;
         let rendered = match result.source_kind {
@@ -13335,6 +14650,15 @@ fn render_facade_search_results(
             }
         };
         body.push(rendered);
+    }
+    if !visible_ids.is_empty() {
+        let count = visible_ids.len();
+        let noun = if count == 1 { "match" } else { "matches" };
+        let pronoun = if count == 1 { "it is" } else { "they are" };
+        body.push(format!(
+            "Memories: {count} additional {noun} suppressed because {pronoun} already visible in your project-memory block (ids {}).",
+            join_i64s(visible_ids)
+        ));
     }
     if results.iter().any(|result| {
         matches!(
@@ -13537,6 +14861,15 @@ fn render_cached_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
         | ck_wire::CkKind::Reasoning { .. }
         | ck_wire::CkKind::RedactedReasoning { .. }
         | ck_wire::CkKind::Opaque(_) => None,
+    }
+}
+
+fn ctx_reduce_held_reply(held: &[u64]) -> String {
+    let tags = format_tag_numbers(held);
+    if held.len() == 1 {
+        format!("Held: {tags} is inside the protected working set; it applies once newer work displaces it.")
+    } else {
+        format!("Held: {tags} are inside the protected working set; they apply once newer work displaces them.")
     }
 }
 
@@ -14542,6 +15875,15 @@ fn plural_word(count: usize, singular: &'static str) -> String {
     }
 }
 
+fn note_dismiss_outcome_text(outcome: NoteDismissOutcome) -> &'static str {
+    match outcome {
+        NoteDismissOutcome::Dismissed => "dismissed",
+        NoteDismissOutcome::NotFound => "not_found",
+        NoteDismissOutcome::NotOwned => "not_owned",
+        NoteDismissOutcome::AlreadyDismissed => "already_dismissed",
+    }
+}
+
 fn format_traffic_age(observed_at_ms: i64, now: i64) -> String {
     if observed_at_ms <= 0 {
         return "unknown".to_string();
@@ -14607,6 +15949,20 @@ fn historian_status_summary(state: &mc_store::HistorianDurableState) -> String {
         return format!("no fire: {}", compact_status_detail(reason));
     }
     if let Some(reason) = state.last_failure.as_deref() {
+        if let Some(detail) = reason.strip_prefix(historian::MODEL_UNRESOLVABLE_PUBLISHED_PREFIX) {
+            return format!(
+                "published seq {}; {}",
+                state.firing_seq,
+                compact_status_detail(detail)
+            );
+        }
+        if reason.starts_with(historian::MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX) {
+            return format!(
+                "failed seq {}: {}",
+                state.firing_seq,
+                compact_status_detail(reason)
+            );
+        }
         return format!("failure: {}", compact_status_detail(reason));
     }
     if state.firing_seq > 0 {
@@ -14746,6 +16102,12 @@ fn usage_numbers(
     let limit = usage
         .map(|u| u.context_limit_tokens as f64)
         .filter(|limit| *limit >= MIN_PLAUSIBLE_CONTEXT_LIMIT as f64)
+        .filter(|limit| {
+            geometry.is_none_or(|geometry| {
+                geometry.absolute_wall < MIN_PLAUSIBLE_CONTEXT_LIMIT
+                    || *limit <= geometry.absolute_wall as f64
+            })
+        })
         .or_else(|| {
             geometry
                 .map(|geometry| geometry.usable_soft as f64)
@@ -14914,7 +16276,7 @@ fn ctx_memory_description() -> String {
 }
 
 fn ctx_search_description() -> String {
-    "Keyword-search saved project memories, session notes, and summarized conversation history. This is literal word or phrase search, not semantic search; use it to find remembered facts or prior discussion snippets before answering.".to_string()
+    "Your long-term recall for this project — search everything that ever happened here, not just what's currently visible.\n\nRetrieval matches meaning as well as exact words and fuses them, so phrasing matters: phrase `query` as a natural-language question that still contains the exact terms you expect in the answer (paths, symbols, config keys, error strings); a bare keyword stack finds less than a question carrying the same words.\n- Good: \"where is the retry backoff for the upload client configured?\"\n- Bad: \"upload client retry backoff config\"\n\nReach for it when something feels familiar but isn't in view: \"did we solve this before?\", \"what did we decide about X?\", \"when did this break?\", \"where does Y live?\". Results only contain things you CANNOT currently see — memories already shown in <project-memory> and the live conversation tail are filtered out. A query that is just one or more memory ids (e.g. `#7234` or `12, 34`) bypasses text search and resolves those ids directly.\n\nSources (omit for a broad search across all):\n- memory: curated cross-session project knowledge — rules, constraints, conventions.\n- message: the raw conversation behind your compacted history. Hits include message ordinals — expand the surrounding exchange with ctx_expand(start=N-10, end=N+5).\n- git_commit: this repository's commit history.\n- note: parked decisions and follow-ups with their recorded text.\n\nPicking sources:\n- \"when did this change / was this working before\" → [\"git_commit\", \"message\"]\n- \"did we discuss this earlier\" → [\"message\"]\n- \"did we decide something about this / leave a follow-up\" → [\"note\"]\n- \"what's our convention / rule for X\" → [\"memory\"]".to_string()
 }
 
 fn ctx_expand_description() -> String {
@@ -14922,7 +16284,7 @@ fn ctx_expand_description() -> String {
 }
 
 fn ctx_note_description() -> String {
-    "Save or inspect durable session notes for future follow-ups. surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
+    "Save or inspect durable session notes for future follow-ups. Dismiss one note with note_id or 1–50 with note_ids, never both. surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
 }
 
 fn ctx_memory_schema() -> Value {
@@ -14937,7 +16299,7 @@ fn ctx_memory_schema() -> Value {
             },
             "category": {
                 "type": "string",
-                "description": "Memory category for a new memory: one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, or NAMING. Required for write."
+                "description": "Memory category: one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, or NAMING. Required for write; optional on update to recategorize, and omission keeps the current category."
             },
             "content": {
                 "type": "string",
@@ -14987,7 +16349,7 @@ fn ctx_search_schema() -> Value {
             "query": {
                 "type": "string",
                 "maxLength": 1024,
-                "description": "Literal keyword or phrase to find in memories and summarized history."
+                "description": "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text."
             },
             "limit": {
                 "type": "integer",
@@ -15021,6 +16383,7 @@ fn ctx_note_schema() -> Value {
             "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
             "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
             "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
+            "note_ids": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }, "description": "One to fifty note ids for 'dismiss' only; do not combine with note_id." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes in each section." },
             "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
@@ -15032,51 +16395,81 @@ fn ctx_note_schema() -> Value {
 
 /// The module manifest registered at HELLO. The startup manifest owns stable tool IDs and schemas;
 /// bound sessions obtain preset-selected description text through `manifest.get`.
-pub fn manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        // Introduced by subc-protocol 0.12: optional pre-validated capability
-        // declarations. MC requests nothing beyond its role grants, so None keeps
-        // the HELLO identical to the pre-field wire shape (serde skips None).
-        capabilities: None,
-        // Introduced by subc-protocol 0.14: optional self-signal manifest registry.
-        // Some(vec![]) is deliberate over None per the falsy-value discrimination
-        // rule: it declares "examined, none to register" (MC emits no self-signals
-        // today), while None would read as "never examined". Serde still emits the
-        // field, which is the examined marker the daemon census reads.
-        self_signals: Some(vec![]),
-        // Introduced by subc-protocol 0.13: build provenance for the deploy ladder.
-        // The git sha is stamped by the release build command (MC_BUILD_SHA env at
-        // compile time); a bare `cargo build` leaves it absent rather than wrong.
-        // The daemon renders these in module status, which gives deploy
-        // verification a queryable build identity instead of binary archaeology.
-        provenance: Some(build_provenance(option_env!("MC_BUILD_SHA"), None, None)),
-        provides: vec![ProviderRole::ToolProvider {
-            tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
-            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: false,
-            sub_supervises: false,
-        }],
-        consumes: vec![ConsumerRole::ServiceClient {
-            of: vec!["thalamus".to_string()],
-        }],
-        bindings: Bindings {
-            storage: StorageBinding {
-                kind: StorageKind::Sqlite,
-                scope: StorageScope::Project,
-                owns_schema: true,
-            },
-            vault_grants: Vec::new(),
-            identity: IdentityBinding {
-                requires: vec![IdentityScope::Project],
-                optional: vec![IdentityScope::Session],
-            },
-        },
+/// The single-line `--version` self-report: `ck-mc <crate version> (<build sha>)`.
+/// The build sha is the same compile-time `MC_BUILD_SHA` that stamps manifest
+/// provenance, so a release train tag whose id is a prefix of that sha
+/// (`ck-mc-alpha.<short sha>`) can be checked against the placed binary by
+/// substring — the fleet's placement-acceptance contract. A bare `cargo build`
+/// prints the crate version alone rather than a fabricated sha.
+pub fn version_line() -> String {
+    match option_env!("MC_BUILD_SHA")
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+    {
+        Some(sha) => format!("ck-mc {} ({sha})", env!("CARGO_PKG_VERSION")),
+        None => format!("ck-mc {}", env!("CARGO_PKG_VERSION")),
     }
+}
+
+pub fn manifest(module_id: &str) -> ModuleManifest {
+    // Constructed via the subc-protocol builder (never a struct literal): ModuleManifest is
+    // #[non_exhaustive], so builder methods are the only construction path that survives additive
+    // field landings. Every field below is set to the exact value the pre-builder struct literal
+    // produced, so the serialized HELLO is byte-identical to the pre-migration wire shape.
+    // Each optional manifest field is declared in whichever direction is TRUE of this
+    // module, and a test pins both directions on the struct and on the wire because the
+    // compiler stopped requiring them in subc-protocol 0.19. trust_tier stays: this module
+    // is first-party. bindings is absent: the only storage scope the enum can express is
+    // `Project`, but the store at ~/.local/share/cortexkit/magic-context/store.db is one per
+    // MACHINE (every project on the host shares it, rows are project-keyed inside), so any
+    // bindings block would assert a partition that does not exist. The daemon hands this
+    // module its StorageDescriptor from its own config and never reads the binding.
+    ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
+    .trust_tier(Some(TrustTier::FirstParty))
+    .protocol_ver(PROTOCOL_VERSION)
+    // Introduced by subc-protocol 0.12: optional pre-validated capability
+    // declarations. MC requests nothing beyond its role grants, so None keeps
+    // the HELLO identical to the pre-field wire shape (serde skips None).
+    .capabilities(None)
+    // Introduced by subc-protocol 0.14: optional self-signal manifest registry.
+    // Some(vec![]) is deliberate over None per the falsy-value discrimination
+    // rule: it declares "examined, none to register" (MC emits no self-signals
+    // today), while None would read as "never examined". Serde still emits the
+    // field, which is the examined marker the daemon census reads. Actual
+    // signal publication remains deferred; this empty marker is preserved
+    // byte-identically from the pre-builder manifest.
+    .self_signals(Some(vec![]))
+    // Introduced by subc-protocol 0.13: build provenance for the deploy ladder.
+    // The git sha is stamped by the release build command (MC_BUILD_SHA env at
+    // compile time); a bare `cargo build` leaves it absent rather than wrong.
+    // The daemon renders these in module status, which gives deploy
+    // verification a queryable build identity instead of binary archaeology.
+    // build_provenance is the subc-protocol library call (re-exported through
+    // subc-client-rs); it normalizes sentinel/empty values to field omission.
+    // Provenance is a deploy marker, not a load-bearing capability: a
+    // non-canonical stamp (subc-protocol 0.17 requires full lowercase 40-hex;
+    // short `rev-parse --short` stamps fail its form check) must degrade to
+    // omission, never panic the module at boot. Deploy verification greps for
+    // the marker and fails loudly on absence, which is the correct failure
+    // surface for a malformed stamp.
+    .provenance(match build_provenance(option_env!("MC_BUILD_SHA"), None, None) {
+        Ok(provenance) => Some(provenance),
+        Err(err) => {
+            eprintln!("mc-module: MC_BUILD_SHA rejected by provenance form check, omitting deploy marker: {err}");
+            None
+        }
+    })
+    .provides(vec![ProviderRole::ToolProvider {
+        tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
+        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+        concurrency: Concurrency::ModuleManaged,
+        emits_push: false,
+        sub_supervises: false,
+    }])
+    .consumes(vec![ConsumerRole::ServiceClient {
+        of: vec!["thalamus".to_string()],
+    }])
+    .build()
 }
 
 #[cfg(test)]
@@ -15137,6 +16530,98 @@ mod tests {
         let (limit, _, pct) = usage_numbers(Some(&one_m), None);
         assert_eq!(limit, 1_000_000.0);
         assert!((pct - 80.0).abs() < 0.01, "pct={pct}");
+
+        let poisoned = ModuleUsage {
+            current_total_input_tokens: 285_310,
+            context_limit_tokens: 593_717,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
+        };
+        let geometry = crate::transform::TransformGeometry {
+            usable_soft: 204_000,
+            usable_hard: 204_000,
+            absolute_wall: 272_000,
+            derivation: "provider-observed".to_string(),
+        };
+        let proof_above_emergency_wall = ModuleUsage {
+            current_total_input_tokens: 255_834,
+            context_limit_tokens: 255_834,
+            final_wire_input_tokens: 0,
+            final_wire_trusted: false,
+        };
+        let (limit, _, _) = usage_numbers(Some(&proof_above_emergency_wall), Some(&geometry));
+        assert_eq!(limit, 255_834.0);
+
+        let (limit, _, pct) = usage_numbers(Some(&poisoned), Some(&geometry));
+        assert_eq!(limit, 204_000.0);
+        assert!((pct - (285_310.0 / 204_000.0 * 100.0)).abs() < 0.01);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn historian_decision_write_fence_records_distinct_pass_evaluations() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.model_chain.clear();
+        let (handler, store, _dir, _project) = handler_with_store(producer, config);
+
+        let mut first = request_with_usage(trigger_ingress_fixture(180, 1_000), 20_000, 200_000);
+        first["request_observed_at_ms"] = json!(1_000);
+        let first_response = call_transform_request(&handler, first).await;
+        assert_eq!(first_response["status"], "ok");
+        let first_state = store.load("ses").unwrap();
+        let first_decisions = &first_state.meta.historian.recent_decisions;
+        assert_eq!(
+            first_decisions.len(),
+            1,
+            "every evaluated pass must write evidence"
+        );
+        let first_tokens = first_decisions[0].eligible_tokens;
+
+        let second_messages = trigger_ingress_fixture(300, 1_000);
+        let mut second = request_with_usage(second_messages.clone(), 140_000, 200_000);
+        second["request_observed_at_ms"] = json!(2_000);
+        let second_response = call_transform_request(&handler, second).await;
+        assert_eq!(second_response["status"], "ok");
+        let second_state = store.load("ses").unwrap();
+        let second_decisions = &second_state.meta.historian.recent_decisions;
+        assert_eq!(second_decisions.len(), 2);
+        assert_eq!(
+            second_decisions
+                .iter()
+                .map(|decision| decision.cause.as_str())
+                .collect::<Vec<_>>(),
+            ["below_proactive_floor", "no_models"]
+        );
+        assert_eq!(
+            second_decisions
+                .iter()
+                .map(|decision| decision.request_observed_at_ms)
+                .collect::<Vec<_>>(),
+            [1_000, 2_000]
+        );
+        assert_ne!(second_decisions[1].eligible_tokens, first_tokens);
+        assert!(second_decisions
+            .iter()
+            .all(|decision| decision.bar_tokens == 19_500));
+        assert!(second_decisions[1].chunk_range.is_some());
+
+        let row_version = second_state.row_version;
+        let mut steady = request_with_usage(second_messages, 140_000, 200_000);
+        steady["request_observed_at_ms"] = json!(3_000);
+        let steady_response = call_transform_request(&handler, steady).await;
+        assert_eq!(steady_response["status"], "ok");
+        let steady_state = store.load("ses").unwrap();
+        assert_eq!(steady_state.row_version, row_version);
+        assert_eq!(steady_state.meta.historian.recent_decisions.len(), 2);
+
+        let status = tool_body(handler.handle_session_status_value(
+            7,
+            &json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        ));
+        assert_eq!(
+            status["historian"]["recent_decisions"],
+            json!(second_decisions)
+        );
     }
 
     #[test]
@@ -15150,6 +16635,7 @@ mod tests {
         let geometry = crate::transform::TransformGeometry {
             usable_soft: 167_000,
             usable_hard: 200_000,
+            absolute_wall: 200_000,
             derivation: "drive".to_string(),
         };
         let (limit, _, _) = usage_numbers(None, Some(&geometry));
@@ -15169,6 +16655,7 @@ mod tests {
         let implausible = crate::transform::TransformGeometry {
             usable_soft: 12,
             usable_hard: 200_000,
+            absolute_wall: 200_000,
             derivation: String::new(),
         };
         let (limit, _, _) = usage_numbers(None, Some(&implausible));
@@ -15297,6 +16784,31 @@ mod tests {
             durability_class: mc_core::DurabilityClass::Lineage,
             reset_rule: String::new(),
         }
+    }
+
+    #[test]
+    fn boundary_token_cache_primes_cold_entries_from_durable_tag_tokens() {
+        let bytes = b"durable tagged block".to_vec();
+        let mut cache = BoundaryTokenCache::new(1024 * 1024);
+        cache.prime_from_persisted_tags(
+            "session",
+            &[mc_store::McTagRow {
+                tag_number: 1,
+                block_id: "m1#0".to_string(),
+                kind: "text".to_string(),
+                token_count: 37,
+                created_at_ms: 1,
+                source_bytes: bytes.clone(),
+            }],
+        );
+        let mut snapshot = cache.snapshot("session");
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(
+            snapshot.token_count("m1#0", "durable tagged block", &digest),
+            37
+        );
+        assert_eq!(snapshot.hits, 1);
+        assert_eq!(snapshot.misses, 0);
     }
 
     #[test]
@@ -15694,8 +17206,15 @@ mod tests {
             PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC
         );
         assert_eq!(profile_render_epoch(SerializerProfile::OwnedLlmRunner), 0);
-        assert_eq!(profile_render_epoch(SerializerProfile::Pi), 0);
-        assert_eq!(profile_render_epoch(SerializerProfile::OpencodeAiSdk), 0);
+        assert_eq!(profile_render_epoch(SerializerProfile::OwnedBroca), 0);
+        assert_eq!(
+            profile_render_epoch(SerializerProfile::Pi),
+            PROFILE_EPOCH_PI
+        );
+        assert_eq!(
+            profile_render_epoch(SerializerProfile::OpencodeAiSdk),
+            PROFILE_EPOCH_OPENCODE_AI_SDK
+        );
     }
 
     #[test]
@@ -15875,10 +17394,63 @@ mod tests {
     }
 
     #[test]
+    fn version_line_carries_the_build_sha_when_stamped() {
+        let line = version_line();
+        let expected_prefix = format!("ck-mc {}", env!("CARGO_PKG_VERSION"));
+        assert!(line.starts_with(&expected_prefix), "got {line}");
+        match option_env!("MC_BUILD_SHA") {
+            Some(sha) if !sha.trim().is_empty() => {
+                assert_eq!(line, format!("{expected_prefix} ({})", sha.trim()));
+                // A train tag id is a short prefix of the full sha; acceptance
+                // checks the tag id as a substring of this line.
+                assert!(line.contains(&sha.trim()[..8.min(sha.trim().len())]));
+            }
+            _ => assert_eq!(line, expected_prefix),
+        }
+    }
+
+    #[test]
     fn manifest_declares_module_id_and_storage() {
         let m = manifest("magic-context");
         assert_eq!(m.module_id, "magic-context");
+        assert_eq!(m.module_version, env!("CARGO_PKG_VERSION"));
+        // Both optional 0.19 fields are pinned in their TRUE direction on the struct AND on
+        // the serialized HELLO (a field can be set and still skipped at serialization):
+        // first-party is a fact, so it is present; no expressible storage scope is true of a
+        // machine-shared store, so bindings is absent.
+        assert_eq!(m.trust_tier, Some(TrustTier::FirstParty));
+        assert_eq!(
+            m.bindings, None,
+            "bindings must stay absent: the store is machine-scoped"
+        );
+        let wire = serde_json::to_value(&m).expect("manifest serializes");
+        assert_eq!(wire["trust_tier"], serde_json::json!("first_party"));
+        assert!(
+            wire.get("bindings").is_none() || wire["bindings"].is_null(),
+            "bindings must not appear on the wire"
+        );
         assert_eq!(m.protocol_ver, PROTOCOL_VERSION);
+        // The builder migration must preserve the deliberate empty self-signal
+        // marker ("examined, none to register") byte-identically; actual signal
+        // publication remains deferred.
+        assert_eq!(m.self_signals, Some(vec![]));
+        // Provenance is stamped by the subc-protocol build_provenance helper.
+        // The wire_crate_version is always present (a compile-time constant of
+        // the linked subc-protocol crate); build_git_sha is present only when
+        // MC_BUILD_SHA was set at compile time.
+        let provenance = m
+            .provenance
+            .as_ref()
+            .expect("manifest must carry provenance");
+        assert_eq!(
+            provenance.wire_crate_version.as_deref(),
+            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+        );
+        assert_eq!(
+            provenance.build_git_sha.as_deref(),
+            option_env!("MC_BUILD_SHA"),
+            "build_git_sha must mirror the compile-time MC_BUILD_SHA exactly"
+        );
         assert_eq!(
             m.consumes,
             vec![ConsumerRole::ServiceClient {
@@ -16310,7 +17882,7 @@ mod tests {
     }
 
     #[test]
-    fn request_byte_cap_widens_for_transform_class_only() {
+    fn request_byte_cap_uses_the_subc_frame_budget_for_every_request_class() {
         let pad = |method: &str, key: &str, bytes: usize| {
             format!(
                 "{{\"{key}\":\"{method}\",\"pad\":\"{}\"}}",
@@ -16318,19 +17890,32 @@ mod tests {
             )
             .into_bytes()
         };
-        // Under the facade cap everything passes without parsing.
         assert!(enforce_request_byte_cap(b"{}").is_ok());
-        // Oversized transform-class bodies pass up to the transform cap.
         let two_mib = 2 * 1024 * 1024;
         assert!(enforce_request_byte_cap(&pad("transform", "kind", two_mib)).is_ok());
         assert!(enforce_request_byte_cap(&pad("state_sync", "method", two_mib)).is_ok());
-        // Oversized facade bodies still reject at 1 MiB.
-        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_err());
-        // Unparseable oversized bodies reject conservatively.
-        assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_err());
-        // The transform cap itself is still a hard ceiling.
+        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", two_mib)).is_ok());
+        assert!(enforce_request_byte_cap(&vec![b'x'; two_mib]).is_ok());
         assert!(
             enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
+        );
+    }
+
+    #[test]
+    fn application_frame_limits_are_derived_from_subc_protocol() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/subc-frame-limits.json")).unwrap();
+        assert_eq!(
+            fixture["max_frame_body_bytes"].as_u64().unwrap() as usize,
+            subc_protocol::MAX_FRAME_BODY_LEN as usize
+        );
+        assert_eq!(
+            fixture["application_body_bytes"].as_u64().unwrap() as usize,
+            TRANSFORM_PAGE_MAX_BYTES
+        );
+        assert_eq!(
+            fixture["transform_staging_bytes"].as_u64().unwrap() as usize,
+            TRANSFORM_PAGE_MAX_STAGED_BYTES
         );
     }
 
@@ -16492,6 +18077,7 @@ mod tests {
         await_results: Mutex<VecDeque<Result<ProducerOutput, HistorianProducerError>>>,
         outputs: Mutex<VecDeque<String>>,
         next_fact: Mutex<Option<String>>,
+        fact_each_run: Mutex<Option<String>>,
         prompts: Mutex<Vec<String>>,
         systems: Mutex<Vec<String>>,
         models: Mutex<Vec<String>>,
@@ -16567,7 +18153,19 @@ mod tests {
             {
                 return result;
             }
-            let output = match self.state.next_fact.lock().expect("next fact mutex").take() {
+            let one_shot_fact = self.state.next_fact.lock().expect("next fact mutex").take();
+            let repeated_fact = self
+                .state
+                .fact_each_run
+                .lock()
+                .expect("fact each run mutex")
+                .clone();
+            let output = match one_shot_fact.or_else(|| {
+                repeated_fact.map(|prefix| {
+                    let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
+                    format!("{prefix} {start}-{end}")
+                })
+            }) {
                 Some(fact) => {
                     let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
                     historian_output_with_fact(start, end, &fact)
@@ -16664,6 +18262,72 @@ mod tests {
         (handler, store, dir, project)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_mural_write_family_is_hash_gated_and_claude_code_inherits_by_project() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project_path = project.to_string_lossy().to_string();
+        let mural_a = "data:image/png;base64,YQ==";
+
+        let mut first = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        first["serializer_profile"] = json!("opencode-aisdk");
+        first["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": mural_a,
+            "content_hash": "mural-a",
+        });
+        let first_response = call_transform_request(&handler, first).await;
+        assert_eq!(first_response["status"], "ok", "{first_response}");
+        let artifact = store
+            .load_project_mural_artifact(&project_path)
+            .unwrap()
+            .expect("OpenCode host artifact");
+        assert_eq!(artifact.data_url, mural_a.as_bytes());
+        assert_eq!(artifact.content_hash, "mural-a");
+
+        let mut same_hash = request(vec![ck("oc-1", 1, "OpenCode tail")]);
+        same_hash["serializer_profile"] = json!("opencode-aisdk");
+        same_hash["render_config"] = json!("cfg1");
+        same_hash["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,c2FtZS1oYXNoLWRyaWZ0",
+            "content_hash": "mural-a",
+        });
+        let same_hash_response = call_transform_request(&handler, same_hash).await;
+        assert_eq!(same_hash_response["status"], "ok", "{same_hash_response}");
+        assert_eq!(
+            store
+                .load_project_mural_artifact(&project_path)
+                .unwrap()
+                .expect("hash-gated artifact"),
+            artifact,
+        );
+
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "claude-code", "cc-ses"),
+        );
+        let mut claude_code = request(vec![ck("cc-1", 1, "Claude Code tail")]);
+        claude_code["serializer_profile"] = json!("claude-code-anthropic");
+        claude_code["session_id"] = json!("cc-ses");
+        claude_code["mural"] = json!({
+            "enabled": true,
+            "supports_vision": true,
+            "data_url": "data:image/png;base64,dW50cnVzdGVkLWNjLWJ5dGVz",
+            "content_hash": "untrusted-cc-hash",
+        });
+        let claude_code_response = call_transform_request(&handler, claude_code).await;
+        assert_eq!(
+            claude_code_response["status"], "ok",
+            "{claude_code_response}"
+        );
+        let response_bytes = serde_json::to_string(&claude_code_response).unwrap();
+        assert!(response_bytes.contains(mural_a));
+        assert!(!response_bytes.contains("dW50cnVzdGVkLWNjLWJ5dGVz"));
+    }
+
     #[test]
     fn claude_code_config_controls_fill_request_without_changing_default_request_bytes() {
         let value = json!({
@@ -16736,6 +18400,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cc_dispatch_resolves_model_threshold_and_keeps_host_override_authoritative() {
+        let mut config = default_test_config();
+        config.execute_threshold_user_config = Some(scheduler::ExecuteThresholdConfig::ByModel(
+            [
+                ("default".to_string(), 75.0),
+                ("openai/gpt-6-astra".to_string(), 85.0),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        config.execute_threshold_user_configured = true;
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config.clone());
+        let mut route = binding(project.to_str().unwrap(), "ses");
+        route.config = config;
+        handler.bind_route(7, route.clone());
+        for (model, usage, host, expected) in [
+            ("anthropic/claude-sonnet-5", 70_000, None, "defer"),
+            ("anthropic/claude-sonnet-5", 70_000, Some(65), "execute"),
+            ("openai/gpt-6-astra-fast", 80_000, None, "defer"),
+        ] {
+            let mut wire = request(vec![ck("tail", 1, "raw tail")]);
+            wire["serializer_profile"] = json!("claude-code-anthropic");
+            wire["model_key"] = json!(model);
+            handler.record_response_observation("ses", now_ms());
+            wire["usage"] =
+                json!({"current_total_input_tokens": usage, "context_limit_tokens": 100_000});
+            if let Some(host) = host {
+                wire["effective_execute_threshold"] = json!(host);
+            }
+            let response = call_transform_request(&handler, wire).await;
+            assert_eq!(response["scheduler_decision"], expected, "{response}");
+        }
+        assert!(handler.threshold_logged_routes.lock().unwrap().contains(&7));
+        handler.bind_route(7, route);
+        assert!(!handler.threshold_logged_routes.lock().unwrap().contains(&7));
+    }
+
     #[test]
     fn wire_execute_threshold_overrides_config_and_absence_preserves_fallback_both_directions() {
         fn decision(wire_threshold: Option<f64>, config_threshold: f64) -> scheduler::BaseDecision {
@@ -16783,8 +18486,14 @@ mod tests {
         McModuleConfig {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             model_chain: vec!["test/model".to_string()],
+            historian_temperature: None,
             language: None,
             execute_threshold_percentage: 65.0,
+            execute_threshold_user_config: None,
+            execute_threshold_user_configured: false,
+            execute_threshold_project_config: None,
+            protected_tokens_user: None,
+            protected_tokens_project: None,
             compaction_enabled: true,
             memory_enabled: true,
             auto_search: crate::config::AutoSearchConfig::default(),
@@ -16792,6 +18501,7 @@ mod tests {
             auto_promote: true,
             user_memory_collection_enabled: false,
             historian_context_limit_tokens: 128_000,
+            historian_context_limit_known: false,
             memory_budget_tokens: 4_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -17432,6 +19142,27 @@ mod tests {
     }
 
     #[test]
+    fn module_health_line_surfaces_last_historian_model_refusal() {
+        let health = DispatchHealth::new();
+        health.record_historian_outcome(
+            "published seq 2; model_unresolvable:opencode/model-a: open_failed".to_string(),
+            4,
+        );
+
+        let report = health.report(10_000);
+        assert!(report.detail.as_deref().is_some_and(|detail| {
+            detail.contains("last historian: published seq 2")
+                && detail.contains("model_unresolvable:opencode/model-a")
+        }));
+        let metrics = report.metrics.unwrap();
+        assert_eq!(
+            metrics["last_historian_outcome"],
+            json!("published seq 2; model_unresolvable:opencode/model-a: open_failed")
+        );
+        assert_eq!(metrics["historian_recent_decisions_count"], json!(4));
+    }
+
+    #[test]
     fn transform_health_reports_oldest_queue_age_as_a_structured_metric() {
         let health = DispatchHealth::new();
         health.oldest_queued_at_ms.store(100, Ordering::Relaxed);
@@ -17462,12 +19193,40 @@ mod tests {
         assert_eq!(metrics["heartbeat_stale"], json!(true));
         assert_eq!(metrics["in_flight_count"], json!(1));
         assert_eq!(metrics["completion_lag_ms"], json!(150_000));
+        assert_eq!(metrics["state"], json!("stuck"));
+        assert_eq!(metrics["stuck"], json!(true));
+    }
+
+    #[test]
+    fn transform_health_stuck_bound_is_typed_and_constant_fenced() {
+        assert_eq!(TRANSFORM_WEDGE_THRESHOLD_MS, 30_000);
+        let health = DispatchHealth::new();
+        health
+            .last_dispatch_started_at_ms
+            .store(1, Ordering::Relaxed);
+        health.in_flight_count.store(1, Ordering::Relaxed);
+
+        let within_bound = health.report(30_001);
+        assert_eq!(within_bound.status, HealthStatus::Ok);
+        let within_metrics = within_bound.metrics.unwrap();
+        assert_eq!(within_metrics["state"], json!("advancing"));
+        assert_eq!(within_metrics["stuck"], json!(false));
+
+        let past_bound = health.report(30_002);
+        assert_eq!(past_bound.status, HealthStatus::Degraded);
+        assert!(past_bound
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("lane stuck")));
+        let stuck_metrics = past_bound.metrics.unwrap();
+        assert_eq!(stuck_metrics["state"], json!("stuck"));
+        assert_eq!(stuck_metrics["stuck"], json!(true));
     }
 
     #[test]
     fn transform_health_normal_advance_is_ok_and_errors_still_advance() {
         let health = DispatchHealth::new();
-        let ticket = TransformDispatchTicket::new(&health);
+        let ticket = TransformDispatchTicket::new(&health, 7);
         ticket.accept();
         assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
         ticket.finish(false);
@@ -17480,7 +19239,7 @@ mod tests {
             json!(0)
         );
 
-        let error_ticket = TransformDispatchTicket::new(&health);
+        let error_ticket = TransformDispatchTicket::new(&health, 7);
         error_ticket.accept();
         error_ticket.finish(true);
         let error_report = health.report(now_ms().max(0) as u64);
@@ -17507,7 +19266,7 @@ mod tests {
         {
             // A refused item never calls accept, so dropping its ticket cannot make the
             // refusal loop look like completed transform work.
-            let _refused = TransformDispatchTicket::new(&health);
+            let _refused = TransformDispatchTicket::new(&health, 7);
         }
 
         let report = health.report(200_001);
@@ -17522,7 +19281,7 @@ mod tests {
     fn transform_dispatch_panic_drop_guard_decrements_without_completion_stamp() {
         let health = DispatchHealth::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let ticket = TransformDispatchTicket::new(&health);
+            let ticket = TransformDispatchTicket::new(&health, 7);
             ticket.accept();
             panic!("simulated transform dispatch panic");
         }));
@@ -17532,6 +19291,44 @@ mod tests {
             health.last_dispatch_completed_at_ms.load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn route_close_releases_only_its_in_flight_dispatch_and_cannot_double_decrement() {
+        let health = DispatchHealth::new();
+        health.route_open(7);
+        health.route_open(8);
+        let closed_route_ticket = TransformDispatchTicket::new(&health, 7);
+        let live_route_ticket = TransformDispatchTicket::new(&health, 8);
+        closed_route_ticket.accept();
+        live_route_ticket.accept();
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 2);
+
+        health.route_gone(7);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
+        closed_route_ticket.finish(false);
+        assert_eq!(
+            health.in_flight_count.load(Ordering::Relaxed),
+            1,
+            "a late completion from the abandoned requester must not decrement another route"
+        );
+
+        let post_close_ticket = TransformDispatchTicket::new(&health, 7);
+        post_close_ticket.accept();
+        assert_eq!(
+            health.in_flight_count.load(Ordering::Relaxed),
+            1,
+            "a torn handler cannot register after route.gone"
+        );
+        live_route_ticket.finish(false);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 0);
+
+        health.route_open(7);
+        let rebound_ticket = TransformDispatchTicket::new(&health, 7);
+        rebound_ticket.accept();
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 1);
+        rebound_ticket.finish(false);
+        assert_eq!(health.in_flight_count.load(Ordering::Relaxed), 0);
     }
 
     // (the same gate as the corruption path itself); a default build has neither the arm
@@ -17835,6 +19632,114 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn frozen_strip_native_transform_path_is_position_independent() {
+        fn assistant(mid: &str, ordinal: u64, trailing: bool) -> CkIngressMessage {
+            let mut content = vec![CkWireBlock::bare(CkKind::Text {
+                text: format!("answer-{mid}"),
+            })];
+            if trailing {
+                content.push(CkWireBlock::bare(CkKind::Text {
+                    text: String::new(),
+                }));
+            }
+            CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck: CkWireMessage::from_parts(
+                    "assistant",
+                    content,
+                    None,
+                    ProviderExtras::new(),
+                    HarnessMeta {
+                        harness_id: Some(mid.to_string()),
+                        ..Default::default()
+                    },
+                ),
+            }
+        }
+
+        fn native(mid: &str, role: &str, text: &str, trailing: bool) -> Value {
+            let mut parts = vec![json!({ "type": "text", "text": text })];
+            if trailing {
+                parts.push(json!({ "type": "text", "text": "" }));
+            }
+            json!({
+                "info": { "id": mid, "sessionID": "ses", "role": role },
+                "parts": parts,
+            })
+        }
+
+        fn rust_mode_request(
+            messages: Vec<CkIngressMessage>,
+            native_messages: Vec<Value>,
+        ) -> Value {
+            let mut value = request(messages);
+            value["serializer_profile"] = json!("opencode-aisdk");
+            value["provider_id"] = json!("anthropic");
+            value["serve_native"] = json!(true);
+            value["native_messages"] = Value::Array(native_messages);
+            value
+        }
+
+        fn native_target_bytes(response: &Value) -> Vec<u8> {
+            let target = response["native_messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["info"]["id"] == "target")
+                .expect("native target must be served");
+            serde_json::to_vec(target).unwrap()
+        }
+
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![assistant("target", 1, false)],
+                vec![native("target", "assistant", "answer-target", false)],
+            ),
+        )
+        .await;
+
+        let newest = call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![assistant("target", 1, true)],
+                vec![native("target", "assistant", "answer-target", true)],
+            ),
+        )
+        .await;
+        let newest_bytes = native_target_bytes(&newest);
+        let historical = call_transform_request(
+            &handler,
+            rust_mode_request(
+                vec![
+                    assistant("target", 1, true),
+                    ck_with_role("user-next", 2, "user", "continue"),
+                    assistant("newest", 3, false),
+                ],
+                vec![
+                    native("target", "assistant", "answer-target", true),
+                    native("user-next", "user", "continue", false),
+                    native("newest", "assistant", "answer-newest", false),
+                ],
+            ),
+        )
+        .await;
+
+        assert_eq!(historical["status"], "ok");
+        assert_eq!(native_target_bytes(&historical), newest_bytes);
+        let target = historical["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == "target")
+            .unwrap();
+        assert_eq!(target["parts"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn native_response_release_guard_full_serializes_without_frontier() {
         let request = native_cache_request(
@@ -17855,7 +19760,7 @@ mod tests {
         finalize_native_messages_response(
             &mut response,
             &request,
-            1,
+            &test_reasoning_clear_units(&request, &BTreeMap::new(), 1),
             &BTreeMap::new(),
             None,
             None,
@@ -17893,7 +19798,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cold_soft_plus_full_sync_primes_the_next_tail_delta() {
         let producer = Arc::new(ProducerState::default());
-        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        store
+            .replace_compartments(
+                "ses",
+                &[StoredCompartment {
+                    sequence: 1,
+                    start_message: 1,
+                    end_message: 1,
+                    start_message_id: "m1#0".to_string(),
+                    end_message_id: "m1#0".to_string(),
+                    title: "covered history".to_string(),
+                    content: "summary of m1".to_string(),
+                    p1: Some("summary of m1".to_string()),
+                    importance: 50,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
         let first_native = json!({
             "info": {
                 "id": "m1",
@@ -17903,11 +19825,15 @@ mod tests {
             },
             "parts": [{ "type": "text", "text": "hello", "customPart": 7 }]
         });
+        let tail_native = json!({
+            "info": { "id": "m2", "sessionID": "ses", "role": "user" },
+            "parts": [{ "type": "text", "text": "tail" }]
+        });
         let full_request = |fingerprint: &str| {
-            let mut body = request(vec![ck("m1", 1, "hello")]);
+            let mut body = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "tail")]);
             body["serializer_profile"] = json!("opencode-aisdk");
             body["serve_native"] = json!(true);
-            body["native_messages"] = json!([first_native.clone()]);
+            body["native_messages"] = json!([first_native.clone(), tail_native.clone()]);
             body["full_array_fingerprint"] = json!(fingerprint);
             body
         };
@@ -17926,6 +19852,12 @@ mod tests {
         assert!(cold["native_messages"]
             .as_array()
             .is_some_and(|messages| messages.first() != Some(&first_native)));
+        assert_eq!(cold["timings"]["build_serialized_messages"], 3);
+        assert!(!cold["ck_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["meta"]["harness_id"] == "m1"));
         assert!(handler
             .transform_snapshots
             .lock()
@@ -17934,31 +19866,35 @@ mod tests {
             .is_none());
 
         let second_native = json!({
-            "info": { "id": "m2", "sessionID": "ses", "role": "user" },
+            "info": { "id": "m3", "sessionID": "ses", "role": "user" },
             "parts": [{ "type": "text", "text": "next" }]
         });
-        let mut delta = request(vec![ck("m2", 2, "next")]);
+        let mut delta = request(vec![ck("m3", 3, "next")]);
         delta["serializer_profile"] = json!("opencode-aisdk");
         delta["serve_native"] = json!(true);
         delta["native_messages"] = json!([second_native]);
         delta["full_array_fingerprint"] = json!("cold-fp-2");
         delta["tail_delta"] = json!({
             "after": "cold-fp-1",
-            "replace_from": 1,
-            "native_replace_from": 1,
+            "replace_from": 2,
+            "native_replace_from": 2,
         });
         let delta_bytes = serde_json::to_vec(&delta).unwrap().len();
-        let mut full_followup = request(vec![ck("m1", 1, "hello"), ck("m2", 2, "next")]);
+        let mut full_followup = request(vec![
+            ck("m1", 1, "hello"),
+            ck("m2", 2, "tail"),
+            ck("m3", 3, "next"),
+        ]);
         full_followup["serializer_profile"] = json!("opencode-aisdk");
         full_followup["serve_native"] = json!(true);
-        full_followup["native_messages"] = json!([first_native, second_native]);
+        full_followup["native_messages"] = json!([first_native, tail_native, second_native]);
         full_followup["full_array_fingerprint"] = json!("cold-fp-2");
         assert!(delta_bytes < serde_json::to_vec(&full_followup).unwrap().len());
 
         let attached = call_transform_request(&handler, delta).await;
         assert_eq!(attached["status"], "ok", "{attached}");
         assert_eq!(attached["action"], "SOFT+", "{attached}");
-        assert_eq!(attached["timings"]["projection_reused_messages"], 1);
+        assert_eq!(attached["timings"]["projection_reused_messages"], 2);
         assert!(
             attached["timings"]["native_cache_reused_messages"]
                 .as_u64()
@@ -18065,11 +20001,11 @@ mod tests {
         revert_epoch: u64,
         mode: NativeCacheKeyMode,
     ) -> (transform::TransformResponse, NativeAttachmentCacheStats) {
-        run_native_cache_pass_with_watermark(
+        run_native_cache_pass_with_clear_units(
             cache,
             request,
             served,
-            1,
+            &test_reasoning_clear_units(request, tag_numbers, 1),
             tag_numbers,
             transition_consumed,
             revert_epoch,
@@ -18077,12 +20013,38 @@ mod tests {
         )
     }
 
+    // These encoder fixtures supply reasoning-clear units as if a cache-busting
+    // transform had already committed them. The encoder only replays those decisions.
+    fn test_reasoning_clear_units(
+        request: &TransformRequest,
+        tags: &BTreeMap<String, u64>,
+        cutoff: u64,
+    ) -> Vec<mc_core::FrozenUnit> {
+        let newest = transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+        request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.ck.role == "assistant"
+                    && Some(message.mid.as_str()) != newest
+                    && tags.get(&message.mid).copied().unwrap_or(message.ordinal) <= cutoff
+            })
+            .map(|message| mc_core::FrozenUnit {
+                key: format!("strip:reasoning_clear:{}", message.mid),
+                kind: "strip_reasoning_clear".to_string(),
+                frozen_payload: String::new(),
+                durability_class: mc_core::DurabilityClass::Lineage,
+                reset_rule: String::new(),
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn run_native_cache_pass_with_watermark(
+    fn run_native_cache_pass_with_clear_units(
         cache: &Mutex<NativeAttachmentCache>,
         request: &TransformRequest,
         served: Vec<CkWireMessage>,
-        reasoning_watermark: u64,
+        reasoning_clear_units: &[mc_core::FrozenUnit],
         tag_numbers: &BTreeMap<String, u64>,
         transition_consumed: bool,
         revert_epoch: u64,
@@ -18111,7 +20073,7 @@ mod tests {
         let stats = attach_native_messages_incremental(
             &mut response,
             request,
-            reasoning_watermark,
+            reasoning_clear_units,
             tag_numbers,
             None,
             None,
@@ -18464,7 +20426,7 @@ mod tests {
         let second_stats = attach_native_messages_incremental(
             &mut response,
             &delta,
-            1,
+            &test_reasoning_clear_units(&delta, &BTreeMap::new(), 1),
             &BTreeMap::new(),
             None,
             None,
@@ -19181,7 +21143,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_reasoning_becomes_historical_after_watermark_tail_advance() {
+    fn newest_reasoning_becomes_historical_after_committed_clear_decision() {
         let first_ingress = vec![ck_reasoning("reasoning-1", 1, "signed-1")];
         let first_native = vec![json!({
             "info": { "id": "reasoning-1", "role": "assistant" },
@@ -19200,11 +21162,11 @@ mod tests {
         );
         first_request.mid_turn = true;
         let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        let (first, _) = run_native_cache_pass_with_watermark(
+        let (first, _) = run_native_cache_pass_with_clear_units(
             &cache,
             &first_request,
             vec![first_ingress[0].ck.clone()],
-            0,
+            &[],
             &BTreeMap::from([("reasoning-1".to_string(), 1)]),
             true,
             0,
@@ -19235,14 +21197,14 @@ mod tests {
             "replace_from": 1,
             "native_replace_from": 1,
         }));
-        let (second, stats) = run_native_cache_pass_with_watermark(
+        let (second, stats) = run_native_cache_pass_with_clear_units(
             &cache,
             &second_request,
             second_ingress
                 .iter()
                 .map(|message| message.ck.clone())
                 .collect(),
-            1,
+            &test_reasoning_clear_units(&second_request, &BTreeMap::new(), 1),
             &BTreeMap::from([
                 ("reasoning-1".to_string(), 1),
                 ("reasoning-2".to_string(), 2),
@@ -19300,11 +21262,11 @@ mod tests {
         target.mark_modified();
 
         let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
-        let (response, _) = run_native_cache_pass_with_watermark(
+        let (response, _) = run_native_cache_pass_with_clear_units(
             &cache,
             &request,
             served,
-            u64::MAX,
+            &test_reasoning_clear_units(&request, &BTreeMap::new(), u64::MAX),
             &BTreeMap::from([(target_mid.to_string(), 1)]),
             true,
             0,
@@ -19368,11 +21330,11 @@ mod tests {
 
         let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
         for _ in 0..2 {
-            let (response, _) = run_native_cache_pass_with_watermark(
+            let (response, _) = run_native_cache_pass_with_clear_units(
                 &cache,
                 &request,
                 served.clone(),
-                u64::MAX,
+                &test_reasoning_clear_units(&request, &BTreeMap::new(), u64::MAX),
                 &BTreeMap::from([(target_mid.to_string(), 1)]),
                 true,
                 0,
@@ -19570,7 +21532,7 @@ mod tests {
         attach_native_messages_incremental(
             &mut response,
             &request,
-            0,
+            &[],
             &BTreeMap::new(),
             None,
             None,
@@ -20153,8 +22115,16 @@ mod tests {
         let cached_state = cached_store.load("ses").unwrap();
         let full_state = control_store.load("ses").unwrap();
         assert_eq!(cached_state.core, full_state.core, "selection/core drift");
+        let normalize_decision_times = |mut historian: HistorianDurableState| {
+            for decision in &mut historian.recent_decisions {
+                decision.at_ms = 0;
+                decision.request_observed_at_ms = 0;
+            }
+            historian
+        };
         assert_eq!(
-            cached_state.meta.historian, full_state.meta.historian,
+            normalize_decision_times(cached_state.meta.historian),
+            normalize_decision_times(full_state.meta.historian),
             "historian boundary math drift"
         );
 
@@ -20445,8 +22415,15 @@ mod tests {
     async fn handler_delta_d5_lineage_descent_forces_full_projection() {
         let target = "projection-lineage-target";
         let source = "projection-lineage-source";
-        let (handler, store, _dir, project) =
-            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let resolver = FakeSessionResolver::with(&[
+            (target, FakeResolve::Hit(target.to_string())),
+            (source, FakeResolve::Hit(source.to_string())),
+        ]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
         handler.bind_route(7, binding(project.to_str().unwrap(), target));
         handler.bind_route(8, binding(project.to_str().unwrap(), source));
         let source_messages = (1..=10)
@@ -20476,6 +22453,41 @@ mod tests {
                 ],
             )
             .unwrap();
+        let project_path = project.to_str().unwrap();
+        let seeded_note_ids = store
+            .seed_authority_rows(
+                "context-db",
+                project_path,
+                "notes",
+                &[AuthoritySeedRow {
+                    source_row_id: 52,
+                    snapshot: json!({
+                        "type": "session",
+                        "project_path": project_path,
+                        "session_id": source,
+                        "content": "compiled note inherited by the successor",
+                        "status": "active",
+                        "surface_condition": "when descent completes",
+                        "compiled_provider": "retina-local-fs",
+                        "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}",
+                        "compiled_at": 5200,
+                        "compile_status": "compiled",
+                        "status_version": 3,
+                        "created_at": 5100,
+                        "updated_at": 5200,
+                    }),
+                }],
+            )
+            .unwrap();
+        let source_note = store
+            .get_note_by_id(project_path, source, seeded_note_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            source_note.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(source_note.compiled_at, Some(5200));
         let source_epoch = store.load(source).unwrap().meta.revert_epoch;
         let summary = "This session is being continued from a previous conversation.\n\nSummary:\nDurable summary alpha\n\nFull transcript: /tmp/session.jsonl";
         let compaction_user = CkIngressMessage {
@@ -20554,6 +22566,30 @@ mod tests {
         assert_eq!(descended["timings"]["projection_reused_messages"], 0);
         assert_eq!(descended["timings"]["projection_projected_messages"], 2);
         assert!(store.load(target).unwrap().meta.descent_completed);
+
+        let inherited_notes = store
+            .search_notes_like(project_path, target, "compiled note inherited")
+            .unwrap();
+        assert_eq!(inherited_notes.len(), 1);
+        let inherited = store
+            .get_note_by_id(project_path, target, inherited_notes[0].id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(inherited.id, source_note.id);
+        assert_eq!(
+            inherited.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            inherited.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\",\"path\":\"src/lib.rs\"}")
+        );
+        assert_eq!(inherited.compiled_at, Some(5200));
+        assert_eq!(inherited.compile_status.as_deref(), Some("compiled"));
+        let successor_facade = tool_text(
+            call_facade_on_channel(&handler, 7, "ctx_note", json!({ "action": "read" })).await,
+        );
+        assert!(successor_facade.contains("compiled note inherited by the successor"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20654,6 +22690,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn post_hard_defer_preserves_demoted_native_thinking_until_priced_pass() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let mut native = vec![
+            json!({"info":{"id":"user","role":"user"},"parts":[{"type":"text","text":"start"}]}),
+            json!({"info":{"id":"previous","role":"assistant"},"parts":[{"type":"text","text":"earlier step"}]}),
+        ];
+        let make_request = |native: &Vec<Value>, model: &str| {
+            let decoded = codec::decode_opencode(native);
+            let mut req = request(decoded.messages);
+            req["serializer_profile"] = json!("opencode-aisdk");
+            req["serve_native"] = json!(true);
+            req["tool_present"] = json!(true);
+            req["provider_id"] = json!("anthropic");
+            req["model_key"] = json!(model);
+            req["mid_turn"] = json!(false);
+            req["native_messages"] = json!(native);
+            req
+        };
+        let warm = call_transform_request(&handler, make_request(&native, "claude-opus-5")).await;
+        assert_eq!(warm["action"], "HARD");
+        let thinking = json!({"type":"reasoning","text":"signed thinking", "metadata":{"anthropic":{"signature":"fixture-signature"}}});
+        native.push(json!({"info":{"id":"thinking","role":"assistant"},"parts":[
+            thinking.clone(), {"type":"text","text":"dispatching"},
+            {"type":"tool","tool":"work","callID":"call-thinking","state":{"status":"completed","input":{"action":"run"},"output":"dispatched"}}
+        ]}));
+        native.push(json!({"info":{"id":"continue","role":"user"},"parts":[{"type":"text","text":"continue"}]}));
+        let hard =
+            call_transform_request(&handler, make_request(&native, "claude-fable-5-1")).await;
+        assert_eq!(hard["action"], "HARD");
+        let mut previous = hard["native_messages"].as_array().unwrap().clone();
+        let hash = |messages: &[Value]| -> String {
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(messages).unwrap())
+            )
+        };
+        for step in 0..2 {
+            native.push(json!({"info":{"id":format!("step-{step}"),"role":"assistant"},"parts":[
+                {"type":"reasoning","text":format!("adaptive step {step}"),"metadata":{"anthropic":{"signature":format!("signature-{step}")}}},
+                {"type":"tool","tool":"work","callID":format!("call-{step}"),"state":{"status":"completed","input":{"action":"show"},"output":"done"}}
+            ]}));
+            let deferred =
+                call_transform_request(&handler, make_request(&native, "claude-fable-5-1")).await;
+            assert_eq!(deferred["action"], "SOFT+");
+            let served = deferred["native_messages"].as_array().unwrap();
+            assert!(served.len() > previous.len());
+            assert_eq!(
+                hash(&served[..previous.len()]),
+                hash(&previous),
+                "demotion must not rewrite the served prefix: {:?}",
+                served
+                    .iter()
+                    .zip(&previous)
+                    .enumerate()
+                    .filter(|(_, (new, old))| new != old)
+                    .collect::<Vec<_>>()
+            );
+            let target = served
+                .iter()
+                .find(|message| message["info"]["id"] == "thinking")
+                .unwrap();
+            assert_eq!(target["parts"][0], thinking);
+            assert!(!store
+                .load("ses")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:merged_reasoning:thinking"));
+            previous = served.clone();
+        }
+        let mut priced_request = make_request(&native, "claude-fable-5-1");
+        priced_request["render_config"] = json!("independent-priced-config-change");
+        let priced = call_transform_request(&handler, priced_request).await;
+        assert_eq!(priced["action"], "HARD");
+        let target = priced["native_messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["info"]["id"] == "thinking")
+            .unwrap();
+        assert!(target["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|part| part["type"] != "reasoning"));
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:merged_reasoning:thinking"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn native_attachment_reuses_transform_tag_baseline_and_preserves_bytes() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -20744,16 +22877,13 @@ mod tests {
         assert_eq!(new_tag_numbers, old_tag_numbers);
 
         let loaded = store.load("ses").unwrap();
-        let reasoning_watermark = loaded
-            .meta
-            .reasoning_cleared_through_tag
-            .max(loaded.meta.reasoning_cleared_through_ordinal);
+        let reasoning_clear_units = &loaded.core.frozen_units;
         let mut replay: transform::TransformResponse = serde_json::from_value(actual).unwrap();
         replay.native_messages = None;
         attach_native_messages_with_tags(
             &mut replay,
             &parsed,
-            reasoning_watermark,
+            reasoning_clear_units,
             &old_tag_numbers,
             None,
             None,
@@ -20768,6 +22898,194 @@ mod tests {
                 .collect::<Vec<_>>(),
             actual_native
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn historian_preflight_reuses_transform_tag_snapshot_and_invalidates_on_generation() {
+        const MESSAGE_COUNT: usize = 2_048;
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages = (1..=MESSAGE_COUNT)
+            .map(|ordinal| {
+                ck(
+                    &format!("m{ordinal}"),
+                    ordinal as u64,
+                    &format!("source-{ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let tags = (1..=MESSAGE_COUNT)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: format!("source-{ordinal}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1).unwrap();
+        let request = request_with_usage(messages, 1_000, 200_000);
+
+        store.reset_tag_payload_query_count_for_test();
+        store.reset_state_load_query_count_for_test();
+        let cold = call_transform_request(&handler, request.clone()).await;
+        assert_eq!(cold["status"], "ok");
+        let cold_messages = serde_json::to_vec(&cold["ck_messages"]).unwrap();
+        assert_eq!(
+            store.tag_payload_query_count_for_test(),
+            1,
+            "the cold transform is the only full tag payload read"
+        );
+        assert_eq!(
+            store.state_load_query_count_for_test(),
+            2,
+            "handler entry and historian preflight each take one state snapshot"
+        );
+
+        for _ in 0..5 {
+            store.reset_tag_payload_query_count_for_test();
+            store.reset_state_load_query_count_for_test();
+            let warm = call_transform_request(&handler, request.clone()).await;
+            let warm_messages = serde_json::to_vec(&warm["ck_messages"]).unwrap();
+            assert_eq!(
+                Sha256::digest(&warm_messages),
+                Sha256::digest(&cold_messages)
+            );
+            assert!(
+                store.tag_payload_query_count_for_test() <= 1,
+                "historian preflight must not add a second payload scan even if another parallel test evicts the process cache"
+            );
+            assert_eq!(store.state_load_query_count_for_test(), 2);
+        }
+
+        transform::load_cached_tags(&store, "ses").unwrap();
+        store.reset_tag_payload_query_count_for_test();
+        store
+            .execute_tag_sql_for_test(
+                "UPDATE mc_tags SET token_count = 777 \
+                 WHERE session_id = 'ses' AND tag_number = 1;",
+            )
+            .unwrap();
+        let refreshed_tags = transform::load_cached_tags(&store, "ses").unwrap();
+        assert_eq!(
+            store.tag_payload_query_count_for_test(),
+            1,
+            "a replacement generation must force exactly one new payload read"
+        );
+        assert_eq!(
+            refreshed_tags
+                .iter()
+                .find(|tag| tag.tag_number == 1)
+                .map(|tag| tag.token_count),
+            Some(777)
+        );
+
+        store.reset_tag_payload_query_count_for_test();
+        let invalidated = call_transform_request(&handler, request).await;
+        let invalidated_messages = serde_json::to_vec(&invalidated["ck_messages"]).unwrap();
+        assert_eq!(
+            Sha256::digest(&invalidated_messages),
+            Sha256::digest(&cold_messages),
+            "cache invalidation may refresh accounting but cannot alter served message bytes"
+        );
+        assert!(store.tag_payload_query_count_for_test() <= 1);
+        // The direct payload-read count is the invalidation oracle: ignoring generation/count/max
+        // would leave it at zero and return the stale token count instead of 777.
+    }
+
+    #[test]
+    #[ignore = "manual 2k-message hot-path timing fixture"]
+    fn historian_tag_and_state_snapshot_hot_path_benchmark() {
+        const MESSAGE_COUNT: usize = 2_048;
+        const SAMPLES: usize = 7;
+        let producer = Arc::new(ProducerState::default());
+        let (_handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let messages = (1..=MESSAGE_COUNT)
+            .map(|ordinal| {
+                ck(
+                    &format!("m{ordinal}"),
+                    ordinal as u64,
+                    &format!("source-{ordinal}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parsed = transform_request(messages, 1_000, 200_000);
+        let projection = crate::ck_wire::project_messages(&parsed.messages).unwrap();
+        let tags = (1..=MESSAGE_COUNT)
+            .map(|ordinal| TagMintInput {
+                block_id: format!("m{ordinal}#0"),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: format!("source-{ordinal}").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1).unwrap();
+        let shared_tags = Arc::new(store.load_tags_for_session("ses").unwrap());
+        let legacy_cache = Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+        let shared_cache = Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES));
+        for cache in [&legacy_cache, &shared_cache] {
+            cache
+                .lock()
+                .unwrap()
+                .prime_from_persisted_tags("ses", shared_tags.as_slice());
+            let warmed = boundary_messages(&parsed, &projection, cache);
+            cache
+                .lock()
+                .unwrap()
+                .replace("ses", warmed.token_cache_snapshot);
+        }
+
+        for _ in 0..SAMPLES {
+            let started_at = Instant::now();
+            let legacy_tags = store.load_tags_for_session("ses").unwrap();
+            legacy_cache
+                .lock()
+                .unwrap()
+                .prime_from_persisted_tags("ses", &legacy_tags);
+            let legacy = boundary_messages(&parsed, &projection, &legacy_cache);
+            legacy_cache
+                .lock()
+                .unwrap()
+                .replace("ses", legacy.token_cache_snapshot);
+            std::hint::black_box(legacy.messages.len());
+            eprintln!(
+                "mc-pass-timing session=r12-before trigger_boundary_build={:.3}",
+                started_at.elapsed().as_secs_f64() * 1_000.0
+            );
+
+            let started_at = Instant::now();
+            shared_cache
+                .lock()
+                .unwrap()
+                .prime_from_persisted_tags("ses", shared_tags.as_slice());
+            let shared = boundary_messages(&parsed, &projection, &shared_cache);
+            shared_cache
+                .lock()
+                .unwrap()
+                .replace("ses", shared.token_cache_snapshot);
+            std::hint::black_box(shared.messages.len());
+            eprintln!(
+                "mc-pass-timing session=r12-after trigger_boundary_build={:.3}",
+                started_at.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
+
+        for _ in 0..SAMPLES {
+            let started_at = Instant::now();
+            std::hint::black_box(store.load("ses").unwrap());
+            std::hint::black_box(store.load("ses").unwrap());
+            eprintln!(
+                "mc-pass-timing session=r07-before handler_state_snapshot={:.3}",
+                started_at.elapsed().as_secs_f64() * 1_000.0
+            );
+
+            let started_at = Instant::now();
+            let snapshot = store.load("ses").unwrap();
+            std::hint::black_box((&snapshot, &snapshot));
+            eprintln!(
+                "mc-pass-timing session=r07-after handler_state_snapshot={:.3}",
+                started_at.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21287,7 +23605,7 @@ mod tests {
         assert_eq!(status["session_id"], "ses");
         assert_eq!(status["row_version"], Value::Null);
         assert_eq!(status["historian"]["last_no_fire"], Value::Null);
-        assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 2);
+        assert_eq!(PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC, 3);
         assert_eq!(
             status["epochs"]["memory_render_epoch"],
             json!(MEMORY_RENDER_FORMAT_EPOCH)
@@ -21296,7 +23614,7 @@ mod tests {
             status["epochs"]["compartment_render_epoch"],
             json!(COMPARTMENT_RENDER_FORMAT_EPOCH)
         );
-        assert_eq!(status["epochs"]["profile_epoch"], json!(2));
+        assert_eq!(status["epochs"]["profile_epoch"], json!(3));
         assert_eq!(
             status["epochs"]["tagger_epoch"],
             json!(TAGGER_FEATURE_EPOCH)
@@ -21312,6 +23630,92 @@ mod tests {
         let health =
             call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
         assert_eq!(health["pass_trace"], status["pass_trace"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_busy_transform_is_typed_and_visible_in_status_and_health() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, dir, _project) = handler_with_store(producer, default_test_config());
+        let baseline = call_transform_request(&handler, request(vec![ck("m1", 1, "one")])).await;
+        assert_eq!(baseline["status"], "ok", "{baseline}");
+
+        let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
+        let StorageBackend::Sqlite { path } = descriptor.backend else {
+            panic!("test descriptor must use SQLite")
+        };
+        let locker = rusqlite::Connection::open(path).unwrap();
+        locker.busy_timeout(Duration::ZERO).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (code, message) = error_frame(
+            call_transform_outcome(
+                &handler,
+                request(vec![ck("m1", 1, "one"), ck("m2", 2, "two")]),
+            )
+            .await,
+        );
+        assert_eq!(code, "transform_failed");
+        assert!(message.contains("database is locked"), "{message}");
+        locker.execute_batch("ROLLBACK").unwrap();
+
+        let status =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+        assert_eq!(status["runtime_store_error"]["code"], "transform_failed");
+        assert_eq!(status["runtime_store_error"]["message"], message);
+        let health =
+            call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
+        assert_eq!(health["runtime_store_error"], status["runtime_store_error"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_store_error_preserves_distinct_failure_codes_in_status_and_health() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let baseline = call_transform_request(&handler, request(vec![ck("m1", 1, "one")])).await;
+        assert_eq!(baseline["status"], "ok", "{baseline}");
+
+        handler
+            .runtime_store_errors
+            .lock()
+            .expect("runtime store errors mutex")
+            .insert(
+                "ses".to_string(),
+                RuntimeStoreError {
+                    code: "store_write_failed".to_string(),
+                    message: "first diagnostic".to_string(),
+                    at_ms: 101,
+                },
+            );
+        let status =
+            call_dispatch_request(&handler, json!({ "kind": "status", "session_id": "ses" })).await;
+
+        handler
+            .runtime_store_errors
+            .lock()
+            .expect("runtime store errors mutex")
+            .insert(
+                "ses".to_string(),
+                RuntimeStoreError {
+                    code: "store_unavailable".to_string(),
+                    message: "second diagnostic".to_string(),
+                    at_ms: 202,
+                },
+            );
+        let health =
+            call_dispatch_request(&handler, json!({ "kind": "health", "session_id": "ses" })).await;
+
+        assert_eq!(status["runtime_store_error"]["code"], "store_write_failed");
+        assert_eq!(status["runtime_store_error"]["message"], "first diagnostic");
+        assert_eq!(status["runtime_store_error"]["at_ms"], 101);
+        assert_eq!(health["runtime_store_error"]["code"], "store_unavailable");
+        assert_eq!(
+            health["runtime_store_error"]["message"],
+            "second diagnostic"
+        );
+        assert_eq!(health["runtime_store_error"]["at_ms"], 202);
+        assert_ne!(
+            status["runtime_store_error"]["code"], health["runtime_store_error"]["code"],
+            "runtime store diagnostics must preserve the failure arm rather than a constant code"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21839,7 +24243,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn smart_note_writes_require_the_host_evaluator_capability() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
             default_test_config(),
             resolver,
@@ -21855,7 +24259,10 @@ mod tests {
         )
         .await;
         let refused_text = tool_text(refused);
-        assert!(refused_text.contains("Smart-note evaluation is unavailable"));
+        assert_eq!(
+            refused_text,
+            "Conditional notes are not available in the current mode. Save a regular note without a condition. (MC-C08)"
+        );
 
         let plain = call_facade(
             &handler,
@@ -21890,11 +24297,82 @@ mod tests {
                 "action": "write",
                 "content": "smart note with evaluator",
                 "surface_condition": "when evaluated",
+                "compiled_provider": "retina-local-fs",
+                "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"old\"}",
+                "compiled_at": 100,
+                "compile_status": "compiled",
             }),
         )
         .await;
         let accepted_text = tool_text(accepted);
         assert!(accepted_text.contains("Created smart note"));
+        let project = project.to_str().unwrap();
+        let note_id = store
+            .search_notes_like(project, "ses", "smart note with evaluator")
+            .unwrap()[0]
+            .id;
+        let written = store
+            .get_note_by_id(project, "ses", note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            written.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(written.compiled_at, Some(100));
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: project,
+                note_id,
+                source_revision: written.status_version,
+                verdict: false,
+                compiled_check: Some("old compiled check"),
+                manifest_json: Some("{\"kind\":\"old\"}"),
+                check_hash: Some("old-hash"),
+                next_due_at: Some(999),
+                now_ms: 150,
+            })
+            .unwrap();
+
+        let updated = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "update",
+                "note_id": note_id,
+                "surface_condition": "when the replacement path exists",
+                "compiled_provider": "retina-local-fs",
+                "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"new\"}",
+                "compiled_at": 200,
+                "compile_status": "compiled",
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(updated));
+        let updated = store
+            .get_note_by_id(project, "ses", note_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.surface_condition.as_deref(),
+            Some("when the replacement path exists")
+        );
+        assert_eq!(
+            updated.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            updated.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\",\"path\":\"new\"}")
+        );
+        assert_eq!(updated.compiled_at, Some(200));
+        assert_eq!(updated.compile_status.as_deref(), Some("compiled"));
+        assert_eq!(updated.compiled_check, None);
+        assert_eq!(updated.manifest_json, None);
+        assert_eq!(updated.check_hash, None);
+        assert_eq!(updated.check_next_due_at, None);
+        assert_eq!(updated.last_checked_at, None);
+        assert_eq!(updated.check_status.as_deref(), Some("uncompiled"));
 
         let plain_with_capability = call_facade(
             &handler,
@@ -21903,6 +24381,29 @@ mod tests {
         )
         .await;
         assert!(!tool_is_error(plain_with_capability));
+    }
+
+    #[test]
+    fn ctx_note_schema_pins_the_multi_dismiss_contract() {
+        let properties = ctx_note_schema()["properties"].clone();
+        assert_eq!(
+            properties["note_id"],
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "Note id for update or dismiss."
+            })
+        );
+        assert_eq!(
+            properties["note_ids"],
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 },
+                "description": "One to fifty note ids for 'dismiss' only; do not combine with note_id."
+            })
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21942,6 +24443,7 @@ mod tests {
                 failure_backoff_at_ms: None,
                 last_failure: None,
                 last_no_fire: None,
+                recent_decisions: Vec::new(),
                 consecutive_publish_failures: 0,
             },
             ..Default::default()
@@ -22042,19 +24544,20 @@ mod tests {
                 ),
             },
         ];
-        let mut snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let generation = snapshots.begin("ses");
-        snapshots.finish_ready(
-            "ses",
-            generation,
-            Arc::new(transform_request(raw_messages, 45_000, 50_000)),
-            0,
-            0,
-        );
-        drop(snapshots);
+        {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let generation = snapshots.begin("ses");
+            snapshots.finish_ready(
+                "ses",
+                generation,
+                Arc::new(transform_request(raw_messages, 45_000, 50_000)),
+                0,
+                0,
+            );
+        }
 
         let verbose = tool_text(
             call_facade(
@@ -22127,14 +24630,85 @@ mod tests {
             json!({"action": "dismiss", "note_id": note_id, "content": "finished"}),
         )
         .await;
+        let dismissed_search = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": "finished", "sources": ["note"]}),
+            )
+            .await,
+        );
+        assert!(!dismissed_search.contains("[note]"), "{dismissed_search}");
         let dismissed = store
-            .search_notes_like(project.to_str().unwrap(), "ses", "finished")
+            .get_note_by_id(project.to_str().unwrap(), "ses", note_id)
+            .unwrap()
             .unwrap();
-        assert_eq!(dismissed[0].status, "dismissed");
+        assert_eq!(dismissed.status, "dismissed");
         assert!(store
             .search_notes_like("/different/project", "ses", "lattice")
             .unwrap()
             .is_empty());
+
+        let _ = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "write", "content": "bulk one"}),
+        )
+        .await;
+        let _ = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "write", "content": "bulk two"}),
+        )
+        .await;
+        store
+            .insert_note(NoteInput {
+                project_path: project.to_str().unwrap(),
+                route_project_root: Some(project.to_str().unwrap()),
+                session_id: "other-session",
+                content: "foreign bulk note",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        let already = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "dismiss", "note_id": 3}),
+            )
+            .await,
+        );
+        assert_eq!(already, "Note #3 dismissed.");
+        let bulk = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "dismiss", "note_ids": [3, 4, 5, 999]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            bulk,
+            "Dismissed 1 of 4 notes.\n- Note #3: already_dismissed\n- Note #4: dismissed\n- Note #5: not_owned\n- Note #999: not_found"
+        );
+        assert_eq!(
+            store
+                .get_note_by_id(project.to_str().unwrap(), "ses", 4)
+                .unwrap()
+                .unwrap()
+                .status,
+            "dismissed"
+        );
+        assert_eq!(
+            store
+                .get_note_by_id(project.to_str().unwrap(), "other-session", 5)
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -22603,36 +25177,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn note_facade_reads_a_preexisting_seeded_ts_note_after_authority_flip() {
+    async fn note_facade_recovers_pre_and_post_migration_compilation_metadata() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
+        let (handler, store, dir, _project) =
             handler_with_store_and_resolver(producer, default_test_config(), resolver);
         handler.bind_route(7, binding("/repo", "token"));
-        store
-            .seed_authority_row(
-                "context-db",
-                "notes",
-                42,
-                &json!({
+        let rows = [
+            AuthoritySeedRow {
+                source_row_id: 42,
+                snapshot: json!({
                     "type": "smart",
                     "project_path": "/repo",
                     "session_id": "session",
-                    "content": "seeded before Rust mode",
+                    "content": "seeded before migration 52",
                     "status": "ready",
-                    "surface_condition": "condition",
-                    "ready_reason": "condition met",
+                    "surface_condition": "legacy condition",
+                    "ready_reason": "legacy condition met",
                     "status_version": 2,
                     "created_at": 1,
                     "updated_at": 2
                 }),
-            )
+            },
+            AuthoritySeedRow {
+                source_row_id: 43,
+                snapshot: json!({
+                    "type": "smart",
+                    "project_path": "/repo",
+                    "session_id": "session",
+                    "content": "seeded after migration 52",
+                    "status": "ready",
+                    "surface_condition": "compiled condition",
+                    "compiled_provider": "retina-local-fs",
+                    "compiled_config": "{\"kind\":\"path_exists\"}",
+                    "compiled_at": 123,
+                    "compile_status": "compiled",
+                    "ready_reason": "compiled condition met",
+                    "status_version": 3,
+                    "created_at": 3,
+                    "updated_at": 4
+                }),
+            },
+        ];
+        store
+            .seed_authority_rows("context-db", "/repo", "notes", &rows)
             .unwrap();
+
+        let pre_migration = store
+            .get_note_by_id("/repo", "session", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre_migration.compiled_provider, None);
+        assert_eq!(pre_migration.compiled_config, None);
+        assert_eq!(pre_migration.compiled_at, None);
+        assert_eq!(pre_migration.compile_status, None);
+        let post_migration = store
+            .get_note_by_id("/repo", "session", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            post_migration.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(
+            post_migration.compiled_config.as_deref(),
+            Some("{\"kind\":\"path_exists\"}")
+        );
+        assert_eq!(post_migration.compiled_at, Some(123));
+        assert_eq!(post_migration.compile_status.as_deref(), Some("compiled"));
 
         let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
         assert!(output.contains("## 🔔 Ready Smart Notes"));
-        assert!(output.contains("seeded before Rust mode"));
+        assert!(output.contains("seeded before migration 52"));
+        assert!(output.contains("seeded after migration 52"));
+
+        drop(handler);
+        drop(store);
+        let reopened = McStore::open(&dev_descriptor_at(
+            dir.path().join("data").to_str().unwrap(),
+        ))
+        .unwrap();
+        let durable = reopened
+            .get_note_by_id("/repo", "session", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.compiled_provider.as_deref(),
+            Some("retina-local-fs")
+        );
+        assert_eq!(durable.compiled_at, Some(123));
+        assert_eq!(durable.compile_status.as_deref(), Some("compiled"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -23162,6 +25797,52 @@ mod tests {
         assert!(!bounded.text.contains("[11] U (user)"));
     }
 
+    #[test]
+    fn ctx_reduce_held_copy_has_no_totals_or_countdown() {
+        assert_eq!(ctx_reduce_held_reply(&[7]), "Held: §7§ is inside the protected working set; it applies once newer work displaces it.");
+        assert_eq!(ctx_reduce_held_reply(&[7, 8]), "Held: §7§, §8§ are inside the protected working set; they apply once newer work displaces them.");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_tools_hide_engine_internals_when_storage_is_unavailable() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let handler = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory { state: producer }),
+            default_test_config(),
+            resolver,
+        );
+        handler.bind_route(8, binding("/path/that/does/not/exist", "ses"));
+
+        let requests = [
+            ("ctx_reduce", json!({ "drop": "1" })),
+            ("ctx_memory", json!({ "action": "get", "ids": [1] })),
+            ("ctx_search", json!({ "query": "architecture" })),
+            ("ctx_expand", json!({ "message": 0 })),
+            ("ctx_note", json!({ "action": "read" })),
+        ];
+        for (name, arguments) in requests {
+            let (_, message) =
+                error_frame(call_facade_on_channel(&handler, 8, name, arguments).await);
+            assert_eq!(
+                message, "Magic Context is temporarily unavailable. Retry in a moment. (MC-C10)",
+                "{name}"
+            );
+            let lowered = message.to_ascii_lowercase();
+            for forbidden in [
+                "authority",
+                "module",
+                "drain",
+                "facade",
+                "changefeed",
+                "mc-store",
+                "harness",
+            ] {
+                assert!(!lowered.contains(forbidden), "{name}: {message}");
+            }
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_resolves_the_session_before_validating_tags() {
         let producer = Arc::new(ProducerState::default());
@@ -23196,7 +25877,7 @@ mod tests {
             .map(|number| TagMintInput {
                 block_id: format!("m{number}#0"),
                 kind: "tool_result".to_string(),
-                token_count: 10,
+                token_count: 800,
                 source_bytes: format!("output {number}").into_bytes(),
             })
             .collect::<Vec<_>>();
@@ -23211,7 +25892,7 @@ mod tests {
             .await,
         );
         assert!(mixed_ack.contains("drop §1§"));
-        assert!(mixed_ack.contains("deferred drop §21§"));
+        assert!(mixed_ack.contains("Held: §21§ is inside the protected working set; it applies once newer work displaces it."));
         assert!(mixed_ack.contains("tags 99, 100 not found"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
@@ -23248,7 +25929,7 @@ mod tests {
 
         let queued_ack =
             tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1, 2, 99" })).await);
-        assert!(queued_ack.contains("deferred drop §2§"));
+        assert!(queued_ack.contains("Held: §2§ is inside the protected working set; it applies once newer work displaces it."), "{queued_ack}");
         assert!(queued_ack.contains("tags 1 already queued"));
         assert!(queued_ack.contains("tags 99 not found"));
 
@@ -23303,6 +25984,7 @@ mod tests {
                     "action",
                     "content",
                     "note_id",
+                    "note_ids",
                     "limit",
                     "offset",
                     "filter",
@@ -23651,6 +26333,102 @@ mod tests {
             feed.rows.len() >= 6,
             "every mutation must append changefeed state"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_facade_update_honors_category_and_rejects_invalid_or_duplicate_targets() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(7, binding("/repo", "token"));
+        let recategorized = insert_memory(&store, "/repo", "CONFIG_VALUES", "old config", 1);
+        let omitted = insert_memory(&store, "/repo", "NAMING", "old name", 1);
+        let duplicate = insert_memory(&store, "/repo", "CONSTRAINTS", "same value", 1);
+        let duplicate_target = insert_memory(&store, "/repo", "ARCHITECTURE", "different value", 1);
+
+        let updated = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update",
+                "id": recategorized,
+                "category": "CONSTRAINTS",
+                "content": "new constraint"
+            }),
+        )
+        .await;
+        assert!(!tool_is_error(updated.clone()));
+        assert_eq!(
+            tool_text(updated),
+            format!("Updated memory [ID: {recategorized}] in CONSTRAINTS.")
+        );
+        let updated_row = store.get_memory_full(recategorized).unwrap().unwrap();
+        assert_eq!(updated_row.category, "CONSTRAINTS");
+        assert_eq!(updated_row.content, "new constraint");
+        let mutation = store
+            .memory_mutations_for_render(&["/repo".to_string()], 0, &[recategorized])
+            .unwrap();
+        assert_eq!(
+            mutation.last().unwrap().category.as_deref(),
+            Some("CONSTRAINTS")
+        );
+
+        let preserved = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({ "action": "update", "id": omitted, "content": "new name" }),
+        )
+        .await;
+        assert!(!tool_is_error(preserved));
+        assert_eq!(
+            store.get_memory_full(omitted).unwrap().unwrap().category,
+            "NAMING"
+        );
+
+        let invalid = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update",
+                "id": omitted,
+                "category": "NOT_A_CATEGORY",
+                "content": "invalid update"
+            }),
+        )
+        .await;
+        assert!(tool_is_error(invalid.clone()));
+        assert_eq!(
+            tool_text(invalid),
+            "Error: category must be one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING."
+        );
+        assert_eq!(
+            store.get_memory_full(omitted).unwrap().unwrap().content,
+            "new name"
+        );
+
+        let duplicate_error = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update",
+                "id": duplicate_target,
+                "category": "CONSTRAINTS",
+                "content": "same value"
+            }),
+        )
+        .await;
+        assert!(tool_is_error(duplicate_error.clone()));
+        let duplicate_text = tool_text(duplicate_error);
+        assert!(
+            duplicate_text.contains(&format!("memory content already exists as ID {duplicate}")),
+            "{duplicate_text}"
+        );
+        assert!(!duplicate_text.contains("UNIQUE constraint failed"));
+        let duplicate_target = store.get_memory_full(duplicate_target).unwrap().unwrap();
+        assert_eq!(duplicate_target.category, "ARCHITECTURE");
+        assert_eq!(duplicate_target.content, "different value");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -24621,8 +27399,12 @@ mod tests {
             .await,
         );
         assert_eq!(code, "facade_project_vocabulary_mismatch");
-        assert!(message.contains("git:identity"));
-        assert!(message.contains(route_project_root));
+        assert_eq!(
+            message,
+            "Memory writes are paused while the engine syncs. Retry in a moment. (MC-C01)"
+        );
+        assert!(!message.contains("git:identity"));
+        assert!(!message.contains(route_project_root));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -24718,6 +27500,9 @@ mod tests {
         }));
         assert!(all.contains(&format!("[memory] score=1.00 id={first_id}")));
         assert!(all.contains(&format!("[memory] score=1.00 id={second_id}")));
+        assert!(all.contains(&format!(
+            "Memories: 1 additional match suppressed because it is already visible in your project-memory block (ids {visible_id})."
+        )));
         assert!(
             all.find(&format!("id={first_id}")) < all.find(&format!("id={second_id}")),
             "equal-score/equal-recency memory ties must use ascending ids: {all}"
@@ -24725,7 +27510,7 @@ mod tests {
         assert!(
             all.contains("[message] score=0.90 compartment_id=1 range=10-20 match=fts title=C1")
         );
-        assert!(all.contains(&format!("[note] score=0.95 id=#{}", note.id)));
+        assert!(all.contains(&format!("[note] score=0.11 id=#{}", note.id)));
         assert!(all.contains("@msg 18"));
         assert!(all.contains("Use ctx_expand(start, end)"));
 
@@ -24751,6 +27536,21 @@ mod tests {
         );
         assert!(id_lookup.contains(&format!("id={second_id}")));
         assert!(id_lookup.contains("match=fts"));
+
+        let visible_lookup = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": format!("#{visible_id}"), "sources": ["memory"]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            visible_lookup,
+            format!(
+                "No hidden results found for \"#{visible_id}\".\n\nMemories: 1 match found, all already visible in your project-memory block (ids {visible_id})."
+            )
+        );
 
         let unsupported_corpus = tool_text(
             call_facade(
@@ -24910,7 +27710,7 @@ mod tests {
         store
             .replace_compartments(scope, &[stored_comp(1, 1, 10, "m10", "SUMMARY")])
             .unwrap();
-        let memory_id = insert_memory(&store, project_root, "CONSTRAINTS", "original rule", 1);
+        let memory_id = insert_memory(&store, project_root, "CONFIG_VALUES", "original rule", 1);
 
         let mut boot_req = request(vec![ck("m10", 10, "raw covered")]);
         boot_req["session_id"] = json!(scope);
@@ -24925,7 +27725,12 @@ mod tests {
             call_facade(
                 &handler,
                 "ctx_memory",
-                json!({ "action": "update", "id": memory_id, "content": "updated rule" }),
+                json!({
+                    "action": "update",
+                    "id": memory_id,
+                    "category": "CONSTRAINTS",
+                    "content": "updated rule"
+                }),
             )
             .await
         ));
@@ -24940,7 +27745,9 @@ mod tests {
         let update_delta = call_transform_request_on_channel(&handler, 8, boot_req.clone()).await;
         assert_eq!(update_delta["action"], "SOFT");
         assert!(synthetic_text(&update_delta, 1).contains("<memory-updates>"));
-        assert!(synthetic_text(&update_delta, 1).contains("updated rule"));
+        assert!(synthetic_text(&update_delta, 1).contains(&format!(
+            "<updated id=\"{memory_id}\" category=\"CONSTRAINTS\">updated rule</updated>"
+        )));
 
         handler.bind_route(9, binding(additive_project_root, additive_scope));
         store
@@ -25092,6 +27899,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn defer_keeps_frozen_prefix_divergence_unacknowledged_across_restart_passes() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) = handler_with_store(producer, default_test_config());
+        let request_body = request(vec![ck("m1", 1, "hello")]);
+        let initial = call_transform_request(&handler, request_body.clone()).await;
+        assert_eq!(initial["status"], "ok", "{initial}");
+
+        let mut loaded = store.load("ses").unwrap();
+        let served_fingerprint_before_restart = loaded.meta.served_output_fingerprint.clone();
+        let m1 = loaded
+            .core
+            .frozen_units
+            .iter_mut()
+            .find(|unit| unit.key == "m1")
+            .expect("initial render stores m1");
+        m1.frozen_payload.push_str("\nrestart-only drift");
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+
+        let restarted = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory {
+                state: Arc::new(ProducerState::default()),
+            }),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        restarted.store.set(Arc::clone(&store)).ok().unwrap();
+        restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+
+        let first_after_restart = call_transform_request(&restarted, request_body.clone()).await;
+        assert_eq!(
+            store.load("ses").unwrap().meta.served_output_fingerprint,
+            served_fingerprint_before_restart,
+            "the first divergent SOFT+ restart pass must retain the byte-identical served fingerprint"
+        );
+        let second_after_restart = call_transform_request(&restarted, request_body).await;
+
+        for response in [&first_after_restart, &second_after_restart] {
+            assert_eq!(response["decision"], "SOFT+", "{response}");
+            assert!(response["materialize_reason"].is_null(), "{response}");
+            assert_eq!(
+                response["first_divergence"]["block_id_old"], "mc_m1#0",
+                "{response}"
+            );
+            assert_eq!(
+                response["first_divergence"]["kind"], "content_changed",
+                "{response}"
+            );
+        }
+        assert_eq!(
+            store.load("ses").unwrap().meta.served_output_fingerprint,
+            served_fingerprint_before_restart,
+            "both divergent SOFT+ restart passes must retain the byte-identical served fingerprint"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn status_distinguishes_current_and_historical_divergence() {
         let producer = Arc::new(ProducerState::default());
         let (handler, _store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -25175,6 +28040,7 @@ mod tests {
         assert!(session_status["pass_trace"]["first_divergence"].is_null());
         assert!(session_status["pass_trace"]["last_divergence"].is_string());
         assert!(session_status["tail_hygiene"]["u"].is_number());
+        assert!(session_status["tail_hygiene"]["reclaimable_tool_output_count"].is_number());
         assert!(session_status["tail_hygiene"]["t"].is_number());
         assert!(session_status["tail_hygiene"]["severity"].is_number());
         assert!(session_status["tail_hygiene"]["evaluable"].is_boolean());
@@ -25635,6 +28501,13 @@ mod tests {
         let loaded = store.load("ses").unwrap();
         let mut meta = loaded.meta;
         meta.historian.consecutive_publish_failures = 0;
+        meta.historian.firing_seq = 2;
+        meta.historian.failure_backoff_at_ms = None;
+        meta.historian.last_no_fire = None;
+        meta.historian.last_failure = Some(
+            "published_with_model_unresolvable:model_unresolvable:opencode/model-a: open_failed: run resolution failed"
+                .to_string(),
+        );
         store
             .commit("ses", loaded.row_version, &loaded.core, &meta)
             .unwrap();
@@ -25644,6 +28517,15 @@ mod tests {
         ));
         assert_eq!(recovered["historian"]["consecutive_publish_failures"], 0);
         assert_eq!(recovered["historian"]["publish_health_degraded"], false);
+        assert!(recovered["historian"]["last_outcome"]
+            .as_str()
+            .is_some_and(|outcome| {
+                outcome.contains("published seq 2")
+                    && outcome.contains("model_unresolvable:opencode/model-a")
+            }));
+        assert!(recovered["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("model_unresolvable:opencode/model-a")));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -25731,6 +28613,15 @@ mod tests {
         assert_eq!(compartments.len(), 1);
         assert_eq!(compartments[0].start_message, 1);
         assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+        let fired_state = store.load("ses").unwrap();
+        assert_eq!(fired_state.meta.historian.recent_decisions.len(), 1);
+        let fired_decision = fired_state.meta.historian.recent_decisions.last().unwrap();
+        assert_eq!(fired_decision.decision, HistorianDecision::Fired);
+        assert_eq!(fired_decision.cause, "trigger_true:emergency");
+        assert_eq!(fired_decision.producer_model.as_deref(), Some("test/model"));
+        assert!(fired_decision.eligible_tokens > 0);
+        assert!(fired_decision.completed_at_ms.is_some());
+        assert_eq!(fired_decision.apply_row_version, fired_state.row_version);
 
         let second = call_transform(&handler, messages).await;
         assert_eq!(second["action"], "HARD");
@@ -25793,13 +28684,11 @@ mod tests {
     /// must refuse at the bootstrap fold: the minted boundary has to name a real
     /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
     /// depend on (a synthetic-anchor seed can never compose, regardless of ranges).
-
     /// Desk rehearsal of the drive's final seed shape: 20 live messages with a
     /// role=system message mid-span at ordinal 1, four imported compartments
     /// partitioning 0..=16 on real live block ids, live tail 17..=19. Must
     /// bootstrap-HARD-fold with the last covered block as the minted boundary —
     /// and the mid-span system ordinal must be absorbed, not rejected.
-
     /// Desk rehearsal of the round-3 drive seed: 18 live messages (system at
     /// ordinal 1 mid-span), four imported compartments partitioning 0..=14 on
     /// real live block ids, tail 15..=17. Must bootstrap-HARD-fold with
@@ -27258,6 +30147,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn rust_wrapup_finality_uses_the_full_target_and_promotes_every_non_final_round() {
+        let producer = Arc::new(ProducerState::default());
+        *producer.fact_each_run.lock().unwrap() = Some("rust wrapup fact".to_string());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(320, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["disposition"], json!("completed"), "{body}");
+        let rounds = producer.starts.load(Ordering::SeqCst);
+        assert!(
+            rounds >= 6,
+            "fixture must span several wrapup rounds: {rounds}"
+        );
+        let facts = store
+            .load_active_memories(project.to_str().unwrap(), 0)
+            .unwrap();
+        assert_eq!(
+            facts.len(),
+            rounds - 1,
+            "Rust measures has_more against the full wrapup target: every non-final round promotes and only the final weak-lookahead round skips"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_wrapup_honors_requested_keep_watermark_without_clamping() {
         // keep=1 is honored as given (floored only to the boundary's one-message
         // minimum): the drain compacts everything except the protected tail. The
@@ -27549,6 +30471,136 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(producer.starts.load(Ordering::SeqCst), starts);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_terminal_wrapup_dispositions_replay_after_module_restart() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(2, 8));
+        store
+            .record_wrapup_command("ses", "completed", "completed", 2, "finished", 10)
+            .unwrap();
+        store
+            .record_wrapup_command(
+                "ses",
+                "nothing",
+                "nothing_to_compact",
+                0,
+                "nothing eligible",
+                11,
+            )
+            .unwrap();
+        let failed_record = tool_body(handler.terminal_wrapup_response(
+            &store,
+            "ses",
+            Some("failed"),
+            1,
+            0,
+            TerminalWrapupResponse {
+                disposition: "failed",
+                rounds: 1,
+                summary: "wrapup failed".to_string(),
+                reason: Some("producer_failed"),
+                detail: Some("producer unavailable".to_string()),
+                include_rounds_without_command: false,
+            },
+        ));
+        assert_eq!(failed_record["disposition"], json!("failed"));
+        drop(handler);
+        drop(store);
+
+        let reopened = Arc::new(
+            McStore::open(&dev_descriptor_at(
+                dir.path().join("data").to_str().unwrap(),
+            ))
+            .unwrap(),
+        );
+        let restarted = McHandler::with_producer_factory_config_resolver(
+            Arc::new(TestProducerFactory {
+                state: Arc::clone(&producer),
+            }),
+            default_test_config(),
+            Arc::new(MissingSessionResolver),
+        );
+        restarted.store.set(reopened).ok().unwrap();
+        restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+
+        let completed = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "completed"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            completed,
+            json!({
+                "ok": true,
+                "disposition": "completed",
+                "rounds": 2,
+                "summary": "finished",
+                "replayed": true
+            })
+        );
+
+        let nothing = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "nothing"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            nothing,
+            json!({
+                "ok": true,
+                "disposition": "nothing_to_compact",
+                "rounds": 0,
+                "summary": "nothing eligible",
+                "replayed": true
+            })
+        );
+
+        let failed = tool_body(
+            restarted
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "command_id": "failed"
+                    }),
+                )
+                .await,
+        );
+        assert_eq!(
+            failed,
+            json!({
+                "ok": false,
+                "disposition": "failed",
+                "rounds": 1,
+                "summary": "wrapup failed",
+                "reason": "producer_failed",
+                "detail": "producer unavailable",
+                "replayed": true
+            })
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -28598,6 +31650,36 @@ mod tests {
         wait_for_idle(&store).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_stuck_historian_is_bounded_and_next_transform_succeeds() {
+        let producer = Arc::new(ProducerState::default());
+        producer.block_output.store(true, Ordering::SeqCst);
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        *handler
+            .transform_historian_followup_budget
+            .lock()
+            .expect("transform historian follow-up budget mutex") = Some(Duration::from_secs(1));
+        let messages = big_messages();
+
+        let started_at = Instant::now();
+        let first = call_transform_with_usage(&handler, messages.clone(), 48_000, 50_000).await;
+        assert!(first["action"].is_string());
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+        assert!(started_at.elapsed() >= Duration::from_secs(1));
+        assert!(started_at.elapsed() < Duration::from_secs(5));
+
+        let retry_started_at = Instant::now();
+        let retry = call_transform_with_usage(&handler, messages, 48_000, 50_000).await;
+        assert!(retry["action"].is_string());
+        assert!(retry_started_at.elapsed() < Duration::from_secs(5));
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 1);
+
+        producer.block_output.store(false, Ordering::SeqCst);
+        producer.notify.notify_waiters();
+        wait_for_idle(&store).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handler_emergency_refolds_when_active_run_publishes_before_live_wait_capture() {
         let producer = Arc::new(ProducerState::default());
@@ -28683,6 +31765,8 @@ mod tests {
                 temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
+                protected_tokens_floor: 16_000,
+                protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
@@ -28860,6 +31944,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            recent_decisions: Vec::new(),
             consecutive_publish_failures: 0,
         };
         store
@@ -28892,6 +31977,7 @@ mod tests {
             failure_backoff_at_ms: None,
             last_failure: None,
             last_no_fire: None,
+            recent_decisions: Vec::new(),
             consecutive_publish_failures: 0,
         };
         store
@@ -28919,6 +32005,7 @@ mod tests {
             0,
             mc_store::CompartmentSetGeneration::default(),
             1,
+            None,
         )
         .unwrap()
         {
@@ -28961,6 +32048,10 @@ mod tests {
         let backed_off = call_transform(&handler, messages.clone()).await;
         assert_eq!(backed_off["historian"]["fired"], false);
         assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(
+            backed_off["historian"]["canonical_cause"],
+            "failure_backoff"
+        );
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
 
         expire_historian_backoff(&store);
@@ -29173,16 +32264,63 @@ mod tests {
         let response = call_transform(&handler, messages).await;
         assert_eq!(response["historian"]["fired"], false);
         assert_eq!(response["historian"]["no_fire"], "backoff");
+        assert_eq!(
+            response["historian"]["canonical_cause"],
+            "validation_rejected"
+        );
+        assert_eq!(
+            response["historian"]["reason"],
+            "validate rejected: stale summary"
+        );
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
         let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.recent_decisions.last().unwrap().cause,
+            "validation_rejected"
+        );
         assert_eq!(state.state, HistorianPhase::Idle);
-        assert_eq!(state.last_no_fire.as_deref(), Some("backoff"));
+        assert_eq!(
+            state.last_no_fire.as_deref(),
+            Some("backoff{raw_cause=ValidationRejected,canonical_cause=validation_rejected,validate rejected: stale summary}")
+        );
         assert!(
             state
                 .failure_backoff_at_ms
                 .is_some_and(|backoff_at_ms| backoff_at_ms > now_ms()),
             "the cooldown remains active until the backoff boundary"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_chain_outage_serves_context_and_exposes_reset_until_probe() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let reset_ms = now_ms() + 60_000;
+        let detail = "chain_exhausted earliest_provider_reset=2026-09-11T20:34:51Z retry=probe";
+        seed_abandoned_idle(&store, reset_ms, detail);
+        let response = call_transform(&handler, big_messages()).await;
+        assert_eq!(response["historian"]["fired"], false);
+        assert_eq!(response["historian"]["canonical_cause"], "chain_exhausted");
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        assert!(response["ck_messages"]
+            .as_array()
+            .is_some_and(|messages| !messages.is_empty()));
+        assert_ne!(response["action"], "RAW");
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.failure_backoff_at_ms, Some(reset_ms));
+        assert!(state.last_no_fire.as_deref().unwrap().contains(detail));
+        assert!(!state
+            .last_no_fire
+            .as_deref()
+            .unwrap()
+            .contains("validate rejected"));
+        let status =
+            call_dispatch_request(&handler, json!({"kind":"status", "session_id":"ses"})).await;
+        assert!(status["historian"]["last_no_fire"]
+            .as_str()
+            .unwrap()
+            .contains(detail));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -29314,6 +32452,10 @@ mod tests {
         let backed_off = call_transform(&handler, messages.clone()).await;
         assert_eq!(backed_off["historian"]["fired"], false);
         assert_eq!(backed_off["historian"]["no_fire"], "backoff");
+        assert_eq!(
+            backed_off["historian"]["canonical_cause"],
+            "failure_backoff"
+        );
         assert_eq!(producer.connects.load(Ordering::SeqCst), 1);
 
         expire_historian_backoff(&store);
@@ -29341,7 +32483,7 @@ mod tests {
         let loaded = store.load("ses").unwrap();
         assert_eq!(
             loaded.meta.historian.last_no_fire.as_deref(),
-            Some("no_models")
+            Some("no_models{raw_cause=NoModels,canonical_cause=no_models}")
         );
         let version_after_first = loaded.row_version;
 
@@ -29415,7 +32557,13 @@ mod tests {
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
         let messages = vec![ck("m1", 1, "small turn")];
         let _ = call_transform(&handler, messages.clone()).await;
-        let _ = call_transform(&handler, messages).await;
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["canonical_cause"], "protected_tail");
+        assert_eq!(response["historian"]["no_fire"], "trigger_false");
+        assert!(response["historian"]["no_fire_detail"]
+            .as_str()
+            .unwrap()
+            .contains("raw_cause=ProtectedTailWindowEmpty"));
         let loaded = store.load("ses").unwrap();
         let detail = loaded
             .meta
@@ -29424,6 +32572,8 @@ mod tests {
             .expect("trigger_false recorded");
         assert!(
             detail.starts_with("trigger_false{")
+                && detail.contains("raw_cause=ProtectedTailWindowEmpty")
+                && detail.contains("canonical_cause=protected_tail")
                 && detail.contains("bar~")
                 && detail.contains("ctx_limit="),
             "detail carries the numbers: {detail}"
@@ -29468,6 +32618,8 @@ mod tests {
                 temporal_awareness: true,
                 now_ms: now_ms(),
                 execute_threshold_percentage: 65.0,
+                protected_tokens_floor: 16_000,
+                protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
@@ -29533,6 +32685,117 @@ mod tests {
         batch
     }
 
+    #[tokio::test]
+    async fn state_sync_receipt_is_generation_fenced_and_staged_progress_is_resumable() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let probe = json!({ "v": 1, "session_id": "ses", "state_sync_seed_id": "receipt-fixture" });
+        let read = || {
+            let outcome = handler.handle_session_status_value(7, &probe);
+            let HandlerOutcome::Response(bytes) = outcome else {
+                panic!("{outcome:?}")
+            };
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        let first = paged_seed_batch("ses", "receipt-fixture", 0, 0, 0, 2, vec![]);
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert_eq!(read()["state_sync"]["next_expected_index"], 1);
+        let last = paged_seed_batch("ses", "receipt-fixture", 0, 0, 1, 2, vec![]);
+        assert!(matches!(
+            handler.dispatch_value(7, last).await,
+            HandlerOutcome::Response(_)
+        ));
+        handler.state_sync_seeds.lock().unwrap().sessions.clear();
+        assert_eq!(read()["state_sync"]["completed"], true);
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        meta.shadow_generation += 1;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &meta)
+            .unwrap();
+        assert!(read()["state_sync"].is_null());
+    }
+
+    #[tokio::test]
+    async fn aft_sized_state_sync_timing_fixture() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let compartments = (0..1627)
+            .map(|sequence| state_sync_compartment(sequence, &"x".repeat(1024)))
+            .collect();
+        let mut first = paged_seed_batch("ses", "aft-fixture", 0, 0, 0, 2, compartments);
+        first.as_object_mut().unwrap().remove("session_id");
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let mut last = paged_seed_batch("ses", "aft-fixture", 0, 0, 1, 2, vec![]);
+        last["drop_seeds"] = json!((0..148_070)
+            .map(|index| json!({ "block_id": format!("m{index}#0"), "drop_mode": "full" }))
+            .collect::<Vec<_>>());
+        assert!(matches!(
+            handler.dispatch_value(7, last).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1627);
+        assert_eq!(store.load("ses").unwrap().core.frozen_units.len(), 148_070);
+        let response = handler.handle_session_status_value(
+            7,
+            &json!({ "v": 1, "session_id": "ses", "state_sync_seed_id": "aft-fixture" }),
+        );
+        let HandlerOutcome::Response(bytes) = response else {
+            panic!("receipt failed")
+        };
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status["state_sync"]["completed"], true);
+        // Dropping all collector state models a daemon restart; the receipt is in SQLite.
+        handler.state_sync_seeds.lock().unwrap().sessions.clear();
+        let response = handler.handle_session_status_value(
+            7,
+            &json!({ "v": 1, "session_id": "ses", "state_sync_seed_id": "aft-fixture" }),
+        );
+        let HandlerOutcome::Response(bytes) = response else {
+            panic!("durable receipt failed")
+        };
+        let status: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status["state_sync"]["completed"], true);
+
+        let loaded = store.load("ses").unwrap();
+        let mut meta = loaded.meta;
+        let mut core = loaded.core;
+        meta.initialized = true;
+        meta.folded_compartment_seq = 1626;
+        core.boundary_id = "m1626#0".into();
+        store
+            .commit("ses", loaded.row_version, &core, &meta)
+            .unwrap();
+        let inventory = handler.handle_session_status_value(
+            7,
+            &json!({ "v": 1, "session_id": "ses", "state_sync_inventory": true }),
+        );
+        let HandlerOutcome::Response(bytes) = inventory else {
+            panic!("inventory failed")
+        };
+        let inventory: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            inventory["state_sync_inventory"]["max_compartment_sequence"],
+            1626
+        );
+        assert_eq!(inventory["state_sync_inventory"]["boundary_id"], "m1626#0");
+        let mut warm = paged_seed_batch("ses", "aft-warm", 0, 1, 0, 1, vec![]);
+        warm["drop_seeds"] = json!((147_788..148_070)
+            .map(|index| json!({ "block_id": format!("m{index}#0"), "drop_mode": "full" }))
+            .collect::<Vec<_>>());
+        assert!(matches!(
+            handler.dispatch_value(7, warm).await,
+            HandlerOutcome::Response(_)
+        ));
+        assert_eq!(store.load("ses").unwrap().core.frozen_units.len(), 148_070);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paged_transform_page(
         _method: &str,
@@ -29591,6 +32854,7 @@ mod tests {
                 }
             ],
             "native_messages": [{"text": "native first"}],
+            "tool_input_key_orders": {"m0#0": ["filePath", "content"]},
             "transform_page_id": "golden-page",
             "transform_generation": 4,
             "transform_page_index": 0,
@@ -29614,6 +32878,7 @@ mod tests {
                 {"mid": "m2", "text": "last"}
             ],
             "native_messages": [{"text": "native last"}],
+            "tool_input_key_orders": {"m2#0": ["filePath", "oldString", "newString"]},
             "extra": "preserved",
             "transform_page_id": "golden-page",
             "transform_generation": 4,
@@ -29638,8 +32903,266 @@ mod tests {
                     {"text": "native first"},
                     {"text": "native last"}
                 ],
+                "tool_input_key_orders": {
+                    "m0#0": ["filePath", "content"],
+                    "m2#0": ["filePath", "oldString", "newString"]
+                },
                 "extra": "preserved"
             })
+        );
+    }
+
+    #[test]
+    fn pageable_map_digest_matches_the_typescript_canonical_fixture() {
+        let request = json!({
+            "messages": [{"mid": "m1", "text": "hello"}],
+            "tool_input_key_orders": {
+                "m1#2": ["newString", "filePath"],
+                "m1#0": ["path", "content"]
+            }
+        });
+        assert_eq!(
+            transform_page_content_digest(&request),
+            "db28d9596edc518ebe4131403a892c60868ee683f80c248e6c1c1a6f0e9bbf17"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pageable_key_order_map_accepts_over_cap_input_and_preserves_served_bytes() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        let key_order_map = |start: usize, end: usize| {
+            Value::Object(
+                (start..end)
+                    .map(|index| {
+                        (
+                            format!("msg_{index:024x}#0"),
+                            json!(["filePath", "oldString", "newString"]),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let mut large_response = None;
+        for index in 0..3 {
+            let complete = index == 2;
+            let messages = if complete {
+                vec![
+                    serde_json::to_value(ck("large-map-message", 0, "large map accepted")).unwrap(),
+                ]
+            } else {
+                Vec::new()
+            };
+            let mut page = paged_transform_page(
+                "transform",
+                "ses",
+                "large-key-order-map",
+                0,
+                index,
+                3,
+                complete,
+                messages,
+            );
+            page["tool_input_key_orders"] = key_order_map(index * 4_000, (index + 1) * 4_000);
+            page["transform_page_digest"] = json!(transform_page_content_digest(&page));
+            assert!(serde_json::to_vec(&page).unwrap().len() <= TRANSFORM_PAGE_MAX_BYTES);
+            match handler.dispatch_value(7, page).await {
+                HandlerOutcome::Response(bytes) if complete => large_response = Some(bytes),
+                HandlerOutcome::Response(_) => {}
+                other => panic!("large key-order map page should be accepted: {other:?}"),
+            }
+        }
+        assert!(large_response.is_some());
+        let large_request = handler
+            .transform_snapshots
+            .lock()
+            .expect("transform snapshots mutex")
+            .ready_request_clone("ses")
+            .expect("large paged transform snapshot");
+        assert_eq!(large_request.tool_input_key_orders.len(), 12_000);
+
+        let project_root = project.to_str().expect("test project path");
+        handler.bind_route(8, binding(project_root, "unpaged-map-parity"));
+        handler.bind_route(9, binding(project_root, "paged-map-parity"));
+        let messages = vec![ck("parity-message", 0, "paging parity")];
+        let small_map = json!({
+            "unused#0": ["filePath", "content"],
+            "unused#1": ["filePath", "oldString", "newString"]
+        });
+        let mut unpaged_request = request(messages.clone());
+        unpaged_request["method"] = json!("transform");
+        unpaged_request["session_id"] = json!("unpaged-map-parity");
+        unpaged_request["tool_input_key_orders"] = small_map.clone();
+        let unpaged_output = match handler.dispatch_value(8, unpaged_request).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("unpaged parity control should execute: {other:?}"),
+        };
+
+        let mut first = paged_transform_page(
+            "transform",
+            "paged-map-parity",
+            "small-key-order-map",
+            0,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        first["tool_input_key_orders"] = json!({"unused#0": ["filePath", "content"]});
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+        let mut final_page = paged_transform_page(
+            "transform",
+            "paged-map-parity",
+            "small-key-order-map",
+            0,
+            1,
+            2,
+            true,
+            messages
+                .into_iter()
+                .map(|message| serde_json::to_value(message).unwrap())
+                .collect(),
+        );
+        final_page["usage"] = json!({
+            "current_total_input_tokens": 45_000,
+            "context_limit_tokens": 50_000,
+            "final_wire_input_tokens": 0,
+            "final_wire_trusted": false,
+        });
+        final_page["tool_input_key_orders"] =
+            json!({"unused#1": ["filePath", "oldString", "newString"]});
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+        let assembled = assemble_transform_pages(vec![first.clone(), final_page.clone()]).unwrap();
+        let mut parity_control = request(vec![ck("parity-message", 0, "paging parity")]);
+        parity_control["method"] = json!("transform");
+        parity_control["session_id"] = json!("paged-map-parity");
+        parity_control["tool_input_key_orders"] = small_map;
+        assert_eq!(assembled, parity_control);
+
+        assert!(matches!(
+            handler.dispatch_value(9, first).await,
+            HandlerOutcome::Response(_)
+        ));
+        let paged_output = match handler.dispatch_value(9, final_page).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("paged parity request should execute: {other:?}"),
+        };
+        assert_eq!(
+            serde_json::to_vec(&paged_output["ck_messages"]).unwrap(),
+            serde_json::to_vec(&unpaged_output["ck_messages"]).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_content_addressed_page_series_replays_without_reexecution() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(state, default_test_config());
+        let first = paged_transform_page(
+            "transform",
+            "ses",
+            "content-addressed-attempt",
+            0,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        let final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "content-addressed-attempt",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("adopted", 0, "completed result")).unwrap()],
+        );
+
+        assert!(matches!(
+            handler.dispatch_value(7, first.clone()).await,
+            HandlerOutcome::Response(_)
+        ));
+        let completed = match handler.dispatch_value(7, final_page.clone()).await {
+            HandlerOutcome::Response(bytes) => bytes,
+            other => panic!("completed series should execute: {other:?}"),
+        };
+        let row_version = store.load("ses").unwrap().row_version;
+
+        let replay_ack = match handler.dispatch_value(7, first).await {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("completed series prefix should replay admission: {other:?}"),
+        };
+        assert_eq!(replay_ack["completed_replay"], true);
+        let adopted = match handler.dispatch_value(7, final_page).await {
+            HandlerOutcome::Response(bytes) => bytes,
+            other => panic!("completed series final page should adopt result: {other:?}"),
+        };
+
+        assert_eq!(adopted, completed);
+        assert_eq!(store.load("ses").unwrap().row_version, row_version);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pageable_map_digest_rejects_tampering() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+        let mut tampered = paged_transform_page(
+            "transform",
+            "ses",
+            "tampered-map",
+            0,
+            0,
+            1,
+            true,
+            vec![serde_json::to_value(ck("tampered", 0, "tampered map")).unwrap()],
+        );
+        tampered["tool_input_key_orders"] = json!({"tampered#0": ["filePath", "content"]});
+        tampered["transform_page_digest"] = json!(transform_page_content_digest(&tampered));
+        tampered["tool_input_key_orders"]["tampered#0"] = json!(["content", "filePath"]);
+
+        assert_eq!(
+            error_code(handler.dispatch_value(7, tampered).await),
+            "authority_transform_page_digest_mismatch"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pageable_map_duplicate_keys_are_integrity_errors() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) = handler_with_store(state, default_test_config());
+        let mut first = paged_transform_page(
+            "transform",
+            "ses",
+            "duplicate-map-key",
+            0,
+            0,
+            2,
+            false,
+            Vec::new(),
+        );
+        first["tool_input_key_orders"] = json!({"duplicate#0": ["filePath", "content"]});
+        first["transform_page_digest"] = json!(transform_page_content_digest(&first));
+        assert!(matches!(
+            handler.dispatch_value(7, first).await,
+            HandlerOutcome::Response(_)
+        ));
+
+        let mut final_page = paged_transform_page(
+            "transform",
+            "ses",
+            "duplicate-map-key",
+            0,
+            1,
+            2,
+            true,
+            vec![serde_json::to_value(ck("duplicate", 0, "duplicate map key")).unwrap()],
+        );
+        final_page["tool_input_key_orders"] = json!({"duplicate#0": ["oldString", "newString"]});
+        final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
+
+        assert_eq!(
+            error_code(handler.dispatch_value(7, final_page).await),
+            "authority_transform_page_digest_mismatch"
         );
     }
 
@@ -30349,6 +33872,86 @@ mod tests {
         assert!(store.load("ses").unwrap().meta.synthetic_todo.is_none());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn todo_verdict_diagnostic_captures_bust_fields_and_skips_probed_defer() {
+        let messages = vec![ck("m1", 1, "hello")];
+        let (hard_handler, _store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+
+        let mut hard_request = request(messages.clone());
+        hard_request["todo_verdict_probed"] = json!(false);
+        hard_request["todo_tool_present"] = json!(true);
+        let hard = call_transform_request(&hard_handler, hard_request).await;
+        assert_eq!(hard["decision"], json!("HARD"), "{hard}");
+        let hard_line = hard_handler
+            .todo_verdict_diagnostic_logs
+            .lock()
+            .expect("todo verdict diagnostic logs mutex")[0]
+            .clone();
+
+        let (soft_handler, soft_store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        soft_store
+            .commit_state_import(
+                "ses",
+                "todo-diagnostic-seed",
+                &[stored_comp(1, 1, 1, "m1", "seed")],
+                1,
+            )
+            .unwrap();
+        let mut setup_request = request(messages.clone());
+        setup_request["todo_verdict_probed"] = json!(true);
+        let setup = call_transform_request(&soft_handler, setup_request).await;
+        assert_eq!(setup["decision"], json!("HARD"), "{setup}");
+        assert!(soft_handler
+            .todo_verdict_diagnostic_logs
+            .lock()
+            .expect("todo verdict diagnostic logs mutex")
+            .is_empty());
+
+        let armed = call_dispatch_request(
+            &soft_handler,
+            json!({ "method": "session.flush", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(armed, json!({ "ok": true, "armed": true }));
+
+        let mut soft_request = request(messages.clone());
+        soft_request["todo_verdict_probed"] = json!(false);
+        soft_request["todo_tool_present"] = json!(false);
+        let soft = call_transform_request(&soft_handler, soft_request).await;
+        assert_eq!(soft["decision"], json!("SOFT"), "{soft}");
+        let soft_line = soft_handler
+            .todo_verdict_diagnostic_logs
+            .lock()
+            .expect("todo verdict diagnostic logs mutex")[0]
+            .clone();
+
+        assert_eq!(
+            hard_line,
+            "mc-todo-verdict session=ses unprobed_bust=1 possible_stale_mint=1 decision=HARD reason=first_render"
+        );
+        assert_eq!(
+            soft_line,
+            "mc-todo-verdict session=ses unprobed_bust=1 possible_stale_mint=0 decision=SOFT reason=explicit_flush"
+        );
+
+        let mut defer_request = request_with_usage(messages, 1_000, 50_000);
+        defer_request["todo_verdict_probed"] = json!(true);
+        defer_request["todo_tool_present"] = json!(true);
+        let defer = call_transform_request(&soft_handler, defer_request).await;
+        assert_eq!(defer["scheduler_decision"], json!("defer"), "{defer}");
+        assert_eq!(
+            soft_handler
+                .todo_verdict_diagnostic_logs
+                .lock()
+                .expect("todo verdict diagnostic logs mutex")
+                .len(),
+            1,
+            "a probed defer must not emit an unprobed-bust diagnostic"
+        );
+    }
+
     #[tokio::test]
     async fn cold_start_state_seed_cannot_rewind_a_materialized_boundary() {
         let (handler, store, _dir, _project) =
@@ -30592,12 +34195,6 @@ mod tests {
             "native_replace_from": 0,
         });
         final_page["transform_page_digest"] = json!(transform_page_content_digest(&final_page));
-        assert!(
-            serde_json::to_vec(&first).unwrap().len()
-                + serde_json::to_vec(&final_page).unwrap().len()
-                > TRANSFORM_PAGE_MAX_BYTES
-        );
-
         let first_ack = handler.dispatch_value(7, first).await;
         let HandlerOutcome::Response(first_ack) = first_ack else {
             panic!("first delta page should stage: {first_ack:?}");
@@ -31454,5 +35051,44 @@ mod tests {
         for property in ["message", "start", "end"] {
             assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_form_degradation {
+    use subc_client_rs::build_provenance;
+
+    // Short 8-hex deploy stamps (the pre-0.17 ladder convention) must fail the
+    // canonical form check — this pins WHY the manifest call site degrades to
+    // omission instead of unwrapping.
+    #[test]
+    fn short_sha_is_rejected_by_form_check_and_full_sha_is_accepted() {
+        assert!(build_provenance(Some("22464bf2"), None, None).is_err());
+        let ok = build_provenance(Some("22464bf25db24c4037f5efda72c8bb02d64baf51"), None, None)
+            .expect("full lowercase 40-hex sha is canonical");
+        assert_eq!(
+            ok.build_git_sha.as_deref(),
+            Some("22464bf25db24c4037f5efda72c8bb02d64baf51")
+        );
+    }
+}
+
+fn unprobed_todo_bust(probed: Option<bool>, decision: &str) -> bool {
+    probed == Some(false) && matches!(decision, "HARD" | "SOFT" | "MIGRATE_HARD" | "EXECUTE")
+}
+
+#[cfg(test)]
+mod todo_verdict_probe_tests {
+    use super::unprobed_todo_bust;
+
+    #[test]
+    fn unprobed_busts_are_reported_without_flagging_defer_or_legacy_clients() {
+        for decision in ["HARD", "SOFT", "MIGRATE_HARD", "EXECUTE"] {
+            assert!(unprobed_todo_bust(Some(false), decision));
+            assert!(!unprobed_todo_bust(Some(true), decision));
+            assert!(!unprobed_todo_bust(None, decision));
+        }
+        assert!(!unprobed_todo_bust(Some(false), "SOFT+"));
+        assert!(!unprobed_todo_bust(Some(false), "DEFER"));
     }
 }

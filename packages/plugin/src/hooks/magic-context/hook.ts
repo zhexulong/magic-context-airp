@@ -2,21 +2,20 @@ import {
     isCompactionEnabled,
     isDreamerRunnable,
     isHistorianRunnable,
-    isSidekickRunnable,
 } from "../../config/agent-disable";
+import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import {
     DEFAULT_HISTORIAN_TIMEOUT_MS,
     type DreamerConfig,
     type HistorianConfig,
-    type SidekickConfig,
+    type MagicContextConfig,
 } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
     applyMirroredNoteCompileFields,
-    applyMirrorPage,
+    drainMirrorPages,
     ensureContextStoreUuid,
-    getMirrorCursor,
     getModuleNoteEvaluationBridge,
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
@@ -52,6 +51,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import {
+    type DatabaseBootTimings,
     getMigrationOnOpenRefusal,
     getSchemaFenceRejection,
     openDatabaseAsync,
@@ -64,6 +64,7 @@ import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embed
 import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
+import type { ConfigParseFailure } from "../../shared/config-diagnostics";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import { resolveHistorianModel } from "../../shared/model-resolution";
@@ -73,7 +74,12 @@ import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications
 import type { Database } from "../../shared/sqlite";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
-import { deriveHistorianChunkTokens, resolveHistorianContextLimit } from "./derive-budgets";
+import {
+    deriveHistorianChunkTokens,
+    resolveHistorianContextLimit,
+    resolveKnownHistorianContextLimit,
+} from "./derive-budgets";
+import { createDroppedInputToolExecuteBeforeHook } from "./dropped-input-guard";
 import {
     autoEmbedAttemptedBySession,
     clearEmbedSessionState,
@@ -87,6 +93,7 @@ import {
     resolveExecuteThresholdDetail,
     resolveModelKey,
 } from "./event-resolvers";
+import { formatEmbedFailureSummary } from "./format-embed-failure";
 import { formatEmbedStatusText } from "./format-embed-status";
 import { clearInjectionCache } from "./inject-compartments";
 import { createDbLkgPersistence } from "./lkg-persist";
@@ -116,7 +123,11 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
-import { type NotificationParams, sendIgnoredMessage } from "./send-session-notification";
+import {
+    type NotificationParams,
+    sendIgnoredMessage,
+    sendStatusNotification,
+} from "./send-session-notification";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import { maybeSendUpgradeReminder } from "./upgrade-reminder";
 
@@ -133,7 +144,8 @@ export interface MagicContextDeps {
     compactionHandler: ReturnType<typeof createCompactionHandler>;
     liveSessionState?: LiveSessionState;
     config: {
-        protected_tags: number;
+        protected_tokens?: number;
+        protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
         /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
         allow_home_project?: boolean;
         language?: string;
@@ -142,7 +154,9 @@ export interface MagicContextDeps {
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
-        cache_ttl: string | Record<string, string>;
+        cache_ttl: MagicContextConfig["cache_ttl"];
+        cacheTtlConfigured?: boolean;
+        configParseFailures?: ConfigParseFailure[];
         prompt_surface?: PromptSurfaceConfig;
 
         historian?: HistorianConfig;
@@ -164,7 +178,6 @@ export interface MagicContextDeps {
         embedding?: {
             provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
-        sidekick?: SidekickConfig;
         dreamer?: DreamerConfig;
         smart_notes?: { retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
@@ -194,6 +207,8 @@ export interface MagicContextDeps {
     rustModeModuleClient?: RustModeModuleClient;
     /** Test and async-boot seam for supplying a database already opened by the caller. */
     openDatabaseForHook?: () => Database | null;
+    /** Plugin-factory diagnostics for the boot-time storage phases. */
+    onStorageBootTimings?: (timings: DatabaseBootTimings) => void;
 }
 
 function notifyMagicContextDisabled(client: PluginContext["client"], reason: string): void {
@@ -366,6 +381,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             resolveHistorianContextLimit(resolveHistorianAttempts().primary?.model),
         );
     const historianModel = resolveHistorianAttempts().primary;
+    const historianContextLimit = resolveKnownHistorianContextLimit(historianModel?.model);
+    const historianMaxOutputTokens = deps.config.historian?.maxTokens ?? 32_000;
     const historianFallbackModels = resolveHistorianAttempts().fallbacks;
 
     // Three independent cache-busting signal sets, sourced from the
@@ -410,6 +427,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const liveModelBySession =
         deps.liveSessionState?.liveModelBySession ??
         new Map<string, { providerID: string; modelID: string }>();
+    const latestAssistantMessageIdBySession =
+        deps.liveSessionState?.latestAssistantMessageIdBySession ?? new Map<string, string>();
     const agentBySession = deps.liveSessionState?.agentBySession ?? new Map<string, string>();
     const sessionDirectoryBySession =
         deps.liveSessionState?.sessionDirectoryBySession ?? new Map<string, string>();
@@ -467,7 +486,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             agentBySession,
             deps.config.toast_duration_ms,
         );
-        void sendIgnoredMessage(deps.client, sessionId, warning, notificationParams).catch(
+        void sendStatusNotification(deps.client, sessionId, warning, notificationParams).catch(
             (error) => {
                 log(
                     `[magic-context] failed to send project identity warning for ${directory}: ${getErrorMessage(error)}`,
@@ -497,6 +516,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // shared live state — and the next transform pass + RPC sidebar see them.
         liveSessionState: {
             liveModelBySession,
+            latestAssistantMessageIdBySession,
             channel1StateBySession,
             variantBySession,
             agentBySession,
@@ -516,6 +536,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         memoryEnabled: deps.config.memory?.enabled ?? true,
         autoPromote: deps.config.memory?.auto_promote ?? true,
         historianModel,
+        historianContextLimit,
+        historianMaxOutputTokens,
         fallbackModels: historianFallbackModels,
         language: deps.config.language,
         fallbackModelId: (() => {
@@ -667,7 +689,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             case "stalled":
                 return terminal(
                     "skipped",
-                    `Embedded ${outcome.embedded} compartments; ${outcome.remaining} could not be embedded (the provider returned no result). Run /ctx-embed start again to retry them.`,
+                    formatEmbedFailureSummary(outcome.embedded, outcome.remaining, outcome.failure),
                 );
             default:
                 return terminal(
@@ -717,7 +739,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         autoEmbedAttemptedBySession.add(sessionId);
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         void (async () => {
-            let completedDrainWithWork = false;
+            // Latch discipline: early exits (no identity, provider off, nothing to
+            // embed yet) release the latch so a young session gets its drain once
+            // real work exists — those paths are silent and cost one coverage
+            // query. Once a drain reaches ANY terminal outcome (busy, stalled,
+            // success), the latch holds for the process lifetime: busy means the
+            // project-level passive backfill owns the backlog, and re-attempting
+            // per pass is the announce/busy livelock this shape replaced.
+            let drainReachedTerminal = false;
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -737,41 +766,24 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 if (!coverage.enabled) return;
                 const remaining = coverage.session.total - coverage.session.embedded;
                 if (remaining <= 0) return;
-                const notifyParams = getLiveNotificationParams(
-                    sessionId,
-                    liveModelBySession,
-                    variantBySession,
-                    agentBySession,
-                );
-                if (!isTuiConnected(sessionId)) {
-                    const startMsg = `Embedding ${remaining} compartment${remaining === 1 ? "" : "s"} of history in the background…`;
-                    await sendIgnoredMessage(deps.client, sessionId, startMsg, {
-                        ...notifyParams,
-                    });
-                }
-                const summary = await executeEmbedHistory(sessionId);
-                const completedCoverage = getEmbeddingCoverageStatus(
-                    db,
-                    sessionProjectIdentity,
-                    sessionId,
-                );
-                completedDrainWithWork =
-                    completedCoverage.session.total - completedCoverage.session.embedded <= 0;
-                if (!isTuiConnected(sessionId)) {
-                    await sendIgnoredMessage(deps.client, sessionId, summary, {
-                        ...notifyParams,
-                    });
-                }
+                // The auto lane is a silent bootstrap trigger: no pre-announce, no
+                // busy/zero-work chatter, and the once-per-process latch never
+                // resets. Announce-then-drain looped every turn on large backlogs —
+                // the project-level passive backfill holds the drain lock for the
+                // whole (bounded, deferred-span) catch-up, so this drain returned
+                // "busy"/zero-work each pass, reset its own latch, and re-announced
+                // the same count forever. Retries belong to the passive backfill;
+                // progress lives in /ctx-embed status and the sidebar.
+                await executeEmbedHistory(sessionId, { silent: true });
+                drainReachedTerminal = true;
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
             } finally {
-                if (!completedDrainWithWork) autoEmbedAttemptedBySession.delete(sessionId);
+                if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };
 
-    const sidekickRunnable = isSidekickRunnable(deps.config);
-    const sidekickConfig = sidekickRunnable ? deps.config.sidekick : undefined;
     const rustMemorySyncRequestedSessions = new Set<string>();
     // Build the same subc-backed client for the TS recovery arm. Constructing the
     // transport is inert; it connects only if a marker actually needs draining.
@@ -843,16 +855,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
     const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
-        for (;;) {
-            const cursor = getMirrorCursor(db, domain);
-            const response = await rustModeModuleClient.mirrorPull({
-                domain,
-                cursor,
-                limit: 1000,
-            });
-            const next = applyMirrorPage({ db, page: response.page });
-            if (!response.page.has_more || next === cursor) break;
-        }
+        await drainMirrorPages({
+            db,
+            module: rustModeModuleClient,
+            domain,
+            limit: 1000,
+        });
     };
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
@@ -1094,7 +1102,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         db,
         channel1StateBySession,
         channel2DirectiveTextBySession,
-        protectedTags: deps.config.protected_tags,
+        protectedTokens: deps.config.protected_tokens,
+        protectedTokenTierOverrides: deps.config.protectedTokenTierOverrides,
         smartDrops: deps.config.smart_drops === true,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
@@ -1102,6 +1111,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         deferredHistoryRefreshSessions,
         pendingMaterializationSessions,
         deferredMaterializationSessions,
+        variantBySession,
         lastHeuristicsTurnId,
         commitSeenLastPass,
         internalChildSessions,
@@ -1125,6 +1135,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         executeThresholdTokens: deps.config.execute_threshold_tokens,
         historianTimeoutMs: deps.config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
         historianModel,
+        historianContextLimit,
+        historianMaxOutputTokens,
         fallbackModels: historianFallbackModels,
         getNotificationParams: (sessionId) =>
             getLiveNotificationParams(
@@ -1196,6 +1208,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         compactionHandler: deps.compactionHandler,
         config: deps.config,
         compactionOff,
+        thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
         db,
         client: deps.client,
@@ -1218,32 +1231,31 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustWireInvalidated: (sessionId: string) => {
             transform.invalidateRustWireState(sessionId);
         },
-        // Clean up per-session state the system-prompt handler maintains so
-        // these module/closure-scope maps don't accumulate entries over the
-        // plugin's lifetime (Finding #3).
-        onSessionDeleted: (sessionId: string) => {
+        rustSessionCleanup: rustModeModuleClient !== undefined,
+        // Remove module-owned state before the context database drops the durable
+        // session→project binding needed to retry a failed module deletion.
+        onSessionDeleted: async (sessionId: string) => {
             dropSlot(sessionId, "session-deleted");
-            transform.clearRustSession(sessionId);
-            systemPromptHash.clearSession(sessionId);
-            // Prune every per-session map this hook closure owns. These
-            // accumulate one entry per session for the plugin process lifetime
-            // (which can span days/weeks across many sessions and subagents);
-            // without this, a long-lived process leaks memory steadily. Some
-            // maps are shared via liveSessionState — clearing on the terminal
-            // session.deleted event is correct since the session is gone.
-            lastHeuristicsTurnId.delete(sessionId);
-            clearToolPermissionDenied(sessionId);
-            commitSeenLastPass.delete(sessionId);
-            variantBySession.delete(sessionId);
-            liveModelBySession.delete(sessionId);
-            agentBySession.delete(sessionId);
-            sessionDirectoryBySession.delete(sessionId);
-            recompProgressBySession.delete(sessionId);
-            internalChildSessions.delete(sessionId);
-            rustMemorySyncRequestedSessions.delete(sessionId);
-            channel1StateBySession.delete(sessionId);
-            channel2DirectiveTextBySession.delete(sessionId);
-            clearEmbedSessionState(sessionId);
+            try {
+                await transform.clearRustSession(sessionId);
+            } finally {
+                systemPromptHash.clearSession(sessionId);
+                // Prune every per-session map this hook closure owns. These maps
+                // otherwise accumulate for the lifetime of a long-running plugin process.
+                lastHeuristicsTurnId.delete(sessionId);
+                clearToolPermissionDenied(sessionId);
+                commitSeenLastPass.delete(sessionId);
+                variantBySession.delete(sessionId);
+                liveModelBySession.delete(sessionId);
+                agentBySession.delete(sessionId);
+                sessionDirectoryBySession.delete(sessionId);
+                recompProgressBySession.delete(sessionId);
+                internalChildSessions.delete(sessionId);
+                rustMemorySyncRequestedSessions.delete(sessionId);
+                channel1StateBySession.delete(sessionId);
+                channel2DirectiveTextBySession.delete(sessionId);
+                clearEmbedSessionState(sessionId);
+            }
         },
     });
 
@@ -1319,7 +1331,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const commandHandler = createMagicContextCommandHandler({
         db,
-        protectedTags: deps.config.protected_tags,
         compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
         executeThresholdPercentage: deps.config.execute_threshold_percentage ?? 65,
@@ -1329,6 +1340,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         rustModeModuleClient,
         projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
+        cacheTtlConfig: deps.config.cache_ttl,
+        cacheTtlConfigured: deps.config.cacheTtlConfigured === true,
+        configParseFailures: deps.config.configParseFailures ?? [],
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific
             // threshold even before the first transform pass has populated
@@ -1403,15 +1417,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 ...params,
             });
         },
-        sidekick: sidekickConfig
-            ? {
-                  config: sidekickConfig,
-                  projectPath,
-                  sessionDirectory: deps.directory,
-                  client: deps.client,
-                  language: deps.config.language,
-              }
-            : undefined,
         dreamer: dreamerConfig
             ? {
                   config: dreamerConfig,
@@ -1469,7 +1474,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const systemPromptHash = createSystemPromptHashHandler({
         db,
-        protectedTags: deps.config.protected_tags,
         dreamerEnabled: dreamerRunnable,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
@@ -1507,6 +1511,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         contextUsageMap,
         db,
         liveModelBySession,
+        latestAssistantMessageIdBySession,
         variantBySession,
         agentBySession,
         sessionDirectoryBySession,
@@ -1518,7 +1523,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         lastHeuristicsTurnId,
         commitSeenLastPass,
         client: deps.client,
-        protectedTags: deps.config.protected_tags,
     });
 
     const hooks = {
@@ -1535,6 +1539,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             pendingMaterializationSessions,
             lastHeuristicsTurnId,
             commandHandler,
+            cacheTtlConfig: deps.config.cache_ttl,
             // E5 — only offer the upgrade reminder when historian can run (so
             // /ctx-session-upgrade is actually actionable). Self-gates per session.
             upgradeReminder: historianRunnable
@@ -1543,7 +1548,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           {
                               client: deps.client,
                               db,
-                              sendIgnoredMessage,
+                              sendStatusNotification,
                               getNotificationParams: (sid) =>
                                   getLiveNotificationParams(
                                       sid,
@@ -1578,6 +1583,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             }
         },
         "command.execute.before": createCommandExecuteBeforeHook(commandHandler),
+        "tool.execute.before": createDroppedInputToolExecuteBeforeHook(),
         "tool.execute.after": createToolExecuteAfterHook({
             db,
             channel1StateBySession,
@@ -1603,10 +1609,29 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
     const hooksWithBackends = hooks as typeof hooks & {
         rustToolBackends?: RustToolBackends;
+        getDebugMemoryHolders?: () => {
+            taggerCache: ReturnType<NonNullable<Tagger["getHeapStats"]>>;
+            wireCache: ReturnType<typeof transform.getRustWireCacheHeapStats>;
+        };
     };
-    Object.defineProperty(hooksWithBackends, "rustToolBackends", {
-        value: rustToolBackends,
-        enumerable: false,
+    Object.defineProperties(hooksWithBackends, {
+        rustToolBackends: {
+            value: rustToolBackends,
+            enumerable: false,
+        },
+        getDebugMemoryHolders: {
+            value: () => ({
+                taggerCache: deps.tagger.getHeapStats?.() ?? {
+                    sessionCount: 0,
+                    assignmentEntries: 0,
+                    toolAccountingEntries: 0,
+                    loadSignatureEntries: 0,
+                    sessions: [],
+                },
+                wireCache: transform.getRustWireCacheHeapStats(),
+            }),
+            enumerable: false,
+        },
     });
     return hooksWithBackends;
 }
@@ -1621,7 +1646,7 @@ export async function createMagicContextHookAsync(
     let database: Database | null;
     try {
         clearHookInitFailure();
-        database = await openDatabaseAsync();
+        database = await openDatabaseAsync({ onBootTimings: deps.onStorageBootTimings });
     } catch (error) {
         const reason = getErrorMessage(error);
         log("[magic-context] hook failed to open storage; disabling feature:", error);
