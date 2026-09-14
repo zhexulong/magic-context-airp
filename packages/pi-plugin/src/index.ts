@@ -24,41 +24,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
 import { registerTavernNarrativeGateMarkerHook } from "./tavern-narrative-gate-marker";
 
-export {
-    createGameBuddyPlayerMemoryReadProjection,
-    type GameBuddyPlayerMemoryReadProjection,
-    type GameBuddyPlayerMemoryReadView,
-} from "./gamebuddy-player-memory-read-projection";
-export {
-    createGameBuddyPlayerMemoryCrudFacade,
-    type GameBuddyPlayerMemoryCrudFacade,
-} from "./gamebuddy-player-memory-crud-facade";
-export {
-    excludeMemorySource,
-    isMemorySourceExcluded,
-    type MemorySourceExclusionInput,
-    type MemorySourceRef,
-    validateMemorySourceRef,
-} from "./memory-source-exclusion";
-export {
-    clearTavernNarrativeGateMarker,
-    countTavernProviderStartObserversForTest,
-    fireTavernProviderStartObservationForTest,
-    GAME_OPERATIONAL_GATE_MARKER_SCHEMA,
-    hasTavernProviderStartObserverForTest,
-    publishGameOperationalGateMaterialization,
-    registerGameOperationalGateMarker,
-    registerTavernNarrativeGateMarker,
-    registerTavernNarrativeGateMarkerHook,
-    registerTavernProviderStartObserver,
-    resetTavernNarrativeGateMarkersForTest,
-    TAVERN_NARRATIVE_GATE_MARKER_SCHEMA,
-    TAVERN_PROVIDER_START_OBSERVATION_SCHEMA,
-    type TavernProviderStartObservation,
-    validateGameOperationalGateMarkerConfig,
-    validateTavernNarrativeGateMarkerConfig,
-} from "./tavern-narrative-gate-marker";
-
 import { join, resolve } from "node:path";
 import type {
     ExtensionAPI,

@@ -21,6 +21,21 @@ export function resolveGameBuddyMemoryProjectPath(
     return `gamebuddy:${projectIdentity}:continuity:${continuityId}`;
 }
 
+export type GameBuddyPlayerMemoryProfileBinding = Readonly<{
+    continuityId: string;
+    runtimeCwd: string;
+    profileId?: string;
+    profileRevision?: number;
+    profileCanonicalHash?: string;
+}>;
+
+export type GameBuddyPlayerMemoryReadInput = Readonly<{
+    continuityId: string;
+    profileId?: string;
+    profileRevision?: number;
+    profileCanonicalHash?: string;
+}>;
+
 export type GameBuddyPlayerMemoryReadView = Readonly<{
     stateToken: string;
     content: string;
@@ -31,12 +46,43 @@ export type GameBuddyPlayerMemoryReadView = Readonly<{
 
 export type GameBuddyPlayerMemoryReadProjection = Readonly<{
     listMemories(
-        input: Readonly<{ continuityId: string }>,
+        input: GameBuddyPlayerMemoryReadInput,
     ): Promise<readonly GameBuddyPlayerMemoryReadView[]>;
     getMemory(
-        input: Readonly<{ continuityId: string; stateToken: string }>,
+        input: GameBuddyPlayerMemoryReadInput & Readonly<{ stateToken: string }>,
     ): Promise<GameBuddyPlayerMemoryReadView>;
 }>;
+
+export function validateMemoryProfileBinding(args: GameBuddyPlayerMemoryProfileBinding): void {
+    if (typeof args.continuityId !== "string" || args.continuityId.length === 0)
+        throw new Error("invalid_memory_profile_binding");
+    if (args.profileId !== undefined) {
+        if (typeof args.profileId !== "string" || args.profileId.length === 0 || args.profileId === "unknown")
+            throw new Error("invalid_memory_profile_binding");
+    }
+    if (args.profileRevision !== undefined) {
+        if (!Number.isSafeInteger(args.profileRevision) || args.profileRevision < 1)
+            throw new Error("invalid_memory_profile_binding");
+    }
+    if (args.profileCanonicalHash !== undefined) {
+        if (typeof args.profileCanonicalHash !== "string" || !/^[a-f0-9]{64}$/.test(args.profileCanonicalHash))
+            throw new Error("invalid_memory_profile_binding");
+    }
+}
+
+export function assertMemoryProfileMatch(
+    bound: GameBuddyPlayerMemoryProfileBinding,
+    input: GameBuddyPlayerMemoryReadInput,
+): void {
+    if (input.continuityId !== bound.continuityId)
+        throw new Error("gamebuddy_memory_continuity_mismatch");
+    if (bound.profileId !== undefined && input.profileId !== undefined && input.profileId !== bound.profileId)
+        throw new Error("gamebuddy_memory_profile_mismatch");
+    if (bound.profileRevision !== undefined && input.profileRevision !== undefined && input.profileRevision !== bound.profileRevision)
+        throw new Error("gamebuddy_memory_profile_mismatch");
+    if (bound.profileCanonicalHash !== undefined && input.profileCanonicalHash !== undefined && input.profileCanonicalHash !== bound.profileCanonicalHash)
+        throw new Error("gamebuddy_memory_profile_mismatch");
+}
 
 function sourceRefs(memory: Memory): readonly string[] | undefined {
     try {
@@ -71,13 +117,10 @@ function view(memory: Memory, stateToken: string): GameBuddyPlayerMemoryReadView
 
 /** Bound read-only projection. It deliberately exposes no Memory mutation method. */
 export function createGameBuddyPlayerMemoryReadProjection(
-    args: Readonly<{ continuityId: string; runtimeCwd: string }>,
+    args: GameBuddyPlayerMemoryProfileBinding,
 ): GameBuddyPlayerMemoryReadProjection {
+    validateMemoryProfileBinding(args);
     const projectPath = resolveGameBuddyMemoryProjectPath(args.runtimeCwd, args.continuityId);
-    const assertContinuity = (continuityId: string): void => {
-        if (continuityId !== args.continuityId)
-            throw new Error("gamebuddy_memory_continuity_mismatch");
-    };
     const open = async (): Promise<MemoryCommandFacade> => {
         const db = await openDatabaseAsync(
             join(args.runtimeCwd, "data", "cortexkit", "magic-context", "context.db"),
@@ -87,7 +130,7 @@ export function createGameBuddyPlayerMemoryReadProjection(
     };
     return Object.freeze({
         async listMemories(input) {
-            assertContinuity(input.continuityId);
+            assertMemoryProfileMatch(args, input);
             return (await open())
                 .list(projectPath)
                 .flatMap((entry) => {
@@ -96,7 +139,7 @@ export function createGameBuddyPlayerMemoryReadProjection(
                 });
         },
         async getMemory(input) {
-            assertContinuity(input.continuityId);
+            assertMemoryProfileMatch(args, input);
             const entry = (await open())
                 .list(projectPath)
                 .find((candidate) => candidate.stateToken === input.stateToken);

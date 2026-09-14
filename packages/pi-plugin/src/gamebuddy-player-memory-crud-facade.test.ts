@@ -79,4 +79,50 @@ describe("GameBuddy player Memory CRUD facade", () => {
         const rows = await facade.listMemories({ continuityId });
         expect(rows).toMatchObject([{ content: "First update" }]);
     });
+
+    test("validates profile binding and rejects mismatched profile operations", async () => {
+        root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-profile-"));
+        const validProfile = {
+            continuityId,
+            runtimeCwd: root,
+            profileId: "profile_01",
+            profileRevision: 2,
+            profileCanonicalHash: "a".repeat(64),
+        };
+        const facade = createGameBuddyPlayerMemoryCrudFacade(validProfile);
+
+        // Mismatched profileId throws
+        await expect(
+            facade.create({ continuityId, content: "Test", profileId: "mismatched_profile" }),
+        ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
+
+        // Mismatched profileRevision throws
+        await expect(
+            facade.create({ continuityId, content: "Test", profileRevision: 99 }),
+        ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
+
+        // Matching profile succeeds
+        const created = await facade.create({
+            continuityId,
+            content: "Profile bound memory",
+            profileId: "profile_01",
+            profileRevision: 2,
+            profileCanonicalHash: "a".repeat(64),
+        });
+        expect(created.content).toBe("Profile bound memory");
+
+        // Mismatched profile read throws
+        await expect(
+            facade.listMemories({ continuityId, profileId: "wrong" }),
+        ).rejects.toThrow("gamebuddy_memory_profile_mismatch");
+
+        // Invalid profile binding throws at construction
+        expect(() =>
+            createGameBuddyPlayerMemoryCrudFacade({
+                continuityId,
+                runtimeCwd: root!,
+                profileId: "",
+            }),
+        ).toThrow("invalid_memory_profile_binding");
+    });
 });

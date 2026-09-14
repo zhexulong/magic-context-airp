@@ -14,28 +14,15 @@ export {
   materializeGameBuddyAuthoredStableCatalog,
 } from "../gamebuddy-stable-context-source";
 
-export {
-  type TavernAuthoredContextRuntimeCapability,
-  publishGameBuddyAuthoredStableCatalog,
-  replaceGameBuddyAuthoredStableCatalog,
+export type {
+  TavernAuthoredContextRuntimeCapability,
 } from "../gamebuddy-authored-context-bridge.internal";
 
-import {
-  type TavernAuthoredContextRuntimeCapability,
-  publishGameBuddyAuthoredStableCatalog,
-  replaceGameBuddyAuthoredStableCatalog,
-} from "../gamebuddy-authored-context-bridge.internal";
 import {
   type GameBuddyAuthoredVolatileSource,
   type GameBuddyChatContextScope,
   materializeGameBuddyAuthoredStableCatalog,
 } from "../gamebuddy-stable-context-source";
-
-export const getAuthoredContextRuntimeCapability = publishGameBuddyAuthoredStableCatalog;
-export type getAuthoredContextRuntimeCapability = typeof publishGameBuddyAuthoredStableCatalog;
-
-export const refreshTavernAuthoredContext = replaceGameBuddyAuthoredStableCatalog;
-export type refreshTavernAuthoredContext = typeof replaceGameBuddyAuthoredStableCatalog;
 
 /**
  * Convenience helper rendering the stable M0 context block from an authored catalog or materialization.
@@ -58,8 +45,14 @@ export function renderGameBuddyStableContextBlock(
   return materializeGameBuddyAuthoredStableCatalog(catalogOrMaterialization, scope).renderedBlock;
 }
 
+const escapeXmlContent = (s: string): string =>
+  s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+const escapeXmlAttr = (s: string): string =>
+  s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
 /**
- * Convenience helper rendering the volatile M1 context block.
+ * Convenience helper rendering the volatile M1 context block with XML injection defense.
  */
 export function renderGameBuddyVolatileContextBlock(
   context:
@@ -78,20 +71,18 @@ export function renderGameBuddyVolatileContextBlock(
     sources = context.volatileSources;
     hash = canonicalHash ?? context.snapshotCanonicalHash ?? context.canonicalHash ?? "";
   } else {
-    sources = context as readonly GameBuddyAuthoredVolatileSource[];
+    sources = (context as readonly GameBuddyAuthoredVolatileSource[]) ?? [];
     hash = canonicalHash ?? "";
   }
 
   if (!sources || sources.length === 0) return "";
-  const esc = (s: string) =>
-    s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
   const renderedSources = sources
     .map(
       (source: GameBuddyAuthoredVolatileSource) =>
-        `<gamebuddy-volatile-source source-id="${esc(source.sourceId)}" revision="${esc(source.revision)}" canonical-hash="${esc(source.canonicalHash)}">\n${source.content}\n</gamebuddy-volatile-source>`,
+        `<gamebuddy-volatile-source source-id="${escapeXmlAttr(source.sourceId)}" revision="${escapeXmlAttr(source.revision)}" canonical-hash="${escapeXmlAttr(source.canonicalHash)}">\n${escapeXmlContent(source.content)}\n</gamebuddy-volatile-source>`,
     )
     .join("\n");
-  return `<gamebuddy-volatile-context canonical-hash="${esc(hash)}">\n${renderedSources}\n</gamebuddy-volatile-context>`;
+  return `<gamebuddy-volatile-context canonical-hash="${escapeXmlAttr(hash)}">\n${renderedSources}\n</gamebuddy-volatile-context>`;
 }
 
 export {

@@ -5,11 +5,20 @@ import {
 } from "@magic-context/core/features/magic-context/memory";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
 import {
+    assertMemoryProfileMatch,
     createGameBuddyPlayerMemoryReadProjection,
     resolveGameBuddyMemoryProjectPath,
+    validateMemoryProfileBinding,
+    type GameBuddyPlayerMemoryProfileBinding,
+    type GameBuddyPlayerMemoryReadInput,
     type GameBuddyPlayerMemoryReadProjection,
     type GameBuddyPlayerMemoryReadView,
 } from "./gamebuddy-player-memory-read-projection";
+
+export type {
+    GameBuddyPlayerMemoryProfileBinding,
+    GameBuddyPlayerMemoryReadInput,
+};
 
 /**
  * Browser-management CRUD boundary for player-owned Memory. It is bound only
@@ -20,29 +29,25 @@ export type GameBuddyPlayerMemoryCrudFacade =
     GameBuddyPlayerMemoryReadProjection &
     Readonly<{
         create(
-            input: Readonly<{ continuityId: string; content: string }>,
+            input: GameBuddyPlayerMemoryReadInput & Readonly<{ content: string }>,
         ): Promise<GameBuddyPlayerMemoryReadView>;
         update(
-            input: Readonly<{
-                continuityId: string;
+            input: GameBuddyPlayerMemoryReadInput & Readonly<{
                 stateToken: string;
                 content: string;
             }>,
         ): Promise<GameBuddyPlayerMemoryReadView>;
         archive(
-            input: Readonly<{ continuityId: string; stateToken: string }>,
+            input: GameBuddyPlayerMemoryReadInput & Readonly<{ stateToken: string }>,
         ): Promise<void>;
     }>;
 
 export function createGameBuddyPlayerMemoryCrudFacade(
-    args: Readonly<{ continuityId: string; runtimeCwd: string }>,
+    args: GameBuddyPlayerMemoryProfileBinding,
 ): GameBuddyPlayerMemoryCrudFacade {
+    validateMemoryProfileBinding(args);
     const projectPath = resolveGameBuddyMemoryProjectPath(args.runtimeCwd, args.continuityId);
     const read = createGameBuddyPlayerMemoryReadProjection(args);
-    const assertContinuity = (continuityId: string): void => {
-        if (continuityId !== args.continuityId)
-            throw new Error("gamebuddy_memory_continuity_mismatch");
-    };
     const open = async (): Promise<MemoryCommandFacade> => {
         const db = await openDatabaseAsync(
             join(args.runtimeCwd, "data", "cortexkit", "magic-context", "context.db"),
@@ -55,7 +60,7 @@ export function createGameBuddyPlayerMemoryCrudFacade(
     return Object.freeze({
         ...read,
         async create(input) {
-            assertContinuity(input.continuityId);
+            assertMemoryProfileMatch(args, input);
             const result = (await open()).create({
                 projectPath,
                 category: "SEMANTIC_MEMORY",
@@ -63,10 +68,10 @@ export function createGameBuddyPlayerMemoryCrudFacade(
                 sourceType: "user",
                 actor: player,
             });
-            return (await read.getMemory({ continuityId: args.continuityId, stateToken: result.stateToken }));
+            return (await read.getMemory({ ...input, stateToken: result.stateToken }));
         },
         async update(input) {
-            assertContinuity(input.continuityId);
+            assertMemoryProfileMatch(args, input);
             // Resolve and compare the opaque token inside the vendor's
             // BEGIN IMMEDIATE transaction so two browser writes cannot both
             // succeed from one stale read-back.
@@ -76,10 +81,10 @@ export function createGameBuddyPlayerMemoryCrudFacade(
                 content: input.content,
                 actor: player,
             });
-            return (await read.getMemory({ continuityId: args.continuityId, stateToken: result.stateToken }));
+            return (await read.getMemory({ ...input, stateToken: result.stateToken }));
         },
         async archive(input) {
-            assertContinuity(input.continuityId);
+            assertMemoryProfileMatch(args, input);
             (await open()).archiveByStateToken(
                 {
                     projectPath,
