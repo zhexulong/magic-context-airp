@@ -1,6 +1,6 @@
 {
 	"name": "@cortexkit/pi-magic-context",
-	"version": "0.41.0",
+	"version": "0.41.0-gamebuddy.1",
 	"type": "module",
 	"description": "Pi and OMP coding agent extension for Magic Context — cross-session memory and context management",
 	"main": "dist/index.js",
@@ -23,12 +23,13 @@
 		"url": "https://github.com/cortexkit/magic-context",
 		"directory": "packages/pi-plugin"
 	},
-	"files": [
-		"dist",
-		"README.md"
-	],
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
 	"scripts": {
-		"build": "tsc -p ../retina-local-fs/tsconfig.build.json && rm -f dist/index.js dist/subagent-entry.js dist/historian-calibration-extension.js dist/*-*.js && bun build src/index.ts src/subagent-entry.ts src/historian-calibration-extension.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
+		"build": "tsc -p ../retina-local-fs/tsconfig.build.json && rm -rf dist && mkdir -p dist && bun build src/index.ts src/subagent-entry.ts src/historian-calibration-extension.ts src/embedded-historian-gate.ts src/gamebuddy-authored-context-bridge.internal.ts src/tavern/index.ts src/memory/index.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external @huggingface/transformers --external node:sqlite",
 		"build:e2e-argv": "bun build src/subagent-runner.ts --outfile ../../tests/docker/.generated/subagent-runner-e2e.mjs --target node --format esm --external node:sqlite",
 		"typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit",
 		"test": "bun install --frozen-lockfile && bun test",
@@ -36,6 +37,7 @@
 		"lint:fix": "biome check --write src",
 		"format": "biome format --write src",
 		"format:check": "biome format src",
+		"verify:gamebuddy-embedded-surface": "node scripts/verify-gamebuddy-embedded-surface.mjs",
 		"clean": "rm -rf dist",
 		"prepublishOnly": "bun run build"
 	},
@@ -51,17 +53,17 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.1",
-		"@earendil-works/pi-ai": "0.83.0",
-		"@earendil-works/pi-coding-agent": "0.83.0",
-		"@earendil-works/pi-tui": "0.83.0",
+		"@earendil-works/pi-ai": "0.84.4",
+		"@earendil-works/pi-coding-agent": "0.84.4",
+		"@earendil-works/pi-tui": "0.84.4",
 		"@types/better-sqlite3": "^7.6.13",
 		"@types/bun": "^1.3.10",
 		"@types/node": "^22.20.0",
 		"typescript": "^5.8.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "^0.80.2",
-		"@earendil-works/pi-tui": "^0.80.2"
+		"@earendil-works/pi-coding-agent": "0.84.4",
+		"@earendil-works/pi-tui": "0.84.4"
 	},
 	"peerDependenciesMeta": {
 		"@earendil-works/pi-coding-agent": {
@@ -71,11 +73,17 @@
 			"optional": true
 		}
 	},
-	"exports": {
-		".": {
-			"import": "./dist/index.js"
-		}
-	},
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./tavern": {
+      "import": "./dist/tavern/index.js"
+    },
+    "./memory": {
+      "import": "./dist/memory/index.js"
+    }
+  },
 	"pi": {
 		"extensions": [
 			"./dist/index.js"

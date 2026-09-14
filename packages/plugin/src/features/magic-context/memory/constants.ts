@@ -15,7 +15,9 @@ export const V2_MEMORY_CATEGORIES = [
 ] as const satisfies readonly MemoryCategory[];
 
 export const PROMOTABLE_CATEGORIES: MemoryCategory[] = [
-    // v2 world taxonomy (what the historian emits today)
+    // ongoing-interaction taxonomy (only emitted by that explicit domain)
+    "SEMANTIC_MEMORY",
+    // v2 world taxonomy (what the coding-project historian emits)
     "PROJECT_RULES",
     "ARCHITECTURE",
     "CONSTRAINTS",
@@ -33,7 +35,11 @@ export const PROMOTABLE_CATEGORIES: MemoryCategory[] = [
 ];
 
 export const CATEGORY_PRIORITY: MemoryCategory[] = [
-    // v2 world taxonomy first (these dominate new sessions)
+    // Ongoing-interaction memory is rendered before legacy coding categories
+    // when a partition intentionally uses that domain.
+    "SEMANTIC_MEMORY",
+    "INTERACTION_EPISODE",
+    // v2 world taxonomy (these dominate coding-project sessions)
     "PROJECT_RULES",
     "ARCHITECTURE",
     "CONSTRAINTS",

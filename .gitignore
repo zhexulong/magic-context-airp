@@ -95,6 +95,12 @@ packages/plugin/scripts/experiments/visual-memory/coverage.json
 packages/plugin/scripts/experiments/visual-memory/spec-*.json
 packages/plugin/scripts/experiments/visual-memory/TRIAL-REPORT.md
 
+# GameBuddy ships its vendored Pi extension from this repository. Keep its
+# generated Node bundle versioned so a fresh GameBuddy install does not require
+# an unreviewed build step before the restricted Host can load the extension.
+!packages/pi-plugin/dist/
+!packages/pi-plugin/dist/**
+
 # Local experiment scratch under scripts/experiments/ — dev-only harnesses and
 # their outputs, several run against REAL session/memory data and must never be
 # tracked. The visual-memory harness CODE is tracked explicitly; everything else

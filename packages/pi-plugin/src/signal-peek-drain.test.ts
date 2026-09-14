@@ -151,7 +151,7 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 
 	test("history drain happens AFTER injectM0M1Pi succeeds", () => {
 		// Find the injection block inside runPipeline. The drain must be:
-		//  1. Inside the try block (so it only runs on success)
+		//  1. Inside the same try block (so it only runs on success)
 		//  2. After the injectM0M1Pi seam returns
 		//  3. Guarded by isCacheBusting
 		// Anchor on the LAST call site: the wire-injection seam. The pre-fold

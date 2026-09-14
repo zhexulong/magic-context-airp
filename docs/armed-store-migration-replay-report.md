@@ -1,7 +1,7 @@
 # Armed-store migration replay coverage report
 
-**Scope:** `packages/plugin` and the authority schema in `crates/mc-store`  
-**Repository state inspected:** latest plugin migration v78; v71 is the durable authority-trigger rebuild  
+**Scope:** `packages/plugin` and the authority schema in `crates/mc-store`
+**Repository state inspected:** latest plugin migration v78; v71 is the durable authority-trigger rebuild
 **Verdict:** **GAP** — there is one replay test with the plugin-side managed marker armed, but no replay leg executes a guarded-table DML operation while armed. No fixture seeds a real `MODULE` authority row in the migration replay harness.
 
 ## Terminology and schema boundary

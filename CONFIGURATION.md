@@ -643,7 +643,7 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 ## `sidekick`
 
-Optional prompt augmenter that runs on `/ctx-aug`. Sidekick is a hidden OpenCode subagent that creates an ephemeral child session, searches memories with `ctx_memory`, and returns a focused context briefing. 
+Optional prompt augmenter that runs on `/ctx-aug`. Sidekick is a hidden OpenCode subagent that creates an ephemeral child session, searches memories with `ctx_memory`, and returns a focused context briefing.
 It is useful when starting a new session. It's better to choose a fast and cheap model, even small local models.
 
 ```jsonc

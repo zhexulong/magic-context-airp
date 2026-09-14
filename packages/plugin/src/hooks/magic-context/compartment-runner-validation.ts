@@ -1,4 +1,5 @@
 import { withContentLanguageDirective } from "../../agents/language-directive";
+import { factCategoriesForDomain, type MemoryDomain } from "../../features/magic-context/memory/domain";
 import { parseCompartmentOutput } from "./compartment-parser";
 import { mapParsedCompartmentsToChunk } from "./compartment-runner-mapping";
 import type {
@@ -122,8 +123,9 @@ export function validateHistorianOutput(
     chunk: HistorianValidationChunk,
     _priorCompartments: StoredCompartmentRange[],
     sequenceOffset: number,
+    domain: MemoryDomain = "coding-project",
 ): ValidatedHistorianPassResult {
-    const parsed = parseCompartmentOutput(text);
+    const parsed = parseCompartmentOutput(text, factCategoriesForDomain(domain));
     if (parsed.compartments.length === 0) {
         return {
             ok: false,

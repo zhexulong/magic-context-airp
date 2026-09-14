@@ -33,6 +33,7 @@ describe("MagicContextConfigSchema", () => {
                 },
                 memory: {
                     enabled: true,
+                    domain: "coding-project",
                     injection_budget_tokens: 4000,
                     auto_promote: true,
                     retrieval_count_promotion_threshold: 3,
@@ -127,6 +128,7 @@ describe("MagicContextConfigSchema", () => {
                 },
                 memory: {
                     enabled: true,
+                    domain: "ongoing-interaction",
                     injection_budget_tokens: 4000,
                     auto_promote: true,
                     retrieval_count_promotion_threshold: 3,

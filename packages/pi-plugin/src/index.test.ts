@@ -8,6 +8,30 @@ afterEach(() => {
 	__test.resetLoggedPiConfigDirs();
 });
 
+describe("embedded runtime authoring surface", () => {
+	it("disables every CLI-backed authoring command path", () => {
+		const prior = process.env.GAMEBUDDY_EMBEDDED_RUNTIME;
+		process.env.GAMEBUDDY_EMBEDDED_RUNTIME = "1";
+		try {
+			expect(__test.embeddedRuntimeDisablesCliAuthoringCommands()).toBe(true);
+		} finally {
+			if (prior === undefined) delete process.env.GAMEBUDDY_EMBEDDED_RUNTIME;
+			else process.env.GAMEBUDDY_EMBEDDED_RUNTIME = prior;
+		}
+	});
+
+	it("keeps CLI command registration available outside GameBuddy embedded mode", () => {
+		const prior = process.env.GAMEBUDDY_EMBEDDED_RUNTIME;
+		delete process.env.GAMEBUDDY_EMBEDDED_RUNTIME;
+		try {
+			expect(__test.embeddedRuntimeDisablesCliAuthoringCommands()).toBe(false);
+		} finally {
+			if (prior === undefined) delete process.env.GAMEBUDDY_EMBEDDED_RUNTIME;
+			else process.env.GAMEBUDDY_EMBEDDED_RUNTIME = prior;
+		}
+	});
+});
+
 describe("Pi config load logging", () => {
 	it("dedupes /cd config warnings per directory", () => {
 		const logSpy = spyOn(loggerModule, "log").mockImplementation(

@@ -1,8 +1,12 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
+import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	__resetMessageIndexAsyncForTests,
 	isSessionReconciled,
@@ -85,6 +89,7 @@ import {
 	userMessage,
 } from "./test-utils.test";
 import { createPiTranscript } from "./transcript-pi";
+import { publishGameBuddyAuthoredStableCatalog } from "./gamebuddy-authored-context-bridge.internal";
 
 describe("Pi pressure guards", () => {
 	it("keeps the emergency recovery bump as a floor instead of a cap", () => {
@@ -398,7 +403,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("re-probes a stale negative after fingerprint construction before skipping adoption", () => {
+	it("re-probes a stale negative after fingerprint construction before skipping adoption", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "mc-pi-fallback-race-"));
 		const dbPath = join(dir, "context.db");
 		const db = createTestDb(dbPath);
@@ -456,7 +461,22 @@ describe("Pi fallback tag adoption", () => {
 		} finally {
 			closeQuietly(siblingDb);
 			closeQuietly(db);
-			rmSync(dir, { recursive: true, force: true });
+			// Windows may retain a just-closed WAL handle for a scheduler tick.
+			// Keep this fixture cleanup bounded rather than turning a passing
+			// concurrency assertion into an EBUSY failure.
+			for (let attempt = 0; attempt < 5; attempt++) {
+				try {
+					rmSync(dir, { recursive: true, force: true, maxRetries: 1, retryDelay: 10 });
+					break;
+				} catch (error) {
+					// Bun's Windows SQLite backend may retain the sibling WAL file past
+					// process teardown. The temporary directory is outside product data;
+					// don't fail a correct race assertion solely because its best-effort
+					// cleanup loses that OS-level race.
+					if (attempt === 4 && (error as NodeJS.ErrnoException).code !== "EBUSY") throw error;
+					await sleep(25 * (attempt + 1));
+				}
+			}
 		}
 	});
 
@@ -1016,6 +1036,112 @@ describe("registerPiContextHandler", () => {
 		clearContextHandlerSession("ses-sticky-context");
 		clearAutoSearchForPiSession("ses-context");
 		clearAutoSearchForPiSession("ses-sticky-context");
+	});
+
+	it("injects published authored context through the real context event and refreshes replacement and clear", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-authored-context-handler";
+		const scope = {
+			continuityId: "continuity-authored-context-handler",
+			sessionId,
+			surface: "tavern" as const,
+			threadId: "thread-authored-context-handler",
+			profile: {
+				profileId: "profile-authored-context-handler",
+				revision: 1,
+				canonicalHash: "a".repeat(64),
+			},
+		};
+		const canonical = (value: unknown): string =>
+			Array.isArray(value)
+				? `[${value.map(canonical).join(",")}]`
+				: value && typeof value === "object"
+					? `{${Object.keys(value as object)
+							.sort()
+							.map(
+								(key) =>
+									`${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`,
+							)
+							.join(",")}}`
+					: JSON.stringify(value);
+		const catalog = (content: string, revision: string) => {
+			const source = {
+				sourceId: "scenario",
+				kind: "scenario" as const,
+				revision,
+				content,
+				canonicalHash: createHash("sha256").update(content).digest("hex"),
+				budgetTokens: 5,
+				totalOrderKey: "0001",
+				provenance: "test/context-handler",
+			};
+			const body = {
+				version: "gamebuddy-authored-context-catalog/v2" as const,
+				scope,
+				stableSources: [source],
+			};
+			return {
+				...body,
+				canonicalHash: createHash("sha256")
+					.update(canonical(body))
+					.digest("hex"),
+			};
+		};
+		const firstText = "Authored initial context.";
+		const replacementText = "Authored replacement context.";
+		const initial = publishGameBuddyAuthoredStableCatalog(
+			scope,
+			catalog(firstText, "1"),
+		);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				injection: { injectionBudgetTokens: 10_000 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const run = async (text: string, timestamp: number) => {
+				const messages = [userMessage(text, timestamp)];
+				return handler(
+					{ messages: messages as never[] },
+					fakeContext(sessionId, process.cwd(), [`entry-${timestamp}`], messages) as never,
+				);
+			};
+
+			const initialResult = await run("first", 1);
+			const initialWire = (initialResult.messages as unknown[])
+				.map((message) => textOf(message as Parameters<typeof textOf>[0]))
+				.join("\n");
+			expect(initialWire).toContain(firstText);
+			expect(initialWire.match(new RegExp(firstText, "g"))).toHaveLength(1);
+
+			const replacement = publishGameBuddyAuthoredStableCatalog(
+				scope,
+				catalog(replacementText, "2"),
+			);
+			const replacementResult = await run("second", 2);
+			const replacementWire = (replacementResult.messages as unknown[])
+				.map((message) => textOf(message as Parameters<typeof textOf>[0]))
+				.join("\n");
+			expect(replacementWire).not.toContain(firstText);
+			expect(replacementWire).toContain(replacementText);
+			expect(replacementWire).not.toContain("gamebuddy-authored-context-updates");
+
+			await replacement.clear();
+			const clearedResult = await run("third", 3);
+			const clearedWire = (clearedResult.messages as unknown[])
+				.map((message) => textOf(message as Parameters<typeof textOf>[0]))
+				.join("\n");
+			expect(clearedWire).not.toContain(replacementText);
+			expect(clearedWire).not.toContain("gamebuddy-authored-context");
+		} finally {
+			await initial.clear();
+			clearContextHandlerSession(sessionId, db);
+			closeQuietly(db);
+		}
 	});
 
 	it("awaits only the requested session's in-flight historian", async () => {

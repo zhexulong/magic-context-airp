@@ -1,8 +1,10 @@
-# Magic Context — Pi / OMP extension
+# Magic Context — Pi / OMP extension (GameBuddy fork)
 
 Cross-session memory and context management for [Pi coding agent](https://github.com/earendil-works/pi-mono) and [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). The same extension package runs on both hosts and shares its SQLite database with the [OpenCode plugin](https://www.npmjs.com/package/@cortexkit/opencode-magic-context).
 
-Requires Pi `>= 0.74.0` or OMP `>= 17.1.7`.
+Based on upstream Magic Context `v0.41.0` (`bcd2f705`) with the GameBuddy delta from `769a58be`.
+
+Requires Pi `0.84.4` or OMP `>= 17.1.7`.
 
 ---
 

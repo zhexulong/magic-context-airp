@@ -181,9 +181,9 @@ interface UserMessage {
 
 function readUserMessages(openDb: Database, sid: string, limit: number): UserMessage[] {
 	const msgRows = openDb.prepare(`
-		SELECT id, data FROM message 
-		WHERE session_id = ? 
-		ORDER BY time_created DESC 
+		SELECT id, data FROM message
+		WHERE session_id = ?
+		ORDER BY time_created DESC
 		LIMIT ?
 	`).all(sid, limit * 3) as Array<{ id: string; data: string }>;
 

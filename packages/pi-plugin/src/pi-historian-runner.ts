@@ -80,10 +80,14 @@ import { insertUserMemoryCandidates } from "@magic-context/core/features/magic-c
 import {
 	buildCompartmentAgentPrompt,
 	buildHistorianEditorPrompt,
-	COMPARTMENT_AGENT_SYSTEM_PROMPT,
 	HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "@magic-context/core/hooks/magic-context/compartment-runner-drop-queue";
+import {
+	factCategoriesForDomain,
+	historianSystemPromptForDomain,
+	type MemoryDomain,
+} from "@magic-context/core/features/magic-context/memory/domain";
 import {
 	buildHistorianFailureNotice,
 	buildHistorianRepairPrompt,
@@ -398,6 +402,8 @@ export interface PiHistorianDeps {
 	allowHomeProject?: boolean;
 	/** Automatic-promotion gate (`memory.auto_promote`). */
 	autoPromote?: boolean;
+	/** Semantic taxonomy used by historian facts/promotion. */
+	memoryDomain?: MemoryDomain;
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
 	 *  historian-extracted user observations are persisted as candidates. */
 	userMemoriesEnabled?: boolean;
@@ -429,6 +435,23 @@ export interface PiHistorianDeps {
 	forceKeepLastCompartment?: boolean;
 }
 
+/**
+ * Test-only direct invocation of the same Historian publication pipeline.
+ *
+ * This bypasses only the long-context pressure scheduler; it remains
+ * inaccessible to Pi commands/configuration and requires the caller to own
+ * the runner, DB lease, raw-message provider, and protected-tail snapshot.
+ * It exists so embedded runtime integrations can verify authoring without
+ * manufacturing an unsafe near-limit player conversation.
+ */
+export async function runPiHistorianForTest(deps: PiHistorianDeps): Promise<void> {
+	// This symbol is exported only from the dedicated test-gate module and has
+	// no config, command, tool, or production call site. It bypasses scheduler
+	// pressure only; all runner, lease, parser, validation, and publish paths
+	// remain exactly those of runPiHistorian.
+	return runPiHistorian(deps);
+}
+
 export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 	const {
 		db,
@@ -453,6 +476,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		memoryEnabled,
 		allowHomeProject,
 		autoPromote,
+		memoryDomain = "coding-project",
 		userMemoriesEnabled,
 		onPublished,
 		compartmentLeaseHolderId,
@@ -819,7 +843,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 
 			retainDrainReservationForRetryThrottle = true;
 			const historianSystemPrompt = withContentLanguageDirective(
-				COMPARTMENT_AGENT_SYSTEM_PROMPT,
+				historianSystemPromptForDomain(memoryDomain),
 				deps.language,
 				{ preserveUserQuotes: true },
 			);
@@ -858,6 +882,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				chunk,
 				priorCompartments,
 				sequenceOffset,
+				memoryDomain,
 			);
 			// Track which subagent run actually produced the validated
 			// draft. This matters for the optional two-pass editor refinement
@@ -910,6 +935,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					chunk,
 					priorCompartments,
 					sequenceOffset,
+					memoryDomain,
 				);
 				// If repair produced a valid result, that's the draft we
 				// want the editor to refine. (If repair also failed,
@@ -972,6 +998,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						chunk,
 						priorCompartments,
 						sequenceOffset,
+						memoryDomain,
 					);
 					if (fbPass.kind === "ok") {
 						validatedPass = fbPass;
@@ -1046,6 +1073,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						chunk,
 						priorCompartments,
 						sequenceOffset,
+						memoryDomain,
 					);
 					if (editorPass.kind === "ok") {
 						sessionLog(
@@ -1115,6 +1143,18 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				return;
 			}
 
+			// XML facts never invent provenance. For this runtime the only
+			// trustworthy candidate span is the exact published compartment range.
+			// Carry it as an opaque Pi range so a player exclusion can veto both
+			// candidate evaluation and the durable promotion commit.
+			const publishedFactSourceRefs = [
+				`pi-range:${sessionId}:${newCompartments[0]?.startMessage ?? chunk.startIndex}:${lastNewEnd}`,
+			];
+			const promotionFacts = (validatedPass.facts ?? []).map((fact) => ({
+				...fact,
+				sourceRefs: fact.sourceRefs ?? publishedFactSourceRefs,
+			}));
+
 			const markerSummary = buildPiCompactionSummary(newCompartments);
 			const lastNewEndMessageId =
 				newCompartments[newCompartments.length - 1]?.endMessageId;
@@ -1146,18 +1186,28 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// skips unanchored promotion.
 			const discardedLast = newCompartments.length < emittedCompartments.length;
 			const weakLookaheadFinalCompartment = forceKeepLastCompartmentForChunk;
-			// discard-last runs must also skip unanchored promotion: facts cannot be
-			// attributed to the persisted range, and a reworded re-emission next run
-			// would double-store.
+			// Neither a discarded provisional tail nor an actual-final weak-lookahead
+			// tail has the durable source boundary required for promotion. The former
+			// will be re-derived; the latter is intentionally retained only so wrapup
+			// can preserve coverage. In both cases, facts/observations/primers must not
+			// become durable memory from an unanchored range.
 			const skipUnanchoredPromotion =
-				discardedLast || weakLookaheadFinalCompartment;
+				discardedLast || (weakLookaheadFinalCompartment && forceKeepLastCompartment !== true);
+			// `forceKeepLastCompartment` is a test-only terminal probe path. It
+			// explicitly treats the retained final compartment as anchored so the
+			// shared admission/promotion lifecycle can be exercised without
+			// inventing a near-limit player conversation. Production never sets it.
 
 			// Two distinct gates (parity with OpenCode): embeddingActive = memory
 			// feature on (drives registration + embedding, the ctx_search / dreamer
 			// linking substrate); promotionActive additionally requires auto_promote
 			// (drives writing facts as memories).
 			const embeddingActive = memoryEnabled !== false;
-			const promotionActive = embeddingActive && autoPromote !== false;
+			const promotionActive =
+				embeddingActive &&
+				(memoryDomain === "ongoing-interaction"
+					? autoPromote === true
+					: autoPromote !== false);
 
 			// Events: stored, NOT rendered. Best-effort. discard-last: drop events
 			// anchored to the discarded provisional compartment.
@@ -1219,7 +1269,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						db,
 						sessionId,
 						projectPath,
-						validatedPass.facts ?? [],
+						promotionFacts,
+						memoryDomain,
 					);
 				}
 
@@ -1560,6 +1611,7 @@ async function validateHistorianResult(
 	chunk: Parameters<typeof validateHistorianOutput>[2],
 	priorCompartments: Parameters<typeof validateHistorianOutput>[3],
 	sequenceOffset: number,
+	memoryDomain: MemoryDomain,
 ): Promise<ValidationOutcome> {
 	if (!result.ok) {
 		return {
@@ -1578,6 +1630,7 @@ async function validateHistorianResult(
 		chunk,
 		priorCompartments,
 		sequenceOffset,
+		memoryDomain,
 	);
 	if (validation.ok) {
 		return {

@@ -7,6 +7,7 @@ import {
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { excludeMemorySource } from "@magic-context/core/features/magic-context/memory/source-exclusion";
 import {
 	getHistorianFailureState,
 	getOverflowState,
@@ -29,6 +30,7 @@ import {
 	buildPiCompactionSummary,
 	clearPiHistorianAlertState,
 	runPiHistorian,
+	runPiHistorianForTest,
 } from "./pi-historian-runner";
 import { createTestDb } from "./test-utils.test";
 
@@ -140,6 +142,47 @@ function successXmlWithUserObservation(observation: string) {
 	return `${successXml()}\n<user_observations>\n* ${observation}\n</user_observations>`;
 }
 
+function ongoingInteractionSuccessXml(fact?: string) {
+	return `<output>
+<compartments>
+<compartment start="1" end="2" title="Interaction arc" episode_type="interaction" importance="40"><p1>The player completed a one-off activity and explicitly discussed future decision support.</p1></compartment>
+</compartments>${fact === undefined ? "" : `\n<facts><SEMANTIC_MEMORY>\n* ${fact}\n</SEMANTIC_MEMORY></facts>`}
+<meta><messages_processed>1-2</messages_processed><unprocessed_from>3</unprocessed_from></meta>
+</output>`;
+}
+
+function ongoingInteractionDualPromotionXml() {
+	return `<output>
+<compartments>
+<compartment start="1" end="2" title="Unresolved interaction arc" episode_type="interaction" importance="70"><p1>The player and agent explicitly agreed to resume the named unresolved topic later.</p1></compartment>
+</compartments>
+<facts>
+<SEMANTIC_MEMORY>* The player explicitly prefers being offered options before consequential decisions.</SEMANTIC_MEMORY>
+<INTERACTION_EPISODE>* The player and agent agreed to resume the named unresolved topic later.</INTERACTION_EPISODE>
+</facts>
+<meta><messages_processed>1-2</messages_processed><unprocessed_from>3</unprocessed_from></meta>
+</output>`;
+}
+
+function ongoingInteractionToolOnlyXml() {
+	return `<output>
+<compartments>
+<compartment start="1" end="2" title="Tool failure and recovery" episode_type="interaction" importance="30"><p1>A tool call failed and the assistant recovered by retrying the ordinary task.</p1></compartment>
+</compartments>
+<meta><messages_processed>1-2</messages_processed><unprocessed_from>3</unprocessed_from></meta>
+</output>`;
+}
+
+function ongoingInteractionToolReceiptFactXml() {
+	return `<output>
+<compartments>
+<compartment start="1" end="2" title="Harvest receipt" episode_type="interaction" importance="30"><p1>The tool receipt completed harvest.</p1></compartment>
+</compartments>
+<facts><INTERACTION_EPISODE>* The tool receipt completed harvest; we explicitly agreed to continue later.</INTERACTION_EPISODE></facts>
+<meta><messages_processed>1-2</messages_processed><unprocessed_from>3</unprocessed_from></meta>
+</output>`;
+}
+
 function twoCompartmentSuccessXml() {
 	return `<compartment start="1" end="2" title="Initial Pi slice"><p1>Summarized the first Pi turn.</p1></compartment>
 <compartment start="3" end="4" title="Provisional Pi slice"><p1>Summarized the provisional Pi turn.</p1></compartment>
@@ -219,6 +262,7 @@ async function runHistorianWith(args: {
 	thinkingLevel?: string;
 	memoryEnabled?: boolean;
 	autoPromote?: boolean;
+	memoryDomain?: "coding-project" | "ongoing-interaction";
 	userMemoriesEnabled?: boolean;
 	twoPass?: boolean;
 	signal?: AbortSignal;
@@ -258,6 +302,7 @@ async function runHistorianWith(args: {
 		thinkingLevel: args.thinkingLevel,
 		memoryEnabled: args.memoryEnabled,
 		autoPromote: args.autoPromote,
+		memoryDomain: args.memoryDomain,
 		userMemoriesEnabled: args.userMemoriesEnabled,
 		onPublished: args.onPublished,
 		appendCompaction: args.appendCompaction,
@@ -273,6 +318,40 @@ async function runHistorianWith(args: {
 }
 
 describe("runPiHistorian", () => {
+	it("keeps the direct test invocation unreachable from production config", async () => {
+		const db = createTestDb();
+		const holderId = "test-direct-invocation";
+		expect(acquireCompartmentLease(db, "ses-historian", holderId)).not.toBeNull();
+		const runner = runnerReturning([
+			ongoingInteractionSuccessXml("The player explicitly confirmed a durable preference."),
+		]);
+		const previousNodeEnv = process.env.NODE_ENV;
+		process.env.NODE_ENV = "test";
+		try {
+			await runPiHistorianForTest({
+				db,
+				sessionId: "ses-historian",
+				directory: process.cwd(),
+				provider: { readMessages: () => rawMessages() },
+				runner,
+				historianModel: "test/model",
+				historianChunkTokens: 20_000,
+				boundarySnapshot: makeBoundarySnapshot(),
+				compartmentLeaseHolderId: holderId,
+				memoryEnabled: true,
+				autoPromote: false,
+				memoryDomain: "ongoing-interaction",
+			});
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+			expect(getMemoriesByProject(db, resolveProjectIdentity(process.cwd()))).toHaveLength(0);
+		} finally {
+			if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+			else process.env.NODE_ENV = previousNodeEnv;
+			closeQuietly(db);
+		}
+	});
+
 	it("clears emergency recovery on protected-tail-only no-op", async () => {
 		const db = createTestDb();
 		const runner = runnerReturning([successXml()]);
@@ -520,6 +599,130 @@ describe("runPiHistorian", () => {
 			expect(
 				getMemoriesByProject(db, projectPath).map((m) => m.content),
 			).toContain("Pi historian facts can promote to memory.");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("uses the ongoing-interaction taxonomy and leaves a one-off interaction episodic when no semantic fact is emitted", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [ongoingInteractionSuccessXml()],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+			autoPromote: true,
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			const prompt = (runner.run as unknown as { mock: { calls: Array<[{ systemPrompt: string }]> } }).mock.calls[0][0].systemPrompt;
+			expect(prompt).toContain("Ongoing Interaction Memory Domain");
+			expect(prompt).toContain("We finished organizing tools during this game.");
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+			const projectPath = resolveProjectIdentity(process.cwd());
+			expect(getMemoriesByProject(db, projectPath)).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("promotes both durable ongoing-interaction categories from one output", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [ongoingInteractionDualPromotionXml()],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+			autoPromote: true,
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			const projectPath = resolveProjectIdentity(process.cwd());
+				expect(getMemoriesByProject(db, projectPath).map((memory) => memory.category)).toEqual([
+				"INTERACTION_EPISODE",
+				"SEMANTIC_MEMORY",
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not promote an XML interaction episode containing a completed tool receipt", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [ongoingInteractionToolReceiptFactXml()],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+			autoPromote: true,
+		});
+		try {
+			const projectPath = resolveProjectIdentity(process.cwd());
+			expect(getMemoriesByProject(db, projectPath)).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not promote tool-only failure/recovery or planner experience", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [ongoingInteractionToolOnlyXml()],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+			autoPromote: true,
+		});
+		try {
+			const projectPath = resolveProjectIdentity(process.cwd());
+			expect(getMemoriesByProject(db, projectPath)).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not promote when the exact published Pi range was already excluded", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [ongoingInteractionDualPromotionXml()],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+			autoPromote: true,
+			beforeRun: (database) => {
+				excludeMemorySource(database, {
+					projectPath: resolveProjectIdentity(process.cwd()),
+					sourceRef: "pi-range:ses-historian:1:2",
+				});
+			},
+		});
+		try {
+			expect(getMemoriesByProject(db, resolveProjectIdentity(process.cwd()))).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("omits ongoing-interaction autoPromote by default and therefore does not promote", async () => {
+		const { db } = await runHistorianWith({
+			outputs: [ongoingInteractionDualPromotionXml()],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+		});
+		try {
+			expect(getMemoriesByProject(db, resolveProjectIdentity(process.cwd()))).toEqual([]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("promotes only an explicit ongoing-interaction semantic fact through the existing lifecycle", async () => {
+		const fact = "The player explicitly prefers being offered options before a consequential decision.";
+		const { db } = await runHistorianWith({
+			outputs: [ongoingInteractionSuccessXml(fact)],
+			memoryDomain: "ongoing-interaction",
+			memoryEnabled: true,
+			autoPromote: true,
+		});
+		try {
+			const projectPath = resolveProjectIdentity(process.cwd());
+			const memories = getMemoriesByProject(db, projectPath);
+			expect(memories).toEqual([
+				expect.objectContaining({ category: "SEMANTIC_MEMORY", content: fact, sourceType: "historian" }),
+			]);
+			expect(JSON.parse(memories[0]?.metadataJson ?? "null")).toEqual({
+				source_refs: ["pi-range:ses-historian:1:2"],
+			});
 		} finally {
 			closeQuietly(db);
 		}

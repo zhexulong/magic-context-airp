@@ -29,7 +29,12 @@ import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
 	getMemoriesByProjects,
+	readNewMemoriesForM1Union,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import {
+	factCategoriesForDomain,
+	type MemoryDomain,
+} from "@magic-context/core/features/magic-context/memory/domain";
 import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
@@ -84,6 +89,11 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import type {
+	GameBuddyStableContextMaterialization,
+	GameBuddyStableContextSourceRecord,
+} from "./gamebuddy-stable-context-source";
+import { renderGameBuddyVolatileContextBlock } from "./tavern";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
@@ -346,6 +356,15 @@ function historySliceTokensPi(m0Text: string): number {
  * user_memories"; OpenCode degrades to an empty profile, so Pi must too —
  * otherwise m[0] materialization crashes the whole transform on such DBs.
  */
+function filterMemoriesForDomain(
+	memories: Memory[],
+	domain: MemoryDomain | undefined,
+): Memory[] {
+	if (domain === undefined) return memories;
+	const allowed = new Set(factCategoriesForDomain(domain));
+	return memories.filter((memory) => allowed.has(memory.category));
+}
+
 function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 	try {
 		return getActiveUserMemories(db);
@@ -357,6 +376,8 @@ function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 
 export interface PiM0M1State {
 	sessionId: string;
+	/** Semantic taxonomy selected by the extension's memory.domain config. */
+	memoryDomain?: MemoryDomain;
 	projectIdentity: string;
 	projectDirectory: string;
 	/** When false, every memory-derived surface is omitted from m[0]/m[1]
@@ -385,6 +406,14 @@ export interface PiM0M1State {
 	/** Explicit mural wire options for tests. When set, skips on-demand resolve
 	 * during HARD materialization (mirrors OpenCode `M0M1RenderOptions.mural`). */
 	mural?: MuralWireOptions;
+	/**
+	 * Pre-validated GameBuddy Tavern stable sources for this exact binding.
+	 * This is renderer input only. The context handler acquires the registered
+	 * process-local publication; this fork owns all m[0]/m[1] persistence.
+	 */
+	stableContext?: Readonly<GameBuddyStableContextMaterialization>;
+	/** Immutable per-turn contributor refs; content is resolved by the registered source owner. */
+	volatileContext?: Readonly<GameBuddyStableContextMaterialization>;
 	/** Keeps memory/docs injection while suppressing compartment history rendering and trimming. */
 	compactionOff?: boolean;
 }
@@ -414,6 +443,9 @@ function readProjectDocsForPiM0(state: PiM0M1State): PiProjectDocsRender {
  * the independent injectDocs flag.
  */
 function memoryProjectPath(state: PiM0M1State): string | undefined {
+	// Undefined preserves upstream legacy behavior for callers that predate
+	// memory.enabled. GameBuddy always sends an explicit boolean, so its
+	// Companion surface remains fail-closed when the gate is false.
 	return state.memoryEnabled === false ? undefined : state.projectIdentity;
 }
 
@@ -671,6 +703,12 @@ export interface PiRenderedCompartmentBoundary {
 }
 
 export interface PiM0M1InjectionResult extends PiInjectionResult {
+	/** Payload-blind aggregate from the persisted m[1] materialization snapshot. */
+	m1MaxMemoryMutationId: number;
+	materializedMemoryCategoryCounts: Readonly<{
+		SEMANTIC_MEMORY: number;
+		INTERACTION_EPISODE: number;
+	}>;
 	m0Materialized: boolean;
 	m0Reason: string | null;
 	m0Bytes: number;
@@ -788,6 +826,19 @@ function setCachedBoundary(
 	db.prepare(
 		"UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
 	).run(boundary, sessionId);
+}
+
+/**
+ * Memory changes are volatile m[1] deltas. Compare their store watermarks with
+ * the cursor persisted alongside cached_m1_bytes: a normal model invocation
+ * refreshes them before prompt materialization, while a DEFER maintenance pass
+ * still calls injectM0M1Pi with its own `recomputeM1ThisPass=false` contract.
+ */
+function m1CoverageAdvancedPi(db: ContextDatabase, state: PiM0M1State): boolean {
+	const row = readCachedPiM0M1Row(db, state.sessionId);
+	if (!row || row.cached_m1_max_memory_id === null || row.cached_m1_max_memory_mutation_id === null) return true;
+	const current = readCurrentMarkers(db, state, undefined);
+	return current.maxMemoryId > row.cached_m1_max_memory_id || current.maxMemoryMutationId > row.cached_m1_max_memory_mutation_id;
 }
 
 function getCachedMarkers(
@@ -1179,20 +1230,22 @@ export function renderM0Pi(
 	const memPath = memoryProjectPath(state);
 	const workspace =
 		workspaceOverride ?? resolveWorkspaceRenderContextPi(state, db);
-	const allMemories =
+	const allMemories = filterMemoriesForDomain(
 		memoriesOverride ??
-		(memPath
-			? workspace.isWorkspaced
-				? getMemoriesByProjects(
-						db,
-						workspace.expandedIdentities,
-						["active", "permanent"],
-						Date.now(),
-						workspace.ownIdentities,
-						workspace.shareCategories,
-					)
-				: getMemoriesByProject(db, memPath, ["active", "permanent"])
-			: []);
+			(memPath
+				? workspace.isWorkspaced
+					? getMemoriesByProjects(
+							db,
+							workspace.expandedIdentities,
+							["active", "permanent"],
+							Date.now(),
+							workspace.ownIdentities,
+							workspace.shareCategories,
+						)
+					: getMemoriesByProject(db, memPath, ["active", "permanent"])
+				: []),
+		state.memoryDomain,
+	);
 	// Use the V2 trim + render helpers (shared with OpenCode) so both harnesses
 	// emit the same category-grouped `#id: fact` bytes and use the same
 	// permanent-first / importance-DESC selection. A divergent shape here would
@@ -1271,6 +1324,7 @@ export function renderM0Pi(
 		trimmedProfile,
 	);
 	if (userProfile.length > 0) sections.push(userProfile);
+	if (state.stableContext) sections.push(state.stableContext.renderedBlock);
 	if (!state.compactionOff) {
 		sections.push(
 			decayed.length > 0
@@ -1654,6 +1708,8 @@ export function materializeM0Pi(
 			maxMutationId: snapshotMarkers.maxMutationId,
 			maxMemoryMutationId: snapshotMarkers.maxMemoryMutationId,
 			m1Bytes,
+			m1MaxMemoryId: snapshotMarkers.maxMemoryId,
+			m1MaxMemoryMutationId: snapshotMarkers.maxMemoryMutationId,
 			projectDocsHash: snapshotMarkers.projectDocsHash,
 			materializedAt: snapshotMarkers.materializedAt,
 			sessionFactsVersion: snapshotMarkers.sessionFactsVersion,
@@ -1828,6 +1884,8 @@ function renderMemoryUpdatesBlockPi(args: {
 interface RenderM1PiResult {
 	text: string;
 	memoryUpdateCount: number;
+	/** Row IDs selected by the renderer; never serialized into the provider request. */
+	materializedMemoryIds: readonly number[];
 }
 
 function renderM1PiWithMetadata(
@@ -1844,6 +1902,9 @@ function renderM1PiWithMetadata(
 	compartmentsOverride?: readonly PiCompartment[],
 ): RenderM1PiResult {
 	const sections: string[] = [];
+	if (state.volatileContext?.volatileSources.length) {
+		sections.push(renderGameBuddyVolatileContextBlock(state.volatileContext));
+	}
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 
 	const memPath = memoryProjectPath(state);
@@ -1951,10 +2012,15 @@ function renderM1PiWithMetadata(
 		if (profileBlock) sections.push(profileBlock);
 	}
 
+	const materializedMemoryIds = [
+		...renderedMemoryIds,
+		...trimmedNewMemories.map((memory) => memory.id),
+	];
 	if (sections.length === 0) {
 		return {
 			text: PI_M1_PLACEHOLDER,
 			memoryUpdateCount: memoryUpdates.count,
+			materializedMemoryIds,
 		};
 	}
 	// Join with "\n" (single newline) to match OpenCode renderM1 exactly — the
@@ -1964,6 +2030,7 @@ function renderM1PiWithMetadata(
 			? `<knowledge-updates>\n${sections.join("\n")}\n</knowledge-updates>`
 			: `<session-history-since>\n${sections.join("\n")}\n</session-history-since>`,
 		memoryUpdateCount: memoryUpdates.count,
+		materializedMemoryIds,
 	};
 }
 
@@ -1996,6 +2063,8 @@ interface CachedPiM0M1Row {
 	cached_m0_model_key: string | null;
 	cached_m0_project_identity: string | null;
 	cached_m0_last_baseline_end_message_id: string | null;
+	cached_m1_max_memory_id: number | null;
+	cached_m1_max_memory_mutation_id: number | null;
 	memory_block_ids: string | null;
 }
 
@@ -2047,6 +2116,8 @@ function readCachedPiM0M1Row(
 					cached_m0_model_key,
 					cached_m0_project_identity,
 					cached_m0_last_baseline_end_message_id,
+					cached_m1_max_memory_id,
+					cached_m1_max_memory_mutation_id,
 					memory_block_ids
 			   FROM session_meta
 			  WHERE session_id = ?`,
@@ -2272,6 +2343,18 @@ function softRefreshCachedM1Pi(args: {
 			args.compartmentsForNormalization,
 		);
 		const m1Bytes = Buffer.from(rendered.text, "utf8");
+		const workspace = resolveWorkspaceRenderContextPi(args.state, args.db);
+		const memPath = memoryProjectPath(args.state);
+		const maxMemoryId = memPath
+			? workspace.isWorkspaced
+				? getMaxMemoryIdForProjects(args.db, workspace.expandedIdentities, workspace.ownIdentities, workspace.shareCategories, markers.materializedAt)
+				: getMaxMemoryIdForProjects(args.db, [memPath], [memPath], undefined, markers.materializedAt)
+			: 0;
+		const maxMemoryMutationId = memPath
+			? workspace.isWorkspaced
+				? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
+				: (getMaxMemoryMutationId(args.db, memPath) ?? 0)
+			: 0;
 		// Advance the persisted trim boundary to the latest compartment now rendered
 		// in m[1]. renderM1 covers compartments seq > cachedM0Seq up to the current
 		// latest, so the visible-message trim must move with it — otherwise the newly
@@ -2290,9 +2373,9 @@ function softRefreshCachedM1Pi(args: {
 				: markers.lastBaselineEndMessageId;
 		args.db
 			.prepare(
-				"UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
+				"UPDATE session_meta SET cached_m1_bytes = ?, cached_m1_max_memory_id = ?, cached_m1_max_memory_mutation_id = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
 			)
-			.run(m1Bytes, advancedBoundary, args.state.sessionId);
+			.run(m1Bytes, maxMemoryId, maxMemoryMutationId, advancedBoundary, args.state.sessionId);
 		args.db.exec("COMMIT");
 		return {
 			m0: decodeCachedM0(row.cached_m0_bytes) ?? "",
@@ -2373,6 +2456,8 @@ export function injectM0M1Pi(
 	piMessages: PiAgentMessage[],
 	entryIds?: readonly (string | undefined)[],
 	recomputeM1ThisPass = false,
+	/** True only for a real provider invocation; false preserves DEFER maintenance replay. */
+	allowExternalMemoryRefresh = false,
 ): PiM0M1InjectionResult {
 	// One compartment snapshot for the WHOLE decision: the materialize decision
 	// and every cached-marker reload below normalize against this same set, so a
@@ -2502,7 +2587,7 @@ export function injectM0M1Pi(
 		m1Recomputed = true;
 	} else if (contentionExhausted) {
 		// m[1] was replayed with the cached m[0] pair above.
-	} else if (recomputeM1ThisPass) {
+	} else if (recomputeM1ThisPass || (allowExternalMemoryRefresh && m1CoverageAdvancedPi(db, state))) {
 		const refreshed = softRefreshCachedM1Pi({
 			state,
 			db,
@@ -2656,8 +2741,31 @@ export function injectM0M1Pi(
 				).length
 			: getMemoriesByProject(db, memPath, ["active", "permanent"]).length
 		: 0;
+	const materializedMemoryCategoryCounts = {
+		SEMANTIC_MEMORY: 0,
+		INTERACTION_EPISODE: 0,
+	};
+	// Cache/category accounting remains independent of evidence. Crucially, do
+	// not reconstruct selected m[1] cards or mutation revisions here: this code
+	// runs after provider-bound bytes are frozen and a concurrent writer could
+	// otherwise credit a revision absent from those bytes.
+	const cachedRow = readCachedPiM0M1Row(db, state.sessionId);
+	const cachedMaterializedIds = new Set(parseMemoryBlockIds(cachedRow?.memory_block_ids ?? null));
+	if (memPath && cachedRow) {
+		const candidates = workspace.isWorkspaced
+			? getMemoriesByProjects(db, workspace.expandedIdentities, ["active", "permanent"], cachedRow.cached_m0_materialized_at ?? Date.now(), workspace.ownIdentities, workspace.shareCategories)
+			: getMemoriesByProject(db, memPath, ["active", "permanent"], cachedRow.cached_m0_materialized_at ?? Date.now());
+		for (const memory of filterMemoriesForDomain(candidates, state.memoryDomain)) {
+			if (!cachedMaterializedIds.has(memory.id)) continue;
+			if (memory.category === "SEMANTIC_MEMORY") materializedMemoryCategoryCounts.SEMANTIC_MEMORY += 1;
+			if (memory.category === "INTERACTION_EPISODE") materializedMemoryCategoryCounts.INTERACTION_EPISODE += 1;
+		}
+	}
 	return {
 		injected: true,
+	m1MaxMemoryMutationId:
+			cachedRow?.cached_m1_max_memory_mutation_id ?? 0,
+	materializedMemoryCategoryCounts,
 		compartmentCount: currentCompartments.length,
 		factCount: 0, // v2: facts retired as a render source (facts = promoted memories)
 		memoryCount,

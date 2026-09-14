@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +10,7 @@ import {
 	getMemoriesByProject,
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
@@ -23,14 +25,58 @@ import { COMPARTMENT_RENDER_EPOCH } from "@magic-context/core/hooks/magic-contex
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	__test,
-	injectM0M1Pi,
-	materializeM0Pi,
+		injectM0M1Pi,
+		clearM0M1PiCache,
+		materializeM0Pi,
 	materializeM0PiWithRetry,
 	mustMaterializePi,
 	renderM0Pi,
 	renderM1Pi,
 } from "./inject-compartments-pi";
+import { materializeGameBuddyAuthoredStableCatalog } from "./gamebuddy-stable-context-source";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
+
+const stableContextBinding = {
+	continuityId: "continuity-stable-source",
+	sessionId: "stable-source-session",
+	surface: "tavern" as const,
+};
+
+function canonicalStableJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalStableJson).join(",")}]`;
+	if (value !== null && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalStableJson(record[key])}`).join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+function stableContext(content: string, sources = true) {
+	const source = {
+		sourceId: "scenario",
+		kind: "scenario" as const,
+		revision: "1",
+		canonicalHash: createHash("sha256").update(content).digest("hex"),
+		content,
+		budgetTokens: 20,
+		totalOrderKey: "0001",
+		provenance: "test/tavern/scenario",
+	};
+	const scope = {
+		...stableContextBinding,
+		threadId: "stable-source-thread",
+		profile: { profileId: "stable-source-profile", revision: 1, canonicalHash: "a".repeat(64) },
+	};
+	const body = {
+		version: "gamebuddy-authored-context-catalog/v2" as const,
+		scope,
+		stableSources: sources ? [source] : [],
+	};
+	return materializeGameBuddyAuthoredStableCatalog(
+		{ ...body, canonicalHash: createHash("sha256").update(canonicalStableJson(body)).digest("hex") },
+		scope,
+	);
+}
 
 function user(text: string, timestamp = 1) {
 	return { role: "user" as const, content: text, timestamp };
@@ -62,6 +108,55 @@ function result(toolCallId: string) {
 		timestamp: 1,
 	};
 }
+
+describe("GameBuddy stable source m[0] lifecycle", () => {
+	it("rebuilds replacement and tombstone changes in m[0] without an authored m[1] delta", () => {
+		const db = createTestDb();
+		try {
+			const initial = stableContext("initial premise");
+			const initialMessages = [user("first")];
+			injectM0M1Pi(
+				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: initial },
+				db,
+				initialMessages,
+			);
+			expect(textOf(initialMessages[0])).toContain("initial premise");
+
+			const replacement = stableContext("revised premise");
+			clearM0M1PiCache(db, stableContextBinding.sessionId, "test-authored-publication-replacement");
+			const replacementMessages = [user("second")];
+			injectM0M1Pi(
+				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: replacement },
+				db,
+				replacementMessages,
+			);
+			expect(textOf(replacementMessages[0])).not.toContain("initial premise");
+			expect(textOf(replacementMessages[0])).toContain("revised premise");
+			expect(replacementMessages.map(textOf).join("\n")).not.toContain("gamebuddy-authored-context-updates");
+
+			const tombstoneMessages = [user("third")];
+			clearM0M1PiCache(db, stableContextBinding.sessionId, "test-authored-publication-clear");
+			injectM0M1Pi(
+				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: stableContext("", false) },
+				db,
+				tombstoneMessages,
+			);
+			expect(textOf(tombstoneMessages[0])).not.toContain("initial premise");
+			expect(tombstoneMessages.map(textOf).join("\n")).not.toContain("tombstone");
+
+			const hardFoldMessages = [user("fourth")];
+			injectM0M1Pi(
+				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: stableContext("", false), hardSignals: { systemHash: "", modelKey: "new-model", cacheExpired: false, lastResponseTime: 0 } },
+				db,
+				hardFoldMessages,
+			);
+			expect(textOf(hardFoldMessages[0])).not.toContain("initial premise");
+			expect(hardFoldMessages.map(textOf).join("\n")).not.toContain("gamebuddy-authored-context-updates");
+		} finally {
+			db.close();
+		}
+	});
+});
 
 describe("workspace memory sharing", () => {
 	it("filters foreign categories consistently in Pi m[0] and status counts", () => {
@@ -518,6 +613,67 @@ describe("injectM0M1Pi memory feature gate", () => {
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 			closeQuietly(db);
+		}
+	});
+});
+
+describe("ongoing-interaction read-only injection", () => {
+	it("renders same-project Semantic Memory and Interaction Episode rows, never unrelated or coding rows", () => {
+		const db = createTestDb();
+		const ownCwd = mkdtempSync(join(tmpdir(), "pi-ongoing-own-"));
+		const otherCwd = mkdtempSync(join(tmpdir(), "pi-ongoing-other-"));
+		try {
+			const own = piState("ses-ongoing-own", ownCwd);
+			const other = piState("ses-ongoing-other", otherCwd);
+			insertMemory(db, {
+				projectPath: own.projectIdentity,
+				category: "SEMANTIC_MEMORY",
+				content: "The player prefers options before consequential decisions.",
+				sourceType: "historian",
+			});
+			insertMemory(db, {
+				projectPath: own.projectIdentity,
+				category: "INTERACTION_EPISODE",
+				content: "The player and Companion agreed to revisit the named topic later.",
+				sourceType: "agent",
+			});
+			insertMemory(db, {
+				projectPath: own.projectIdentity,
+				category: "PROJECT_RULES",
+				content: "Coding taxonomy must not appear in interaction injection.",
+				sourceType: "historian",
+			});
+			insertMemory(db, {
+				projectPath: other.projectIdentity,
+				category: "SEMANTIC_MEMORY",
+				content: "Other continuity memory must not cross the opaque project scope.",
+				sourceType: "historian",
+			});
+
+			const ownMessages = [userMessage("hello", 10)];
+			injectM0M1Pi({ ...own, memoryEnabled: true, memoryDomain: "ongoing-interaction" }, db, ownMessages as never, undefined, true);
+			const ownM0 = textOf(ownMessages[0] as never);
+			expect(ownM0).toContain("The player prefers options before consequential decisions.");
+			expect(ownM0).toContain("The player and Companion agreed to revisit the named topic later.");
+			expect(ownM0).not.toContain("Coding taxonomy must not appear");
+			expect(ownM0).not.toContain("Other continuity memory must not cross");
+
+			const otherMessages = [userMessage("hello", 10)];
+			injectM0M1Pi({ ...other, memoryEnabled: true, memoryDomain: "ongoing-interaction" }, db, otherMessages as never, undefined, true);
+			const otherM0 = textOf(otherMessages[0] as never);
+			expect(otherM0).toContain("Other continuity memory must not cross the opaque project scope.");
+			expect(otherM0).not.toContain("The player prefers options before consequential decisions.");
+
+			const disabled = piState("ses-ongoing-disabled", ownCwd);
+			const memoryDisabled = [userMessage("hello", 10)];
+			injectM0M1Pi({ ...disabled, memoryEnabled: false, memoryDomain: "ongoing-interaction" }, db, memoryDisabled as never, undefined, true);
+			const disabledM0 = textOf(memoryDisabled[0] as never);
+			expect(disabledM0).not.toContain("The player prefers options before consequential decisions.");
+			expect(disabledM0).not.toContain("Coding taxonomy must not appear");
+		} finally {
+			closeQuietly(db);
+			rmSync(ownCwd, { recursive: true, force: true });
+			rmSync(otherCwd, { recursive: true, force: true });
 		}
 	});
 });
@@ -1253,6 +1409,92 @@ describe("injectM0M1Pi", () => {
 				"New additive memory appears only after a bust.",
 			);
 		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("refreshes externally committed Memory before a provider invocation without folding m[0]", () => {
+		const db = createTestDb();
+		const cwd = mkdtempSync(join(tmpdir(), "pi-m1-external-memory-"));
+		try {
+			const state = piState("ses-pi-m1-external-memory", cwd);
+			const first = [userMessage("hello", 10)];
+			injectM0M1Pi(state, db, first as never, undefined, true, true);
+			const initialM0 = textOf(first[0] as never);
+			insertMemory(db, {
+				projectPath: state.projectIdentity,
+				category: "SEMANTIC_MEMORY",
+				content: "Player-managed Memory arrives before this turn.",
+				sourceType: "agent",
+			});
+			const provider = [userMessage("provider", 20)];
+			injectM0M1Pi(state, db, provider as never, undefined, false, true);
+			expect(textOf(provider[0] as never)).toBe(initialM0);
+			expect(textOf(provider[1] as never)).toContain("Player-managed Memory arrives before this turn.");
+			const deferred = [userMessage("defer", 30)];
+			injectM0M1Pi(state, db, deferred as never, undefined, false, false);
+			expect(textOf(deferred[1] as never)).toBe(textOf(provider[1] as never));
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("refreshes a player mutation across separate Chat and Game sessions on their next provider invocations", () => {
+		const db = createTestDb();
+		const sharedCwd = mkdtempSync(join(tmpdir(), "pi-cross-surface-memory-"));
+		const foreignCwd = mkdtempSync(join(tmpdir(), "pi-cross-surface-memory-foreign-"));
+		try {
+			const chat = {
+				...piState("chat-surface-session", sharedCwd),
+				memoryEnabled: true,
+				memoryDomain: "ongoing-interaction" as const,
+			};
+			const game = {
+				...piState("game-surface-session", sharedCwd),
+				memoryEnabled: true,
+				memoryDomain: "ongoing-interaction" as const,
+			};
+			const foreign = {
+				...piState("other-continuity-session", foreignCwd),
+				memoryEnabled: true,
+				memoryDomain: "ongoing-interaction" as const,
+			};
+
+			// Establish independent surface caches before the player mutation.
+			const chatInitial = [userMessage("Chat initial", 10)];
+			const gameInitial = [userMessage("Game initial", 11)];
+			injectM0M1Pi(chat, db, chatInitial as never, undefined, true, true);
+			injectM0M1Pi(game, db, gameInitial as never, undefined, true, true);
+			const chatM0 = textOf(chatInitial[0] as never);
+			const gameM0 = textOf(gameInitial[0] as never);
+
+			// This is the same governed command facade used by the player API,
+			// not a direct storage insert. It queues the mutation cursor that each
+			// independently cached surface must consume before its provider call.
+			new MemoryCommandFacade(db).create({
+				actor: { principal: "player_direct", delegated: false },
+				projectPath: chat.projectIdentity,
+				category: "SEMANTIC_MEMORY",
+				content: "The player prefers calm options before consequential decisions.",
+				sourceType: "agent",
+			});
+
+			const gameNextInvocation = [userMessage("Game next", 20)];
+			injectM0M1Pi(game, db, gameNextInvocation as never, undefined, false, true);
+			expect(textOf(gameNextInvocation[0] as never)).toBe(gameM0);
+			expect(textOf(gameNextInvocation[1] as never)).toContain("The player prefers calm options");
+
+			const chatReturnInvocation = [userMessage("Chat return", 30)];
+			injectM0M1Pi(chat, db, chatReturnInvocation as never, undefined, false, true);
+			expect(textOf(chatReturnInvocation[0] as never)).toBe(chatM0);
+			expect(textOf(chatReturnInvocation[1] as never)).toContain("The player prefers calm options");
+
+			const foreignInvocation = [userMessage("Foreign continuity", 40)];
+			injectM0M1Pi(foreign, db, foreignInvocation as never, undefined, false, true);
+			expect(`${textOf(foreignInvocation[0] as never)}${textOf(foreignInvocation[1] as never)}`).not.toContain("The player prefers calm options");
+		} finally {
+			rmSync(sharedCwd, { recursive: true, force: true });
+			rmSync(foreignCwd, { recursive: true, force: true });
 			closeQuietly(db);
 		}
 	});

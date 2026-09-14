@@ -212,6 +212,12 @@ import {
 	type PiM0M1InjectionResult as PiInjectionResult,
 	trimPiMessagesToCachedBoundary,
 } from "./inject-compartments-pi";
+import {
+	__gamebuddyClearAuthoredMaterialization,
+	__gamebuddyReadAuthoredMaterialization,
+	__gamebuddyReadAuthoredVolatileMaterialization,
+} from "./gamebuddy-stable-context-source";
+import { publishGameOperationalGateMaterialization } from "./tavern-narrative-gate-marker";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
 import {
 	resolvePiUsableContextLimit,
@@ -274,6 +280,7 @@ function isPiHardCacheExpired(
 }
 
 let injectM0M1PiForRun = injectM0M1Pi;
+const publishedStableContextHashBySession = new Map<string, string | null>();
 let persistReasoningWatermarkForRun = updateSessionMeta;
 let persistStableIdSchemeForRun = updateSessionMeta;
 let afterFallbackAdoptionForTests:
@@ -921,6 +928,8 @@ export interface PiHistorianOptions {
 	allowHomeProject?: boolean;
 	/** Automatic-promotion gate (`memory.auto_promote`). */
 	autoPromote?: boolean;
+	/** Semantic taxonomy used by historian facts/promotion. */
+	memoryDomain?: import("@magic-context/core/features/magic-context/memory/domain").MemoryDomain;
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
 	 *  historian user observations are persisted as candidates. */
 	userMemoriesEnabled?: boolean;
@@ -975,6 +984,8 @@ export interface PiHeuristicsOptions {
 
 /** <session-history> injection config — writes compartments+facts+memories into message[0]. */
 export interface PiInjectionOptions {
+	/** Semantic taxonomy used to select native m[0]/m[1] memory rows. */
+	memoryDomain?: import("@magic-context/core/features/magic-context/memory/domain").MemoryDomain;
 	/** When false (config `memory.enabled=false`), project memories are NOT read
 	 *  or rendered into m[0]/m[1]. Docs are controlled by injectDocs. */
 	memoryEnabled?: boolean;
@@ -1043,6 +1054,9 @@ export interface PiContextHandlerOptions {
 	 * async after each tagging pass.
 	 */
 	historian?: PiHistorianOptions;
+	/** Binds an embedded historian runner to this exact SDK context's model
+	 * registry before trigger scheduling; a CLI runner uses a no-op binding. */
+	bindHistorianRunner?: (ctx: ExtensionContext) => void;
 	/**
 	 * Optional auto-search hint wiring (Step 4b.4). When omitted or
 	 * disabled, no hint computation runs. Notes that auto-search shares
@@ -2079,6 +2093,9 @@ export function registerPiContextHandler(
 			// resolver is wired (tests) or the resolver returns nothing.
 			const options =
 				baseOptions.resolveForProject?.(projectDirectory) ?? baseOptions;
+			// Bind the hidden embedded Historian from this actual SDK context before
+			// any trigger can schedule it. This is a no-op for CLI runners.
+			options.bindHistorianRunner?.(ctx);
 			const schedulerConfig = options.scheduler ?? DEFAULT_SCHEDULER_CONFIG;
 			const scheduler = schedulerFor(options);
 			const projectIdentity =
@@ -3652,6 +3669,7 @@ function spawnPiHistorianRun(args: {
 				memoryEnabled: historian.memoryEnabled,
 				allowHomeProject: historian.allowHomeProject,
 				autoPromote: historian.autoPromote,
+				memoryDomain: historian.memoryDomain,
 				userMemoriesEnabled: historian.userMemoriesEnabled,
 				language: historian.language,
 				compartmentLeaseHolderId: holderId,
@@ -4031,7 +4049,6 @@ function maybeFireHistorian(args: {
 			args.taggerFloor,
 			{ canClearReasoning: true },
 		);
-
 		if (!trigger.shouldFire) {
 			sessionLog(
 				sessionId,
@@ -4146,6 +4163,8 @@ interface RunPipelineArgs {
 	emergencyCeilingTokens?: number;
 	/** Memory-injection config — when omitted, no <session-history> injection runs. */
 	injection?: {
+		/** Semantic taxonomy used to select native m[0]/m[1] memory rows. */
+		memoryDomain?: import("@magic-context/core/features/magic-context/memory/domain").MemoryDomain;
 		/** When false (config `memory.enabled=false`), project memories are NOT
 		 *  read or rendered into m[0]/m[1]. Docs are controlled by injectDocs. */
 		memoryEnabled?: boolean;
@@ -4550,6 +4569,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				};
 			})()
 		: undefined;
+	// Read the process-local authored publication once and thread that exact
+	// snapshot through both the preflight and wire injection. Omitting it from
+	// state construction would let the real context handler fold stale/empty m[0]
+	// even though the publication transition was observed below.
+	const stableContext = __gamebuddyReadAuthoredMaterialization(args.sessionId);
+	const volatileContext = __gamebuddyReadAuthoredVolatileMaterialization(args.sessionId);
 	// Build the fold state once and reuse it for both the preflight and the wire
 	// injection. Omitting a render-affecting field from only one of those calls can
 	// manufacture a HARD signal that the real injection immediately disproves.
@@ -4565,6 +4590,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					historyBudgetTokens: args.injection.historyBudgetTokens,
 					hardSignals: piHardSignals,
 					muralEnabled: args.injection.muralEnabled === true,
+					stableContext,
+					volatileContext,
 				}
 			: undefined;
 	const foldDueDecision = piM0State
@@ -5449,6 +5476,23 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// a HARD trigger. injectM0M1Pi now keeps cached m[0] and soft-refreshes m[1];
 			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
 			// re-materialize inside mustMaterializePi when genuinely needed.
+			const stableHash = stableContext?.snapshotCanonicalHash ?? null;
+			const priorStableHash = publishedStableContextHashBySession.get(args.sessionId);
+			const stablePublicationChanged =
+				(stableContext !== undefined || publishedStableContextHashBySession.has(args.sessionId)) &&
+				priorStableHash !== stableHash;
+			if (stablePublicationChanged) {
+				// Authored source content is part of the stable m[0] baseline. Any
+				// publication replacement or clear must discard the cached pair before
+				// injection so the next pass rebuilds m[0] from the exact publication;
+				// it must never be represented as an m[1] delta.
+				clearM0M1PiCache(
+					args.db,
+					args.sessionId,
+					"gamebuddy_authored_context_publication_changed",
+				);
+				publishedStableContextHashBySession.set(args.sessionId, stableHash);
+			}
 			const wireInjectionResult = injectM0M1PiForRun(
 				piM0State!,
 				args.db,
@@ -5461,7 +5505,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				// re-render m[1] so the new compartment surfaces; gating on work alone
 				// (the prior behavior, masked by the now-removed cache clear) would
 				// replay stale m[1]. Mirrors OpenCode's isCacheBustingPass gate.
-				args.isCacheBusting || deferredHistoryRefresh || executedWorkThisPass,
+				args.isCacheBusting ||
+					deferredHistoryRefresh ||
+					executedWorkThisPass ||
+					(stablePublicationChanged && stableContext !== undefined),
+				// Provider invocations may soft-refresh m[1] after ordinary
+				// external Memory changes. Internal DEFER maintenance remains
+				// byte-identical by retaining the default false.
+				true,
 			);
 			injectionResult = preFoldInjectionResult?.m0Materialized
 				? {
@@ -5494,6 +5545,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// retries the rebuild. Deferred-history is NOT drained
 			// here; Pi-native compaction marker application happens at
 			// the end of runPipeline after materializing work succeeds.
+			// The marker registry ignores unbound sessions. This passes only the
+			// source-owned aggregate from the injection that constructed this request.
+			publishGameOperationalGateMaterialization(args.sessionId, {
+				m1MaxMemoryMutationId: injectionResult.m1MaxMemoryMutationId,
+				materializedCategoryCounts: injectionResult.materializedMemoryCategoryCounts,
+			});
 			if (args.isCacheBusting) {
 				historyRefreshSessions.delete(args.sessionId);
 				historyWasConsumedThisPass = true;
@@ -6157,7 +6214,10 @@ function clearPiCompactionOffInMemoryState(sessionId: string): void {
 // merely switched away from — a data-loss bug far worse than the bounded
 // orphan-row cost for sessions that are genuinely abandoned and never resumed.
 // Do not add DB clearSession here.
-export function clearContextHandlerSession(sessionId: string): void {
+export function clearContextHandlerSession(
+	sessionId: string,
+	db?: ContextDatabase,
+): void {
 	invalidateTrueRawTokenCache({ sessionId, reason: "pi.branch.changed" });
 	activeContextHandlerSessions.delete(sessionId);
 	clearAutoSearchForPiSession(sessionId);
@@ -6182,6 +6242,15 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piTextIdentitySourceCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
+	// Stable-context publications are process-local, whereas m[0] is durable.
+	// When the lifecycle owner has the database, invalidate the latter before
+	// dropping the former; otherwise a reused Pi session id could replay the
+	// departed Tavern source from cached m[0].
+	if (db && __gamebuddyReadAuthoredMaterialization(sessionId) !== undefined) {
+		clearM0M1PiCache(db, sessionId, "gamebuddy_stable_context_session_cleared");
+	}
+	publishedStableContextHashBySession.delete(sessionId);
+	__gamebuddyClearAuthoredMaterialization(sessionId);
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);
 	lastSeenProjectIdentityBySession.delete(sessionId);

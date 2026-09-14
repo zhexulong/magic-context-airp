@@ -3,6 +3,10 @@ import { z } from "zod";
 import { isValidLanguageCode } from "../../agents/language-directive";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { isValidCron } from "../../features/magic-context/dreamer/cron";
+import {
+    MEMORY_DOMAINS,
+    type MemoryDomain,
+} from "../../features/magic-context/memory/domain";
 import type {
     AGENTIC_DREAM_TASKS,
     DreamTaskName,
@@ -880,6 +884,8 @@ export interface MagicContextConfig {
     shadow_embedding?: ShadowEmbeddingConfig;
     memory: {
         enabled: boolean;
+        /** Semantic model used by the Magic Context historian/promotion pipeline. */
+        domain: MemoryDomain;
         injection_budget_tokens: number;
         auto_promote: boolean;
         retrieval_count_promotion_threshold: number;
@@ -1268,6 +1274,10 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe("Enable cross-session memory (default: true)"),
+                domain: z
+                    .enum(MEMORY_DOMAINS)
+                    .default("coding-project")
+                    .describe("Memory interpretation domain. coding-project preserves upstream defaults; ongoing-interaction uses Episodic/Semantic boundaries."),
                 injection_budget_tokens: z
                     .number()
                     .min(500)
@@ -1350,6 +1360,7 @@ export const MagicContextConfigSchema = z
             })
             .default({
                 enabled: true,
+                domain: "coding-project",
                 injection_budget_tokens: 4000,
                 auto_promote: true,
                 retrieval_count_promotion_threshold: 3,

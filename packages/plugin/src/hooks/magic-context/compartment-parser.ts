@@ -18,6 +18,12 @@ export interface ParsedCompartment {
 export interface ParsedFact {
     category: string;
     content: string;
+    /**
+     * Adapter-supplied opaque provenance only. Historian XML deliberately does
+     * not define this field: callers may attach refs only when they can derive
+     * an exact source range without inventing a blanket session reference.
+     */
+    sourceRefs?: readonly string[];
 }
 
 /**
@@ -83,10 +89,16 @@ const TIER_CLOSE_ANY_REGEX = /<\/p\d/;
 // Any tier's OPENING tag (`<p1>`…`<p9>`) — the over-capture guard: a tier body
 // must never swallow a following tier's opener.
 const TIER_OPEN_ANY_REGEX = /<p\d/;
-// v2 world taxonomy (5 categories). The historian emits only these; legacy 9-cat
-// names are accepted at the ctx_memory layer (E3 aliases), not here.
-const CATEGORY_BLOCK_REGEX =
-    /<(PROJECT_RULES|ARCHITECTURE|CONSTRAINTS|CONFIG_VALUES|NAMING)>(.*?)<\/\1>/gs;
+// The default coding-project taxonomy. The ongoing-interaction domain supplies
+// its own allowlist to parseCompartmentOutput rather than treating semantic
+// interaction facts as project rules.
+const DEFAULT_FACT_CATEGORIES = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+] as const;
 const FACT_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
 const UNPROCESSED_REGEX = /<unprocessed_from>(\d+)<\/unprocessed_from>/;
 const USER_OBSERVATIONS_REGEX = /<user_observations>(.*?)<\/user_observations>/s;
@@ -159,7 +171,15 @@ export function extractTiersFromInner(inner: string): {
     };
 }
 
-export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
+function factCategoryRegex(categories: readonly string[]): RegExp {
+    const alternatives = categories.map((category) => category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    return new RegExp(`<(${alternatives})>(.*?)<\\/\\1>`, "gs");
+}
+
+export function parseCompartmentOutput(
+    text: string,
+    factCategories: readonly string[] = DEFAULT_FACT_CATEGORIES,
+): ParsedCompartmentOutput {
     const compartments: ParsedCompartment[] = [];
     const facts: ParsedFact[] = [];
 
@@ -237,7 +257,7 @@ export function parseCompartmentOutput(text: string): ParsedCompartmentOutput {
         : text
               .replace(EVENTS_BLOCK_REGEX, "")
               .replace(/<compartment\s+[^>]*?\s*>.*?<\/compartment>/gs, "");
-    for (const categoryMatch of factsScope.matchAll(CATEGORY_BLOCK_REGEX)) {
+    for (const categoryMatch of factsScope.matchAll(factCategoryRegex(factCategories))) {
         const category = categoryMatch[1];
         const blockContent = categoryMatch[2];
         for (const itemMatch of blockContent.matchAll(FACT_ITEM_REGEX)) {

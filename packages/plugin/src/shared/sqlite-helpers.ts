@@ -20,7 +20,11 @@ export function closeQuietly(db: Database | null | undefined): void {
     // and node:sqlite throws on an already-closed handle — both are handled by
     // the bare try/catch.
     try {
-        db.close();
+        // Bun's SQLite close defaults to throwing while statements are still
+        // finalizing. Test fixtures legitimately close sibling WAL handles in
+        // rapid succession; request its documented quiet-close mode while
+        // node:sqlite simply ignores the optional argument at runtime.
+        (db.close as unknown as (throwOnError?: boolean) => void)(false);
     } catch {
         // intentional: caller wants quiet close
     }
