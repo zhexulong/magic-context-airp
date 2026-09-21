@@ -1641,10 +1641,12 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				}),
 				// All win32 runs deliver the message through stdin to stay below
 				// CreateProcess's command-line cap; POSIX can keep argv delivery.
-				stdio: process.platform === "win32"
-					? ["pipe", "pipe", "pipe"]
-					: ["ignore", "pipe", "pipe"],
-			}));
+				stdio:
+					process.platform === "win32"
+						? ["pipe", "pipe", "pipe"]
+						: ["ignore", "pipe", "pipe"],
+			}),
+		);
 		expect(result).toEqual({
 			ok: true,
 			assistantText: "final answer",

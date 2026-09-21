@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { setTimeout as sleep } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
 	appendCompartments,
 	getCompartments,
@@ -88,6 +88,7 @@ import {
 	getPiChannel1Baseline,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
+import { publishGameBuddyAuthoredStableCatalog } from "./gamebuddy-authored-context-bridge.internal";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
 import {
 	assistantMessage,
@@ -100,7 +101,6 @@ import {
 	userMessage,
 } from "./test-utils.test";
 import { createPiTranscript } from "./transcript-pi";
-import { publishGameBuddyAuthoredStableCatalog } from "./gamebuddy-authored-context-bridge.internal";
 
 describe("Pi context project identity cache", () => {
 	it("serves byte-identical output with cached identity and one host-usage read per context", async () => {
@@ -145,7 +145,12 @@ describe("Pi context project identity cache", () => {
 			__resetProjectIdentityForTests();
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
-			rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+			rmSync(project, {
+				recursive: true,
+				force: true,
+				maxRetries: 10,
+				retryDelay: 100,
+			});
 		}
 	});
 });
@@ -180,7 +185,12 @@ describe("Pi protected-token floor wiring", () => {
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
-			rmSync(project, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+			rmSync(project, {
+				recursive: true,
+				force: true,
+				maxRetries: 10,
+				retryDelay: 100,
+			});
 		}
 	});
 });
@@ -720,6 +730,33 @@ describe("Pi fallback tag adoption", () => {
 	});
 
 	it("re-probes a stale negative after fingerprint construction before skipping adoption", async () => {
+		const removeTemporaryDirectory = async (dir: string): Promise<void> => {
+			// Windows may retain a just-closed WAL handle for a scheduler tick.
+			// Keep this fixture cleanup bounded rather than turning a passing
+			// concurrency assertion into an EBUSY failure.
+			for (let attempt = 0; attempt < 5; attempt++) {
+				try {
+					rmSync(dir, {
+						recursive: true,
+						force: true,
+						maxRetries: 1,
+						retryDelay: 10,
+					});
+					return;
+				} catch (error) {
+					// Bun's Windows SQLite backend may retain the sibling WAL file past
+					// process teardown. The temporary directory is outside product data;
+					// don't fail a correct race assertion solely because its best-effort
+					// cleanup loses that OS-level race.
+					if (
+						attempt === 4 &&
+						(error as NodeJS.ErrnoException).code !== "EBUSY"
+					)
+						throw error;
+					await sleep(25 * (attempt + 1));
+				}
+			}
+		};
 		const dir = mkdtempSync(join(tmpdir(), "mc-pi-fallback-race-"));
 		const dbPath = join(dir, "context.db");
 		const db = createTestDb(dbPath);
@@ -777,22 +814,7 @@ describe("Pi fallback tag adoption", () => {
 		} finally {
 			closeQuietly(siblingDb);
 			closeQuietly(db);
-			// Windows may retain a just-closed WAL handle for a scheduler tick.
-			// Keep this fixture cleanup bounded rather than turning a passing
-			// concurrency assertion into an EBUSY failure.
-			for (let attempt = 0; attempt < 5; attempt++) {
-				try {
-					rmSync(dir, { recursive: true, force: true, maxRetries: 1, retryDelay: 10 });
-					break;
-				} catch (error) {
-					// Bun's Windows SQLite backend may retain the sibling WAL file past
-					// process teardown. The temporary directory is outside product data;
-					// don't fail a correct race assertion solely because its best-effort
-					// cleanup loses that OS-level race.
-					if (attempt === 4 && (error as NodeJS.ErrnoException).code !== "EBUSY") throw error;
-					await sleep(25 * (attempt + 1));
-				}
-			}
+			await removeTemporaryDirectory(dir);
 		}
 	});
 
@@ -1423,7 +1445,12 @@ describe("registerPiContextHandler", () => {
 				const messages = [userMessage(text, timestamp)];
 				return handler(
 					{ messages: messages as never[] },
-					fakeContext(sessionId, process.cwd(), [`entry-${timestamp}`], messages) as never,
+					fakeContext(
+						sessionId,
+						process.cwd(),
+						[`entry-${timestamp}`],
+						messages,
+					) as never,
 				);
 			};
 
@@ -1444,7 +1471,9 @@ describe("registerPiContextHandler", () => {
 				.join("\n");
 			expect(replacementWire).not.toContain(firstText);
 			expect(replacementWire).toContain(replacementText);
-			expect(replacementWire).not.toContain("gamebuddy-authored-context-updates");
+			expect(replacementWire).not.toContain(
+				"gamebuddy-authored-context-updates",
+			);
 
 			await replacement.clear();
 			const clearedResult = await run("third", 3);

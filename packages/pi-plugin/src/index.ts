@@ -22,12 +22,10 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRequire } from "node:module";
-import { registerTavernNarrativeGateMarkerHook } from "./tavern-narrative-gate-marker";
-
 import { join, resolve } from "node:path";
 import type {
-    ExtensionAPI,
-    ModelRegistry,
+	ExtensionAPI,
+	ModelRegistry,
 } from "@earendil-works/pi-coding-agent";
 import {
 	isCompactionEnabled,
@@ -41,12 +39,12 @@ import type {
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
 import {
-    summarizeDreamSchedule,
-    userMemoryCollectionEnabled,
+	summarizeDreamSchedule,
+	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import {
-    type FailClosedReason,
-    formatFailClosedBlockingMessage,
+	type FailClosedReason,
+	formatFailClosedBlockingMessage,
 } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
@@ -54,10 +52,10 @@ import { detectOverflow } from "@magic-context/core/features/magic-context/overf
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
-    getOrCreateSessionMeta,
-    getPendingPiCompactionMarkerState,
-    getSessionsWithPendingPiMarker,
-    updateSessionMeta,
+	getOrCreateSessionMeta,
+	getPendingPiCompactionMarkerState,
+	getSessionsWithPendingPiMarker,
+	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
@@ -79,22 +77,22 @@ import {
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import {
-    clearNoteNudgeTriggerAndCooldown,
-    onNoteTrigger,
+	clearNoteNudgeTriggerAndCooldown,
+	onNoteTrigger,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { preloadTokenizer } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { normalizeTodoStateJson } from "@magic-context/core/hooks/magic-context/todo-view";
 import { maybeSendUpgradeReminder } from "@magic-context/core/hooks/magic-context/upgrade-reminder";
 import {
-    beginBootQuietPeriod,
-    scheduleAfterBootQuiet,
+	beginBootQuietPeriod,
+	scheduleAfterBootQuiet,
 } from "@magic-context/core/plugin/boot-quiet";
 import {
-    ANNOUNCEMENT_FEATURES,
-    ANNOUNCEMENT_FOOTER,
-    ANNOUNCEMENT_VERSION,
-    markAnnouncementSeen,
-    shouldShowAnnouncement,
+	ANNOUNCEMENT_FEATURES,
+	ANNOUNCEMENT_FOOTER,
+	ANNOUNCEMENT_VERSION,
+	markAnnouncementSeen,
+	shouldShowAnnouncement,
 } from "@magic-context/core/shared/announcement";
 import { seedSessionCacheTtlIfUnsynced } from "@magic-context/core/shared/cache-ttl-seed";
 import {
@@ -116,11 +114,12 @@ import {
 	hasTrustedAbsoluteWall,
 	reloadWindowOverlay,
 } from "@magic-context/core/shared/window-geometry";
-
 import { handlePiCloneSessionStart } from "./clone-inheritance";
-
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
-import { maybeAutoEmbedPiSession, registerCtxEmbedCommand } from "./commands/ctx-embed";
+import {
+	maybeAutoEmbedPiSession,
+	registerCtxEmbedCommand,
+} from "./commands/ctx-embed";
 import { registerCtxFlushCommand } from "./commands/ctx-flush";
 import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
@@ -134,37 +133,37 @@ import {
 } from "./commands/pi-command-utils";
 import { loadPiConfig } from "./config";
 import {
-    awaitInFlightHistorians,
-    clearContextHandlerSession,
-    clearPiM0Cache,
-    clearSystemPromptRefresh,
-    hasSystemPromptRefresh,
-    type PiAutoSearchHandlerOptions,
-    type PiContextHandlerOptions,
-    type PiHistorianOptions,
-    recordPiLiveModel,
-    registerPiContextHandler,
-    signalPiDeferredHistoryRefresh,
-    signalPiDeferredMaterialization,
-    signalPiHistoryRefresh,
-    signalPiPendingMaterialization,
-    signalPiSystemPromptRefresh,
-    signalPiSystemPromptRefreshForProject,
-    trackSessionForProject,
+	awaitInFlightHistorians,
+	clearContextHandlerSession,
+	clearPiM0Cache,
+	clearSystemPromptRefresh,
+	hasSystemPromptRefresh,
+	type PiAutoSearchHandlerOptions,
+	type PiContextHandlerOptions,
+	type PiHistorianOptions,
+	recordPiLiveModel,
+	registerPiContextHandler,
+	signalPiDeferredHistoryRefresh,
+	signalPiDeferredMaterialization,
+	signalPiHistoryRefresh,
+	signalPiPendingMaterialization,
+	signalPiSystemPromptRefresh,
+	signalPiSystemPromptRefreshForProject,
+	trackSessionForProject,
 } from "./context-handler";
 import {
-    markPiChannel1Reduced,
-    maybeChannel1ReminderForToolResult,
-    maybeDeliverChannel2Pi,
+	markPiChannel1Reduced,
+	maybeChannel1ReminderForToolResult,
+	maybeDeliverChannel2Pi,
 } from "./ctx-reduce-nudge-pi";
 import {
-    awaitInFlightDreamers,
-    registerPiDreamerProject,
-    unregisterPiDreamerProject,
+	awaitInFlightDreamers,
+	registerPiDreamerProject,
+	unregisterPiDreamerProject,
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
-import { EmbeddedPiHistorianRunner } from "./embedded-pi-historian-runner";
 import { registerPiDroppedInputGuard } from "./dropped-input-guard-pi";
+import { EmbeddedPiHistorianRunner } from "./embedded-pi-historian-runner";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
@@ -183,9 +182,9 @@ import { readPiSessionMessages } from "./read-session-pi";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 import {
-    configurePiSubagentExtensions,
-    MAGIC_CONTEXT_PI_SUBAGENT_ENV,
-    PiSubagentRunner,
+	configurePiSubagentExtensions,
+	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
+	PiSubagentRunner,
 } from "./subagent-runner";
 import {
 	buildMagicContextBlock,
@@ -193,14 +192,15 @@ import {
 	composeMagicContextSystemPrompt,
 	processSystemPromptForCache,
 } from "./system-prompt";
+import { registerTavernNarrativeGateMarkerHook } from "./tavern-narrative-gate-marker";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
-    parseTodos,
-    registerTodoOverlay,
-    registerTodoStateLifecycle,
-    rememberTodowriteToolCallTodos,
-    setTodoSnapshot,
+	parseTodos,
+	registerTodoOverlay,
+	registerTodoStateLifecycle,
+	rememberTodowriteToolCallTodos,
+	setTodoSnapshot,
 } from "./tools/todo-view-pi";
 
 const PI_HARNESS_DETECTION = await resolvePiHarnessDetection();
@@ -302,8 +302,8 @@ function resolveCurrentProject(
 }
 
 export function signalPiDeferredCompactionMarkerDrain(sessionId: string): void {
-    signalPiDeferredHistoryRefresh(sessionId);
-    signalPiDeferredMaterialization(sessionId);
+	signalPiDeferredHistoryRefresh(sessionId);
+	signalPiDeferredMaterialization(sessionId);
 }
 
 /**
@@ -338,10 +338,10 @@ export function canonicalPiModelKey(provider: string, model: string): string {
 }
 
 export function persistPiMessageEndModelMeta(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    message: unknown;
-    cacheTtlConfig: MagicContextConfig["cache_ttl"];
+	db: ContextDatabase;
+	sessionId: string;
+	message: unknown;
+	cacheTtlConfig: MagicContextConfig["cache_ttl"];
 }): void {
 	if (!args.message || typeof args.message !== "object") return;
 	const msg = args.message as {
@@ -372,38 +372,40 @@ export function persistPiMessageEndModelMeta(args: {
 type TodoOverlayUpdater = { update: (sessionId?: string) => void };
 
 type CompatiblePiTodoCapture = {
-    normalized: string;
-    todos: Exclude<ReturnType<typeof parseTodos>, null>;
+	normalized: string;
+	todos: Exclude<ReturnType<typeof parseTodos>, null>;
 };
 
-function getCompatiblePiTodoCapture(todos: unknown): CompatiblePiTodoCapture | null {
-    if (!Array.isArray(todos)) return null;
-    const normalized = normalizeTodoStateJson(todos);
-    if (normalized === null) return null;
-    const parsed = parseTodos(todos);
-    if (parsed === null) return null;
-    return { normalized, todos: parsed };
+function getCompatiblePiTodoCapture(
+	todos: unknown,
+): CompatiblePiTodoCapture | null {
+	if (!Array.isArray(todos)) return null;
+	const normalized = normalizeTodoStateJson(todos);
+	if (normalized === null) return null;
+	const parsed = parseTodos(todos);
+	if (parsed === null) return null;
+	return { normalized, todos: parsed };
 }
 
 function applyCompatiblePiTodoCapture(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    todowriteEnabled: boolean;
-    todoOverlay?: TodoOverlayUpdater;
-    persist: boolean;
-    toolCallId?: string;
-    capture: CompatiblePiTodoCapture;
+	db: ContextDatabase;
+	sessionId: string;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+	toolCallId?: string;
+	capture: CompatiblePiTodoCapture;
 }): void {
-    rememberTodowriteToolCallTodos(args.toolCallId, args.capture.todos);
-    if (args.todowriteEnabled) {
-        setTodoSnapshot(args.sessionId, args.capture.todos);
-        args.todoOverlay?.update(args.sessionId);
-    }
-    if (args.persist) {
-        updateSessionMeta(args.db, args.sessionId, {
-            lastTodoState: args.capture.normalized,
-        });
-    }
+	rememberTodowriteToolCallTodos(args.toolCallId, args.capture.todos);
+	if (args.todowriteEnabled) {
+		setTodoSnapshot(args.sessionId, args.capture.todos);
+		args.todoOverlay?.update(args.sessionId);
+	}
+	if (args.persist) {
+		updateSessionMeta(args.db, args.sessionId, {
+			lastTodoState: args.capture.normalized,
+		});
+	}
 }
 
 /**
@@ -413,18 +415,18 @@ function applyCompatiblePiTodoCapture(args: {
  * transcript render cache.
  */
 export function capturePiTodowriteArgsIfCompatible(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    todos: unknown;
-    todowriteEnabled: boolean;
-    todoOverlay?: TodoOverlayUpdater;
-    persist: boolean;
-    toolCallId?: string;
+	db: ContextDatabase;
+	sessionId: string;
+	todos: unknown;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
+	toolCallId?: string;
 }): boolean {
-    const capture = getCompatiblePiTodoCapture(args.todos);
-    if (capture === null) return false;
-    applyCompatiblePiTodoCapture({ ...args, capture });
-    return true;
+	const capture = getCompatiblePiTodoCapture(args.todos);
+	if (capture === null) return false;
+	applyCompatiblePiTodoCapture({ ...args, capture });
+	return true;
 }
 
 /**
@@ -433,45 +435,45 @@ export function capturePiTodowriteArgsIfCompatible(args: {
  * captures state when their payload matches Magic Context's todo enums exactly.
  */
 export function capturePiTodowriteMessageIfCompatible(args: {
-    db: ContextDatabase;
-    sessionId: string;
-    message: unknown;
-    todowriteEnabled: boolean;
-    todoOverlay?: TodoOverlayUpdater;
-    persist: boolean;
+	db: ContextDatabase;
+	sessionId: string;
+	message: unknown;
+	todowriteEnabled: boolean;
+	todoOverlay?: TodoOverlayUpdater;
+	persist: boolean;
 }): boolean {
-    const msg = args.message as { role?: unknown; content?: unknown } | undefined;
-    if (msg?.role !== "assistant" || !Array.isArray(msg.content)) {
-        return false;
-    }
+	const msg = args.message as { role?: unknown; content?: unknown } | undefined;
+	if (msg?.role !== "assistant" || !Array.isArray(msg.content)) {
+		return false;
+	}
 
-    for (const block of msg.content) {
-        if (!block || typeof block !== "object") continue;
-        const b = block as {
-            type?: unknown;
-            name?: unknown;
-            arguments?: unknown;
-        };
-        if (b.type !== "toolCall") continue;
-        if (typeof b.name !== "string") continue;
-        if (b.name !== "todowrite") continue;
-        const capture = getCompatiblePiTodoCapture(
-            (b.arguments as { todos?: unknown } | null | undefined)?.todos,
-        );
-        if (capture === null) continue;
-        applyCompatiblePiTodoCapture({ ...args, capture });
-        return true;
-    }
+	for (const block of msg.content) {
+		if (!block || typeof block !== "object") continue;
+		const b = block as {
+			type?: unknown;
+			name?: unknown;
+			arguments?: unknown;
+		};
+		if (b.type !== "toolCall") continue;
+		if (typeof b.name !== "string") continue;
+		if (b.name !== "todowrite") continue;
+		const capture = getCompatiblePiTodoCapture(
+			(b.arguments as { todos?: unknown } | null | undefined)?.todos,
+		);
+		if (capture === null) continue;
+		applyCompatiblePiTodoCapture({ ...args, capture });
+		return true;
+	}
 
-    return false;
+	return false;
 }
 
 function info(message: string, data?: unknown): void {
-    log(`${PREFIX} ${message}`, data);
+	log(`${PREFIX} ${message}`, data);
 }
 
 function warn(message: string, data?: unknown): void {
-    log(`${PREFIX} WARN ${message}`, data);
+	log(`${PREFIX} WARN ${message}`, data);
 }
 
 // Migrate config from the legacy per-harness locations to the shared CortexKit
@@ -484,37 +486,37 @@ const migratedConfigDirs = new Set<string>();
 // summary/warning lines on every hot-path config resolution.
 const loggedPiConfigDirs = new Set<string>();
 function ensureConfigLocationsMigrated(dir: string): void {
-    if (migratedConfigDirs.has(dir)) return;
-    migratedConfigDirs.add(dir);
-    migrateMagicContextConfigLocations(dir, {
-        warn: (m) => warn(m),
-        info: (m) => info(m),
-    });
+	if (migratedConfigDirs.has(dir)) return;
+	migratedConfigDirs.add(dir);
+	migrateMagicContextConfigLocations(dir, {
+		warn: (m) => warn(m),
+		info: (m) => info(m),
+	});
 }
 
 function logPiConfigLoad(args: {
-    dir: string;
-    loadedFromPaths: string[];
-    warnings: string[];
-    dedupe?: boolean;
+	dir: string;
+	loadedFromPaths: string[];
+	warnings: string[];
+	dedupe?: boolean;
 }): void {
-    const key = resolve(args.dir);
-    if (args.dedupe && loggedPiConfigDirs.has(key)) return;
-    if (args.dedupe) {
-        loggedPiConfigDirs.add(key);
-    }
-    if (args.loadedFromPaths.length > 0) {
-        info(`config loaded from: ${args.loadedFromPaths.join(", ")}`);
-    } else {
-        info("config: no magic-context.jsonc found, using schema defaults");
-    }
-    for (const warning of args.warnings) {
-        warn(`config: ${warning}`);
-    }
+	const key = resolve(args.dir);
+	if (args.dedupe && loggedPiConfigDirs.has(key)) return;
+	if (args.dedupe) {
+		loggedPiConfigDirs.add(key);
+	}
+	if (args.loadedFromPaths.length > 0) {
+		info(`config loaded from: ${args.loadedFromPaths.join(", ")}`);
+	} else {
+		info("config: no magic-context.jsonc found, using schema defaults");
+	}
+	for (const warning of args.warnings) {
+		warn(`config: ${warning}`);
+	}
 }
 
 function embeddedRuntimeDisablesCliAuthoringCommands(): boolean {
-    return process.env.GAMEBUDDY_EMBEDDED_RUNTIME === "1";
+	return process.env.GAMEBUDDY_EMBEDDED_RUNTIME === "1";
 }
 
 export function formatProtectedTagsDeprecationNotice(): string {
@@ -548,21 +550,21 @@ export const __test = {
 };
 
 function formatTokens(value: number): string {
-    return value.toLocaleString();
+	return value.toLocaleString();
 }
 
 function getPiMessageModel(message: unknown): {
-    provider: string | undefined;
-    model: string | undefined;
+	provider: string | undefined;
+	model: string | undefined;
 } {
-    if (!message || typeof message !== "object") {
-        return { provider: undefined, model: undefined };
-    }
-    const msg = message as { provider?: unknown; model?: unknown };
-    return {
-        provider: typeof msg.provider === "string" ? msg.provider : undefined,
-        model: typeof msg.model === "string" ? msg.model : undefined,
-    };
+	if (!message || typeof message !== "object") {
+		return { provider: undefined, model: undefined };
+	}
+	const msg = message as { provider?: unknown; model?: unknown };
+	return {
+		provider: typeof msg.provider === "string" ? msg.provider : undefined,
+		model: typeof msg.model === "string" ? msg.model : undefined,
+	};
 }
 
 const piUsageBoundLogSeen = new Set<string>();
@@ -799,12 +801,12 @@ export async function persistPiPressureFromMessageEnd(args: {
 
 /** Plugin version from package.json. */
 const PLUGIN_VERSION: string = (() => {
-    try {
-        const req = createRequire(import.meta.url);
-        return (req("../package.json") as { version: string }).version;
-    } catch {
-        return "0.0.0";
-    }
+	try {
+		const req = createRequire(import.meta.url);
+		return (req("../package.json") as { version: string }).version;
+	} catch {
+		return "0.0.0";
+	}
 })();
 
 /** Lock the harness at module load. Safe to import this file in tests; the
@@ -827,11 +829,17 @@ setHarness(PI_HARNESS_KIND);
 
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
-	optionsOrHarness?: { embeddedModelRegistry?: ModelRegistry; forbidExternalPiCli?: boolean } | PiHarnessKind,
+	optionsOrHarness?:
+		| { embeddedModelRegistry?: ModelRegistry; forbidExternalPiCli?: boolean }
+		| PiHarnessKind,
 	harnessArg: PiHarnessKind = PI_HARNESS_KIND,
 ): PiHistorianOptions | undefined {
-	const harness = typeof optionsOrHarness === "string" ? optionsOrHarness : harnessArg;
-	const options = typeof optionsOrHarness === "object" && optionsOrHarness !== null ? optionsOrHarness : undefined;
+	const harness =
+		typeof optionsOrHarness === "string" ? optionsOrHarness : harnessArg;
+	const options =
+		typeof optionsOrHarness === "object" && optionsOrHarness !== null
+			? optionsOrHarness
+			: undefined;
 	// Defensive: schema declares `historian` required with default {}, but the
 	// runtime config can come from a malformed JSONC merge that drops the
 	// field. Fall back to undefined-safe access so plugin load never crashes.
@@ -892,18 +900,22 @@ export function resolveHistorianFromConfig(
 	};
 }
 
-function resolveAutoSearchFromConfig(config: MagicContextConfig): PiAutoSearchHandlerOptions {
-    const auto = config.memory.auto_search;
-    const enabled = auto?.enabled ?? false;
-    return {
-        enabled,
-        scoreThreshold: auto?.score_threshold ?? 0.55,
-        minPromptChars: auto?.min_prompt_chars ?? 20,
-    };
+function resolveAutoSearchFromConfig(
+	config: MagicContextConfig,
+): PiAutoSearchHandlerOptions {
+	const auto = config.memory.auto_search;
+	const enabled = auto?.enabled ?? false;
+	return {
+		enabled,
+		scoreThreshold: auto?.score_threshold ?? 0.55,
+		minPromptChars: auto?.min_prompt_chars ?? 20,
+	};
 }
 
-export function resolveDreamerFromConfig(config: MagicContextConfig): DreamerConfig | undefined {
-    return config.dreamer?.disable === true ? undefined : config.dreamer;
+export function resolveDreamerFromConfig(
+	config: MagicContextConfig,
+): DreamerConfig | undefined {
+	return config.dreamer?.disable === true ? undefined : config.dreamer;
 }
 
 /**
@@ -918,22 +930,26 @@ const embeddedRuntime = process.env.GAMEBUDDY_EMBEDDED_RUNTIME === "1";
 let embeddedModelRegistry: ModelRegistry | undefined;
 
 export type EmbeddedHistorianRuntimeBinding = Readonly<{
-    bind: (registry: ModelRegistry) => boolean;
+	bind: (registry: ModelRegistry) => boolean;
 }>;
 
 /** Process-private production seam used by the embedding Host after session construction. */
-export function getEmbeddedHistorianRuntimeBinding(): EmbeddedHistorianRuntimeBinding | undefined {
-    return activeEmbeddedHistorianRuntimeBinding;
+export function getEmbeddedHistorianRuntimeBinding():
+	| EmbeddedHistorianRuntimeBinding
+	| undefined {
+	return activeEmbeddedHistorianRuntimeBinding;
 }
 
-let activeEmbeddedHistorianRuntimeBinding: EmbeddedHistorianRuntimeBinding | undefined = embeddedRuntime
-    ? Object.freeze({
-        bind(registry: ModelRegistry): boolean {
-            embeddedModelRegistry = registry;
-            return true;
-        },
-    })
-    : undefined;
+const activeEmbeddedHistorianRuntimeBinding:
+	| EmbeddedHistorianRuntimeBinding
+	| undefined = embeddedRuntime
+	? Object.freeze({
+			bind(registry: ModelRegistry): boolean {
+				embeddedModelRegistry = registry;
+				return true;
+			},
+		})
+	: undefined;
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	if (process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV] === "1") {
@@ -1082,9 +1098,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
  * runtime without requiring a process restart.
  */
 async function startPiMagicContextRuntime(
-    pi: ExtensionAPI,
-    database: ContextDatabase,
-    dbPath: string,
+	pi: ExtensionAPI,
+	database: ContextDatabase,
+	dbPath: string,
 ): Promise<void> {
 	const db = database;
 
@@ -1307,12 +1323,12 @@ async function startPiMagicContextRuntime(
 		historian: hist,
 		bindHistorianRunner: embeddedRuntime
 			? (ctx) => {
-				const registry = ctx.modelRegistry;
-				embeddedModelRegistry = registry;
-				if (hist?.runner instanceof EmbeddedPiHistorianRunner) {
-					hist.runner.bindModelRegistry(registry);
+					const registry = ctx.modelRegistry;
+					embeddedModelRegistry = registry;
+					if (hist?.runner instanceof EmbeddedPiHistorianRunner) {
+						hist.runner.bindModelRegistry(registry);
+					}
 				}
-			}
 			: undefined,
 		language: cfg.language,
 		autoSearch: auto,
@@ -1595,7 +1611,6 @@ async function startPiMagicContextRuntime(
 			: "registered auto-search hint: DISABLED (memory.auto_search.enabled=false)",
 	);
 
-
 	// Register the shared renderer before any command can append a status entry.
 	// Plain custom entries render in interactive Pi without entering model context.
 	const statusEntryRendererAvailable = registerCtxStatusEntryRenderer(pi);
@@ -1608,10 +1623,17 @@ async function startPiMagicContextRuntime(
 	// Step 5c: register the diagnostic/admin slash commands so Pi reaches
 	// command-surface parity with the OpenCode plugin. Their user-facing output
 	// uses model-invisible custom entries when the runtime can render them.
-	const cliAuthoringDisabled = embeddedRuntime || embeddedRuntimeDisablesCliAuthoringCommands();
-	const recompRunner = cliAuthoringDisabled ? undefined : new PiSubagentRunner();
-	const wrapupRunner = cliAuthoringDisabled ? undefined : new PiSubagentRunner();
-	const upgradeRunner = cliAuthoringDisabled ? undefined : new PiSubagentRunner();
+	const cliAuthoringDisabled =
+		embeddedRuntime || embeddedRuntimeDisablesCliAuthoringCommands();
+	const recompRunner = cliAuthoringDisabled
+		? undefined
+		: new PiSubagentRunner();
+	const wrapupRunner = cliAuthoringDisabled
+		? undefined
+		: new PiSubagentRunner();
+	const upgradeRunner = cliAuthoringDisabled
+		? undefined
+		: new PiSubagentRunner();
 	registerCtxStatusCommand(pi, {
 		db,
 		projectIdentity,
@@ -1668,131 +1690,135 @@ async function startPiMagicContextRuntime(
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run
 	// concurrently with normal historian, and giving each its own runner
 	// avoids cross-cancellation. Same model + fallback chain as historian.
-	if (recompRunner) registerCtxRecompCommand(pi, {
-		db,
-		runner: recompRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
-		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
-		language: bootProjectDeps.config.language,
-		memoryEnabled: bootProjectDeps.config.memory.enabled,
-		autoPromote: bootProjectDeps.config.memory.auto_promote,
-		compactionOff,
-		resolveRuntimeDeps: (ctx) => {
-			const current = resolveCurrentProjectDeps(ctx);
-			return {
-				db,
-				runner: recompRunner,
-				historianModel: current.historianConfig?.model,
-				historianChunkTokens: deriveHistorianChunkTokens(
-					resolveHistorianContextLimit(current.historianConfig?.model),
-				),
-				historianFallbacks: current.historianConfig?.fallbackModels,
-				historianTimeoutMs: current.config.historian_timeout_ms,
-				historianThinkingLevel: current.historianConfig?.thinkingLevel,
-				language: current.config.language,
-				memoryEnabled: current.config.memory.enabled,
-				autoPromote: current.config.memory.auto_promote,
-				compactionOff,
-			};
-		},
-	});
+	if (recompRunner)
+		registerCtxRecompCommand(pi, {
+			db,
+			runner: recompRunner,
+			historianModel: bootProjectDeps.historianConfig?.model,
+			historianChunkTokens: deriveHistorianChunkTokens(
+				resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+			),
+			historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+			historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+			historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+			language: bootProjectDeps.config.language,
+			memoryEnabled: bootProjectDeps.config.memory.enabled,
+			autoPromote: bootProjectDeps.config.memory.auto_promote,
+			compactionOff,
+			resolveRuntimeDeps: (ctx) => {
+				const current = resolveCurrentProjectDeps(ctx);
+				return {
+					db,
+					runner: recompRunner,
+					historianModel: current.historianConfig?.model,
+					historianChunkTokens: deriveHistorianChunkTokens(
+						resolveHistorianContextLimit(current.historianConfig?.model),
+					),
+					historianFallbacks: current.historianConfig?.fallbackModels,
+					historianTimeoutMs: current.config.historian_timeout_ms,
+					historianThinkingLevel: current.historianConfig?.thinkingLevel,
+					language: current.config.language,
+					memoryEnabled: current.config.memory.enabled,
+					autoPromote: current.config.memory.auto_promote,
+					compactionOff,
+				};
+			},
+		});
 	info("registered /ctx-recomp");
 
-	if (wrapupRunner) registerCtxWrapupCommand(pi, {
-		db,
-		runner: wrapupRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
-		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
-		language: bootProjectDeps.config.language,
-		memoryEnabled: bootProjectDeps.config.memory.enabled,
-		autoPromote: bootProjectDeps.config.memory.auto_promote,
-		compactionOff,
-		userMemoriesEnabled: userMemoryCollectionEnabled(
-			bootProjectDeps.config.dreamer,
-		),
-		executeThresholdPercentage:
-			bootProjectDeps.config.execute_threshold_percentage,
-		executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
-		resolveRuntimeDeps: (ctx) => {
-			const current = resolveCurrentProjectDeps(ctx);
-			return {
-				db,
-				runner: wrapupRunner,
-				historianModel: current.historianConfig?.model,
-				historianChunkTokens: deriveHistorianChunkTokens(
-					resolveHistorianContextLimit(current.historianConfig?.model),
-				),
-				historianFallbacks: current.historianConfig?.fallbackModels,
-				historianTimeoutMs: current.config.historian_timeout_ms,
-				historianThinkingLevel: current.historianConfig?.thinkingLevel,
-				language: current.config.language,
-				memoryEnabled: current.config.memory.enabled,
-				autoPromote: current.config.memory.auto_promote,
-				compactionOff,
-				userMemoriesEnabled: userMemoryCollectionEnabled(
-					current.config.dreamer,
-				),
-				executeThresholdPercentage: current.config.execute_threshold_percentage,
-				executeThresholdTokens: current.config.execute_threshold_tokens,
-			};
-		},
-	});
+	if (wrapupRunner)
+		registerCtxWrapupCommand(pi, {
+			db,
+			runner: wrapupRunner,
+			historianModel: bootProjectDeps.historianConfig?.model,
+			historianChunkTokens: deriveHistorianChunkTokens(
+				resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+			),
+			historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+			historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+			historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+			language: bootProjectDeps.config.language,
+			memoryEnabled: bootProjectDeps.config.memory.enabled,
+			autoPromote: bootProjectDeps.config.memory.auto_promote,
+			compactionOff,
+			userMemoriesEnabled: userMemoryCollectionEnabled(
+				bootProjectDeps.config.dreamer,
+			),
+			executeThresholdPercentage:
+				bootProjectDeps.config.execute_threshold_percentage,
+			executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
+			resolveRuntimeDeps: (ctx) => {
+				const current = resolveCurrentProjectDeps(ctx);
+				return {
+					db,
+					runner: wrapupRunner,
+					historianModel: current.historianConfig?.model,
+					historianChunkTokens: deriveHistorianChunkTokens(
+						resolveHistorianContextLimit(current.historianConfig?.model),
+					),
+					historianFallbacks: current.historianConfig?.fallbackModels,
+					historianTimeoutMs: current.config.historian_timeout_ms,
+					historianThinkingLevel: current.historianConfig?.thinkingLevel,
+					language: current.config.language,
+					memoryEnabled: current.config.memory.enabled,
+					autoPromote: current.config.memory.auto_promote,
+					compactionOff,
+					userMemoriesEnabled: userMemoryCollectionEnabled(
+						current.config.dreamer,
+					),
+					executeThresholdPercentage:
+						current.config.execute_threshold_percentage,
+					executeThresholdTokens: current.config.execute_threshold_tokens,
+				};
+			},
+		});
 	info("registered /ctx-wrapup");
 
 	// E6b/E6c: /ctx-session-upgrade — full recomp (legacy→v2 tiered) + once-per-
 	// project memory migration into the 5-category taxonomy. Own runner instance
 	// for the same isolation reasons as /ctx-recomp.
-	if (upgradeRunner) registerCtxSessionUpgradeCommand(pi, {
-		db,
-		runner: upgradeRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
-		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
-		language: bootProjectDeps.config.language,
-		memoryEnabled: bootProjectDeps.config.memory.enabled,
-		allowHomeProject: bootProjectDeps.config.allow_home_project,
-		autoPromote: bootProjectDeps.config.memory.auto_promote,
-		compactionOff,
-		userMemoriesEnabled: userMemoryCollectionEnabled(
-			bootProjectDeps.config.dreamer,
-		),
-		resolveRuntimeDeps: (ctx) => {
-			const current = resolveCurrentProjectDeps(ctx);
-			return {
-				db,
-				runner: upgradeRunner,
-				historianModel: current.historianConfig?.model,
-				historianChunkTokens: deriveHistorianChunkTokens(
-					resolveHistorianContextLimit(current.historianConfig?.model),
-				),
-				historianFallbacks: current.historianConfig?.fallbackModels,
-				historianTimeoutMs: current.config.historian_timeout_ms,
-				historianThinkingLevel: current.historianConfig?.thinkingLevel,
-				language: current.config.language,
-				memoryEnabled: current.config.memory.enabled,
-				allowHomeProject: current.config.allow_home_project,
-				autoPromote: current.config.memory.auto_promote,
-				compactionOff,
-				userMemoriesEnabled: userMemoryCollectionEnabled(
-					current.config.dreamer,
-				),
-			};
-		},
-	});
+	if (upgradeRunner)
+		registerCtxSessionUpgradeCommand(pi, {
+			db,
+			runner: upgradeRunner,
+			historianModel: bootProjectDeps.historianConfig?.model,
+			historianChunkTokens: deriveHistorianChunkTokens(
+				resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+			),
+			historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
+			historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
+			historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
+			language: bootProjectDeps.config.language,
+			memoryEnabled: bootProjectDeps.config.memory.enabled,
+			allowHomeProject: bootProjectDeps.config.allow_home_project,
+			autoPromote: bootProjectDeps.config.memory.auto_promote,
+			compactionOff,
+			userMemoriesEnabled: userMemoryCollectionEnabled(
+				bootProjectDeps.config.dreamer,
+			),
+			resolveRuntimeDeps: (ctx) => {
+				const current = resolveCurrentProjectDeps(ctx);
+				return {
+					db,
+					runner: upgradeRunner,
+					historianModel: current.historianConfig?.model,
+					historianChunkTokens: deriveHistorianChunkTokens(
+						resolveHistorianContextLimit(current.historianConfig?.model),
+					),
+					historianFallbacks: current.historianConfig?.fallbackModels,
+					historianTimeoutMs: current.config.historian_timeout_ms,
+					historianThinkingLevel: current.historianConfig?.thinkingLevel,
+					language: current.config.language,
+					memoryEnabled: current.config.memory.enabled,
+					allowHomeProject: current.config.allow_home_project,
+					autoPromote: current.config.memory.auto_promote,
+					compactionOff,
+					userMemoriesEnabled: userMemoryCollectionEnabled(
+						current.config.dreamer,
+					),
+				};
+			},
+		});
 	info("registered /ctx-session-upgrade");
 
 	registerCtxDreamCommand(pi, {
@@ -2707,13 +2733,13 @@ function registerPiSubagentInitContextCleanup(
  * naive interpolation printed the map form as `[object Object]%`.
  */
 function formatExecuteThresholdForLog(
-    value: number | { default: number; [modelKey: string]: number } | undefined,
+	value: number | { default: number; [modelKey: string]: number } | undefined,
 ): string {
-    if (value === undefined) return "65%";
-    if (typeof value === "number") return `${value}%`;
-    const overrides = Object.entries(value)
-        .filter(([key]) => key !== "default")
-        .map(([key, pct]) => `${key}=${pct}%`);
-    const base = `${value.default}%`;
-    return overrides.length > 0 ? `${base} (${overrides.join(", ")})` : base;
+	if (value === undefined) return "65%";
+	if (typeof value === "number") return `${value}%`;
+	const overrides = Object.entries(value)
+		.filter(([key]) => key !== "default")
+		.map(([key, pct]) => `${key}=${pct}%`);
+	const base = `${value.default}%`;
+	return overrides.length > 0 ? `${base} (${overrides.join(", ")})` : base;
 }

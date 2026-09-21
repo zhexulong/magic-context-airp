@@ -26,15 +26,15 @@
  */
 
 import {
+	factCategoriesForDomain,
+	type MemoryDomain,
+} from "@magic-context/core/features/magic-context/memory/domain";
+import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
 	getMemoriesByProjects,
 	readNewMemoriesForM1Union,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import {
-	factCategoriesForDomain,
-	type MemoryDomain,
-} from "@magic-context/core/features/magic-context/memory/domain";
 import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "@magic-context/core/features/magic-context/mural/resolve-mural";
@@ -91,14 +91,14 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
+import { sessionLog as logSession } from "@magic-context/core/shared/logger";
+import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 import {
 	type GameBuddyStableContextMaterialization,
 	type GameBuddyStableContextSourceRecord,
 	renderGameBuddyVolatileContextBlock,
 } from "./gamebuddy-stable-context-source";
-import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
-import { sessionLog as logSession } from "@magic-context/core/shared/logger";
-import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 
 /**
@@ -876,11 +876,22 @@ function setCachedBoundary(
  * refreshes them before prompt materialization, while a DEFER maintenance pass
  * still calls injectM0M1Pi with its own `recomputeM1ThisPass=false` contract.
  */
-function m1CoverageAdvancedPi(db: ContextDatabase, state: PiM0M1State): boolean {
+function m1CoverageAdvancedPi(
+	db: ContextDatabase,
+	state: PiM0M1State,
+): boolean {
 	const row = readCachedPiM0M1Row(db, state.sessionId);
-	if (!row || row.cached_m1_max_memory_id === null || row.cached_m1_max_memory_mutation_id === null) return true;
+	if (
+		!row ||
+		row.cached_m1_max_memory_id === null ||
+		row.cached_m1_max_memory_mutation_id === null
+	)
+		return true;
 	const current = readCurrentMarkers(db, state, undefined);
-	return current.maxMemoryId > row.cached_m1_max_memory_id || current.maxMemoryMutationId > row.cached_m1_max_memory_mutation_id;
+	return (
+		current.maxMemoryId > row.cached_m1_max_memory_id ||
+		current.maxMemoryMutationId > row.cached_m1_max_memory_mutation_id
+	);
 }
 
 function getCachedMarkers(
@@ -1638,7 +1649,11 @@ export function materializeM0Pi(
 	// Phase 1 (no lock): read markers + render. Rendering can be slow, so we do
 	// it OUTSIDE the write lock to keep the BEGIN IMMEDIATE critical section tiny.
 	const docs = passSnapshot?.projectDocs ?? readProjectDocsForPiM0(state);
-	if (passSnapshot && typeof passSnapshot === "object" && passSnapshot.projectDocs === undefined) {
+	if (
+		passSnapshot &&
+		typeof passSnapshot === "object" &&
+		passSnapshot.projectDocs === undefined
+	) {
 		passSnapshot.projectDocs = docs;
 	}
 	const foldMaterializedAt = Date.now();
@@ -2480,12 +2495,27 @@ function softRefreshCachedM1Pi(args: {
 		const memPath = memoryProjectPath(args.state);
 		const maxMemoryId = memPath
 			? workspace.isWorkspaced
-				? getMaxMemoryIdForProjects(args.db, workspace.expandedIdentities, workspace.ownIdentities, workspace.shareCategories, markers.materializedAt)
-				: getMaxMemoryIdForProjects(args.db, [memPath], [memPath], undefined, markers.materializedAt)
+				? getMaxMemoryIdForProjects(
+						args.db,
+						workspace.expandedIdentities,
+						workspace.ownIdentities,
+						workspace.shareCategories,
+						markers.materializedAt,
+					)
+				: getMaxMemoryIdForProjects(
+						args.db,
+						[memPath],
+						[memPath],
+						undefined,
+						markers.materializedAt,
+					)
 			: 0;
 		const maxMemoryMutationId = memPath
 			? workspace.isWorkspaced
-				? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
+				? (getMaxMemoryMutationIdForProjects(
+						args.db,
+						workspace.expandedIdentities,
+					) ?? 0)
 				: (getMaxMemoryMutationId(args.db, memPath) ?? 0)
 			: 0;
 		// Advance the persisted trim boundary to the latest compartment now rendered
@@ -2508,7 +2538,13 @@ function softRefreshCachedM1Pi(args: {
 			.prepare(
 				"UPDATE session_meta SET cached_m1_bytes = ?, cached_m1_max_memory_id = ?, cached_m1_max_memory_mutation_id = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
 			)
-			.run(m1Bytes, maxMemoryId, maxMemoryMutationId, advancedBoundary, args.state.sessionId);
+			.run(
+				m1Bytes,
+				maxMemoryId,
+				maxMemoryMutationId,
+				advancedBoundary,
+				args.state.sessionId,
+			);
 		args.db.exec("COMMIT");
 		logSlowWriteTransaction("pi_soft_refresh_cache", transactionStartedAt);
 		return {
@@ -2838,7 +2874,10 @@ export function injectM0M1Pi(
 		m1Recomputed = true;
 	} else if (contentionExhausted) {
 		// m[1] was replayed with the cached m[0] pair above.
-	} else if (recomputeM1ThisPass || (allowExternalMemoryRefresh && m1CoverageAdvancedPi(db, state))) {
+	} else if (
+		recomputeM1ThisPass ||
+		(allowExternalMemoryRefresh && m1CoverageAdvancedPi(db, state))
+	) {
 		try {
 			const refreshed = softRefreshCachedM1Pi({
 				state,
@@ -3029,22 +3068,40 @@ export function injectM0M1Pi(
 	// runs after provider-bound bytes are frozen and a concurrent writer could
 	// otherwise credit a revision absent from those bytes.
 	const cachedRow = readCachedPiM0M1Row(db, state.sessionId);
-	const cachedMaterializedIds = new Set(parseMemoryBlockIds(cachedRow?.memory_block_ids ?? null));
+	const cachedMaterializedIds = new Set(
+		parseMemoryBlockIds(cachedRow?.memory_block_ids ?? null),
+	);
 	if (memPath && cachedRow) {
 		const candidates = workspace.isWorkspaced
-			? getMemoriesByProjects(db, workspace.expandedIdentities, ["active", "permanent"], cachedRow.cached_m0_materialized_at ?? Date.now(), workspace.ownIdentities, workspace.shareCategories)
-			: getMemoriesByProject(db, memPath, ["active", "permanent"], cachedRow.cached_m0_materialized_at ?? Date.now());
-		for (const memory of filterMemoriesForDomain(candidates, state.memoryDomain)) {
+			? getMemoriesByProjects(
+					db,
+					workspace.expandedIdentities,
+					["active", "permanent"],
+					cachedRow.cached_m0_materialized_at ?? Date.now(),
+					workspace.ownIdentities,
+					workspace.shareCategories,
+				)
+			: getMemoriesByProject(
+					db,
+					memPath,
+					["active", "permanent"],
+					cachedRow.cached_m0_materialized_at ?? Date.now(),
+				);
+		for (const memory of filterMemoriesForDomain(
+			candidates,
+			state.memoryDomain,
+		)) {
 			if (!cachedMaterializedIds.has(memory.id)) continue;
-			if (memory.category === "SEMANTIC_MEMORY") materializedMemoryCategoryCounts.SEMANTIC_MEMORY += 1;
-			if (memory.category === "INTERACTION_EPISODE") materializedMemoryCategoryCounts.INTERACTION_EPISODE += 1;
+			if (memory.category === "SEMANTIC_MEMORY")
+				materializedMemoryCategoryCounts.SEMANTIC_MEMORY += 1;
+			if (memory.category === "INTERACTION_EPISODE")
+				materializedMemoryCategoryCounts.INTERACTION_EPISODE += 1;
 		}
 	}
 	const result: PiM0M1InjectionResult = {
 		injected: true,
-	m1MaxMemoryMutationId:
-			cachedRow?.cached_m1_max_memory_mutation_id ?? 0,
-	materializedMemoryCategoryCounts,
+		m1MaxMemoryMutationId: cachedRow?.cached_m1_max_memory_mutation_id ?? 0,
+		materializedMemoryCategoryCounts,
 		compartmentCount: currentCompartments.length,
 		factCount: 0, // v2: facts retired as a render source (facts = promoted memories)
 		memoryCount,

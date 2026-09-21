@@ -6,8 +6,8 @@ import {
 	getSessionFacts,
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { excludeMemorySource } from "@magic-context/core/features/magic-context/memory/source-exclusion";
+import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	getHistorianFailureState,
 	getOverflowState,
@@ -335,9 +335,13 @@ describe("runPiHistorian", () => {
 	it("keeps the direct test invocation unreachable from production config", async () => {
 		const db = createTestDb();
 		const holderId = "test-direct-invocation";
-		expect(acquireCompartmentLease(db, "ses-historian", holderId)).not.toBeNull();
+		expect(
+			acquireCompartmentLease(db, "ses-historian", holderId),
+		).not.toBeNull();
 		const runner = runnerReturning([
-			ongoingInteractionSuccessXml("The player explicitly confirmed a durable preference."),
+			ongoingInteractionSuccessXml(
+				"The player explicitly confirmed a durable preference.",
+			),
 		]);
 		const previousNodeEnv = process.env.NODE_ENV;
 		process.env.NODE_ENV = "test";
@@ -358,7 +362,9 @@ describe("runPiHistorian", () => {
 			});
 			expect(runner.run).toHaveBeenCalledTimes(1);
 			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
-			expect(getMemoriesByProject(db, resolveProjectIdentity(process.cwd()))).toHaveLength(0);
+			expect(
+				getMemoriesByProject(db, resolveProjectIdentity(process.cwd())),
+			).toHaveLength(0);
 		} finally {
 			if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
 			else process.env.NODE_ENV = previousNodeEnv;
@@ -686,9 +692,15 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			expect(runner.run).toHaveBeenCalledTimes(1);
-			const prompt = (runner.run as unknown as { mock: { calls: Array<[{ systemPrompt: string }]> } }).mock.calls[0][0].systemPrompt;
+			const prompt = (
+				runner.run as unknown as {
+					mock: { calls: Array<[{ systemPrompt: string }]> };
+				}
+			).mock.calls[0][0].systemPrompt;
 			expect(prompt).toContain("Ongoing Interaction Memory Domain");
-			expect(prompt).toContain("We finished organizing tools during this game.");
+			expect(prompt).toContain(
+				"We finished organizing tools during this game.",
+			);
 			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
 			const projectPath = resolveProjectIdentity(process.cwd());
 			expect(getMemoriesByProject(db, projectPath)).toEqual([]);
@@ -707,10 +719,9 @@ describe("runPiHistorian", () => {
 		try {
 			expect(runner.run).toHaveBeenCalledTimes(1);
 			const projectPath = resolveProjectIdentity(process.cwd());
-				expect(getMemoriesByProject(db, projectPath).map((memory) => memory.category)).toEqual([
-				"INTERACTION_EPISODE",
-				"SEMANTIC_MEMORY",
-			]);
+			expect(
+				getMemoriesByProject(db, projectPath).map((memory) => memory.category),
+			).toEqual(["INTERACTION_EPISODE", "SEMANTIC_MEMORY"]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -760,7 +771,9 @@ describe("runPiHistorian", () => {
 			},
 		});
 		try {
-			expect(getMemoriesByProject(db, resolveProjectIdentity(process.cwd()))).toEqual([]);
+			expect(
+				getMemoriesByProject(db, resolveProjectIdentity(process.cwd())),
+			).toEqual([]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -773,14 +786,17 @@ describe("runPiHistorian", () => {
 			memoryEnabled: true,
 		});
 		try {
-			expect(getMemoriesByProject(db, resolveProjectIdentity(process.cwd()))).toEqual([]);
+			expect(
+				getMemoriesByProject(db, resolveProjectIdentity(process.cwd())),
+			).toEqual([]);
 		} finally {
 			closeQuietly(db);
 		}
 	});
 
 	it("promotes only an explicit ongoing-interaction semantic fact through the existing lifecycle", async () => {
-		const fact = "The player explicitly prefers being offered options before a consequential decision.";
+		const fact =
+			"The player explicitly prefers being offered options before a consequential decision.";
 		const { db } = await runHistorianWith({
 			outputs: [ongoingInteractionSuccessXml(fact)],
 			memoryDomain: "ongoing-interaction",
@@ -791,7 +807,11 @@ describe("runPiHistorian", () => {
 			const projectPath = resolveProjectIdentity(process.cwd());
 			const memories = getMemoriesByProject(db, projectPath);
 			expect(memories).toEqual([
-				expect.objectContaining({ category: "SEMANTIC_MEMORY", content: fact, sourceType: "historian" }),
+				expect.objectContaining({
+					category: "SEMANTIC_MEMORY",
+					content: fact,
+					sourceType: "historian",
+				}),
 			]);
 			expect(JSON.parse(memories[0]?.metadataJson ?? "null")).toEqual({
 				source_refs: ["pi-range:ses-historian:1:2"],

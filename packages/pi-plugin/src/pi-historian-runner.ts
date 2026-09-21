@@ -50,6 +50,11 @@ import {
 	embedPromotedFacts,
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
+import {
+	factCategoriesForDomain,
+	historianSystemPromptForDomain,
+	type MemoryDomain,
+} from "@magic-context/core/features/magic-context/memory/domain";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
@@ -83,11 +88,6 @@ import {
 	HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "@magic-context/core/hooks/magic-context/compartment-runner-drop-queue";
-import {
-	factCategoriesForDomain,
-	historianSystemPromptForDomain,
-	type MemoryDomain,
-} from "@magic-context/core/features/magic-context/memory/domain";
 import {
 	buildHistorianFailureNotice,
 	buildHistorianRepairPrompt,
@@ -453,7 +453,9 @@ export interface PiHistorianDeps {
  * It exists so embedded runtime integrations can verify authoring without
  * manufacturing an unsafe near-limit player conversation.
  */
-export async function runPiHistorianForTest(deps: PiHistorianDeps): Promise<void> {
+export async function runPiHistorianForTest(
+	deps: PiHistorianDeps,
+): Promise<void> {
 	// This symbol is exported only from the dedicated test-gate module and has
 	// no config, command, tool, or production call site. It bypasses scheduler
 	// pressure only; all runner, lease, parser, validation, and publish paths
@@ -1233,7 +1235,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// can preserve coverage. In both cases, facts/observations/primers must not
 			// become durable memory from an unanchored range.
 			const skipUnanchoredPromotion =
-				discardedLast || (weakLookaheadFinalCompartment && forceKeepLastCompartment !== true);
+				discardedLast ||
+				(weakLookaheadFinalCompartment && forceKeepLastCompartment !== true);
 			// `forceKeepLastCompartment` is a test-only terminal probe path. It
 			// explicitly treats the retained final compartment as anchored so the
 			// shared admission/promotion lifecycle can be exercised without

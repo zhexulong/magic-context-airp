@@ -4,13 +4,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	archiveMemory,
 	getMemoriesByProject,
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
@@ -23,6 +23,7 @@ import {
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import { COMPARTMENT_RENDER_EPOCH } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { materializeGameBuddyAuthoredStableCatalog } from "./gamebuddy-stable-context-source";
 import {
 	__test,
 	clearM0M1PiCache,
@@ -34,7 +35,6 @@ import {
 	renderM0Pi,
 	renderM1Pi,
 } from "./inject-compartments-pi";
-import { materializeGameBuddyAuthoredStableCatalog } from "./gamebuddy-stable-context-source";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
 const stableContextBinding = {
@@ -44,10 +44,16 @@ const stableContextBinding = {
 };
 
 function canonicalStableJson(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(canonicalStableJson).join(",")}]`;
+	if (Array.isArray(value))
+		return `[${value.map(canonicalStableJson).join(",")}]`;
 	if (value !== null && typeof value === "object") {
 		const record = value as Record<string, unknown>;
-		return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalStableJson(record[key])}`).join(",")}}`;
+		return `{${Object.keys(record)
+			.sort()
+			.map(
+				(key) => `${JSON.stringify(key)}:${canonicalStableJson(record[key])}`,
+			)
+			.join(",")}}`;
 	}
 	return JSON.stringify(value);
 }
@@ -66,7 +72,11 @@ function stableContext(content: string, sources = true) {
 	const scope = {
 		...stableContextBinding,
 		threadId: "stable-source-thread",
-		profile: { profileId: "stable-source-profile", revision: 1, canonicalHash: "a".repeat(64) },
+		profile: {
+			profileId: "stable-source-profile",
+			revision: 1,
+			canonicalHash: "a".repeat(64),
+		},
 	};
 	const body = {
 		version: "gamebuddy-authored-context-catalog/v2" as const,
@@ -74,7 +84,12 @@ function stableContext(content: string, sources = true) {
 		stableSources: sources ? [source] : [],
 	};
 	return materializeGameBuddyAuthoredStableCatalog(
-		{ ...body, canonicalHash: createHash("sha256").update(canonicalStableJson(body)).digest("hex") },
+		{
+			...body,
+			canonicalHash: createHash("sha256")
+				.update(canonicalStableJson(body))
+				.digest("hex"),
+		},
 		scope,
 	);
 }
@@ -117,42 +132,82 @@ describe("GameBuddy stable source m[0] lifecycle", () => {
 			const initial = stableContext("initial premise");
 			const initialMessages = [user("first")];
 			injectM0M1Pi(
-				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: initial },
+				{
+					...stableContextBinding,
+					projectIdentity: "stable-source",
+					projectDirectory: process.cwd(),
+					stableContext: initial,
+				},
 				db,
 				initialMessages,
 			);
 			expect(textOf(initialMessages[0])).toContain("initial premise");
 
 			const replacement = stableContext("revised premise");
-			clearM0M1PiCache(db, stableContextBinding.sessionId, "test-authored-publication-replacement");
+			clearM0M1PiCache(
+				db,
+				stableContextBinding.sessionId,
+				"test-authored-publication-replacement",
+			);
 			const replacementMessages = [user("second")];
 			injectM0M1Pi(
-				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: replacement },
+				{
+					...stableContextBinding,
+					projectIdentity: "stable-source",
+					projectDirectory: process.cwd(),
+					stableContext: replacement,
+				},
 				db,
 				replacementMessages,
 			);
 			expect(textOf(replacementMessages[0])).not.toContain("initial premise");
 			expect(textOf(replacementMessages[0])).toContain("revised premise");
-			expect(replacementMessages.map(textOf).join("\n")).not.toContain("gamebuddy-authored-context-updates");
+			expect(replacementMessages.map(textOf).join("\n")).not.toContain(
+				"gamebuddy-authored-context-updates",
+			);
 
 			const tombstoneMessages = [user("third")];
-			clearM0M1PiCache(db, stableContextBinding.sessionId, "test-authored-publication-clear");
+			clearM0M1PiCache(
+				db,
+				stableContextBinding.sessionId,
+				"test-authored-publication-clear",
+			);
 			injectM0M1Pi(
-				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: stableContext("", false) },
+				{
+					...stableContextBinding,
+					projectIdentity: "stable-source",
+					projectDirectory: process.cwd(),
+					stableContext: stableContext("", false),
+				},
 				db,
 				tombstoneMessages,
 			);
 			expect(textOf(tombstoneMessages[0])).not.toContain("initial premise");
-			expect(tombstoneMessages.map(textOf).join("\n")).not.toContain("tombstone");
+			expect(tombstoneMessages.map(textOf).join("\n")).not.toContain(
+				"tombstone",
+			);
 
 			const hardFoldMessages = [user("fourth")];
 			injectM0M1Pi(
-				{ ...stableContextBinding, projectIdentity: "stable-source", projectDirectory: process.cwd(), stableContext: stableContext("", false), hardSignals: { systemHash: "", modelKey: "new-model", cacheExpired: false, lastResponseTime: 0 } },
+				{
+					...stableContextBinding,
+					projectIdentity: "stable-source",
+					projectDirectory: process.cwd(),
+					stableContext: stableContext("", false),
+					hardSignals: {
+						systemHash: "",
+						modelKey: "new-model",
+						cacheExpired: false,
+						lastResponseTime: 0,
+					},
+				},
 				db,
 				hardFoldMessages,
 			);
 			expect(textOf(hardFoldMessages[0])).not.toContain("initial premise");
-			expect(hardFoldMessages.map(textOf).join("\n")).not.toContain("gamebuddy-authored-context-updates");
+			expect(hardFoldMessages.map(textOf).join("\n")).not.toContain(
+				"gamebuddy-authored-context-updates",
+			);
 		} finally {
 			db.close();
 		}
@@ -635,7 +690,8 @@ describe("ongoing-interaction read-only injection", () => {
 			insertMemory(db, {
 				projectPath: own.projectIdentity,
 				category: "INTERACTION_EPISODE",
-				content: "The player and Companion agreed to revisit the named topic later.",
+				content:
+					"The player and Companion agreed to revisit the named topic later.",
 				sourceType: "agent",
 			});
 			insertMemory(db, {
@@ -647,29 +703,62 @@ describe("ongoing-interaction read-only injection", () => {
 			insertMemory(db, {
 				projectPath: other.projectIdentity,
 				category: "SEMANTIC_MEMORY",
-				content: "Other continuity memory must not cross the opaque project scope.",
+				content:
+					"Other continuity memory must not cross the opaque project scope.",
 				sourceType: "historian",
 			});
 
 			const ownMessages = [userMessage("hello", 10)];
-			injectM0M1Pi({ ...own, memoryEnabled: true, memoryDomain: "ongoing-interaction" }, db, ownMessages as never, undefined, true);
+			injectM0M1Pi(
+				{ ...own, memoryEnabled: true, memoryDomain: "ongoing-interaction" },
+				db,
+				ownMessages as never,
+				undefined,
+				true,
+			);
 			const ownM0 = textOf(ownMessages[0] as never);
-			expect(ownM0).toContain("The player prefers options before consequential decisions.");
-			expect(ownM0).toContain("The player and Companion agreed to revisit the named topic later.");
+			expect(ownM0).toContain(
+				"The player prefers options before consequential decisions.",
+			);
+			expect(ownM0).toContain(
+				"The player and Companion agreed to revisit the named topic later.",
+			);
 			expect(ownM0).not.toContain("Coding taxonomy must not appear");
 			expect(ownM0).not.toContain("Other continuity memory must not cross");
 
 			const otherMessages = [userMessage("hello", 10)];
-			injectM0M1Pi({ ...other, memoryEnabled: true, memoryDomain: "ongoing-interaction" }, db, otherMessages as never, undefined, true);
+			injectM0M1Pi(
+				{ ...other, memoryEnabled: true, memoryDomain: "ongoing-interaction" },
+				db,
+				otherMessages as never,
+				undefined,
+				true,
+			);
 			const otherM0 = textOf(otherMessages[0] as never);
-			expect(otherM0).toContain("Other continuity memory must not cross the opaque project scope.");
-			expect(otherM0).not.toContain("The player prefers options before consequential decisions.");
+			expect(otherM0).toContain(
+				"Other continuity memory must not cross the opaque project scope.",
+			);
+			expect(otherM0).not.toContain(
+				"The player prefers options before consequential decisions.",
+			);
 
 			const disabled = piState("ses-ongoing-disabled", ownCwd);
 			const memoryDisabled = [userMessage("hello", 10)];
-			injectM0M1Pi({ ...disabled, memoryEnabled: false, memoryDomain: "ongoing-interaction" }, db, memoryDisabled as never, undefined, true);
+			injectM0M1Pi(
+				{
+					...disabled,
+					memoryEnabled: false,
+					memoryDomain: "ongoing-interaction",
+				},
+				db,
+				memoryDisabled as never,
+				undefined,
+				true,
+			);
 			const disabledM0 = textOf(memoryDisabled[0] as never);
-			expect(disabledM0).not.toContain("The player prefers options before consequential decisions.");
+			expect(disabledM0).not.toContain(
+				"The player prefers options before consequential decisions.",
+			);
 			expect(disabledM0).not.toContain("Coding taxonomy must not appear");
 		} finally {
 			closeQuietly(db);
@@ -1475,7 +1564,9 @@ describe("injectM0M1Pi", () => {
 			const provider = [userMessage("provider", 20)];
 			injectM0M1Pi(state, db, provider as never, undefined, false, true);
 			expect(textOf(provider[0] as never)).toBe(initialM0);
-			expect(textOf(provider[1] as never)).toContain("Player-managed Memory arrives before this turn.");
+			expect(textOf(provider[1] as never)).toContain(
+				"Player-managed Memory arrives before this turn.",
+			);
 			const deferred = [userMessage("defer", 30)];
 			injectM0M1Pi(state, db, deferred as never, undefined, false, false);
 			expect(textOf(deferred[1] as never)).toBe(textOf(provider[1] as never));
@@ -1487,7 +1578,9 @@ describe("injectM0M1Pi", () => {
 	it("refreshes a player mutation across separate Chat and Game sessions on their next provider invocations", () => {
 		const db = createTestDb();
 		const sharedCwd = mkdtempSync(join(tmpdir(), "pi-cross-surface-memory-"));
-		const foreignCwd = mkdtempSync(join(tmpdir(), "pi-cross-surface-memory-foreign-"));
+		const foreignCwd = mkdtempSync(
+			join(tmpdir(), "pi-cross-surface-memory-foreign-"),
+		);
 		try {
 			const chat = {
 				...piState("chat-surface-session", sharedCwd),
@@ -1520,23 +1613,51 @@ describe("injectM0M1Pi", () => {
 				actor: { principal: "player_direct", delegated: false },
 				projectPath: chat.projectIdentity,
 				category: "SEMANTIC_MEMORY",
-				content: "The player prefers calm options before consequential decisions.",
+				content:
+					"The player prefers calm options before consequential decisions.",
 				sourceType: "agent",
 			});
 
 			const gameNextInvocation = [userMessage("Game next", 20)];
-			injectM0M1Pi(game, db, gameNextInvocation as never, undefined, false, true);
+			injectM0M1Pi(
+				game,
+				db,
+				gameNextInvocation as never,
+				undefined,
+				false,
+				true,
+			);
 			expect(textOf(gameNextInvocation[0] as never)).toBe(gameM0);
-			expect(textOf(gameNextInvocation[1] as never)).toContain("The player prefers calm options");
+			expect(textOf(gameNextInvocation[1] as never)).toContain(
+				"The player prefers calm options",
+			);
 
 			const chatReturnInvocation = [userMessage("Chat return", 30)];
-			injectM0M1Pi(chat, db, chatReturnInvocation as never, undefined, false, true);
+			injectM0M1Pi(
+				chat,
+				db,
+				chatReturnInvocation as never,
+				undefined,
+				false,
+				true,
+			);
 			expect(textOf(chatReturnInvocation[0] as never)).toBe(chatM0);
-			expect(textOf(chatReturnInvocation[1] as never)).toContain("The player prefers calm options");
+			expect(textOf(chatReturnInvocation[1] as never)).toContain(
+				"The player prefers calm options",
+			);
 
 			const foreignInvocation = [userMessage("Foreign continuity", 40)];
-			injectM0M1Pi(foreign, db, foreignInvocation as never, undefined, false, true);
-			expect(`${textOf(foreignInvocation[0] as never)}${textOf(foreignInvocation[1] as never)}`).not.toContain("The player prefers calm options");
+			injectM0M1Pi(
+				foreign,
+				db,
+				foreignInvocation as never,
+				undefined,
+				false,
+				true,
+			);
+			expect(
+				`${textOf(foreignInvocation[0] as never)}${textOf(foreignInvocation[1] as never)}`,
+			).not.toContain("The player prefers calm options");
 		} finally {
 			rmSync(sharedCwd, { recursive: true, force: true });
 			rmSync(foreignCwd, { recursive: true, force: true });

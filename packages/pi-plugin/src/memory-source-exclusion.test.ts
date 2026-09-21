@@ -31,22 +31,36 @@ describe("memory source exclusions", () => {
 			"host-receipt:contains\nnewline",
 			"host-receipt:contains\u0000null",
 		]) {
-			expect(() => validateMemorySourceRef(ref)).toThrow("Invalid memory source reference");
+			expect(() => validateMemorySourceRef(ref)).toThrow(
+				"Invalid memory source reference",
+			);
 		}
 	});
 
 	it("isolates exclusions by project and stores only the opaque reference", () => {
 		const db = createTestDb();
 		try {
-			expect(isMemorySourceExcluded(db, { projectPath: "/project/a", sourceRef })).toBe(false);
+			expect(
+				isMemorySourceExcluded(db, { projectPath: "/project/a", sourceRef }),
+			).toBe(false);
 			excludeMemorySource(db, { projectPath: "/project/a", sourceRef });
 			excludeMemorySource(db, { projectPath: "/project/a", sourceRef });
 
-			expect(isMemorySourceExcluded(db, { projectPath: "/project/a", sourceRef })).toBe(true);
-			expect(isMemorySourceExcluded(db, { projectPath: "/project/b", sourceRef })).toBe(false);
+			expect(
+				isMemorySourceExcluded(db, { projectPath: "/project/a", sourceRef }),
+			).toBe(true);
+			expect(
+				isMemorySourceExcluded(db, { projectPath: "/project/b", sourceRef }),
+			).toBe(false);
 			const rows = db
-				.prepare("SELECT project_path, source_ref, created_at FROM memory_source_exclusions")
-				.all() as Array<{ project_path: string; source_ref: string; created_at: number }>;
+				.prepare(
+					"SELECT project_path, source_ref, created_at FROM memory_source_exclusions",
+				)
+				.all() as Array<{
+				project_path: string;
+				source_ref: string;
+				created_at: number;
+			}>;
 			expect(rows).toHaveLength(1);
 			expect(rows[0].project_path).toBe("/project/a");
 			expect(rows[0].source_ref).toBe(sourceRef);

@@ -39,7 +39,8 @@ afterEach(() => {
 	closeDatabase();
 	if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
 	else process.env.XDG_DATA_HOME = prevDataHome;
-	if (prevTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+	if (prevTestDataDir === undefined)
+		delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 	else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = prevTestDataDir;
 	// `node:sqlite` can retain a SQLite file handle until its prepared
 	// statements are garbage-collected on Windows. The migration assertions have
@@ -47,11 +48,20 @@ afterEach(() => {
 	// deliberately best-effort so a host file-lock detail cannot turn every
 	// behavioral test red or strand the Bun worker.
 	try {
-		rmSync(tempHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 });
+		rmSync(tempHome, {
+			recursive: true,
+			force: true,
+			maxRetries: 3,
+			retryDelay: 25,
+		});
 	} catch (error) {
 		if ((error as { code?: string }).code !== "EBUSY") throw error;
 		const cleanupMarker = join(tempHome, ".cleanup-pending");
-		try { closeSync(openSync(cleanupMarker, "w")); } catch { /* best effort */ }
+		try {
+			closeSync(openSync(cleanupMarker, "w"));
+		} catch {
+			/* best effort */
+		}
 	}
 });
 
