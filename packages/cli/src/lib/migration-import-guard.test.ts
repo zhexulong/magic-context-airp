@@ -11,6 +11,9 @@ const SOURCE_ROOTS = ["packages/cli/src", "packages/plugin/src", "packages/pi-pl
 const ALLOWED_RUN_MIGRATIONS_IMPORTS = new Set([
     "packages/cli/src/commands/doctor-repair-db.ts",
     "packages/plugin/src/features/magic-context/storage-db.ts",
+    // airp fork: embedded Pi-historian authoring gate initializes an in-memory
+    // ContextDatabase and runs the same migration set before the probe path.
+    "packages/pi-plugin/src/embedded-historian-gate.ts",
 ]);
 
 function sourceFiles(directory: string): string[] {
@@ -37,7 +40,8 @@ describe("schema migration import boundary", () => {
         const offenders: string[] = [];
         for (const root of SOURCE_ROOTS) {
             for (const path of sourceFiles(resolve(REPOSITORY_ROOT, root))) {
-                const relativePath = relative(REPOSITORY_ROOT, path);
+                // Normalize Windows separators so the allow-list matches on any OS.
+                const relativePath = relative(REPOSITORY_ROOT, path).replaceAll("\\", "/");
                 if (hasRunMigrationsImport(readFileSync(path, "utf8"))) {
                     if (!ALLOWED_RUN_MIGRATIONS_IMPORTS.has(relativePath)) {
                         offenders.push(relativePath);
