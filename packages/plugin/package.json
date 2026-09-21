@@ -32,6 +32,9 @@
     "src/agents",
     "src/features/magic-context/dreamer/cron.ts",
     "src/features/magic-context/dreamer/task-registry.ts",
+    "src/features/magic-context/memory/domain.ts",
+    "src/hooks/magic-context/historian-prompt.generated.ts",
+    "src/hooks/magic-context/ongoing-interaction-historian-prompt.generated.ts",
     "README.md"
   ],
   "scripts": {
