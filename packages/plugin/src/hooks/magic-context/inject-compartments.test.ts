@@ -2592,9 +2592,14 @@ describe("m[0]/m[1] materialization", () => {
         const beforePin = pin(before);
         const afterPin = pin(after);
 
+        // airp semantics: defer refreshes m[1] when memory coverage advances
+        // (the expiry archive bumps the max memory mutation id), without
+        // rebuilding m[0]. The archived memory must surface as removed in the
+        // refreshed volatile block rather than staying byte-pinned.
         expect(beforePin).toBe("4eaba563c2a26f33c8e4087f199a0e31620b6e3d7adc8981b5c2d88a12fe10d4");
-        expect(afterPin).toBe(beforePin);
+        expect(afterPin).not.toBe(beforePin);
         expect(after.m0RematerializedThisPass).toBe(false);
+        expect(after.m1Text ?? "").toContain(`<removed id="${expiring.id}"/>`);
         expect(db.prepare("SELECT status FROM memories WHERE id = ?").get(expiring.id)).toEqual({
             status: "archived",
         });
@@ -3565,3 +3570,4 @@ describe("m[0]/m[1] materialization", () => {
         });
     });
 });
+

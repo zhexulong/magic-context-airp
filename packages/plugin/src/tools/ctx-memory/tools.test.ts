@@ -731,10 +731,14 @@ describe("createCtxMemoryTools", () => {
                 expect(winnerInsert).not.toBeNull();
                 const memories = getMemoriesByProject(db1, "/repo/project");
 
-                expect(winnerInsert?.inserted).toBe(true);
-                expect(loserResult).toContain("Memory already exists");
-                expect(memories).toHaveLength(1);
-                expect(memories[0]?.seenCount).toBe(2);
+				expect(winnerInsert?.inserted).toBe(true);
+				expect(loserResult).toContain("Memory already exists");
+				expect(memories).toHaveLength(1);
+				// airp semantics: a duplicate create that loses the race returns the
+				// existing immutable revision without bumping seen_count (duplicate
+				// create must not mutate updated_at or invalidate the caller's state
+				// token). The winner's insert set seen_count to 1.
+				expect(memories[0]?.seenCount).toBe(1);
             } finally {
                 closeQuietly(db1);
                 closeQuietly(db2);
