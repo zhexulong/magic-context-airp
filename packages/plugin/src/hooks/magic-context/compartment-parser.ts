@@ -172,7 +172,9 @@ export function extractTiersFromInner(inner: string): {
 }
 
 function factCategoryRegex(categories: readonly string[]): RegExp {
-    const alternatives = categories.map((category) => category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    const alternatives = categories
+        .map((category) => category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("|");
     return new RegExp(`<(${alternatives})>(.*?)<\\/\\1>`, "gs");
 }
 

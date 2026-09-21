@@ -35,10 +35,7 @@ function validateInput({ projectPath, sourceRef }: MemorySourceExclusionInput): 
 }
 
 /** Persist an idempotent, project-scoped exclusion without retaining source content. */
-export function excludeMemorySource(
-    db: Database,
-    input: MemorySourceExclusionInput,
-): void {
+export function excludeMemorySource(db: Database, input: MemorySourceExclusionInput): void {
     validateInput(input);
     db.prepare(
         `INSERT OR IGNORE INTO memory_source_exclusions (project_path, source_ref, created_at)
@@ -47,10 +44,7 @@ export function excludeMemorySource(
 }
 
 /** Return whether an exact opaque source reference is excluded for this project. */
-export function isMemorySourceExcluded(
-    db: Database,
-    input: MemorySourceExclusionInput,
-): boolean {
+export function isMemorySourceExcluded(db: Database, input: MemorySourceExclusionInput): boolean {
     validateInput(input);
     return (
         db

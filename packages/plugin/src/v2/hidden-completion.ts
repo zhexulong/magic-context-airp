@@ -1,7 +1,7 @@
 import {
-    HiddenCompletionRefusal,
     type HiddenCompletion,
     type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
     type HiddenRunHandle,
     type HiddenRunIdentity,
 } from "../hooks/magic-context/compartment-runner-types";

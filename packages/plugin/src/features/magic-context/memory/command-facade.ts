@@ -5,8 +5,8 @@ import { excludeMemorySource, validateMemorySourceRef } from "./source-exclusion
 import {
     archiveMemory,
     deleteMemory,
-    getMemoryById,
     getMemoriesByProject,
+    getMemoryById,
     insertMemoryIdempotent,
     supersededMemory,
     updateMemoryContent,
@@ -173,15 +173,18 @@ export class MemoryCommandFacade {
     /** Read views remain project-bound at the facade boundary; callers never query arbitrary IDs. */
     list(projectPath: string): MemoryCommandResult[] {
         requireProjectPath(projectPath);
-        return getMemoriesByProject(this.db, projectPath, ["active", "permanent", "archived"])
-            .map((memory) => ({ memory, stateToken: createMemoryStateToken(memory) }));
+        return getMemoriesByProject(this.db, projectPath, ["active", "permanent", "archived"]).map(
+            (memory) => ({ memory, stateToken: createMemoryStateToken(memory) }),
+        );
     }
 
     create(input: MemoryCommandCreateInput): MemoryCommandResult {
         return this.createWithCommitReceipt(input).value;
     }
 
-    createWithCommitReceipt(input: MemoryCommandCreateInput): MemoryCommandCommitResult<MemoryCommandResult> {
+    createWithCommitReceipt(
+        input: MemoryCommandCreateInput,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
         requireProjectPath(input.projectPath);
         return runMutation(this.db, () => {
             const { actor, ...memoryInput } = input;
@@ -196,10 +199,16 @@ export class MemoryCommandFacade {
                         : (memoryInput.metadataJson ?? null),
             });
             const mutation = queueMemoryMutation(this.db, {
-                projectPath: memory.projectPath, mutationType: "update", targetMemoryId: memory.id,
-                category: memory.category, newContent: memory.content,
+                projectPath: memory.projectPath,
+                mutationType: "update",
+                targetMemoryId: memory.id,
+                category: memory.category,
+                newContent: memory.content,
             });
-            return { value: result(this.db, input.projectPath, memory.id), committedMemoryMutationId: mutation.id };
+            return {
+                value: result(this.db, input.projectPath, memory.id),
+                committedMemoryMutationId: mutation.id,
+            };
         });
     }
 
@@ -234,7 +243,9 @@ export class MemoryCommandFacade {
         return this.updateWithCommitReceipt(input).value;
     }
 
-    updateWithCommitReceipt(input: MemoryCommandUpdateInput): MemoryCommandCommitResult<MemoryCommandResult> {
+    updateWithCommitReceipt(
+        input: MemoryCommandUpdateInput,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
         const content = input.content.trim();
         if (!content) throw new Error("Memory content must not be empty");
         return runMutation(this.db, () => {
@@ -246,14 +257,23 @@ export class MemoryCommandFacade {
                 setMetadata(this.db, updated.id, playerGovernedMetadata(updated.metadataJson));
             }
             const mutation = queueMemoryMutation(this.db, {
-                projectPath: memory.projectPath, mutationType: "update", targetMemoryId: memory.id,
-                category: memory.category, newContent: content,
+                projectPath: memory.projectPath,
+                mutationType: "update",
+                targetMemoryId: memory.id,
+                category: memory.category,
+                newContent: content,
             });
-            return { value: result(this.db, input.projectPath, memory.id), committedMemoryMutationId: mutation.id };
+            return {
+                value: result(this.db, input.projectPath, memory.id),
+                committedMemoryMutationId: mutation.id,
+            };
         });
     }
 
-    archiveByStateToken(input: Omit<MemoryCommandMutationInput, "id">, reason?: string): MemoryCommandResult {
+    archiveByStateToken(
+        input: Omit<MemoryCommandMutationInput, "id">,
+        reason?: string,
+    ): MemoryCommandResult {
         return runMutation(this.db, () => {
             const memory = this.requireMemoryByStateToken(input);
             if (reason === undefined) updateMemoryStatus(this.db, memory.id, "archived");
@@ -267,29 +287,65 @@ export class MemoryCommandFacade {
         });
     }
 
-    archive(input: MemoryCommandMutationInput, reason?: string): MemoryCommandResult { return this.archiveWithCommitReceipt(input, reason).value; }
-    archiveWithCommitReceipt(input: MemoryCommandMutationInput, reason?: string): MemoryCommandCommitResult<MemoryCommandResult> { return this.transitionWithCommitReceipt(input, "archived", "archive", reason); }
-    restore(input: MemoryCommandMutationInput): MemoryCommandResult { return this.restoreWithCommitReceipt(input).value; }
-    restoreWithCommitReceipt(input: MemoryCommandMutationInput): MemoryCommandCommitResult<MemoryCommandResult> { return this.transitionWithCommitReceipt(input, "active"); }
-    pin(input: MemoryCommandMutationInput): MemoryCommandResult { return this.pinWithCommitReceipt(input).value; }
-    pinWithCommitReceipt(input: MemoryCommandMutationInput): MemoryCommandCommitResult<MemoryCommandResult> { return this.transitionWithCommitReceipt(input, "permanent"); }
-    unpin(input: MemoryCommandMutationInput): MemoryCommandResult { return this.unpinWithCommitReceipt(input).value; }
-    unpinWithCommitReceipt(input: MemoryCommandMutationInput): MemoryCommandCommitResult<MemoryCommandResult> { return this.transitionWithCommitReceipt(input, "active"); }
+    archive(input: MemoryCommandMutationInput, reason?: string): MemoryCommandResult {
+        return this.archiveWithCommitReceipt(input, reason).value;
+    }
+    archiveWithCommitReceipt(
+        input: MemoryCommandMutationInput,
+        reason?: string,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
+        return this.transitionWithCommitReceipt(input, "archived", "archive", reason);
+    }
+    restore(input: MemoryCommandMutationInput): MemoryCommandResult {
+        return this.restoreWithCommitReceipt(input).value;
+    }
+    restoreWithCommitReceipt(
+        input: MemoryCommandMutationInput,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
+        return this.transitionWithCommitReceipt(input, "active");
+    }
+    pin(input: MemoryCommandMutationInput): MemoryCommandResult {
+        return this.pinWithCommitReceipt(input).value;
+    }
+    pinWithCommitReceipt(
+        input: MemoryCommandMutationInput,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
+        return this.transitionWithCommitReceipt(input, "permanent");
+    }
+    unpin(input: MemoryCommandMutationInput): MemoryCommandResult {
+        return this.unpinWithCommitReceipt(input).value;
+    }
+    unpinWithCommitReceipt(
+        input: MemoryCommandMutationInput,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
+        return this.transitionWithCommitReceipt(input, "active");
+    }
 
-    deleteEntry(input: MemoryCommandMutationInput): void { this.deleteEntryWithCommitReceipt(input); }
-    deleteEntryWithCommitReceipt(input: MemoryCommandMutationInput): MemoryCommandCommitResult<void> {
+    deleteEntry(input: MemoryCommandMutationInput): void {
+        this.deleteEntryWithCommitReceipt(input);
+    }
+    deleteEntryWithCommitReceipt(
+        input: MemoryCommandMutationInput,
+    ): MemoryCommandCommitResult<void> {
         return runMutation(this.db, () => {
             const memory = requireCurrentMutableMemory(this.db, input);
             deleteMemory(this.db, memory.id);
-            const mutation = queueMemoryMutation(this.db, { projectPath: memory.projectPath, mutationType: "delete", targetMemoryId: memory.id });
+            const mutation = queueMemoryMutation(this.db, {
+                projectPath: memory.projectPath,
+                mutationType: "delete",
+                targetMemoryId: memory.id,
+            });
             return { value: undefined, committedMemoryMutationId: mutation.id };
         });
     }
 
-    excludeSourcesWithCommitReceipt(input: MemoryCommandExcludeSourceInput): MemoryCommandCommitResult<void> {
+    excludeSourcesWithCommitReceipt(
+        input: MemoryCommandExcludeSourceInput,
+    ): MemoryCommandCommitResult<void> {
         return runMutation(this.db, () => {
             const memory = requireCurrentMutableMemory(this.db, input);
-            if (input.sourceRefs.length === 0) throw new Error("Memory source reference is required");
+            if (input.sourceRefs.length === 0)
+                throw new Error("Memory source reference is required");
             for (const sourceRef of input.sourceRefs) {
                 validateMemorySourceRef(sourceRef);
                 excludeMemorySource(this.db, { projectPath: memory.projectPath, sourceRef });
@@ -308,26 +364,43 @@ export class MemoryCommandFacade {
         });
     }
 
-    merge(input: MemoryCommandMergeInput): MemoryCommandResult { return this.mergeWithCommitReceipt(input).value; }
-    mergeWithCommitReceipt(input: MemoryCommandMergeInput): MemoryCommandCommitResult<MemoryCommandResult> {
+    merge(input: MemoryCommandMergeInput): MemoryCommandResult {
+        return this.mergeWithCommitReceipt(input).value;
+    }
+    mergeWithCommitReceipt(
+        input: MemoryCommandMergeInput,
+    ): MemoryCommandCommitResult<MemoryCommandResult> {
         return runMutation(this.db, () => {
             const source = requireCurrentMutableMemory(this.db, input);
-            const target = getMemoriesByProject(this.db, source.projectPath, ["active", "permanent", "archived"])
-                .find((memory) => createMemoryStateToken(memory) === input.targetStateToken);
-            if (!target || target.id === source.id) throw new Error("Memory merge target was not found");
+            const target = getMemoriesByProject(this.db, source.projectPath, [
+                "active",
+                "permanent",
+                "archived",
+            ]).find((memory) => createMemoryStateToken(memory) === input.targetStateToken);
+            if (!target || target.id === source.id)
+                throw new Error("Memory merge target was not found");
             assertMutationAuthorized(target, input.actor);
             supersededMemory(this.db, source.id, target.id);
-            const mutation = queueMemoryMutation(this.db, { projectPath: source.projectPath, mutationType: "superseded", targetMemoryId: source.id, supersededById: target.id });
-            return { value: result(this.db, source.projectPath, target.id), committedMemoryMutationId: mutation.id };
+            const mutation = queueMemoryMutation(this.db, {
+                projectPath: source.projectPath,
+                mutationType: "superseded",
+                targetMemoryId: source.id,
+                supersededById: target.id,
+            });
+            return {
+                value: result(this.db, source.projectPath, target.id),
+                committedMemoryMutationId: mutation.id,
+            };
         });
     }
 
-    private requireMemoryByStateToken(
-        input: Omit<MemoryCommandMutationInput, "id">,
-    ): Memory {
+    private requireMemoryByStateToken(input: Omit<MemoryCommandMutationInput, "id">): Memory {
         requireProjectPath(input.projectPath);
-        const memory = getMemoriesByProject(this.db, input.projectPath, ["active", "permanent", "archived"])
-            .find((candidate) => createMemoryStateToken(candidate) === input.stateToken);
+        const memory = getMemoriesByProject(this.db, input.projectPath, [
+            "active",
+            "permanent",
+            "archived",
+        ]).find((candidate) => createMemoryStateToken(candidate) === input.stateToken);
         if (!memory) throw new Error("Memory state token was not found or is stale");
         assertMutationAuthorized(memory, input.actor);
         return memory;
@@ -344,10 +417,15 @@ export class MemoryCommandFacade {
             if (mutationType === "archive") archiveMemory(this.db, memory.id, reason);
             else updateMemoryStatus(this.db, memory.id, status);
             const mutation = queueMemoryMutation(this.db, {
-                projectPath: memory.projectPath, mutationType: mutationType ?? "update", targetMemoryId: memory.id,
+                projectPath: memory.projectPath,
+                mutationType: mutationType ?? "update",
+                targetMemoryId: memory.id,
                 category: mutationType ? undefined : "__mc_visibility__",
             });
-            return { value: result(this.db, input.projectPath, memory.id), committedMemoryMutationId: mutation.id };
+            return {
+                value: result(this.db, input.projectPath, memory.id),
+                committedMemoryMutationId: mutation.id,
+            };
         });
     }
 }

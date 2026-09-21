@@ -4,9 +4,9 @@ import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { createV1HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
 import {
-    HiddenCompletionRefusal,
     type HiddenCompletion,
     type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
     type HiddenRunHandle,
 } from "../../../hooks/magic-context/compartment-runner-types";
 import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";

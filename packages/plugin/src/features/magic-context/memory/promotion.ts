@@ -1,11 +1,11 @@
 import { sessionLog } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
+import type { MemoryDomain } from "./domain";
 import { embedTextForProject } from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
-import { areMemorySourcesEligible } from "./source-exclusion";
 import { isOngoingInteractionDurableFactAdmissible } from "./ongoing-interaction-admission";
-import type { MemoryDomain } from "./domain";
+import { areMemorySourcesEligible } from "./source-exclusion";
 import {
     getMemoryByHash,
     getMemoryById,

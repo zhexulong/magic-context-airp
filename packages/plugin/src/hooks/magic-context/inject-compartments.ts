@@ -2936,7 +2936,10 @@ function replayCachedM1(state: M0M1State): string {
     return decodeM0Bytes(state.cachedM1Bytes) ?? M1_EMPTY_PLACEHOLDER;
 }
 
-function currentM1Coverage(options: M0M1RenderOptions, markers: M0SnapshotMarkers): {
+function currentM1Coverage(
+    options: M0M1RenderOptions,
+    markers: M0SnapshotMarkers,
+): {
     maxMemoryId: number;
     maxMemoryMutationId: number;
 } {

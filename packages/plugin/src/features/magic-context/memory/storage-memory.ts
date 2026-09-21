@@ -253,8 +253,12 @@ function isUniqueConstraintError(error: unknown): boolean {
     // Bun's SQLite adapter reports SQLITE_CONSTRAINT_UNIQUE, while Node's
     // node:sqlite reports ERR_SQLITE_ERROR plus SQLite extended errcode 2067.
     // Both represent the same exact-hash dedup race handled below.
-    return sqlite.code === "SQLITE_CONSTRAINT_UNIQUE"
-        || (sqlite.code === "ERR_SQLITE_ERROR" && sqlite.errcode === 2067 && sqlite.errstr === "constraint failed");
+    return (
+        sqlite.code === "SQLITE_CONSTRAINT_UNIQUE" ||
+        (sqlite.code === "ERR_SQLITE_ERROR" &&
+            sqlite.errcode === 2067 &&
+            sqlite.errstr === "constraint failed")
+    );
 }
 
 function isNullableString(value: unknown): value is string | null {

@@ -70,16 +70,27 @@ describe("MemoryCommandFacade", () => {
         db = makeDatabase();
         const facade = new MemoryCommandFacade(db);
         const created = facade.createWithCommitReceipt({
-            actor: player, projectPath: "/repo", category: "USER_DIRECTIVES", content: "Exact receipt",
+            actor: player,
+            projectPath: "/repo",
+            category: "USER_DIRECTIVES",
+            content: "Exact receipt",
         });
         const update = facade.updateWithCommitReceipt({
-            actor: player, projectPath: "/repo", id: created.value.memory.id,
-            stateToken: created.value.stateToken, content: "Exact final receipt",
+            actor: player,
+            projectPath: "/repo",
+            id: created.value.memory.id,
+            stateToken: created.value.stateToken,
+            content: "Exact final receipt",
         });
         expect(update.committedMemoryMutationId).toBe(
-            (db.prepare("SELECT MAX(id) AS id FROM memory_mutation_log").get() as { id: number }).id,
+            (db.prepare("SELECT MAX(id) AS id FROM memory_mutation_log").get() as { id: number })
+                .id,
         );
-        expect(db.prepare("SELECT new_content FROM memory_mutation_log WHERE id = ?").get(update.committedMemoryMutationId)).toEqual({
+        expect(
+            db
+                .prepare("SELECT new_content FROM memory_mutation_log WHERE id = ?")
+                .get(update.committedMemoryMutationId),
+        ).toEqual({
             new_content: "Exact final receipt",
         });
     });
@@ -100,12 +111,14 @@ describe("MemoryCommandFacade", () => {
             content: "Updated player memory",
         });
         expect(updated.memory.content).toBe("Updated player memory");
-        expect(() => facade.updateByStateToken({
-            actor: player,
-            projectPath: "/repo",
-            stateToken: created.stateToken,
-            content: "Stale update",
-        })).toThrow(/not found or is stale/);
+        expect(() =>
+            facade.updateByStateToken({
+                actor: player,
+                projectPath: "/repo",
+                stateToken: created.stateToken,
+                content: "Stale update",
+            }),
+        ).toThrow(/not found or is stale/);
         const archived = facade.archiveByStateToken({
             actor: player,
             projectPath: "/repo",
@@ -229,25 +242,61 @@ describe("MemoryCommandFacade", () => {
     it("queues an active create even when storage deduplicates it, so a stale m[1] can refresh", () => {
         db = makeDatabase();
         const facade = new MemoryCommandFacade(db);
-        const first = facade.create({ actor: companion, projectPath: "/repo", category: "SEMANTIC_MEMORY", content: "We share a tea ritual." });
-        const second = facade.create({ actor: companion, projectPath: "/repo", category: "SEMANTIC_MEMORY", content: "We share a tea ritual." });
+        const first = facade.create({
+            actor: companion,
+            projectPath: "/repo",
+            category: "SEMANTIC_MEMORY",
+            content: "We share a tea ritual.",
+        });
+        const second = facade.create({
+            actor: companion,
+            projectPath: "/repo",
+            category: "SEMANTIC_MEMORY",
+            content: "We share a tea ritual.",
+        });
         expect(second.memory.id).toBe(first.memory.id);
         expect(second.stateToken).toBe(first.stateToken);
-        expect(db.prepare("SELECT seen_count FROM memories WHERE id = ?").get(first.memory.id)).toEqual({ seen_count: 1 });
-        expect(db.prepare("SELECT mutation_type, target_memory_id, category FROM memory_mutation_log ORDER BY id").all()).toEqual([
-            { mutation_type: "update", target_memory_id: first.memory.id, category: "SEMANTIC_MEMORY" },
-            { mutation_type: "update", target_memory_id: first.memory.id, category: "SEMANTIC_MEMORY" },
+        expect(
+            db.prepare("SELECT seen_count FROM memories WHERE id = ?").get(first.memory.id),
+        ).toEqual({ seen_count: 1 });
+        expect(
+            db
+                .prepare(
+                    "SELECT mutation_type, target_memory_id, category FROM memory_mutation_log ORDER BY id",
+                )
+                .all(),
+        ).toEqual([
+            {
+                mutation_type: "update",
+                target_memory_id: first.memory.id,
+                category: "SEMANTIC_MEMORY",
+            },
+            {
+                mutation_type: "update",
+                target_memory_id: first.memory.id,
+                category: "SEMANTIC_MEMORY",
+            },
         ]);
     });
 
     it("deduplicates the Node node:sqlite extended unique error exactly as Bun's unique code", () => {
         db = makeDatabase();
         const facade = new MemoryCommandFacade(db);
-        const first = facade.create({ actor: companion, projectPath: "/repo", category: "SEMANTIC_MEMORY", content: "Node SQLite duplicate." });
+        const first = facade.create({
+            actor: companion,
+            projectPath: "/repo",
+            category: "SEMANTIC_MEMORY",
+            content: "Node SQLite duplicate.",
+        });
         // node:sqlite reports ERR_SQLITE_ERROR / errcode 2067 instead of Bun's
         // SQLITE_CONSTRAINT_UNIQUE. The production facade must retain the
         // original immutable revision rather than leaking the raw constraint.
-        const second = facade.create({ actor: companion, projectPath: "/repo", category: "SEMANTIC_MEMORY", content: "Node SQLite duplicate." });
+        const second = facade.create({
+            actor: companion,
+            projectPath: "/repo",
+            category: "SEMANTIC_MEMORY",
+            content: "Node SQLite duplicate.",
+        });
         expect(second.memory.id).toBe(first.memory.id);
         expect(second.stateToken).toBe(first.stateToken);
     });
@@ -255,18 +304,44 @@ describe("MemoryCommandFacade", () => {
     it("merges a player-selected source into a same-project target", () => {
         db = makeDatabase();
         const facade = new MemoryCommandFacade(db);
-        const target = facade.create({ actor: player, projectPath: "/repo", category: "USER_DIRECTIVES", content: "Preferred plan" });
-        const source = facade.create({ actor: player, projectPath: "/repo", category: "USER_DIRECTIVES", content: "Old plan" });
+        const target = facade.create({
+            actor: player,
+            projectPath: "/repo",
+            category: "USER_DIRECTIVES",
+            content: "Preferred plan",
+        });
+        const source = facade.create({
+            actor: player,
+            projectPath: "/repo",
+            category: "USER_DIRECTIVES",
+            content: "Old plan",
+        });
         const merged = facade.merge({
-            projectPath: "/repo", id: source.memory.id, stateToken: source.stateToken,
-            targetStateToken: target.stateToken, actor: player,
+            projectPath: "/repo",
+            id: source.memory.id,
+            stateToken: source.stateToken,
+            targetStateToken: target.stateToken,
+            actor: player,
         });
         expect(merged.memory.id).toBe(target.memory.id);
-        expect(db.prepare("SELECT status, superseded_by_memory_id FROM memories WHERE id = ?").get(source.memory.id)).toEqual({
-            status: "archived", superseded_by_memory_id: target.memory.id,
+        expect(
+            db
+                .prepare("SELECT status, superseded_by_memory_id FROM memories WHERE id = ?")
+                .get(source.memory.id),
+        ).toEqual({
+            status: "archived",
+            superseded_by_memory_id: target.memory.id,
         });
-        expect(db.prepare("SELECT mutation_type, target_memory_id, superseded_by_id FROM memory_mutation_log ORDER BY id DESC LIMIT 1").get()).toEqual({
-            mutation_type: "superseded", target_memory_id: source.memory.id, superseded_by_id: target.memory.id,
+        expect(
+            db
+                .prepare(
+                    "SELECT mutation_type, target_memory_id, superseded_by_id FROM memory_mutation_log ORDER BY id DESC LIMIT 1",
+                )
+                .get(),
+        ).toEqual({
+            mutation_type: "superseded",
+            target_memory_id: source.memory.id,
+            superseded_by_id: target.memory.id,
         });
     });
 

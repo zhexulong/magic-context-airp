@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { parseCompartmentOutput } from "../../../hooks/magic-context/compartment-parser";
 import {
     DEFAULT_CODING_PROJECT_MEMORY_CATEGORIES,
     factCategoriesForDomain,
     historianSystemPromptForDomain,
     ONGOING_INTERACTION_MEMORY_CATEGORIES,
 } from "./domain";
-import { parseCompartmentOutput } from "../../../hooks/magic-context/compartment-parser";
 
 const interactionOutput = `<output>
 <compartments>
@@ -45,7 +45,8 @@ describe("ongoing-interaction memory domain", () => {
         expect(parsed.facts).toEqual([
             {
                 category: "SEMANTIC_MEMORY",
-                content: "The player explicitly prefers being offered options before a consequential decision.",
+                content:
+                    "The player explicitly prefers being offered options before a consequential decision.",
             },
             {
                 category: "INTERACTION_EPISODE",

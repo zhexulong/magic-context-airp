@@ -31,7 +31,6 @@ import {
     COMPARTMENT_AGENT_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./compartment-prompt";
-import { HiddenCompletionRefusal } from "./compartment-runner-types";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -41,6 +40,7 @@ import type {
     StoredCompartmentRange,
     ValidatedHistorianPassResult,
 } from "./compartment-runner-types";
+import { HiddenCompletionRefusal } from "./compartment-runner-types";
 import {
     buildHistorianRepairPrompt,
     type HistorianValidationChunk,

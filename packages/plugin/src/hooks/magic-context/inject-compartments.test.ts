@@ -2677,8 +2677,12 @@ describe("m[0]/m[1] materialization", () => {
             isCacheBustingPass: false,
         });
 
-        expect(renderedText(deferOne[1])).toContain("New additive memory appears only after a bust.");
-        expect(renderedText(deferTwo[1])).toContain("New additive memory appears only after a bust.");
+        expect(renderedText(deferOne[1])).toContain(
+            "New additive memory appears only after a bust.",
+        );
+        expect(renderedText(deferTwo[1])).toContain(
+            "New additive memory appears only after a bust.",
+        );
         expect(renderedText(deferOne[0])).toBe(renderedText(first[0]));
         expect(initialM1).not.toContain("New additive memory");
 

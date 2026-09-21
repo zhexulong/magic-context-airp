@@ -1,5 +1,5 @@
-import { ONGOING_INTERACTION_HISTORIAN_SYSTEM_PROMPT } from "../../../hooks/magic-context/ongoing-interaction-historian-prompt.generated";
 import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "../../../hooks/magic-context/historian-prompt.generated";
+import { ONGOING_INTERACTION_HISTORIAN_SYSTEM_PROMPT } from "../../../hooks/magic-context/ongoing-interaction-historian-prompt.generated";
 
 export const MEMORY_DOMAINS = ["coding-project", "ongoing-interaction"] as const;
 export type MemoryDomain = (typeof MEMORY_DOMAINS)[number];

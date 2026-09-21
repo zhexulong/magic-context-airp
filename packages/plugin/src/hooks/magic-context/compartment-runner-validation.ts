@@ -1,5 +1,8 @@
 import { withContentLanguageDirective } from "../../agents/language-directive";
-import { factCategoriesForDomain, type MemoryDomain } from "../../features/magic-context/memory/domain";
+import {
+    factCategoriesForDomain,
+    type MemoryDomain,
+} from "../../features/magic-context/memory/domain";
 import { renderUserFacingFailure } from "../../shared/user-facing-codes";
 import { parseCompartmentOutput } from "./compartment-parser";
 import { mapParsedCompartmentsToChunk } from "./compartment-runner-mapping";
