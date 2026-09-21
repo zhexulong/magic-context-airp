@@ -70,7 +70,7 @@ describe("Tavern provider-start observation", () => {
 
     it("is exact-session, one-shot, and unregister is opaque and exact-session", () => {
         const received: unknown[] = [];
-        const unregister = registerTavernProviderStartObserver("session_1", (observation) => {
+        registerTavernProviderStartObserver("session_1", (observation) => {
             received.push(observation);
         });
         expect(hasTavernProviderStartObserverForTest("session_1")).toBe(true);
@@ -83,7 +83,12 @@ describe("Tavern provider-start observation", () => {
         expect(observation.schema).toBe(TAVERN_PROVIDER_START_OBSERVATION_SCHEMA);
         expect(observation.sessionId).toBe("session_1");
         expect(observation.statusClass).toBe("success");
-        expect(Object.keys(observation).sort()).toEqual(["observedAtMs", "schema", "sessionId", "statusClass"]);
+        expect(Object.keys(observation).sort()).toEqual([
+            "observedAtMs",
+            "schema",
+            "sessionId",
+            "statusClass",
+        ]);
         // One-shot: a second fire must not invoke or write again.
         fireTavernProviderStartObservationForTest("session_1", "error");
         expect(received.length).toBe(1);
@@ -139,9 +144,16 @@ describe("Tavern provider-start observation", () => {
         const afterResponse = handlers.get("after_provider_response");
         if (!afterResponse) throw new Error("missing after_provider_response hook");
         const provider = (status: number) =>
-            afterResponse({ type: "after_provider_response", status, headers: { "x-secret": "must-not-leak" } }, {
-                sessionManager: { getSessionId: () => "session_1" },
-            });
+            afterResponse(
+                {
+                    type: "after_provider_response",
+                    status,
+                    headers: { "x-secret": "must-not-leak" },
+                },
+                {
+                    sessionManager: { getSessionId: () => "session_1" },
+                },
+            );
         provider(200);
         provider(201);
         expect((received[0] as Record<string, unknown>).statusClass).toBe("success");
@@ -190,11 +202,16 @@ describe("Tavern provider-start observation", () => {
     });
 
     it("keeps the before_provider_request narrative-gate IPC marker untouched", () => {
-        expect(TAVERN_NARRATIVE_GATE_MARKER_SCHEMA).toBe("gamebuddy-tavern-narrative-gate-marker/v1");
+        expect(TAVERN_NARRATIVE_GATE_MARKER_SCHEMA).toBe(
+            "gamebuddy-tavern-narrative-gate-marker/v1",
+        );
         const handlers = captureHandlers();
         expect(handlers.has("before_provider_request")).toBe(true);
         registerTavernProviderStartObserver("session_1", () => undefined);
-        const marker = registerTavernNarrativeGateMarker({ sessionId: "session_1", nonceSha256: digest });
+        const marker = registerTavernNarrativeGateMarker({
+            sessionId: "session_1",
+            nonceSha256: digest,
+        });
         const reports: unknown[] = [];
         const originalSend = process.send;
         const originalConnected = process.connected;
