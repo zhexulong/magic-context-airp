@@ -158,6 +158,15 @@ const FIELD_DEFS: FieldDef[] = [
     section: "Memory",
   },
   {
+    key: "memory.domain",
+    label: "Memory Domain",
+    type: "select",
+    options: ["coding-project", "ongoing-interaction"],
+    description:
+      "Memory interpretation domain. coding-project preserves upstream defaults; ongoing-interaction uses Episodic/Semantic boundaries.",
+    section: "Memory",
+  },
+  {
     key: "memory.injection_budget_tokens",
     label: "Injection Budget (tokens)",
     type: "number",

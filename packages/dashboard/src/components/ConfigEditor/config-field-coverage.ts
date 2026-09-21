@@ -45,6 +45,7 @@ export const RENDERED_PREFIXES: readonly string[] = [
   "embedding",
   // Memory
   "memory.enabled",
+  "memory.domain",
   "memory.injection_budget_tokens",
   "memory.auto_promote",
   "memory.retrieval_count_promotion_threshold",
