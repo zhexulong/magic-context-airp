@@ -131,6 +131,7 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 |---|---|---|---|
 | `memory` | object | — | Cross-session memory configuration |
 | `memory.enabled` | boolean | `true` | Enable cross-session memory (default: true) |
+| `memory.domain` | `"coding-project"` \\| `"ongoing-interaction"` | `"coding-project"` | Memory interpretation domain. coding-project preserves upstream defaults; ongoing-interaction uses Episodic/Semantic boundaries. |
 | `memory.injection_budget_tokens` | number (500–20000) | `4000` | Token budget for memory injection on session start (min: 500, max: 20000, default: 4000) |
 | `memory.auto_promote` | boolean | `true` | Automatically promote eligible session facts into memory (default: true) |
 | `memory.retrieval_count_promotion_threshold` | number (1–) | `3` | retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3) |

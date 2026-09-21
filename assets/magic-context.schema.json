@@ -2392,6 +2392,7 @@
     "memory": {
       "default": {
         "enabled": true,
+        "domain": "coding-project",
         "injection_budget_tokens": 4000,
         "auto_promote": true,
         "retrieval_count_promotion_threshold": 3,
@@ -2413,6 +2414,15 @@
           "default": true,
           "description": "Enable cross-session memory (default: true)",
           "type": "boolean"
+        },
+        "domain": {
+          "default": "coding-project",
+          "description": "Memory interpretation domain. coding-project preserves upstream defaults; ongoing-interaction uses Episodic/Semantic boundaries.",
+          "type": "string",
+          "enum": [
+            "coding-project",
+            "ongoing-interaction"
+          ]
         },
         "injection_budget_tokens": {
           "default": 4000,
