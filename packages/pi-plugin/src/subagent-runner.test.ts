@@ -3017,7 +3017,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			}),
 		);
 		const spawnArgs = spawnImpl.mock.calls[0]?.[1] as string[] | undefined;
-		expect(spawnArgs).toEqual([
+		// On Windows the prompt travels via stdin to avoid the CreateProcess argv cap;
+		// on POSIX the prompt is appended as the final positional message.
+		const expectedArgs = [
 			"--print",
 			"--mode",
 			"json",
@@ -3031,9 +3033,15 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			expect.stringMatching(/system-prompt\.txt$/),
 			"--model",
 			"anthropic/primary",
-			// On Windows the prompt travels via stdin to avoid the CreateProcess argv cap.
-		]);
-		expect(child.stdinText).toBe("summarize this session");
+		];
+		expect(spawnArgs).toEqual(
+			process.platform === "win32"
+				? expectedArgs
+				: [...expectedArgs, "summarize this session"],
+		);
+		if (process.platform === "win32") {
+			expect(child.stdinText).toBe("summarize this session");
+		}
 		const spawnOptions = spawnImpl.mock.calls[0]?.[2] as
 			| { env?: NodeJS.ProcessEnv }
 			| undefined;

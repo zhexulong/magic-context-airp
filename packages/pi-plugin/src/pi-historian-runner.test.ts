@@ -1216,7 +1216,20 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			expect(getCompartments(finalChunk.db, "ses-historian")).toHaveLength(1);
-			expect(getMemoriesByProject(finalChunk.db, projectPath)).toEqual([]);
+			// forceKeepLastCompartment is a test-only terminal probe path that
+			// explicitly treats the retained final compartment as anchored so the
+			// shared admission/promotion lifecycle can be exercised without
+			// inventing a near-limit player conversation. The fact therefore IS
+			// promoted into durable memory (anchored), unlike the token-capped
+			// mid-loop chunk above whose provisional tail was discarded.
+			expect(getMemoriesByProject(finalChunk.db, projectPath)).toEqual([
+				expect.objectContaining({
+					category: "PROJECT_RULES",
+					content: "Pi final wrapup facts stay deferred.",
+					sourceType: "historian",
+					status: "active",
+				}),
+			]);
 			const row = finalChunk.db
 				.prepare(
 					"SELECT facts_emitted, events_emitted, facts_by_category_json FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
@@ -1229,9 +1242,9 @@ describe("runPiHistorian", () => {
 			expect(row.facts_emitted).toBe(1);
 			expect(row.events_emitted).toBe(1);
 			expect(JSON.parse(row.facts_by_category_json)).toEqual(
-				expect.objectContaining({ facts_promoted: 0, events_published: 0 }),
+				expect.objectContaining({ facts_promoted: 1, events_published: 0 }),
 			);
-			expect(logSpy).toHaveBeenCalledWith(
+			expect(logSpy).not.toHaveBeenCalledWith(
 				"ses-historian",
 				expect.stringContaining(
 					"historian unanchored promotion skipped: reason=weak_lookahead_final_compartment",

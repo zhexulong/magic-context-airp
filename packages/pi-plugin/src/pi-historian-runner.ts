@@ -1268,7 +1268,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			});
 			const unanchoredPromotionSkipReason = discardedLast
 				? "discarded_last"
-				: weakLookaheadFinalCompartment
+				: weakLookaheadFinalCompartment && forceKeepLastCompartment !== true
 					? "weak_lookahead_final_compartment"
 					: null;
 			if (unanchoredPromotionSkipReason) {
