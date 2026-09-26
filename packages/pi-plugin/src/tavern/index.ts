@@ -31,3 +31,10 @@ export {
 	validateGameOperationalGateMarkerConfig,
 	validateTavernNarrativeGateMarkerConfig,
 } from "../tavern-narrative-gate-marker";
+
+export {
+	emitProbeFoldCommittedMarker,
+	emitProbeM0DigestMarker,
+	PROBE_FOLD_COMMITTED_PREFIX,
+	PROBE_M0_DIGEST_PREFIX,
+} from "../probe-materialization-marker";

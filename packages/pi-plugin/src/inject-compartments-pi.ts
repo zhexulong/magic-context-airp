@@ -25,6 +25,11 @@
  *     historyRefreshSessions signal.
  */
 
+import { createHash } from "node:crypto";
+import {
+	emitProbeFoldCommittedMarker,
+	emitProbeM0DigestMarker,
+} from "./probe-materialization-marker";
 import {
 	factCategoriesForDomain,
 	type MemoryDomain,
@@ -1861,6 +1866,22 @@ export function materializeM0Pi(
 	}
 }
 
+/**
+ * Compute the SHA-256 of the exact persisted m[0] bytes. Only the digest (never
+ * the text) is exposed through the Class B marker.
+ */
+function m0DigestHex(m0Bytes: Buffer) {
+	return createHash("sha256").update(m0Bytes).digest("hex");
+}
+
+/**
+ * The opaque fold revision: the materialization timestamp of the fold that was
+ * just committed. It is stable, content-free, and never exposes fold internals.
+ */
+function materializationRevision(snapshotMarkers: PiM0SnapshotMarkers) {
+	return String(snapshotMarkers.materializedAt);
+}
+
 /** Retry materializeM0Pi on contention (parity with OpenCode materializeWithRetry). */
 export function materializeM0PiWithRetry(
 	state: PiM0M1State,
@@ -2752,6 +2773,15 @@ export function injectM0M1Pi(
 	let markers: PiM0SnapshotMarkers | null = null;
 	let materialized = false;
 	let contentionExhausted = false;
+	// Pre-pass m[0] coverage. A fold means new compartment content is certified
+	// into the m[0] baseline, i.e. this watermark advances — the same definition
+	// the vendor's `rearmChannel2AfterCoverageAdvancingHardFold` uses. Captured as a
+	// primitive BEFORE the materializer runs so the comparison cannot observe its
+	// own write.
+	const m0CoverageBeforePass = normalizeCachedMaxCompartmentSeq(
+		snapshot.sessionMeta.cachedM0MaxCompartmentSeq ?? EMPTY_MAX_COMPARTMENT_SEQ,
+		currentCompartments,
+	);
 	let memoryUpdateCount = 0;
 	let m1Recomputed = false;
 	let freshFallbackRenderedMemoryIds: number[] | null = null;
@@ -2769,6 +2799,24 @@ export function injectM0M1Pi(
 			markers = result.snapshotMarkers;
 			materialized = true;
 			m1Recomputed = true;
+			// The HARD fold committed. `materializeM0PiWithRetry` only returns after its
+			// transaction COMMIT, so a crash in the pre-COMMIT window cannot claim
+			// durability. The marker fires only when m[0] coverage actually ADVANCED:
+			// `mustMaterializePi` also fires for busts that re-render the baseline
+			// without folding new compartments (`model_change`, `system_hash`,
+			// `project_change`), and `materializeM0Pi` is additionally reached for
+			// `cache_invalid` / `drift` repairs. Reporting those as folds would
+			// misposition the fold probe, so the gate is coverage advance.
+			if (
+				normalizeCachedMaxCompartmentSeq(
+					result.snapshotMarkers.maxCompartmentSeq,
+					currentCompartments,
+				) > m0CoverageBeforePass
+			) {
+				emitProbeFoldCommittedMarker(
+					materializationRevision(result.snapshotMarkers),
+				);
+			}
 		} catch (error) {
 			if (!(error instanceof PiMaterializeContentionError)) throw error;
 
@@ -3023,6 +3071,20 @@ export function injectM0M1Pi(
 	// claiming an image follows and keep the fallback internally consistent.
 	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
 	prependM0M1Messages(piMessages, m0, m1, muralWire);
+	// Every branch above (fresh materialization, cached replay, contention
+	// fallback) converges here on the exact m[0] bytes that go to the provider, so
+	// this is the one place a per-presentation digest can be taken without
+	// duplicating the decision tree. The marker is per pass, not per fold: the
+	// `prefix_bit_stability` dimension compares m[0] against a baseline on EVERY
+	// turn, so a digest emitted only on folds would leave the dimension blind. Only
+	// the digest leaves this process — never the bytes, which stay Magic
+	// Context-owned (memory architecture rule #538).
+	if (markers) {
+		emitProbeM0DigestMarker(
+			m0DigestHex(Buffer.from(m0, "utf8")),
+			materializationRevision(markers),
+		);
+	}
 	logSession(
 		state.sessionId,
 		`injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`,

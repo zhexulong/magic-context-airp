@@ -193,6 +193,10 @@ import {
 	processSystemPromptForCache,
 } from "./system-prompt";
 import { registerTavernNarrativeGateMarkerHook } from "./tavern-narrative-gate-marker";
+import {
+	emitProbeFoldCommittedMarker,
+	emitProbeM0DigestMarker,
+} from "./probe-materialization-marker";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
