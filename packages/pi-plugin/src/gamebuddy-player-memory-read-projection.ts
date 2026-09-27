@@ -26,14 +26,12 @@ export type GameBuddyPlayerMemoryProfileBinding = Readonly<{
 	runtimeCwd: string;
 	profileId: string;
 	profileRevision: number;
-	profileCanonicalHash: string;
 }>;
 
 export type GameBuddyPlayerMemoryReadInput = Readonly<{
 	continuityId: string;
 	profileId: string;
 	profileRevision: number;
-	profileCanonicalHash: string;
 }>;
 
 export type GameBuddyPlayerMemoryReadView = Readonly<{
@@ -80,11 +78,6 @@ export function validateMemoryProfileBinding(
 		args.profileRevision < 1
 	)
 		throw new Error("invalid_memory_profile_binding");
-	if (
-		typeof args.profileCanonicalHash !== "string" ||
-		!/^[a-f0-9]{64}$/.test(args.profileCanonicalHash)
-	)
-		throw new Error("invalid_memory_profile_binding");
 }
 
 export function assertMemoryProfileMatch(
@@ -103,11 +96,6 @@ export function assertMemoryProfileMatch(
 	if (
 		typeof input.profileRevision !== "number" ||
 		input.profileRevision !== bound.profileRevision
-	)
-		throw new Error("gamebuddy_memory_profile_mismatch");
-	if (
-		typeof input.profileCanonicalHash !== "string" ||
-		input.profileCanonicalHash !== bound.profileCanonicalHash
 	)
 		throw new Error("gamebuddy_memory_profile_mismatch");
 }

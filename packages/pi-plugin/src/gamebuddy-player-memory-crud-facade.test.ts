@@ -11,7 +11,6 @@ const continuityId = "continuity_01";
 const defaultProfile = {
 	profileId: "profile_01",
 	profileRevision: 1,
-	profileCanonicalHash: "a".repeat(64),
 };
 let root: string | undefined;
 
@@ -157,7 +156,6 @@ describe("GameBuddy player Memory CRUD facade", () => {
 			runtimeCwd: root,
 			profileId: "profile_01",
 			profileRevision: 2,
-			profileCanonicalHash: "a".repeat(64),
 		};
 		const facade = createGameBuddyPlayerMemoryCrudFacade(validProfile);
 
@@ -168,7 +166,6 @@ describe("GameBuddy player Memory CRUD facade", () => {
 				content: "Test",
 				profileId: "mismatched_profile",
 				profileRevision: 2,
-				profileCanonicalHash: "a".repeat(64),
 			}),
 		).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
@@ -179,20 +176,19 @@ describe("GameBuddy player Memory CRUD facade", () => {
 				content: "Test",
 				profileId: "profile_01",
 				profileRevision: 99,
-				profileCanonicalHash: "a".repeat(64),
 			}),
 		).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
-		// Mismatched hash throws
-		await expect(
-			facade.create({
-				continuityId,
-				content: "Test",
-				profileId: "profile_01",
-				profileRevision: 2,
-				profileCanonicalHash: "b".repeat(64),
-			}),
-		).rejects.toThrow("gamebuddy_memory_profile_mismatch");
+  		// The D-02 owner decision removed profileCanonicalHash from ordinary
+  		// Memory CRUD binding: the facade no longer requires or matches it.
+  		await expect(
+  			facade.create({
+  				continuityId,
+  				content: "Test",
+  				profileId: "profile_01",
+  				profileRevision: 2,
+  			}),
+  		).resolves.toBeTruthy();
 
 		// Matching profile succeeds
 		const created = await facade.create({
@@ -200,7 +196,6 @@ describe("GameBuddy player Memory CRUD facade", () => {
 			content: "Profile bound memory",
 			profileId: "profile_01",
 			profileRevision: 2,
-			profileCanonicalHash: "a".repeat(64),
 		});
 		expect(created.content).toBe("Profile bound memory");
 
@@ -210,7 +205,6 @@ describe("GameBuddy player Memory CRUD facade", () => {
 				continuityId,
 				profileId: "wrong",
 				profileRevision: 2,
-				profileCanonicalHash: "a".repeat(64),
 			}),
 		).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
@@ -221,7 +215,6 @@ describe("GameBuddy player Memory CRUD facade", () => {
 				runtimeCwd: root!,
 				profileId: "",
 				profileRevision: 1,
-				profileCanonicalHash: "a".repeat(64),
 			}),
 		).toThrow("invalid_memory_profile_binding");
 	});
