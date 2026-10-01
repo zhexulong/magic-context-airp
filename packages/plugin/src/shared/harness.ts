@@ -22,6 +22,27 @@
  */
 export type HarnessId = "opencode" | "opencode2" | "pi" | "omp";
 
+/**
+ * A host-declared project identity for runtimes that are not repositories.
+ *
+ * Magic Context normally derives a project identity by walking up from the
+ * session cwd looking for a git root. That heuristic is wrong for a product that
+ * runs its sessions inside its own private, per-tenant directory: the walk climbs
+ * out of the runtime and can land on the USER'S home repository, which yields
+ * either a single identity shared by every tenant or - when the home project is
+ * disallowed - `undefined`, silently disabling memory injection altogether.
+ *
+ * A host that owns its session root therefore declares the partition directly.
+ * The declared value is used verbatim as the project identity by every path that
+ * scopes memory, so several mounts of the same runtime can never disagree about
+ * which partition they are reading.
+ */
+export type DeclaredProjectIdentity = Readonly<{
+  identity: string;
+}>;
+
+let declaredProjectIdentity: string | undefined;
+
 let currentHarness: HarnessId = "opencode";
 let harnessLocked = false;
 
@@ -59,4 +80,49 @@ export function getHarness(): HarnessId {
 export function _resetHarnessForTesting(): void {
     currentHarness = "opencode";
     harnessLocked = false;
+    declaredProjectIdentity = undefined;
+}
+
+/**
+ * Declare the project identity this process's sessions must use.
+ *
+ * Boot-time, like `setHarness`, and locked the same way: a second call with a
+ * DIFFERENT value throws, because swapping identities mid-process would silently
+ * move reads onto another tenant's partition. Re-declaring the same value is a
+ * no-op so a host may call it defensively on every runtime construction.
+ *
+ * Call with `undefined` to clear (test-only reset).
+ */
+export function setDeclaredProjectIdentity(value: string | undefined): void {
+    if (value === undefined) {
+        declaredProjectIdentity = undefined;
+        return;
+    }
+    if (!isValidDeclaredProjectIdentity(value)) {
+        throw new Error(
+            "Magic Context: declared project identity must be a non-empty, whitespace-free, bounded string",
+        );
+    }
+    if (
+        declaredProjectIdentity !== undefined &&
+        declaredProjectIdentity !== value
+    ) {
+        throw new Error(
+            `Magic Context: project identity already declared as "${declaredProjectIdentity}"; refusing to switch to "${value}"`,
+        );
+    }
+    declaredProjectIdentity = value;
+}
+
+/**
+ * The host-declared identity, or undefined when this process did not declare one
+ * (OpenCode and other repository-driven hosts keep the git heuristic).
+ */
+export function getDeclaredProjectIdentity(): string | undefined {
+    return declaredProjectIdentity;
+}
+
+/** Reject anything that could break storage keys or produce an ambiguous value. */
+function isValidDeclaredProjectIdentity(value: string): boolean {
+    return value.length > 0 && value.length <= 256 && !/\s/.test(value);
 }

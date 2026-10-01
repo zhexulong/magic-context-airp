@@ -17,6 +17,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { log } from "../../../shared/logger";
+import { getDeclaredProjectIdentity } from "../../../shared/harness";
 
 // execFileSync is intentional here (audit #19): this runs once per unique directory per process
 // lifetime when git is healthy, and successful git identities are cached in identityCache. The
@@ -440,6 +441,11 @@ export function isUserHomeDirectory(directory: string): boolean {
 }
 
 export function resolveProjectIdentity(directory: string): string {
+    // A host that owns its session root declares the partition; the git heuristic
+    // would otherwise walk out of that root and land on whatever repository
+    // contains it (see DeclaredProjectIdentity).
+    const declared = getDeclaredProjectIdentity();
+    if (declared !== undefined) return declared;
     const canonical = path.resolve(directory);
     const cachedFallback = directoryFallbackCache.get(canonical);
     if (cachedFallback !== undefined) {
@@ -562,6 +568,12 @@ export function resolveProjectIdentityForSession(
     directory: string,
     allowHomeProject = false,
 ): string | undefined {
+    // Declared identity wins over every heuristic, including the home-project
+    // gate: a host-managed runtime is never "the user's home project", and
+    // letting that gate answer here returned `undefined`, which switched memory
+    // injection off entirely for the whole product.
+    const declared = getDeclaredProjectIdentity();
+    if (declared !== undefined) return declared;
     const resolvedDirectory = path.resolve(directory);
     const cacheKey = `${allowHomeProject ? "1" : "0"}\0${resolvedDirectory}`;
     const cached = sessionIdentityCache.get(cacheKey);
