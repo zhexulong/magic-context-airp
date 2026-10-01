@@ -3,6 +3,7 @@ import {
 	type Memory,
 	MemoryCommandFacade,
 } from "@magic-context/core/features/magic-context/memory";
+import { getDeclaredProjectIdentity } from "@magic-context/core/shared/harness";
 import { resolveProjectIdentityOrFallback } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
 
@@ -15,6 +16,16 @@ export function resolveGameBuddyMemoryProjectPath(
 	runtimeCwd: string,
 	continuityId: string,
 ): string {
+	// A host that declared its render-side partition (setDeclaredProjectIdentity)
+	// supplies the FULL final path already; returning it unchanged makes this
+	// function idempotent for that host. Without this, the declared value flows
+	// back through resolveProjectIdentityOrFallback and the path becomes
+	// `gamebuddy:gamebuddy:<identity>:continuity:<id>:continuity:<id>` - the
+	// double-wrap the memory loop measured: management wrote a doubled path while
+	// the render session bound the single-wrapped one, so the two halves of one
+	// continuity could never meet.
+	const declared = getDeclaredProjectIdentity();
+	if (declared !== undefined) return declared;
 	// GameBuddy passes its private product runtime root, not an interactive Pi
 	// project cwd. It may legitimately live beneath the player's home directory.
 	const projectIdentity = resolveProjectIdentityOrFallback(runtimeCwd);

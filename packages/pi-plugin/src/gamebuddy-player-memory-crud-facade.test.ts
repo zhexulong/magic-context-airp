@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
 import { createGameBuddyPlayerMemoryCrudFacade } from "./gamebuddy-player-memory-crud-facade";
-import { resolveGameBuddyMemoryProjectPath } from "./gamebuddy-player-memory-read-projection";
+import { resolveGameBuddyMemoryProjectPath, validateMemoryProfileBinding } from "./gamebuddy-player-memory-read-projection";
+import { setDeclaredProjectIdentity, _resetHarnessForTesting } from "@magic-context/core/shared/harness";
 
 const continuityId = "continuity_01";
 const defaultProfile = {
@@ -23,6 +24,46 @@ afterEach(async () => {
 			retryDelay: 250,
 		}).catch(() => undefined);
 	root = undefined;
+	_resetHarnessForTesting();
+});
+
+describe("resolveGameBuddyMemoryProjectPath with a declared partition", () => {
+	test("is idempotent: the declared full path is returned verbatim", () => {
+		// The render side declares the full path (setDeclaredProjectIdentity). The
+		// management CRUD side runs in the same process and must write under that
+		// SAME path, not re-wrap it. Before the fix this returned
+		// `gamebuddy:gamebuddy:<identity>:continuity:<id>:continuity:<id>` and the
+		// render session could never meet the written rows.
+		const declared = resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_x");
+		setDeclaredProjectIdentity(declared);
+		expect(resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_x")).toBe(declared);
+		// Even a different continuity id cannot change the already-declared path;
+		// the declaration is boot-time locked.
+		expect(resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_y")).toBe(declared);
+	});
+	test("writes land under the declared path, not a doubled one", async () => {
+		root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-declared-"));
+		const before = resolveGameBuddyMemoryProjectPath(root, continuityId);
+		setDeclaredProjectIdentity(before);
+		const facade = createGameBuddyPlayerMemoryCrudFacade({
+			continuityId,
+			runtimeCwd: root,
+			...defaultProfile,
+		});
+		const created = await facade.create({
+			continuityId,
+			content: "declared partition row",
+			...defaultProfile,
+		});
+		expect(created.content).toBe("declared partition row");
+		// The durable store row must be scoped to the single-wrapped declared path.
+		const { openDatabaseAsync: open } = await import("@magic-context/core/features/magic-context/storage-db");
+		const db = await open(join(root, "data", "cortexkit", "magic-context", "context.db"));
+		const row = db
+			.prepare("SELECT project_path FROM memories WHERE content = ?")
+			.get("declared partition row") as { project_path: string } | undefined;
+		expect(row?.project_path).toBe(before);
+	});
 });
 
 describe("GameBuddy player Memory CRUD facade", () => {
