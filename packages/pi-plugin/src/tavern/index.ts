@@ -35,6 +35,8 @@ export {
 export {
 	emitProbeFoldCommittedMarker,
 	emitProbeM0DigestMarker,
+	emitProbeM0MemoryIdsMarker,
 	PROBE_FOLD_COMMITTED_PREFIX,
 	PROBE_M0_DIGEST_PREFIX,
+	PROBE_M0_MEMORY_IDS_PREFIX,
 } from "../probe-materialization-marker";

@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import {
 	emitProbeFoldCommittedMarker,
 	emitProbeM0DigestMarker,
+	emitProbeM0MemoryIdsMarker,
 } from "./probe-materialization-marker";
 import {
 	factCategoriesForDomain,
@@ -3083,6 +3084,17 @@ export function injectM0M1Pi(
 		emitProbeM0DigestMarker(
 			m0DigestHex(Buffer.from(m0, "utf8")),
 			materializationRevision(markers),
+		);
+		// WHICH memories are in those bytes, alongside the digest above. Read from
+		// the row the materialize transaction committed with THIS m[0], NOT from a
+		// pass-local variable: a soft refresh or a sibling writer can diverge the
+		// locals from the frozen bytes, and the accounting below (line ~3130) reads
+		// the same persisted column for exactly that reason. Emitting here - after
+		// every branch converged on the provider-bound m[0] - is what makes the
+		// marker describe the bytes a provider actually received.
+		emitProbeM0MemoryIdsMarker(
+			materializationRevision(markers),
+			parseMemoryBlockIds(readCachedPiM0M1Row(db, state.sessionId)?.memory_block_ids ?? null),
 		);
 	}
 	logSession(

@@ -2,8 +2,10 @@ import { expect, test } from "bun:test";
 import {
 	emitProbeFoldCommittedMarker,
 	emitProbeM0DigestMarker,
+	emitProbeM0MemoryIdsMarker,
 	PROBE_FOLD_COMMITTED_PREFIX,
 	PROBE_M0_DIGEST_PREFIX,
+	PROBE_M0_MEMORY_IDS_PREFIX,
 } from "./probe-materialization-marker";
 
 /**
@@ -86,4 +88,34 @@ test("the marker never carries m[0]/m[1] text — only the digest or revision", 
 		`${PROBE_M0_DIGEST_PREFIX} ${"b".repeat(64)} rev_8\n${PROBE_FOLD_COMMITTED_PREFIX} rev_42\n`,
 	);
 	expect(payload.length).toBeLessThan(220);
+});
+
+test("m0 memory-ids marker reports the assembled id set, never content", () => {
+	// The L2 answer: ``which of my facts reached the prompt``. The vendor reports
+	// only the ids it assembled, so it never needs to know which id a caller seeded.
+	const ok = captureStderr(() => emitProbeM0MemoryIdsMarker("rev_9", [3, 1, 2]));
+	// Sorted and de-duplicated so two passes with the same set compare equal
+	// regardless of render order.
+	expect(ok).toBe(`${PROBE_M0_MEMORY_IDS_PREFIX} rev_9 1,2,3\n`);
+
+	// An EMPTY set is a real answer, not an omission: it says "m[0] was rendered
+	// with no memories this pass", which is exactly what an L2 miss needs to see.
+	const empty = captureStderr(() => emitProbeM0MemoryIdsMarker("rev_10", []));
+	expect(empty).toBe(`${PROBE_M0_MEMORY_IDS_PREFIX} rev_10 -\n`);
+});
+
+test("m0 memory-ids marker ignores malformed input and stays bounded", () => {
+	for (const badRevision of [undefined, null, "", "has space", 123, "r".repeat(129)]) {
+		expect(captureStderr(() => emitProbeM0MemoryIdsMarker(badRevision, [1]))).toBe("");
+	}
+	// Not an array (including a Set, which a caller might pass by mistake) is a
+	// no-op rather than a throw: a diagnostic must never break materialization.
+	for (const badIds of [undefined, null, "1,2,3", 42, new Set([1, 2])]) {
+		expect(captureStderr(() => emitProbeM0MemoryIdsMarker("rev_11", badIds))).toBe("");
+	}
+	// Non-integer / negative / unsafe ids are dropped instead of poisoning the line.
+	const filtered = captureStderr(() =>
+		emitProbeM0MemoryIdsMarker("rev_12", [1, -1, 2.5, Number.NaN, Number.MAX_VALUE, "3", 4]),
+	);
+	expect(filtered).toBe(`${PROBE_M0_MEMORY_IDS_PREFIX} rev_12 1,4\n`);
 });
