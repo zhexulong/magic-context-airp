@@ -1,8 +1,13 @@
 # GameBuddy Magic Context Fork
 
-This directory is a parent-repository-tracked, project-maintained fork of upstream
-Magic Context `v0.41.0` commit `bcd2f705af70bfd055e974a47c958640e2484b7f`
-(MIT). GameBuddy applies its product-specific delta directly in this vendored tree;
+This directory is a parent-repository-tracked, project-maintained fork of MIT-licensed
+Magic Context. Its version is `0.42.3-airp.1`, and its lineage is:
+
+* branched from upstream `v0.41.0` — `bcd2f7051e501478110660c3ce52a1a486756da3`
+  (recorded by commit `4f1565b4c`, "airp Tavern context and memory engine based on upstream v0.41.0")
+* synced with upstream `dc952bf3` (`v0.42.3+6`) by merge commit `98c6d94de`
+
+GameBuddy applies its product-specific delta directly in this vendored tree;
 the dependency, lockfiles, generated `dist`, SBOM, and third-party license inventory
 must be regenerated and verified from this exact tracked source before release.
 
@@ -75,6 +80,26 @@ manufacturing production-scale context pressure or enabling the production gate.
 This fork is not evidence that cross-session Chat/Game recall, embeddings,
 Dreamer, or Sidekick are enabled or accepted. They each need independent
 controlled live verification before changing a gate.
+
+## Upstream-shape seams
+
+GameBuddy keeps the fork's divergence as small as the product allows, so an
+upstream sync stays a merge instead of a rewrite. Where GameBuddy and upstream
+independently introduced the same seam, the fork adopts upstream's shape:
+
+* `resolveHistorianFromConfig(config, harness = PI_HARNESS_KIND)` matches the
+  upstream signature. GameBuddy deliberately omits the optional `modelRegistry`
+  argument: an embedded runtime's registry only exists after session
+  construction, so the runner binds it later through `bindHistorianRunner`
+  (driven by the embedding Host) rather than at resolver time.
+* `EmbeddedPiHistorianRunner` — a no-tool, one-shot request through the already
+  embedded Pi SDK's ModelRegistry. It never spawns `pi`, never opens a user Pi
+  session, and never exposes tools. This is GameBuddy's own runner and stays.
+* An embedded runtime (`GAMEBUDDY_EMBEDDED_RUNTIME=1`) selects that runner and
+  disables the CLI-backed authoring runners. Run
+  `node packages/pi-plugin/scripts/verify-gamebuddy-embedded-surface.mjs` to
+  check those boundaries; the check collapses whitespace so a reformat cannot
+  silently disable it.
 
 ## Build checks
 

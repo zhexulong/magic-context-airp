@@ -2,7 +2,7 @@
 
 Cross-session memory and context management for [Pi coding agent](https://github.com/earendil-works/pi-mono) and [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi). The same extension package runs on both hosts and shares its SQLite database with the [OpenCode plugin](https://www.npmjs.com/package/@cortexkit/opencode-magic-context).
 
-Based on upstream Magic Context `v0.41.0` (`bcd2f705`) with the GameBuddy delta from `769a58be`.
+Based on upstream Magic Context `v0.41.0` (`bcd2f7051e501478110660c3ce52a1a486756da3`), synced with upstream `dc952bf3` (`v0.42.3+6`), and versioned as `0.42.3-airp.1`.
 
 Requires Pi `0.84.4` or OMP `>= 17.1.7`.
 
