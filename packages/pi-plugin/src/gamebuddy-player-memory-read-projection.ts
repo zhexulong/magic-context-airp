@@ -27,8 +27,13 @@ export function resolveGameBuddyMemoryProjectPath(
 	const declared = getDeclaredProjectIdentity();
 	if (declared !== undefined) return declared;
 	// GameBuddy passes its private product runtime root, not an interactive Pi
-	// project cwd. It may legitimately live beneath the player's home directory.
-	const projectIdentity = resolveProjectIdentityOrFallback(runtimeCwd);
+	// project cwd. It may legitimately live beneath the player's home directory
+	// (a disposable fixture root under %TEMP%, or a product data root under
+	// %LOCALAPPDATA%), so the home-project gate must not apply here: the very
+	// first call (before the host has a declared identity to return) resolves
+	// the base identity this wrapper partitions, and a home-directory runtime is
+	// the GameBuddy product's normal case, never a user's interactive project.
+	const projectIdentity = resolveProjectIdentityOrFallback(runtimeCwd, true);
 	return `gamebuddy:${projectIdentity}:continuity:${continuityId}`;
 }
 
