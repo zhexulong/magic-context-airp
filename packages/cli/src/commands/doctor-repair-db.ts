@@ -19,7 +19,10 @@ import {
     inspectRpcServerDiscovery,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
-import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
+import {
+    inspectLivePiProcesses,
+    inspectWindowsProcessesSync,
+} from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
 import { type PromptIO, promptIO } from "../lib/prompts";
@@ -70,8 +73,13 @@ interface SalvageResult {
     schemaVersionAfter?: number;
 }
 
-function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
-    const rpc = inspectRpcServerDiscovery(storageDir);
+export function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
+    const processes = process.platform === "win32" ? inspectWindowsProcessesSync() : undefined;
+    const rpc = inspectRpcServerDiscovery(storageDir, processes, {
+        deadlineMs: 15_000,
+        onProgress: (checked, total) =>
+            console.error(`Inspecting RPC database holders: ${checked}/${total} records checked`),
+    });
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
         return {
@@ -83,7 +91,13 @@ function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
 
     const blockers =
         rpc.state === "live" ? rpc.serverPids.map((pid) => `OpenCode server (PID ${pid})`) : [];
-    const pi = inspectLivePiProcesses();
+    if (rpc.state === "inconclusive")
+        return {
+            safe: false,
+            blockers: [],
+            uncertainty: `RPC process liveness could not be determined (PID ${(rpc.inconclusivePids ?? []).join(", ")})`,
+        };
+    const pi = processes?.pi ?? inspectLivePiProcesses();
     if (pi.state === "unreadable" || pi.state === "inconclusive") {
         return {
             safe: false,
@@ -128,7 +142,7 @@ function copyBackupBundle(dbPath: string, stamp: string): BackupBundle {
     return { basePath, copiedPaths };
 }
 
-function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
+export function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
     const copiedPaths: string[] = [];
     for (const suffix of DATABASE_SUFFIXES) {
         const source = `${sourceBase}${suffix}`;

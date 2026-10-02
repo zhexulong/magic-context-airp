@@ -48,6 +48,8 @@ export const OVERFLOW_PATTERNS: ReadonlyArray<RegExp> = [
     /too large for model with \d+ maximum context length/i, // Mistral
     /model_context_window_exceeded/i, // z.ai non-standard finish_reason
     /context size has been exceeded/i, // Lemonade / llama-cpp wrappers
+    /prepared prompt exceeds engine max_context/i, // Matches local-engine errors phrased as “prepared prompt exceeds engine max_context”.
+    /prompt exceeds (?:the )?.{0,32}\bmax_context\b/i, // Other local engines
 ];
 
 /**
@@ -88,6 +90,8 @@ const LIMIT_EXTRACTION_PATTERNS: ReadonlyArray<LimitExtractionPattern> = [
         pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
         provenance: "prompt_only",
     }, // Anthropic reports the accepted input ceiling, not input plus output.
+    { pattern: /prepared prompt exceeds engine max_context\s+(\d+)/i, provenance: "unknown" }, // This format reports the engine's max_context limit after the message.
+    { pattern: /prompt exceeds (?:the )?.{0,32}\bmax_context\s+(\d+)/i, provenance: "unknown" }, // Other local engines
     { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }, // generic fallback
 ];
 
@@ -110,15 +114,26 @@ export interface ThinkingBindingMismatchDetection {
     isBindingMismatch: boolean;
     /** Stable provider message substring used for diagnostics. */
     matchedPattern?: string;
-    /** Provider-supplied id of the assistant whose bound block was rejected. */
-    messageId?: string;
+    /**
+     * Diagnostics only: the provider's path to the first rejected thinking block
+     * (for example `messages.1.content.0`). It indexes the provider request array
+     * after the host lowered it, not host message ids, so recovery never uses it
+     * to pick a message.
+     */
+    failingBlockPath?: string;
+    /** Diagnostics only: the provider's path to the first changed prefix position. */
+    firstChangedPath?: string;
 }
 
 const THINKING_BINDING_MISMATCH_PATTERN = /bound to a different conversation/i;
+const THINKING_BINDING_FAILING_PATH_PATTERN = /^\s*(messages\.\d+\.content\.\d+):/;
+const THINKING_BINDING_FIRST_CHANGED_PATTERN = /first at `?(messages\.\d+\.content\.\d+)`?/;
 
 export interface OverflowDetection {
     /** True if the error message matches a known overflow pattern. */
     isOverflow: boolean;
+    /** Provider-reported token count for the rejected input, when present. */
+    reportedInputTokens?: number;
     /** Reported context limit in tokens, if extractable from the message. */
     reportedLimit?: number;
     /** Whether the number is a prompt-only ceiling or a combined context window. */
@@ -162,30 +177,6 @@ export function extractErrorMessage(error: unknown): string {
     return String(error);
 }
 
-/**
- * Detect whether an error represents a provider-side context-overflow
- * rejection, and optionally extract the reported limit.
- */
-function extractThinkingBindingMessageId(error: unknown): string | undefined {
-    if (!error || typeof error !== "object") return undefined;
-    const seen = new Set<object>();
-    const queue: object[] = [error];
-    while (queue.length > 0) {
-        const current = queue.shift();
-        if (!current || seen.has(current)) continue;
-        seen.add(current);
-        const record = current as Record<string, unknown>;
-        for (const key of ["message_id", "messageID", "messageId"]) {
-            const value = record[key];
-            if (typeof value === "string" && value.length > 0) return value;
-        }
-        for (const value of Object.values(record)) {
-            if (value && typeof value === "object") queue.push(value);
-        }
-    }
-    return undefined;
-}
-
 function extractExplicitHttpStatus(error: unknown): number | undefined {
     if (!error || typeof error !== "object") return undefined;
     const seen = new Set<object>();
@@ -207,11 +198,12 @@ function extractExplicitHttpStatus(error: unknown): number | undefined {
 }
 
 /**
- * Classify Fable 5.1's documented thinking-prefix binding rejection. The docs
- * guarantee the phrase, not the surrounding error prose, so only that stable
- * substring is matched. Runtime account enforcement and exact SDK wrappers vary.
- * Source (no live specimen available):
- * https://platform.claude.com/docs/en/models/fable-5-1/whats-new-fable-5-1
+ * Classify Anthropic's thinking-prefix binding rejection (Claude Fable 5.1 and
+ * Claude Opus 5.5). Only the stable phrase is matched; the surrounding prose
+ * and SDK wrappers vary. The live 400 (captured in
+ * docs/reports/anthropic-thinking-binding.md) carries no message id, only
+ * provider request-array paths, so the result never names a host message.
+ * Source: https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function detectThinkingBindingMismatch(error: unknown): ThinkingBindingMismatchDetection {
     const message = extractErrorMessage(error);
@@ -222,15 +214,38 @@ export function detectThinkingBindingMismatch(error: unknown): ThinkingBindingMi
     ) {
         return { isBindingMismatch: false };
     }
-    const messageId = extractThinkingBindingMessageId(error);
+    const failingBlockPath = THINKING_BINDING_FAILING_PATH_PATTERN.exec(message)?.[1];
+    const firstChangedPath = THINKING_BINDING_FIRST_CHANGED_PATTERN.exec(message)?.[1];
     return {
         isBindingMismatch: true,
         matchedPattern: "bound to a different conversation",
-        ...(messageId ? { messageId } : {}),
+        ...(failingBlockPath ? { failingBlockPath } : {}),
+        ...(firstChangedPath ? { firstChangedPath } : {}),
     };
 }
 
-/** True only for canonical Anthropic Fable 5.1 model identifiers. */
+/**
+ * True for the models whose signed thinking blocks Anthropic binds to the
+ * request prefix: Claude Fable 5.1 and Claude Opus 5.5. Accounts created on or
+ * after 2026-08-31 get a 400 on these models when anything before a replayed
+ * thinking block changed. Only the first-party `anthropic` provider is covered;
+ * Bedrock and Vertex enforce the same rule but are not handled here.
+ */
+export function isPrefixBoundThinkingModel(
+    providerID: string | null | undefined,
+    modelID: string | null | undefined,
+): boolean {
+    if (providerID?.toLowerCase() !== "anthropic" || !modelID) return false;
+    return (
+        isFable51ThinkingBindingModel(providerID, modelID) ||
+        /(?:^|[-_.])opus[-_.]?5[-_.]5(?:$|[-_.])/i.test(modelID)
+    );
+}
+
+/**
+ * True only for canonical Anthropic Fable 5.1 model identifiers. Binding
+ * recovery uses isPrefixBoundThinkingModel instead, which also covers Opus 5.5.
+ */
 export function isFable51ThinkingBindingModel(
     providerID: string | null | undefined,
     modelID: string | null | undefined,
@@ -239,6 +254,10 @@ export function isFable51ThinkingBindingModel(
     return /(?:^|[-_.])fable[-_.]?5[-_.]1(?:$|[-_.])/i.test(modelID);
 }
 
+/**
+ * Detect whether an error represents a provider-side context-overflow
+ * rejection, and optionally extract the reported limit.
+ */
 export function detectOverflow(error: unknown): OverflowDetection {
     const message = extractErrorMessage(error);
     if (!message) {
@@ -263,9 +282,11 @@ export function detectOverflow(error: unknown): OverflowDetection {
     }
 
     const reportedLimit = parseReportedLimit(message);
+    const reportedInputTokens = parseReportedInputTokens(message);
 
     return {
         isOverflow: true,
+        reportedInputTokens,
         reportedLimit: reportedLimit?.value,
         reportedLimitProvenance: reportedLimit?.provenance,
         matchedPattern: matched?.source,
@@ -277,6 +298,24 @@ export function detectOverflow(error: unknown): OverflowDetection {
  * of the known patterns matches. Returns undefined when no plausible number
  * can be extracted. Guards against false matches via plausibility clamp.
  */
+export function parseReportedInputTokens(message: string): number | undefined {
+    if (!message) return undefined;
+    const patterns = [
+        /prompt is too long:\s*(\d+)/i,
+        /input token count\s*(\d+)/i,
+        /input length\s*(\d+)/i,
+        /prompt was\s*(\d+)/i,
+        /messages resulted in\s*(\d+)\s*tokens?/i,
+    ];
+    for (const pattern of patterns) {
+        const raw = message.match(pattern)?.[1];
+        if (!raw) continue;
+        const value = Number.parseInt(raw, 10);
+        if (Number.isFinite(value) && value > 0) return value;
+    }
+    return undefined;
+}
+
 export function parseReportedLimit(message: string): ReportedContextLimit | undefined {
     if (!message) return undefined;
     for (const { pattern, provenance } of LIMIT_EXTRACTION_PATTERNS) {

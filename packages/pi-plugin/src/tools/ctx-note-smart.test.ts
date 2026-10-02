@@ -60,16 +60,15 @@ async function callNote(args: {
 }
 
 describe("Pi ctx_note smart notes", () => {
-	it("pins the multi-dismiss schema fields", () => {
+	it("declares one id field and pins its schema", () => {
 		const tool = createCtxNoteTool({ db: createTestDb() });
 		const properties = (
 			tool.parameters as { properties: Record<string, unknown> }
 		).properties;
-		expect(properties.note_id).toEqual({
-			type: "number",
-			description: "Note ID (required for 'dismiss' and 'update' actions).",
-		});
-		expect(properties.note_ids).toEqual({
+		// A second scalar id field is what made required-all tool surfaces fail
+		// every call with filler in both (issue 460).
+		expect(properties.note_id).toBeUndefined();
+		expect(JSON.parse(JSON.stringify(properties.note_ids))).toEqual({
 			type: "array",
 			items: {
 				type: "integer",
@@ -79,7 +78,7 @@ describe("Pi ctx_note smart notes", () => {
 			minItems: 1,
 			maxItems: 50,
 			description:
-				"One to fifty note ids for 'dismiss' only; do not combine with note_id.",
+				"Note ids: one for update, 1–50 for dismiss, any number for read (returns full bodies). Ignored by write.",
 		});
 	});
 
@@ -344,7 +343,7 @@ describe("Pi ctx_note smart notes", () => {
 		await callNote({
 			db,
 			sessionId: "ses-a",
-			params: { action: "dismiss", note_id: 3 },
+			params: { action: "dismiss", note_ids: [3] },
 		});
 
 		const result = await callNote({
@@ -357,7 +356,7 @@ describe("Pi ctx_note smart notes", () => {
 		expect(result.text).toBe(
 			"Dismissed 1 of 4 notes.\n" +
 				"- Note #1: dismissed\n" +
-				"- Note #2: not_owned\n" +
+				"- Note #2: not_found\n" +
 				"- Note #3: already_dismissed\n" +
 				"- Note #999: not_found",
 		);
@@ -373,34 +372,63 @@ describe("Pi ctx_note smart notes", () => {
 		]);
 	});
 
-	it("rejects note_ids outside dismiss and rejects note_id conflicts", async () => {
+	it("ignores note_ids on write, reads owned ids, and hides foreign ids as missing", async () => {
+		// Required-all tool surfaces make the model fill every declared
+		// property on write; read uses IDs intentionally and must not disclose
+		// whether an inaccessible ID exists.
 		const db = createTestDb();
-		const outsideDismiss = await callNote({
+		const writeWithFiller = await callNote({
 			db,
-			params: { action: "update", note_ids: [1], content: "not allowed" },
+			params: {
+				action: "write",
+				content: "Filler-tolerant note",
+				note_ids: [1],
+			},
 		});
-		const conflict = await callNote({
+		addNote(db, "session", {
+			sessionId: "ses-foreign",
+			content: "Foreign note body",
+		});
+		const targetedRead = await callNote({
 			db,
-			params: { action: "dismiss", note_id: 1, note_ids: [1] },
+			params: { action: "read", note_ids: [1, 2, 999] },
 		});
-		const nonDismissConflict = await callNote({
+		const updateTwo = await callNote({
 			db,
-			params: { action: "update", note_id: 1, note_ids: [1] },
+			params: { action: "update", note_ids: [1, 2], content: "two ids" },
 		});
+		const updateNone = await callNote({
+			db,
+			params: { action: "update", content: "no ids" },
+		});
+		const dismissNone = await callNote({ db, params: { action: "dismiss" } });
 
-		expect(outsideDismiss.isError).toBe(true);
-		expect(outsideDismiss.text).toContain("'note_ids' is only valid");
-		expect(conflict.isError).toBe(true);
-		expect(conflict.text).toContain("'note_id' and 'note_ids'");
-		expect(nonDismissConflict.isError).toBe(true);
-		expect(nonDismissConflict.text).toContain("'note_id' and 'note_ids'");
+		expect(writeWithFiller.isError).toBe(false);
+		expect(writeWithFiller.text).toContain("Saved session note #1");
+		expect(targetedRead.isError).toBe(false);
+		expect(targetedRead.text).toContain("Filler-tolerant note");
+		expect(targetedRead.text).toContain("- Note #2: not_found");
+		expect(targetedRead.text).toContain("- Note #999: not_found");
+		expect(targetedRead.text).not.toContain("Foreign note body");
+		expect(updateTwo.isError).toBe(true);
+		expect(updateTwo.text).toContain(
+			"exactly one positive integer id when action is 'update'",
+		);
+		expect(updateNone.isError).toBe(true);
+		expect(updateNone.text).toContain(
+			"exactly one positive integer id when action is 'update'",
+		);
+		expect(dismissNone.isError).toBe(true);
+		expect(dismissNone.text).toContain(
+			"1 to 50 positive integer ids when action is 'dismiss'",
+		);
 	});
 
 	it("read with filter='active' is STRICTER than default — does not include pending smart notes", async () => {
-		// Parity regression for Round 7 audit finding #4 (Phase 4):
-		// `filter === undefined` (default) = active session notes + READY smart notes
-		// `filter === "active"`            = ALL active notes of both types
-		// These two are DIFFERENT — see OpenCode tools/ctx-note/tools.ts:46-95.
+		// The default glance shows every smart note, ready or still parked, so the
+		// agent sees the whole tray in one listing (the ratified ctx_note
+		// description: ready smart notes first, then pending, then plain notes).
+		// `filter='active'` is the narrower view: active status only, both types.
 		const db = createTestDb();
 		const projectIdentity = resolveProjectIdentity(process.cwd());
 
@@ -415,30 +443,26 @@ describe("Pi ctx_note smart notes", () => {
 			sessionId: "ses-note-1",
 		});
 
-		// Default read (no filter) shows session note but NOT pending smart note.
+		// Default read shows the session note AND the parked smart note.
 		const { text: defaultText } = await callNote({
 			db,
 			dreamerEnabled: true,
 			params: { action: "read" },
 		});
 		expect(defaultText).toContain("Active session note");
-		expect(defaultText).not.toContain("Active smart note");
+		expect(defaultText).toContain(
+			"Active smart note (not yet ready) · pending",
+		);
 
-		// Explicit filter='active' returns session note PLUS the pending smart note
-		// (which has status='pending' actually, so it's filtered out by 'active'),
-		// but if it was active status it would be included.
+		// Explicit filter='active' returns only active-status notes, so the
+		// pending smart note drops out.
 		const { text: activeText } = await callNote({
 			db,
 			dreamerEnabled: true,
 			params: { action: "read", filter: "active" },
 		});
-		// Active session note is still there.
 		expect(activeText).toContain("Active session note");
-		// The smart note with surfaceCondition is in 'pending' status so won't
-		// appear with filter='active' either — but the contract is that we
-		// DO query smart notes with status='active' (which would match if they
-		// were promoted). The test that this is a separate code branch is
-		// implicit in the differing output structure.
+		expect(activeText).not.toContain("Active smart note");
 	});
 
 	it("read with filter='pending' returns only unsurfaced smart notes", async () => {
@@ -502,7 +526,7 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: {
 				action: "update",
-				note_id: created.id,
+				note_ids: [created.id],
 				surface_condition: "New condition",
 			},
 		});
@@ -533,7 +557,7 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: {
 				action: "update",
-				note_id: created.id,
+				note_ids: [created.id],
 				content: "New content",
 			},
 		});
@@ -557,7 +581,7 @@ describe("Pi ctx_note smart notes", () => {
 		const { isError, text } = await callNote({
 			db,
 			sessionId: "ses-note-1",
-			params: { action: "dismiss", note_id: created.id },
+			params: { action: "dismiss", note_ids: [created.id] },
 		});
 
 		expect(isError).toBe(true);
@@ -581,7 +605,7 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: {
 				action: "update",
-				note_id: created.id,
+				note_ids: [created.id],
 				content: "Hijacked smart note",
 			},
 		});
@@ -621,9 +645,13 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: { action: "read" },
 		});
-		// Default read includes both ready smart notes AND active session notes.
+		// Default read includes both ready smart notes AND active session notes,
+		// with the ready smart note listed first and marked `· ready`.
 		expect(text).toContain("Smart that's ready");
 		expect(text).toContain("Active session note");
-		expect(text).toContain("🔔");
+		expect(text).toContain("· ready");
+		expect(text.indexOf("Smart that's ready")).toBeLessThan(
+			text.indexOf("Active session note"),
+		);
 	});
 });

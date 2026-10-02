@@ -9,7 +9,9 @@ export type CtxSearchSource = "memory" | "message" | "git_commit" | "primer" | "
 export interface CtxSearchArgs extends ImitatedReducedArgs {
     query?: string;
     limit?: number;
-    /** Restrict search to specific sources. Omit to search all; [] searches none. */
+    from?: string;
+    to?: string;
+    /** Restrict search to specific sources. Omit or pass [] to search all. */
     sources?: CtxSearchSource[];
 }
 

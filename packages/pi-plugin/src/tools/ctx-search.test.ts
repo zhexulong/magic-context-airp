@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { insertMemory } from "@magic-context/core/features/magic-context/memory";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
@@ -7,6 +8,27 @@ import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxSearchTool } from "./ctx-search";
 
 describe("createCtxSearchTool", () => {
+	it("returns a typed tool error for an invalid date", async () => {
+		const db = createTestDb();
+		try {
+			const tool = createCtxSearchTool({ db });
+			const result = await tool.execute(
+				"call-date",
+				{ query: "needle", to: "not-a-date" },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search") as never,
+			);
+
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toBe(
+				"Error: Invalid 'to' date; use YYYY-MM-DD or a full ISO datetime.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("prints ctx_expand ranges and footer for message search hits", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
@@ -223,6 +245,76 @@ describe("createCtxSearchTool", () => {
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
+		}
+	});
+
+	it("treats empty sources and limit 0 as the omitted defaults so required-all filler matches a clean search", async () => {
+		const spy = spyOn(searchModule, "unifiedSearch");
+		const run = async (args: {
+			query: string;
+			sources?: Array<"memory" | "message" | "git_commit" | "primer" | "note">;
+			limit?: number;
+		}) => {
+			const db = createTestDb();
+			try {
+				const projectIdentity = resolveProjectIdentity(process.cwd());
+				for (const [content, label] of [
+					["Needle alpha", "first"],
+					["Needle alpha alpha", "second"],
+					["Needle alpha alpha alpha", "third"],
+				]) {
+					insertMemory(db, {
+						projectPath: projectIdentity,
+						category: "ARCHITECTURE",
+						content: `${content} ${label} result.`,
+					});
+				}
+				const tool = createCtxSearchTool({
+					db,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					gitCommitsEnabled: false,
+				});
+				const result = await tool.execute(
+					"call-search",
+					args,
+					new AbortController().signal,
+					undefined,
+					fakeContext("ses-search", process.cwd()) as never,
+				);
+				return result.content[0]?.text ?? "";
+			} finally {
+				closeQuietly(db);
+			}
+		};
+
+		try {
+			const clean = await run({ query: "Needle alpha" });
+			const filler = await run({
+				query: "Needle alpha",
+				sources: [],
+				limit: 0,
+			});
+			expect(filler).toBe(clean);
+			expect(clean).toContain("Found 3 results");
+			for (const label of ["first", "second", "third"]) {
+				expect(clean).toContain(`${label} result`);
+			}
+
+			const cleanOpts = spy.mock.calls[0]?.[4] as {
+				sources?: unknown;
+				limit?: number;
+			};
+			const fillerOpts = spy.mock.calls[1]?.[4] as {
+				sources?: unknown;
+				limit?: number;
+			};
+			expect(fillerOpts.sources).toEqual(cleanOpts.sources);
+			expect(fillerOpts.limit).toEqual(cleanOpts.limit);
+			expect(fillerOpts.sources).toBeUndefined();
+			expect(fillerOpts.limit).toBe(10);
+		} finally {
+			spy.mockRestore();
 		}
 	});
 });

@@ -606,7 +606,7 @@ describe("subagent-runner pure helpers", () => {
 		]);
 	});
 
-	it("loads the provider calibration extension only for historian requests", () => {
+	it("loads the calibration and provenance extension for historian and dreamer requests", () => {
 		const historian = buildArgsForTest(
 			{ ...baseOptions, agent: "magic-context-historian" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
@@ -618,7 +618,7 @@ describe("subagent-runner pure helpers", () => {
 			{ ...baseOptions, agent: "dreamer" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
 		);
-		expect(dreamer).not.toContain("/tmp/historian-calibration.js");
+		expect(dreamer).toContain("/tmp/historian-calibration.js");
 	});
 
 	it("passes the active entry thinking level through Pi's --thinking flag", () => {
@@ -1002,7 +1002,7 @@ describe("subagent-runner pure helpers", () => {
 		}
 	});
 
-	it("locks base dreamer (curate) to --tools ctx_memory, stripping all built-ins", () => {
+	it("locks base dreamer (curate) to the two memory tools, stripping all built-ins", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer",
@@ -1010,9 +1010,9 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe("ctx_memory");
+		expect(args[idx + 1]).toBe("ctx_memory,ctx_memory_list");
 		expect(args).not.toContain("--no-tools");
-		// No codebase/shell built-ins survive the allow-list. (ctx_memory itself is
+		// No codebase/shell built-ins survive the allow-list. (The memory tools are
 		// registered by the lean extension when a real bundle path is present; in
 		// this dev/test env SUBAGENT_ENTRY_PATH is undefined so --extension and the
 		// dreamer-actions flag are absent — the strict allow-list is independent.)
@@ -1030,7 +1030,7 @@ describe("subagent-runner pure helpers", () => {
 		}
 	});
 
-	it("locks magic-context-dreamer (Pi facade default) to --tools ctx_memory only", () => {
+	it("locks magic-context-dreamer (Pi facade default) to the two memory tools", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "magic-context-dreamer",
@@ -1038,7 +1038,7 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe("ctx_memory");
+		expect(args[idx + 1]).toBe("ctx_memory,ctx_memory_list");
 		expect(args).not.toContain("--no-tools");
 		const toolList = args[idx + 1];
 		for (const denied of [
@@ -1077,7 +1077,7 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--tools");
 	});
 
-	it("locks dreamer-docs to file tools plus optional AFT read tools, with no ctx_memory and no extension", () => {
+	it("locks dreamer-docs to read-only file tools and optional AFT reads", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-docs",
@@ -1086,11 +1086,10 @@ describe("subagent-runner pure helpers", () => {
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
 		expect(args[idx + 1]).toBe(
-			"read,grep,find,ls,bash,write,edit,aft_outline,aft_zoom,aft_search",
+			"read,grep,find,ls,aft_outline,aft_zoom,aft_search",
 		);
 		expect(args).not.toContain("--no-tools");
-		// Edits docs, never the memory store: no ctx_memory, and the lean extension
-		// (which would register it) is not loaded for this agent.
+		// No shell, writing, memory tools or extension are available.
 		expect(args[idx + 1]).not.toContain("ctx_memory");
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
@@ -1898,12 +1897,13 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
 
-		const resultPromise = runner.run(baseOptions);
+		const resultPromise = runner.run({ ...baseOptions, maxOutputTokens: 32 });
 		child.writeStdoutLine(
 			agentEnd([
 				{
 					role: "assistant",
 					content: [{ type: "text", text: "partial" }],
+					usage: { input: 5, output: 32, cacheRead: 0, cacheWrite: 1 },
 					stopReason: "length",
 				},
 			]),
@@ -1913,7 +1913,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(await resultPromise).toEqual({
 			ok: false,
 			reason: "truncated",
-			error: 'pi assistant stopped with reason "length"',
+			error:
+				'pi assistant stopped with reason "length"; tokens={"input":5,"output":32,"reasoning":null,"cache_read":0,"cache_write":1,"max_tokens":32,"finish_reason":"length"}',
 			durationMs: expect.any(Number),
 			meta: { stderr: undefined },
 		});
@@ -3327,5 +3328,328 @@ describe("Pi subagent schema-fence probe", () => {
 			else process.env.XDG_DATA_HOME = originalXdgDataHome;
 			rmSync(dataHome, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("child observability", () => {
+	it("warns once for replaced prompts and never for identical prompts", async () => {
+		const { createHash } = await import("node:crypto");
+		const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+		try {
+			for (const changed of [false, true]) {
+				log.mockClear();
+				const child = createMockChild();
+				const { runner } = runnerWith(child);
+				const run = runner.run(baseOptions);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				const text = changed ? "another persona" : baseOptions.systemPrompt;
+				const event = {
+					type: "mc_system_prompt",
+					bytes: Buffer.byteLength(text),
+					sha256: createHash("sha256").update(text).digest("hex"),
+					containsIntended: !changed,
+				};
+				child.writeStdoutLine(event);
+				child.writeStdoutLine(event);
+				child.writeStdoutLine({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "done" }],
+					},
+				});
+				child.emitClose();
+				await run;
+				const warnings = log.mock.calls.filter((args) =>
+					String(args[1]).startsWith("subagent_system_prompt_replaced "),
+				);
+				expect(warnings.length).toBe(changed ? 1 : 0);
+			}
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it("logs exact step, tool output byte and prompt token counts without terminal duplication", async () => {
+		const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+		try {
+			const child = createMockChild();
+			const { runner } = runnerWith(child);
+			const run = runner.run(baseOptions);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			const messages = [
+				{
+					role: "assistant",
+					stopReason: "toolUse",
+					usage: { input: 10, cacheRead: 20, cacheWrite: 5 },
+					content: [
+						{ type: "toolCall", id: "a", name: "read" },
+						{ type: "toolCall", id: "b", name: "read" },
+					],
+				},
+				{
+					role: "assistant",
+					stopReason: "stop",
+					usage: { input: 7, cacheRead: 40 },
+					content: [{ type: "text", text: "done" }],
+				},
+			];
+			child.writeStdoutLine({ type: "message_end", message: messages[0] });
+			for (const id of ["a", "b"])
+				child.writeStdoutLine({
+					type: "tool_execution_end",
+					toolCallId: id,
+					toolName: "read",
+					result: { content: [{ type: "text", text: "é" }] },
+				});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "a",
+					content: [{ type: "text", text: "é" }],
+				},
+			});
+			child.writeStdoutLine({ type: "message_end", message: messages[1] });
+			child.writeStdoutLine({ type: "agent_end", messages });
+			child.emitClose();
+			await run;
+			const lines = log.mock.calls.filter((args) =>
+				String(args[1]).startsWith("subagent_telemetry "),
+			);
+			expect(lines).toHaveLength(1);
+			const summary = JSON.parse(
+				String(lines[0]?.[1]).slice("subagent_telemetry ".length),
+			);
+			expect(summary.steps).toBe(2);
+			expect(summary.tools).toEqual({ read: { calls: 2, outputBytes: 4 } });
+			expect(summary.promptTokens).toEqual({ first: 35, last: 47, max: 47 });
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it("aborts over-cap streams with step_limit", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const run = runner.run({ ...baseOptions, agent: "dreamer-classifier" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		for (let n = 0; n < 5; n++)
+			child.writeStdoutLine({
+				type: "message_end",
+				message: { role: "assistant", stopReason: "toolUse", content: [] },
+			});
+		const killed = child.killed;
+		child.emitClose();
+		const result = await run;
+		expect(result.ok).toBe(false);
+		expect(!result.ok && result.reason).toBe("step_limit");
+		expect(killed).toBe(true);
+	});
+});
+
+it("accepts provenance redirected to chunked stderr by Pi's output guard", async () => {
+	const { promptFingerprint } = await import("./subagent-telemetry");
+	const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+	try {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const run = runner.run(baseOptions);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const line = `${JSON.stringify({
+			type: "mc_system_prompt",
+			...promptFingerprint("replacement"),
+			containsIntended: false,
+		})}\n`;
+		child.writeStderr(line.slice(0, 10));
+		child.writeStderr(line.slice(10));
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "done" }],
+			},
+		});
+		child.emitClose();
+		await run;
+		expect(
+			log.mock.calls.filter((args) =>
+				String(args[1]).startsWith("subagent_system_prompt_replaced "),
+			),
+		).toHaveLength(1);
+	} finally {
+		log.mockRestore();
+	}
+});
+
+describe("Pi dreamer prompt-token budget", () => {
+	it("hard-stops at soft limit when the lean tool guard is unavailable", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "pi-test", prefixArgs: [], targetHarness: "pi" },
+		});
+		const run = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			tokenBudget: 100,
+		});
+		for (let i = 0; i < 100 && spawnImpl.mock.calls.length === 0; i++)
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		expect(spawnImpl.mock.calls[0]?.[1]).toContain("json");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		expect(await run).toMatchObject({
+			ok: false,
+			reason: "token_budget",
+			meta: { tokenBudget: { finalizeFired: false } },
+		});
+		expect(child.stdinText).not.toContain("dreamer-finalize");
+	});
+	const invocation = {
+		command: "pi-test",
+		prefixArgs: [],
+		targetHarness: "pi" as const,
+	};
+	async function started() {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation,
+			subagentExtensions: ["subagent-entry.js"],
+		});
+		const run = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			tokenBudget: 100,
+		});
+		for (
+			let i = 0;
+			i < 100 && !child.stdinText.includes("dreamer-initial");
+			i++
+		)
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		expect(child.stdinText).toContain("dreamer-initial");
+		expect(spawnImpl.mock.calls[0]?.[1]).toContain("rpc");
+		return { child, run, spawnImpl };
+	}
+
+	it("does not steer a completed under-budget child", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 50 },
+				stopReason: "stop",
+				content: [{ type: "text", text: "<mappings/>" }],
+			},
+		});
+		child.emitClose();
+		expect(await run).toMatchObject({ ok: true, assistantText: "<mappings/>" });
+		expect(child.stdinText).not.toContain("dreamer-finalize");
+	});
+
+	it("steers once at 80%, retains its tools, and accepts a final manifest", async () => {
+		const { child, run, spawnImpl } = await started();
+		const argsBefore = JSON.stringify(spawnImpl.mock.calls[0]?.[1]);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 20, cacheRead: 61, cacheWrite: 0 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(child.stdinText.match(/dreamer-finalize/g)).toHaveLength(1);
+		expect(child.stdinText).toContain("no more tool calls");
+		expect(JSON.stringify(spawnImpl.mock.calls[0]?.[1])).toBe(argsBefore);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 1 },
+				stopReason: "stop",
+				content: [{ type: "text", text: "<mappings/>" }],
+			},
+		});
+		child.emitClose();
+		const result = await run;
+		expect(result).toMatchObject({ ok: true, assistantText: "<mappings/>" });
+	});
+
+	it("hard-stops at 100% even after only one refused call", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		child.writeStdoutLine({
+			type: "tool_execution_end",
+			toolCallId: "blocked-1",
+			toolName: "read",
+			isError: true,
+			result: {
+				content: [
+					{
+						type: "text",
+						text: "Out of token budget: no more tool calls. Output your result now.",
+					},
+				],
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 19 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
+	});
+
+	it("hard-stops after two blocked post-finalize calls", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		for (let i = 0; i < 2; i++)
+			child.writeStdoutLine({
+				type: "tool_execution_end",
+				toolCallId: `blocked-${i}`,
+				toolName: "read",
+				isError: true,
+				result: {
+					content: [
+						{
+							type: "text",
+							text: "Out of token budget: no more tool calls. Output your result now.",
+						},
+					],
+				},
+			});
+		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
 	});
 });

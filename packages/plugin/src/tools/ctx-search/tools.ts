@@ -4,7 +4,10 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
-import { directoryHasGitMetadata } from "../../features/magic-context/memory/project-identity";
+import {
+    describeUnresolvedProjectIdentity,
+    directoryHasGitMetadata,
+} from "../../features/magic-context/memory/project-identity";
 import {
     createUnifiedSearchDiagnostics,
     formatSearchResults,
@@ -19,6 +22,7 @@ import {
     CTX_SEARCH_TOOL_NAME,
     DEFAULT_CTX_SEARCH_LIMIT,
 } from "./constants";
+import { parseSearchDateRange, SearchDateRangeError } from "./date-range";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
 
 export { CTX_SEARCH_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -32,7 +36,7 @@ const VALID_SOURCES: ReadonlySet<CtxSearchSource> = new Set([
 ]);
 
 function normalizeLimit(limit?: number): number {
-    if (typeof limit !== "number" || !Number.isFinite(limit)) {
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit === 0) {
         return DEFAULT_CTX_SEARCH_LIMIT;
     }
 
@@ -41,10 +45,10 @@ function normalizeLimit(limit?: number): number {
 
 /** Validate and normalize the `sources` arg. Drops unknown strings (the enum
  *  constraint catches them at the schema layer, but we still want a safe
- *  runtime check for plugins/tests that call this directly). Returns
- *  `undefined` only when the caller OMITTED `sources`; an explicit [] must stay
- *  [] so unifiedSearch honors the documented "no sources" meaning instead of
- *  widening back to "all sources". */
+ *  runtime check for plugins/tests that call this directly). Required-all
+ *  surfaces fill unused arrays with `[]`; treat that the same as omitting
+ *  `sources` so the search covers every enabled source instead of silently
+ *  returning nothing. */
 function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
     if (sources === undefined) return undefined;
     const result: CtxSearchSource[] = [];
@@ -58,23 +62,24 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
             }
         }
     }
-    return result;
+    return sources.length === 0 ? undefined : result;
 }
 
 const ctxSearchArgsShape = {
     query: tool.schema
         .string()
         .optional()
-        .describe(
-            "Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
-        ),
-    limit: tool.schema.number().optional().describe("Maximum results to return (default: 10)"),
+        .describe("A natural-language question carrying the exact terms you expect in the answer."),
+    limit: tool.schema.number().optional().describe("Maximum results (default 10)."),
+    from: tool.schema.string().optional().describe("Earliest date, YYYY-MM-DD (inclusive)."),
+    to: tool.schema
+        .string()
+        .optional()
+        .describe("Latest date, YYYY-MM-DD (inclusive; default open)."),
     sources: tool.schema
         .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
         .optional()
-        .describe(
-            'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources; pass [] to search no sources.',
-        ),
+        .describe("Restrict to these sources; omit for all. [] searches none."),
 };
 // The tool definition exposes only the documented argument shape to the model
 // provider, but older callers may still send extra arguments. Parse with
@@ -91,6 +96,8 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             args = unwrapImitatedReducedArgs(args, ["query"], {
                 query: "string",
                 limit: "number",
+                from: "string",
+                to: "string",
                 sources: {
                     type: "array",
                     items: "string",
@@ -101,6 +108,13 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             const query = args.query?.trim();
             if (!query) {
                 return "Error: 'query' is required.";
+            }
+            let dateRange: ReturnType<typeof parseSearchDateRange>;
+            try {
+                dateRange = parseSearchDateRange(args.from, args.to);
+            } catch (error) {
+                if (error instanceof SearchDateRangeError) return `Error: ${error.message}`;
+                throw error;
             }
 
             // Only search message history up to the last compartment boundary —
@@ -126,13 +140,15 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             // runs `opencode -s <id>` from outside the project.
             const projectPath = deps.resolveProjectPath(toolContext.directory);
             if (!projectPath) {
-                return "Error: Could not resolve project identity for search.";
+                return `Error: Could not resolve project identity for search: ${describeUnresolvedProjectIdentity(toolContext.directory)}`;
             }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
             const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
             const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? deps.memoryEnabled;
+            // Query embedding serves history, memory and commit lanes alike, so it
+            // follows the provider alone; each lane applies its own feature gate.
             const embeddingEnabled = embeddingSnapshot
-                ? embeddingSnapshot.enabled || embeddingSnapshot.gitCommitEnabled
+                ? embeddingSnapshot.historyEnabled
                 : deps.embeddingEnabled;
             const gitCommitsEnabled =
                 embeddingSnapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
@@ -157,6 +173,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     limit: Math.max(normalizeLimit(args.limit), idShape.length),
                     visibleMemoryIds,
                     diagnostics,
+                    ...dateRange,
                 });
                 if (idResults !== null || diagnostics.suppressedVisibleMemoryIds.length > 0) {
                     return formatSearchResults(
@@ -201,6 +218,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     // recall for symbol/command/path lookups. Auto-search hints
                     // (the hot path) leave this off to protect their latency.
                     explicitSearch: true,
+                    ...dateRange,
                 },
             );
 

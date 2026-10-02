@@ -15,6 +15,7 @@ import { configSaveBlocker } from "./config-save-guard";
 import type { DreamTaskConfig, DreamTaskModelConfig } from "./DreamerTasksField";
 import DreamerTasksField from "./DreamerTasksField";
 import HarnessModelFields, { type Harness, modelCatalogForHarness } from "./HarnessModelFields";
+import LiveBadge from "./LiveBadge";
 import PerModelField from "./PerModelField";
 
 // ── JSONC helpers ───────────────────────────────────────────
@@ -537,6 +538,7 @@ function ConfigForm(props: {
       <div class="config-field">
         <div class="config-field-header">
           <span class="config-field-label">{field.label}</span>
+          <LiveBadge path={field.key} />
           <span class="config-field-key">{field.key}</span>
         </div>
         <span class="config-field-desc">{field.description}</span>
@@ -1446,6 +1448,7 @@ function ConfigForm(props: {
             <div class="config-field">
               <div class="config-field-header">
                 <span class="config-field-label">Task schedules and model overrides</span>
+                <LiveBadge path={`dreamer.${dreamerHarness()}.tasks`} />
                 <span class="config-field-key">dreamer.tasks / dreamer.{"<harness>"}.tasks</span>
               </div>
               <span class="config-field-desc">
@@ -1803,7 +1806,7 @@ function ConfigForm(props: {
               (getNestedValue(formData(), "todowrite") as
                 | { enabled?: boolean; overlay?: boolean }
                 | undefined) ?? {};
-            const todowriteEnabled = () => todowrite().enabled ?? true;
+            const todowriteEnabled = () => todowrite().enabled ?? false;
             const todowriteOverlay = () => todowrite().overlay ?? true;
             const setTodowrite = (patch: Record<string, unknown>) =>
               handleFieldChange("todowrite", { ...todowrite(), ...patch });
@@ -2227,6 +2230,9 @@ function ProjectConfigDetail(props: {
 export default function ConfigEditor(props: {
   modelCatalogs: ModelCatalogs;
   opencodeInstallState: OpencodeInstallState;
+  catalogLoading: boolean;
+  catalogError: string | null;
+  onRetryCatalogs: () => void;
 }) {
   const [configTarget, setConfigTarget] = createSignal<ConfigTarget>(loadConfigTarget());
   const [userConfig, { refetch: refetchUser }] = createResource(() => getConfig("user"));
@@ -2288,6 +2294,17 @@ export default function ConfigEditor(props: {
           </button>
         </div>
       </div>
+
+      <Show when={props.catalogLoading || props.catalogError}>
+        <div class="empty-state" role="status">
+          <span>{props.catalogLoading ? "Loading OpenCode models..." : props.catalogError}</span>
+          <Show when={!props.catalogLoading && props.catalogError}>
+            <button type="button" class="btn sm" onClick={props.onRetryCatalogs}>
+              Retry model discovery
+            </button>
+          </Show>
+        </div>
+      </Show>
 
       <div class="tab-pills">
         <button

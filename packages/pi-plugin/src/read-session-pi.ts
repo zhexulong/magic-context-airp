@@ -265,6 +265,17 @@ function rawEntryVersion(entry: MessageEntry): string | number {
 		: entry.id;
 }
 
+/** Pi/OMP persist JSONL entry timestamps as ISO strings; tolerate numeric SDK fixtures too. */
+export function parsePiEntryTimestamp(entry: MessageEntry): number | null {
+	const record = entry as unknown as Record<string, unknown>;
+	const raw = record.timestamp;
+	if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0)
+		return raw;
+	if (typeof raw !== "string" || raw.trim().length === 0) return null;
+	const parsed = Date.parse(raw);
+	return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function attachPiPartVersion(
 	parts: unknown[],
 	version: string | number,
@@ -285,13 +296,13 @@ function attachPiPartVersion(
 	});
 }
 
-function convertEntriesToRawMessageRange(
-	entries: readonly unknown[],
+export function* iterateEntriesToRawMessageRange(
+	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
-): RawMessage[] {
-	const result: RawMessage[] = [];
+): Generator<RawMessage> {
+	let emitted = 0;
 	const normalizedAfter = Math.max(0, Math.floor(afterOrdinal));
 	const normalizedLimit = Math.max(1, Math.floor(limit));
 	const normalizedWatermark = Math.max(
@@ -303,20 +314,28 @@ function convertEntriesToRawMessageRange(
 	let hasPendingToolParts = false;
 	let pendingFirstRealId = "";
 	let pendingFirstRealVersion: string | number = "";
+	let pendingFirstCreatedAt: number | null = null;
 
-	const appendMessage = (
+	const appendMessage = function* (
 		id: string,
 		role: string,
 		version: string | number,
+		createdAt: number | null,
 		parts: () => unknown[],
-	): boolean => {
+	): Generator<RawMessage, boolean> {
 		const ordinal = nextOrdinal++;
 		if (ordinal > normalizedAfter && ordinal <= normalizedWatermark) {
-			result.push({ ordinal, id, role, parts: parts(), version });
+			emitted++;
+			yield {
+				ordinal,
+				id,
+				role,
+				parts: parts(),
+				version,
+				...(createdAt === null ? {} : { createdAt }),
+			};
 		}
-		return (
-			result.length >= normalizedLimit || nextOrdinal > normalizedWatermark
-		);
+		return emitted >= normalizedLimit || nextOrdinal > normalizedWatermark;
 	};
 
 	for (const entry of entries) {
@@ -335,6 +354,7 @@ function convertEntriesToRawMessageRange(
 			if (pendingFirstRealId === "") {
 				pendingFirstRealId = entry.id;
 				pendingFirstRealVersion = version;
+				pendingFirstCreatedAt = parsePiEntryTimestamp(entry);
 			}
 			continue;
 		}
@@ -342,14 +362,21 @@ function convertEntriesToRawMessageRange(
 		if (role === "user") {
 			const version = rawEntryVersion(entry);
 			const bufferedToolParts = pendingToolParts;
-			const done = appendMessage(entry.id, "user", version, () => [
-				...bufferedToolParts,
-				...attachPiPartVersion(synthesizeUserParts(msg), version),
-			]);
+			const done = yield* appendMessage(
+				entry.id,
+				"user",
+				version,
+				parsePiEntryTimestamp(entry),
+				() => [
+					...bufferedToolParts,
+					...attachPiPartVersion(synthesizeUserParts(msg), version),
+				],
+			);
 			pendingToolParts = [];
 			hasPendingToolParts = false;
 			pendingFirstRealId = "";
 			pendingFirstRealVersion = "";
+			pendingFirstCreatedAt = null;
 			if (done) break;
 			continue;
 		}
@@ -359,23 +386,29 @@ function convertEntriesToRawMessageRange(
 				const bufferedToolParts = pendingToolParts;
 				const pendingId = pendingFirstRealId;
 				const pendingVersion = pendingFirstRealVersion;
-				const done = appendMessage(
+				const done = yield* appendMessage(
 					`${SYNTH_USER_ID_PREFIX}${pendingId}`,
 					"user",
 					pendingVersion,
+					pendingFirstCreatedAt,
 					() => bufferedToolParts,
 				);
 				pendingToolParts = [];
 				hasPendingToolParts = false;
 				pendingFirstRealId = "";
 				pendingFirstRealVersion = "";
+				pendingFirstCreatedAt = null;
 				if (done) break;
 			}
 
 			const version = rawEntryVersion(entry);
 			if (
-				appendMessage(entry.id, "assistant", version, () =>
-					attachPiPartVersion(synthesizeAssistantParts(msg), version),
+				yield* appendMessage(
+					entry.id,
+					"assistant",
+					version,
+					parsePiEntryTimestamp(entry),
+					() => attachPiPartVersion(synthesizeAssistantParts(msg), version),
 				)
 			) {
 				break;
@@ -383,11 +416,15 @@ function convertEntriesToRawMessageRange(
 			continue;
 		}
 
+		// Protocol entries retain canonical ordinals so persisted boundaries do not
+		// shift. Their empty content projection keeps system prompts and tool
+		// declarations out of historian prose while chunk coverage absorbs the slot.
 		if (
-			appendMessage(
+			yield* appendMessage(
 				entry.id,
 				typeof role === "string" ? role : "unknown",
 				rawEntryVersion(entry),
+				parsePiEntryTimestamp(entry),
 				() => [],
 			)
 		) {
@@ -397,51 +434,55 @@ function convertEntriesToRawMessageRange(
 
 	if (
 		hasPendingToolParts &&
-		result.length < normalizedLimit &&
+		emitted < normalizedLimit &&
 		nextOrdinal <= normalizedWatermark
 	) {
-		appendMessage(
+		yield* appendMessage(
 			`${SYNTH_USER_ID_PREFIX}${pendingFirstRealId}`,
 			"user",
 			pendingFirstRealVersion,
+			pendingFirstCreatedAt,
 			() => pendingToolParts,
 		);
 	}
-
-	return result;
 }
 
 /** Pure full conversion exposed for callers that need an entire Pi branch. */
 export function convertEntriesToRawMessages(
 	entries: readonly unknown[],
 ): RawMessage[] {
-	return convertEntriesToRawMessageRange(
-		entries,
-		0,
-		Number.MAX_SAFE_INTEGER,
-		Number.MAX_SAFE_INTEGER,
-	);
+	return [
+		...iterateEntriesToRawMessageRange(
+			entries,
+			0,
+			Number.MAX_SAFE_INTEGER,
+			Number.MAX_SAFE_INTEGER,
+		),
+	];
 }
 
 /** Convert only one raw-message page without hydrating the rest of the Pi branch. */
 export function convertEntriesToRawMessagePage(
-	entries: readonly unknown[],
+	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
 ): RawMessage[] {
-	return convertEntriesToRawMessageRange(
-		entries,
-		afterOrdinal,
-		limit,
-		finalWatermark,
-	);
+	return [
+		...iterateEntriesToRawMessageRange(
+			entries,
+			afterOrdinal,
+			limit,
+			finalWatermark,
+		),
+	];
 }
 
-interface MessageEntry {
+export interface MessageEntry {
 	type: "message";
 	id: string;
 	message: unknown;
+	timestamp?: string | number;
 }
 
 function isMessageEntry(value: unknown): value is MessageEntry {

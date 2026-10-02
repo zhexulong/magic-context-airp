@@ -5,6 +5,7 @@ import {
     getOrCreateSessionMeta,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import type { PluginContext } from "../../plugin/types";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
@@ -14,7 +15,12 @@ import {
     createPromptSurfaceRuntime,
     promptSurfaceHashMaterial,
 } from "../../shared/prompt-surface-runtime";
-import { resolveCtxReduceAvailability } from "./ctx-reduce-availability";
+import {
+    ctxReduceSpawnPermissionReadNeeded,
+    primeCtxReduceSpawnPermission,
+    resolveCtxReduceAvailability,
+    spawnAgentFromOpenCodeDb,
+} from "./ctx-reduce-availability";
 
 import { estimateTokens } from "./read-session-formatting";
 
@@ -77,29 +83,32 @@ function isInternalOpenCodeAgent(systemPromptContent: string): boolean {
         // compaction.txt opens with this exact line
         systemPromptContent.includes(
             "You are an anchored context summarization assistant for coding sessions.",
+        ) ||
+        // compaction.txt from OpenCode 1.18 on opens with this line instead
+        systemPromptContent.includes(
+            "You are a context summarization agent. You are given a conversation between a user and an agent.",
         )
     );
 }
 
 /**
  * Detect Magic Context's OWN hidden child agents by their system-prompt
- * openers. These children (historian/dreamer/memory-migration) load a
- * fixed agent identity and must NOT receive the MC guidance block — it's wasted
- * spend and a contradictory second identity frame ("You are Historian…" plus
- * "You are the user's long-term partner…").
+ * openers. These children (historian/dreamer) load a fixed agent identity and
+ * must NOT receive the MC guidance block — it's wasted spend and a
+ * contradictory second identity frame ("You are Historian…" plus "You are the
+ * user's long-term partner…").
  *
  * This is the timing-independent companion to the `internalChildSessions` flag:
  * the flag is set at `session.created` (may race the very first system.transform
  * by event-delivery latency), whereas this signature is present in the prompt
- * content on pass 1 with zero timing dependency. Memory-migration loads the
- * historian agent prompt, so the historian opener covers it.
+ * content on pass 1 with zero timing dependency.
  *
  * Literal substrings (not fuzzy) so an upstream prompt edit fails open (resumes
  * injection) rather than silently mis-detecting.
  */
 export function isMagicContextInternalAgent(systemPromptContent: string): boolean {
     return (
-        // HISTORIAN_AGENT (also used by memory-migration)
+        // HISTORIAN_AGENT
         systemPromptContent.includes(
             "You are Historian — the hippocampus of a long-running coding agent.",
         ) ||
@@ -170,7 +179,7 @@ export function createSystemPromptHashHandler(deps: {
     injectionSkipSignatures?: string[];
     /**
      * Process-scoped set of Magic Context's OWN hidden child sessions
-     * (historian/dreamer/memory-migration), flagged by title prefix at
+     * (historian/dreamer), flagged by title prefix at
      * `session.created`. When the active session is in this set we skip ALL
      * injection — these children have their own fixed agent identity/prompt and
      * never benefit from the MC guidance block. Belt to the prompt-signature
@@ -185,6 +194,14 @@ export function createSystemPromptHashHandler(deps: {
     experimentalPinKeyFilesTokenBudget?: number;
     /** When true, add a temporal-awareness guidance paragraph + surface compartment dates */
     experimentalTemporalAwareness?: boolean;
+    /**
+     * OpenCode SDK client used to read the agent and session permissions for
+     * ctx_reduce before the verdict freezes. OpenCode can run this hook before
+     * the messages transform, so this hook may be the one that freezes it.
+     * Absent (tests, hosts without the SDK): the verdict freezes from the
+     * tools map alone, as before permissions were considered.
+     */
+    client?: PluginContext["client"];
     /** When true, inject a "BEWARE: history compression is on" warning so the
      *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
@@ -255,7 +272,7 @@ export function createSystemPromptHashHandler(deps: {
         }
 
         // ── Skip Magic Context's OWN hidden children ──
-        // historian/dreamer/memory-migration must not get the MC
+        // historian/dreamer must not get the MC
         // guidance block (wasted spend + contradictory identity frame). Two
         // signals: the title-prefix flag (set at session.created) and the
         // prompt-signature (timing-independent, reliable on pass 1). Either
@@ -325,6 +342,15 @@ export function createSystemPromptHashHandler(deps: {
         // never persisted as the session's baseline — if the first user message
         // then denies the tool, the variant settles BEFORE any hash existed,
         // instead of flipping a persisted hash and busting the prompt cache.
+        // Read the agent and session permissions before this call can freeze
+        // the verdict. Only once the first user message is stored: before that
+        // the spawn agent is unknown and the verdict stays provisional anyway.
+        if (deps.client && ctxReduceSpawnPermissionReadNeeded(sessionId)) {
+            const spawn = spawnAgentFromOpenCodeDb(sessionId);
+            if (spawn.persisted) {
+                await primeCtxReduceSpawnPermission(deps.client, sessionId, spawn.agent);
+            }
+        }
         const availability = resolveCtxReduceAvailability(sessionId);
         const ctxReduceCallable = availability.callable;
         const subagentReduceMode = isSubagentSession && ctxReduceCallable;
@@ -389,6 +415,10 @@ export function createSystemPromptHashHandler(deps: {
         if (liveSystemContent.length === 0) return;
         const previousHash = sessionMetaEarly?.systemPromptHash ?? "";
         const hasPersistedHash = previousHash !== "" && previousHash !== "0";
+        // When the durable system-prompt hash is cleared, the new host must
+        // establish a new baseline. Discard the session's sticky date instead of
+        // reusing the date line frozen for the earlier host projection.
+        if (!hasPersistedHash) stickyDateBySession.delete(sessionId);
         // Every element carrying a date line participates in freezing. Only MC
         // injects the line today, but a host prompt carrying the same format
         // must not leave a second live date that busts the hash at midnight.
@@ -436,7 +466,6 @@ export function createSystemPromptHashHandler(deps: {
 
         // ── Step 3: Persist only after all routing identities are frozen ──
         const systemContent = output.system.join("\n");
-
         // The first stable ctx_reduce verdict and resolved model jointly own the
         // baseline. A provisional tool verdict or unknown model can render a
         // prompt, but neither may persist a hash that the settled route would flip.
@@ -505,6 +534,12 @@ export function createSystemPromptHashHandler(deps: {
                 updateSessionMeta(deps.db, sessionId, {
                     systemPromptHash: currentHash,
                     systemPromptTokens,
+                    // On OpenCode 1, messages.transform runs before system.transform.
+                    // After a rebase clears the previous host baseline, the first
+                    // m[0] render records no system-prompt hash. Store this request's
+                    // hash with that cached render so the following pass recognizes
+                    // the unchanged system prompt and reuses the cache.
+                    cachedM0SystemHash: hasPersistedHash ? undefined : currentHash,
                 });
             } catch (error) {
                 sessionLog(sessionId, "system prompt meta persist failed (fail-open):", error);

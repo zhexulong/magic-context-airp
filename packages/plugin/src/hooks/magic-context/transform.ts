@@ -6,18 +6,23 @@ import {
     ensureContextStoreUuid,
     getAuthorityManagedMarker,
     observeAuthorityRouting,
+    reconcileAuthorityMarker,
 } from "../../features/magic-context/context-authority";
 import {
     isLinkedGitWorktree,
-    resolveProjectIdentity,
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
-import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
-import { isFable51ThinkingBindingModel } from "../../features/magic-context/overflow-detection";
+import {
+    type MessageReconciliationSource,
+    scheduleReconciliation,
+} from "../../features/magic-context/message-index-async";
+import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
+import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     type ContextDatabase,
@@ -39,14 +44,22 @@ import {
     clearThinkingBindingRecoveryIf,
     getChannel1NudgeState,
     getChannel2NudgeState,
+    getEmergencyInputSample,
+    getHistorianFailureState,
     getLastNudgeUndropped,
     getOverflowState,
+    getPersistedCompactionMarkerState,
     loadTransformPassStateSnapshot,
     recordOverflowDetected,
     resetProtectedTailNoEligibleHead,
     resolveEpochFloorForPass,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
+import type { CoordinateGeneration } from "../../features/magic-context/store-generation-rebase";
+import {
+    readCoordinateGeneration,
+    rebaseSessionCoordinatesAsync,
+} from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
 import {
     clearOpenCodePendingTransformDecision,
@@ -63,6 +76,7 @@ import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkContextLimit } from "../../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
+import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { replayCavemanCompression } from "./caveman-cleanup";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
@@ -70,8 +84,10 @@ import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-ru
 import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
 import {
     type CtxReduceAvailabilityVerdict,
+    primeCtxReduceSpawnPermission,
     resolveCtxReduceAvailabilityFromMessages,
     resolveTodowriteAvailabilityFromMessages,
+    spawnAgentFromMessages,
     type ToolAvailabilityVerdict,
 } from "./ctx-reduce-availability";
 import {
@@ -84,6 +100,7 @@ import { deriveTriggerBudget } from "./derive-budgets";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
+    historyBudgetPolicyIdentity,
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
     resolveModelKey,
@@ -96,6 +113,9 @@ import {
 } from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
 import {
+    capturePrefixTrimSourceOrder,
+    findHostCompactionWindow,
+    type HostCompactionWindow,
     mustMaterialize,
     type PreparedCompartmentInjection,
     prepareCompartmentInjection,
@@ -127,11 +147,13 @@ import {
     stripClearedReasoning,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
-import { runCompartmentPhase } from "./transform-compartment-phase";
+import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
+import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
     contextUsagePassSnapshot,
     loadContextUsage,
     resolveSchedulerDecision,
+    resolveUnknownUsageFromWireEstimate,
 } from "./transform-context-state";
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
@@ -145,6 +167,7 @@ import {
 import {
     abortSessionFailClosed,
     type CompactionMarkerStrategy,
+    clearRustModeBoundaryRecord,
     defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
@@ -191,14 +214,14 @@ function maybeSendProjectIdentityWarning(
     if (!deps.client) return;
     const warning = takeDubiousOwnershipProjectIdentityWarning(directory);
     if (!warning) return;
-    void sendStatusNotification(deps.client, sessionId, warning, notificationParams).catch(
-        (error) => {
-            sessionLog(
-                sessionId,
-                `project identity warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
-            );
-        },
-    );
+    void withoutSqliteTransformPass(() =>
+        sendStatusNotification(deps.client, sessionId, warning, notificationParams),
+    ).catch((error) => {
+        sessionLog(
+            sessionId,
+            `project identity warning delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    });
 }
 
 export function clearMessageTokensCache(sessionId: string, messageId?: string): void {
@@ -215,6 +238,10 @@ export function clearMessageTokensCache(sessionId: string, messageId?: string): 
 // appears (or changes) for a session in this process — not on every transform
 // pass. Bounded so crashed/abandoned sessions can't leak the guard forever.
 const recordedSessionProjectIdentity = new BoundedSessionMap<string>(MESSAGE_TOKENS_CACHE_MAX);
+
+// Summary id of the native host compaction last logged per session, so the
+// window head is reported once per compaction rather than on every pass.
+const hostCompactionLoggedBySession = new BoundedSessionMap<string>(MESSAGE_TOKENS_CACHE_MAX);
 
 // Tagger / trigger load-scoping floor (OpenCode only). Several hot-path reads
 // preload an in-memory map or aggregate over a session's tags; on a large/old
@@ -401,6 +428,12 @@ export async function recoverTsAuthorityProject(args: {
     projectRoot: string;
     module: RustModeModuleClient;
 }): Promise<TsAuthorityRecoveryOutcome> {
+    if (!getAuthorityManagedMarker(args.db, args.projectPath)) return "completed";
+    let releasedMarker = false;
+    const onMarkerReleased = () => {
+        bumpProjectMemoryEpoch(args.db, args.projectPath);
+        releasedMarker = true;
+    };
     const module = authorityModuleForProject(args.module, args.projectRoot);
     const domains = ["memories", "notes"] as const;
     const statuses = await Promise.all(
@@ -443,6 +476,7 @@ export async function recoverTsAuthorityProject(args: {
                 projectPath: args.projectPath,
                 domain,
                 module,
+                onMarkerReleased,
                 checksum: () => {
                     const table = domain === "memories" ? "memories" : "notes";
                     const rows = args.db
@@ -461,12 +495,19 @@ export async function recoverTsAuthorityProject(args: {
         drainedDomain = true;
     }
 
-    // drainAuthority removes the shared marker only after every domain is TS.
-    // After a completed replay, bump the project memory epoch once so the memory
-    // view re-renders any changes mirrored during recovery.
-    if (drainedDomain && !getAuthorityManagedMarker(args.db, args.projectPath)) {
-        bumpProjectMemoryEpoch(args.db, args.projectPath);
-        observeAuthorityRouting(args.projectPath, "TS");
+    // A previous process may have finished the drain before removing its marker.
+    // Use the same identity-checked heal as startup reconciliation, not another drain.
+    if (!drainedDomain && getAuthorityManagedMarker(args.db, args.projectPath)) {
+        await reconcileAuthorityMarker({
+            db: args.db,
+            projectPath: args.projectPath,
+            module,
+            onMarkerReleased,
+        });
+    }
+    if (!getAuthorityManagedMarker(args.db, args.projectPath)) {
+        // Only the caller that atomically released the marker owns this transition.
+        if (releasedMarker) observeAuthorityRouting(args.projectPath, "TS");
         return "completed";
     }
     return "retryable";
@@ -502,31 +543,61 @@ export function scheduleTsAuthorityRecovery(args: {
     }
 
     tsAuthorityRecoveryStateByProject.set(args.projectPath, "running");
-    void Promise.resolve()
-        .then(() => recoverTsAuthorityProject({ ...args, module }))
-        .then((outcome) => {
-            if (outcome === "completed") {
+    void withoutSqliteTransformPass(() =>
+        Promise.resolve()
+            .then(() => recoverTsAuthorityProject({ ...args, module }))
+            .then((outcome) => {
+                if (outcome === "completed") {
+                    tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
+                    log(`[magic-context] authority drain complete for project ${args.projectPath}`);
+                } else {
+                    // A bounded contention result is durable and resumable. Do not cache it
+                    // so the next project setup can resume the module's DRAINING state.
+                    tsAuthorityRecoveryStateByProject.delete(args.projectPath);
+                }
+            })
+            .catch((error) => {
                 tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
-                log(`[magic-context] authority drain complete for project ${args.projectPath}`);
-            } else {
-                // A bounded contention result is durable and resumable. Do not cache it
-                // so the next project setup can resume the module's DRAINING state.
-                tsAuthorityRecoveryStateByProject.delete(args.projectPath);
-            }
-        })
-        .catch((error) => {
-            tsAuthorityRecoveryStateByProject.set(args.projectPath, "complete");
-            if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
-                tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
-                log(
-                    `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
-                    error,
-                );
-            }
-        });
+                if (!tsAuthorityUnreachableLoggedProjects.has(args.projectPath)) {
+                    tsAuthorityUnreachableLoggedProjects.add(args.projectPath);
+                    log(
+                        `[magic-context] authority recovery for ${args.projectPath} cannot reach subc; writes remain fenced. Run magic-context doctor drain-authority ${args.projectRoot} with rust mode or restore subc connectivity.`,
+                        error,
+                    );
+                }
+            }),
+    );
+}
+
+export const EMERGENCY_REFUSAL_NOTICE = "Context full — /ctx-flush or /clear to continue.";
+
+export type HostRefusalNotice = (
+    client: PluginContext["client"] | undefined,
+    sessionId: string,
+    message: string,
+    notificationParams: import("./send-session-notification").NotificationParams,
+) => Promise<void>;
+
+export async function sendEmergencyRefusalNotice(
+    client: PluginContext["client"] | undefined,
+    sessionId: string,
+    message: string,
+    notificationParams: import("./send-session-notification").NotificationParams,
+): Promise<void> {
+    if (!client) throw new Error("OpenCode client is unavailable");
+    const notification = await sendStatusNotification(
+        client,
+        sessionId,
+        message,
+        notificationParams,
+    );
+    if (notification !== "sent" && notification !== "queued") {
+        throw new Error(`Emergency recovery notification was ${notification}`);
+    }
 }
 
 export interface TransformDeps {
+    cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
     hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
     /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
     compactionMarkerStrategy?: CompactionMarkerStrategy & {
@@ -534,9 +605,11 @@ export interface TransformDeps {
         publish?: typeof import("./compaction-marker-manager").updateCompactionMarkerAfterPublication;
     };
     /** Host storage and cancellation adapters; omitted callbacks retain OpenCode 1 behavior. */
-    hostRawMessages?: typeof readRawSessionMessages;
+    hostRawMessages?: (sessionId: string) => ReturnType<typeof readRawSessionMessages>;
+    hostMessageReconciliationSource?: MessageReconciliationSource;
     hostProtectedTailBoundary?: typeof resolveOpenCodeProtectedTailBoundary;
     hostModelFallback?: typeof findLastAssistantModelFromOpenCodeDb;
+    hostRefusalNotice?: HostRefusalNotice;
     hostRefuse?: typeof abortSessionFailClosed;
     tagger: Tagger;
     scheduler: Scheduler;
@@ -625,8 +698,34 @@ export interface TransformDeps {
     historianMaxOutputTokens?: number;
     /** Resolved fallback chain for historian-family calls. */
     fallbackModels?: readonly ModelInput[];
+    resolveHistorianRun?: () => {
+        model?: ModelInput;
+        fallbackModels: readonly ModelInput[];
+        contextLimit?: number;
+        maxOutputTokens?: number;
+        timeoutMs: number;
+        twoPass: boolean;
+        autoPromote: boolean;
+        userMemoriesEnabled: boolean;
+        commitClusterTrigger?: { enabled: boolean; min_clusters: number };
+        toastDurationMs?: number;
+        chunkTokens: number;
+    };
     /** False when historian.disable=true, blocking historian-backed child agents. */
     historianRunnable?: boolean;
+    /**
+     * Which side runs the historian completion in Rust transform mode
+     * (`historian.runner`). Absent means the harness default, which for OpenCode 1
+     * and OpenCode 2 is the host: the module queues the completion and this
+     * process's pull loop runs it. Only "broca" leaves the pull loop unbuilt.
+     */
+    historianRunner?: "broca" | "host";
+    /**
+     * Operator kill switch for this process's historian pull loop
+     * (`historian.host_runner.enabled`). Absent means enabled; it only matters
+     * when `historianRunner` is not "broca".
+     */
+    historianHostRunnerEnabled?: boolean;
     /**
      * Compaction-off mode (issue #266), boot-resolved and process-stable.
      * When true the transform runs additive-only: m[0]/m[1] memory/docs
@@ -640,6 +739,7 @@ export interface TransformDeps {
      * delivery.
      */
     compactionOff?: boolean;
+    hostCleanupCompactionMarkers?: Parameters<typeof reconcileCompactionMode>[0]["cleanupMarkers"];
     getNotificationParams?: (
         sessionId: string,
     ) => import("./send-session-notification").NotificationParams;
@@ -674,7 +774,7 @@ export interface TransformDeps {
     sessionDirectoryBySession?: Map<string, string>;
     /**
      * Process-scoped set of Magic Context's OWN hidden child sessions
-     * (historian/dreamer/memory-migration), detected by title prefix
+     * (historian/dreamer), detected by title prefix
      * at `session.created`. When a session is in this set the transform returns
      * immediately (messages unmodified) — these children have their own fixed
      * agent identity and never use any MC feature, so even reduced-mode work
@@ -723,20 +823,41 @@ export interface TransformDeps {
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
     onRustModeProjectPrepared?: (projectPath: string) => void;
+    onRustEngineReconnectRefusal?: (args: {
+        sessionId: string;
+        projectRoot: string;
+        refusedUserMessageId: string;
+        providerProvenEmergency: boolean;
+        compactionOff: boolean;
+    }) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
+    /**
+     * Which projection of the OpenCode store this host serves. Supplied by the
+     * OpenCode 1 and OpenCode 2 hooks; omitted by every other harness, which
+     * keeps them (Pi in particular) out of the coordinate rebase entirely.
+     */
+    storeGeneration?: CoordinateGeneration;
 }
 
 export function resolveTransformHostSeams(
     deps: Pick<
         TransformDeps,
-        "hostRawMessages" | "hostProtectedTailBoundary" | "hostModelFallback" | "hostRefuse"
+        | "hostRawMessages"
+        | "hostMessageReconciliationSource"
+        | "hostProtectedTailBoundary"
+        | "hostModelFallback"
+        | "hostRefusalNotice"
+        | "hostRefuse"
     >,
 ) {
     return {
         hostRawMessages: deps.hostRawMessages ?? readRawSessionMessages,
+        hostMessageReconciliationSource:
+            deps.hostMessageReconciliationSource ?? readRawSessionMessages,
         hostProtectedTailBoundary:
             deps.hostProtectedTailBoundary ?? resolveOpenCodeProtectedTailBoundary,
         hostModelFallback: deps.hostModelFallback ?? findLastAssistantModelFromOpenCodeDb,
+        hostRefusalNotice: deps.hostRefusalNotice ?? sendEmergencyRefusalNotice,
         hostRefuse: deps.hostRefuse ?? abortSessionFailClosed,
     };
 }
@@ -752,6 +873,7 @@ export function createTransform(deps: TransformDeps) {
                   projectRoot: deps.rustModeProjectRoot,
                   notifyParked: deps.onRustModeParked,
                   onProjectPrepared: deps.onRustModeProjectPrepared,
+                  onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
                   allowAuthorityProtocolBypassForTests:
                       deps.rustModeAllowAuthorityProtocolBypassForTests,
@@ -781,6 +903,7 @@ export function createTransform(deps: TransformDeps) {
         output: { messages: unknown[] },
     ): Promise<void> => {
         const startTime = performance.now();
+        const historianRun = deps.resolveHistorianRun?.();
         const messages = output.messages as MessageLike[];
         const passOutcome = createPassOutcome();
         const lkgInput = projectLkgEntry(messages);
@@ -789,13 +912,64 @@ export function createTransform(deps: TransformDeps) {
             return;
         }
         const resolvedSessionId = sessionId;
+        const runNotificationParams = (sid: string) => {
+            const params = deps.getNotificationParams?.(sid) ?? {};
+            return historianRun?.toastDurationMs === undefined
+                ? params
+                : { ...params, toastDurationMs: historianRun.toastDurationMs };
+        };
         beginLkgPass(sessionId);
         clearOpenCodePendingTransformDecision(sessionId);
         logTransformTiming(sessionId, "findSessionId", startTime, `messages=${messages.length}`);
 
         const db = deps.db;
+
+        // Runs before anything reads a saved coordinate. Every ordinal this
+        // session stored is a position in the message list some host served; if
+        // the host in front of us serves a different projection of the same
+        // conversation, those positions must be re-derived from the surviving
+        // message ids first. Failing here must not take the chat down: the
+        // generation stamp is only written on success, so the next pass retries.
+        if (deps.storeGeneration !== undefined) {
+            try {
+                // The module keeps its own copy of this conversation, keyed on the
+                // numbering the previous host served. Nothing re-derives that copy,
+                // so it is deleted before the host rows are renumbered and re-seeded
+                // cold from the rebased rows on this same pass. Doing it first is
+                // what makes a failure recoverable: the generation stamp is written
+                // by the rebase below, so throwing here leaves the session on its old
+                // generation and the next pass tries the whole sequence again.
+                if (
+                    rustModeTransform &&
+                    readCoordinateGeneration(db, sessionId) !== deps.storeGeneration
+                ) {
+                    clearRustModeBoundaryRecord(db, sessionId);
+                    await rustModeTransform.clearSession(sessionId);
+                    sessionLog(
+                        sessionId,
+                        `rust module session deleted before the store projection rebase to ${deps.storeGeneration}; the next serve seeds cold`,
+                    );
+                }
+                await rebaseSessionCoordinatesAsync({
+                    db,
+                    sessionId,
+                    generation: deps.storeGeneration,
+                    readMessages: host.hostRawMessages,
+                });
+            } catch (error) {
+                passOutcome.record("store-generation-rebase-failure");
+                sessionLog(
+                    sessionId,
+                    "store projection rebase failed (retrying next pass):",
+                    error,
+                );
+            }
+        }
+
         if (deps.client !== undefined) {
-            scheduleReconciliation(db, sessionId, host.hostRawMessages);
+            withoutSqliteTransformPass(() =>
+                scheduleReconciliation(db, sessionId, host.hostMessageReconciliationSource),
+            );
         }
 
         const tUserMsg = performance.now();
@@ -808,6 +982,16 @@ export function createTransform(deps: TransformDeps) {
         try {
             // Intentional fail-open: magic-context should not block live chat if session state read fails.
             sessionMeta = getOrCreateSessionMeta(db, sessionId);
+            const ttlModel =
+                findNewestUserModel(messages) ??
+                deps.liveModelBySession?.get(sessionId) ??
+                findLastAssistantModel(messages);
+            sessionMeta.cacheTtl = resolveSessionCacheTtl(
+                db,
+                sessionId,
+                deps.cacheTtlConfig,
+                ttlModel ? `${ttlModel.providerID}/${ttlModel.modelID}` : undefined,
+            ).value;
         } catch (error) {
             passOutcome.record("session-meta-early-return", "fatal");
             sessionLog(sessionId, "transform failed reading session meta:", error);
@@ -815,7 +999,29 @@ export function createTransform(deps: TransformDeps) {
         }
         logTransformTiming(sessionId, "getOrCreateSessionMeta", tMeta);
 
-        // Magic Context's OWN hidden children (historian/dreamer/memory-migration)
+        // Read before anything in this pass trims the messages: a native host
+        // compaction is recognised by the rows at the head of the host window.
+        let hostCompaction: HostCompactionWindow | null = null;
+        try {
+            hostCompaction = findHostCompactionWindow(
+                messages,
+                () => getPersistedCompactionMarkerState(db, sessionId)?.summaryMessageId || null,
+            );
+            if (
+                hostCompaction &&
+                hostCompactionLoggedBySession.get(sessionId) !== hostCompaction.summaryMessageId
+            ) {
+                hostCompactionLoggedBySession.set(sessionId, hostCompaction.summaryMessageId);
+                sessionLog(
+                    sessionId,
+                    `transform: native host compaction heads the window (request ${hostCompaction.compactionMessageId}, summary ${hostCompaction.summaryMessageId}, completed ${hostCompaction.completedAt}); a baseline older than it folds on this pass`,
+                );
+            }
+        } catch (error) {
+            sessionLog(sessionId, "transform: reading the host compaction head failed:", error);
+        }
+
+        // Magic Context's OWN hidden children (historian/dreamer)
         // are fully exempt from the transform. They have a
         // fixed agent identity + single-shot/bounded job and use zero MC
         // features, so even reduced-mode work (tagging, heuristic drops) is
@@ -848,6 +1054,7 @@ export function createTransform(deps: TransformDeps) {
                 compactionOff,
                 historianRunnable: deps.historianRunnable !== false,
                 compartmentInProgress: sessionMeta.compartmentInProgress,
+                cleanupMarkers: deps.hostCleanupCompactionMarkers,
             });
             const hasTransitionEffects =
                 transition.recordToWrite !== null ||
@@ -891,7 +1098,7 @@ export function createTransform(deps: TransformDeps) {
                             deps.client,
                             sessionId,
                             notice,
-                            deps.getNotificationParams?.(sessionId) ?? {},
+                            runNotificationParams(sessionId) ?? {},
                         )) === "sent";
                 }
                 if (noticeDelivered && transition.recordToWrite !== null) {
@@ -906,6 +1113,20 @@ export function createTransform(deps: TransformDeps) {
         } catch (error) {
             passOutcome.record("compaction-mode-transition-failure");
             sessionLog(sessionId, "compaction mode transition failed (retrying next pass):", error);
+        }
+
+        // Read the agent and session permissions for ctx_reduce before either
+        // renderer freezes the ctx_reduce verdict below. OpenCode keeps those
+        // permissions off the first user message's tools map, so without this
+        // read a session whose agent denies ctx_reduce would still get §N§ tags,
+        // reduce guidance, and nudges. This is a no-op once the verdict froze,
+        // so a later permission change never flips provider-visible bytes.
+        if (deps.client !== undefined && !compactionOff) {
+            await primeCtxReduceSpawnPermission(
+                deps.client,
+                sessionId,
+                spawnAgentFromMessages(messages),
+            );
         }
 
         // Rust mode is an authority adapter, not a second implementation of the
@@ -926,7 +1147,7 @@ export function createTransform(deps: TransformDeps) {
             await rustModeTransform.run(sessionId, messages, output, sessionMeta);
             // Rust returns before the TypeScript post-pass hook below. Run the
             // host-owned embedding trigger after either implementation publishes.
-            deps.maybeAutoEmbedSession?.(sessionId);
+            withoutSqliteTransformPass(() => deps.maybeAutoEmbedSession?.(sessionId));
             return;
         }
 
@@ -1091,6 +1312,10 @@ export function createTransform(deps: TransformDeps) {
                     piModelRefToCanonical(lastUsageModelKey) !==
                         piModelRefToCanonical(outgoingModelKey)
                 ) {
+                    const outgoingOverflow = getOverflowState(db, sessionId, outgoingModelKey);
+                    const preserveOutgoingOverflow =
+                        outgoingOverflow.detectedContextLimit > 0 &&
+                        outgoingOverflow.detectedContextLimitModelKey !== null;
                     dropSlot(sessionId, "model-change");
                     sessionLog(
                         sessionId,
@@ -1106,15 +1331,20 @@ export function createTransform(deps: TransformDeps) {
                     clearHistorianFailureState(db, sessionId);
                     clearPersistedReasoningWatermark(db, sessionId);
                     // The emergency-drop watermark is keyed to the prior model's
-                    // ceiling (contextLimit × executeThreshold); a model change
-                    // moves the ceiling, so reset the latch to re-evaluate the
-                    // full tail. The detected-overflow limit + recovery flag were
-                    // specific to the prior model and must not leak into the new
-                    // model's pressure math, so clear them too (the proactive arm
-                    // below re-arms from scratch against the new model if needed).
+                    // ceiling (contextLimit × executeThreshold), so re-evaluate the
+                    // full tail. Clear overflow state only when it is also keyed to
+                    // the prior model; a provider error may already have recorded a
+                    // detected limit for the outgoing model before stale usage is reset.
                     clearEmergencyDropSample(db, sessionId);
-                    clearDetectedContextLimit(db, sessionId);
-                    clearEmergencyRecovery(db, sessionId);
+                    if (preserveOutgoingOverflow) {
+                        sessionLog(
+                            sessionId,
+                            `transform: preserving detected limit ${outgoingOverflow.detectedContextLimit} and overflow recovery for outgoing model ${outgoingModelKey}`,
+                        );
+                    } else {
+                        clearDetectedContextLimit(db, sessionId);
+                        clearEmergencyRecovery(db, sessionId);
+                    }
                     // Clear the in-memory usage map so loadContextUsage recomputes.
                     deps.contextUsageMap.delete(sessionId);
                     sessionMeta = {
@@ -1299,11 +1529,13 @@ export function createTransform(deps: TransformDeps) {
                     };
                     usagePercentageSynthetic = true;
                 } else if (recoveryNoHeadEscapeActive && deps.client) {
-                    void sendStatusNotification(
-                        deps.client,
-                        sessionId,
-                        "Magic Context can't compact yet — the recent history is a single in-progress block. Continuing; it will compact once the block completes. Run `/ctx-recomp` if this persists.",
-                        deps.getNotificationParams?.(sessionId) ?? {},
+                    void withoutSqliteTransformPass(() =>
+                        sendStatusNotification(
+                            deps.client,
+                            sessionId,
+                            "Magic Context can't compact yet — the recent history is a single in-progress block. Continuing; it will compact once the block completes. Run `/ctx-recomp` if this persists.",
+                            runNotificationParams(sessionId) ?? {},
+                        ),
                     );
                 }
             } catch (error) {
@@ -1368,6 +1600,18 @@ export function createTransform(deps: TransformDeps) {
               ? (contextUsageEarly.inputTokens / windowGeometry.usableHard) * 100
               : contextUsageEarly.percentage;
         const currentModelKeyForBoundary = deps.getModelKey?.(sessionId);
+        const providerProvenLimitForRecovery =
+            earlyStateSnapshot.overflow.needsEmergencyRecovery &&
+            earlyStateSnapshot.overflow.emergencyRecoveryOrigin === "provider_overflow" &&
+            typeof currentModelKeyForBoundary === "string" &&
+            currentModelKeyForBoundary.length > 0 &&
+            earlyStateSnapshot.overflow.detectedContextLimit > 0 &&
+            piModelRefToCanonical(
+                earlyStateSnapshot.overflow.detectedContextLimitModelKey ?? "",
+            ) === piModelRefToCanonical(currentModelKeyForBoundary)
+                ? earlyStateSnapshot.overflow.detectedContextLimit
+                : undefined;
+        const providerProvenInputForRecovery = persistedUsageBeforeResets?.usage.inputTokens;
         const thresholdContextLimit =
             resolvedContextLimit && resolvedContextLimit > 0
                 ? resolvedContextLimit
@@ -1402,13 +1646,32 @@ export function createTransform(deps: TransformDeps) {
         const boundaryUsageForProtectedTail = persistedUsageFreshForBoundary ?? contextUsageEarly;
         const boundaryUsageSource = persistedUsageFreshForBoundary ? "persisted" : "live";
 
+        const historyPolicyIdentity = historyBudgetPolicyIdentity(
+            deps.historyBudgetPercentage,
+            deps.executeThresholdPercentage,
+            currentModelKeyForBoundary,
+            deps.executeThresholdTokens,
+        );
+        // A cold-pass usage reset must not hide the last matched usable window.
+        // For catalog-absent models, rendering against the 60K default here would
+        // manufacture a larger baseline, then force a shrink on the next pass.
+        // A newly resolved live/catalog/overflow limit always takes precedence.
+        const historyContextLimit =
+            resolvedContextLimit ??
+            (currentModelKeyForBoundary &&
+            persistedUsageBeforeResets?.lastObservedModelKey &&
+            piModelRefToCanonical(currentModelKeyForBoundary) ===
+                piModelRefToCanonical(persistedUsageBeforeResets.lastObservedModelKey) &&
+            persistedUsageBeforeResets.lastUsageContextLimit > 0
+                ? persistedUsageBeforeResets.lastUsageContextLimit
+                : undefined);
         const historyBudgetTokens = resolveHistoryBudgetTokens(
             deps.historyBudgetPercentage,
             contextUsageEarly,
             deps.executeThresholdPercentage,
             deps.getModelKey?.(sessionId),
             deps.executeThresholdTokens,
-            resolvedContextLimit,
+            historyContextLimit,
         );
         // Ceiling for the tiered emergency drop = contextLimit × executeThreshold%
         // (the usable working ceiling, NOT scaled by history_budget_percentage).
@@ -1446,6 +1709,9 @@ export function createTransform(deps: TransformDeps) {
         //
         const historyRefreshExplicitBeforePrepare = deps.historyRefreshSessions.has(sessionId);
         const deferredHistoryWasPendingAtPassStart = deferredHistoryRefreshSessions.has(sessionId);
+        const prefixTrimSourceOrder = deferredHistoryWasPendingAtPassStart
+            ? capturePrefixTrimSourceOrder(messages)
+            : undefined;
         const earlyActiveRunBlocksMaterialization =
             (getActiveCompartmentRun(sessionId) !== undefined ||
                 sessionMeta.compartmentInProgress) &&
@@ -1460,7 +1726,7 @@ export function createTransform(deps: TransformDeps) {
         const consumingDeferredEarly =
             canConsumeDeferredEarly && deferredHistoryWasPendingAtPassStart;
         const isCacheBusting = historyRefreshExplicitBeforePrepare || consumingDeferredEarly;
-        const notificationParams = deps.getNotificationParams?.(sessionId) ?? {};
+        const notificationParams = runNotificationParams(sessionId) ?? {};
         const boundaryContextLimit =
             resolvedContextLimit && resolvedContextLimit > 0
                 ? resolvedContextLimit
@@ -1512,8 +1778,6 @@ export function createTransform(deps: TransformDeps) {
             }
             return false;
         };
-        let skipCompartmentAwaitForThisPass = false;
-
         const startRecoveryRun = (): boolean => {
             const scale = emergencyUsagePercentageEarly >= 95 ? 0.25 : 0.5;
             let boundarySnapshot = getRunnableBoundaryForCompartment();
@@ -1549,23 +1813,25 @@ export function createTransform(deps: TransformDeps) {
                 compactionMarkerStrategy: deps.compactionMarkerStrategy,
                 db,
                 sessionId,
-                historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
+                historianChunkTokens:
+                    historianRun?.chunkTokens ?? deps.getHistorianChunkTokens?.() ?? 20_000,
                 boundarySnapshot,
                 currentContextLimit: boundaryContextLimit,
                 historyBudgetTokens,
-                historianTimeoutMs: deps.historianTimeoutMs,
-                model: deps.historianModel,
-                fallbackModels: deps.fallbackModels,
+                historianTimeoutMs: historianRun?.timeoutMs ?? deps.historianTimeoutMs,
+                model: historianRun?.model ?? deps.historianModel,
+                fallbackModels: historianRun?.fallbackModels ?? deps.fallbackModels,
                 directory: compartmentDirectory,
                 fallbackModelId,
                 getNotificationParams: () => notificationParams,
-                experimentalUserMemories: deps.experimentalUserMemories,
+                experimentalUserMemories:
+                    historianRun?.userMemoriesEnabled ?? deps.experimentalUserMemories,
                 experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
-                historianTwoPass: deps.historianTwoPass,
+                historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
                 // Issue #44: gate historian-driven memory promotion so users
                 // who disable the feature actually see no memories created.
                 memoryEnabled: deps.memoryConfig?.enabled,
-                autoPromote: deps.memoryConfig?.autoPromote,
+                autoPromote: historianRun?.autoPromote ?? deps.memoryConfig?.autoPromote,
                 ensureProjectRegistered: deps.ensureProjectRegistered,
                 // Historian publication invalidates the injection cache AND
                 // changes compartments/facts that render into message[0]. We
@@ -1583,7 +1849,6 @@ export function createTransform(deps: TransformDeps) {
                     deferredMaterializationSessions.add(sid);
                 },
             });
-            skipCompartmentAwaitForThisPass = true;
             return true;
         };
 
@@ -1594,7 +1859,6 @@ export function createTransform(deps: TransformDeps) {
             emergencyUsagePercentageEarly >= 95 &&
             !recoveryNoHeadEscapeActive
         ) {
-            skipCompartmentAwaitForThisPass = true;
             const emergencyPercentage = contextUsageEarly.percentage.toFixed(1);
             const recoveryStarted = startRecoveryRun();
             // If recovery can't start because there is no eligible pre-tail
@@ -1632,11 +1896,13 @@ export function createTransform(deps: TransformDeps) {
                 `transform: historian recovery triggered on session load after ${historianFailureState.failureCount} failure(s)`,
             );
             if (deps.client) {
-                void sendStatusNotification(
-                    deps.client,
-                    sessionId,
-                    `## Historian recovery\n\nHistorian previously failed ${historianFailureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
-                    notificationParams,
+                void withoutSqliteTransformPass(() =>
+                    sendStatusNotification(
+                        deps.client,
+                        sessionId,
+                        `## Historian recovery\n\nHistorian previously failed ${historianFailureState.failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
+                        notificationParams,
+                    ),
                 );
             }
         }
@@ -1651,7 +1917,7 @@ export function createTransform(deps: TransformDeps) {
         // first call per directory in a new process spawns `git rev-list`.
         const memoryProjectDirectory = compartmentDirectory || process.cwd();
         const projectIdentity = deps.memoryConfig?.enabled
-            ? resolveProjectIdentity(memoryProjectDirectory)
+            ? resolveProjectIdentityForSession(memoryProjectDirectory, deps.allowHomeProject)
             : undefined;
         if (deps.memoryConfig?.enabled) {
             maybeSendProjectIdentityWarning(
@@ -1673,7 +1939,9 @@ export function createTransform(deps: TransformDeps) {
         // (session dir == launch dir) costs nothing extra.
         const sessionProjectIdentity =
             projectIdentity ??
-            (sessionDirectory ? resolveProjectIdentity(sessionDirectory) : deps.projectPath);
+            (sessionDirectory
+                ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
+                : deps.projectPath);
         const sessionIdentityForBinding = sessionDirectory
             ? resolveProjectIdentityForSession(sessionDirectory, deps.allowHomeProject)
             : undefined;
@@ -1770,12 +2038,21 @@ export function createTransform(deps: TransformDeps) {
                     boundaryExecuteThreshold,
                     deriveTriggerBudget(boundaryContextLimit, boundaryExecuteThreshold),
                     deps.clearReasoningAge,
-                    deps.commitClusterTrigger,
+                    historianRun?.commitClusterTrigger ?? deps.commitClusterTrigger,
                     undefined,
                     boundaryContextLimit,
                     inMemoryTail,
                     taggerFloor,
                     { providerID: resolvedProviderID },
+                    {
+                        hardFold: false,
+                        force:
+                            contextUsageEarly.percentage >= forceMaterializationPercentage &&
+                            (contextUsageEarly.percentage >= 95 ||
+                                getEmergencyInputSample(db, sessionId) === 0),
+                        explicitFlush: deps.pendingMaterializationSessions.has(sessionId),
+                        publishedHistory: isCacheBusting,
+                    },
                 );
                 if (triggerResult.shouldFire) {
                     sessionLog(
@@ -1935,8 +2212,18 @@ export function createTransform(deps: TransformDeps) {
                     messagesBeforeInitialPrepare && hiddenMessagesAtCompactionSeam.length > 0
                         ? messagesBeforeInitialPrepare
                         : messages;
+                const canAdoptScopedToolSweep = isCacheBusting || canConsumeDeferredEarly;
+                // A pass that may not change bytes and has not adopted yet
+                // cannot pick a sweep from a default: which array this session
+                // was last served decides it. The resolver runs at finalize,
+                // where both candidate arrays exist.
+                const scopedToolSweep = useScopedToolSweep(db, sessionId, canAdoptScopedToolSweep)
+                    ? true
+                    : createPreAdoptionToolSweepResolver(db, sessionId);
                 const result = tagMessages(sessionId, messagesForTagging, deps.tagger, db, {
                     skipPrefixInjection,
+                    scopedToolSweep,
+                    servedMessages: messages,
                 });
                 targets = result.targets;
                 reasoningByMessage = result.reasoningByMessage;
@@ -2106,9 +2393,8 @@ export function createTransform(deps: TransformDeps) {
         // instead of the full-array scan we used to do here.
         const watermark = getMaxDroppedTagNumber(db, sessionId);
 
-        // Reuse the early scheduler result — inputs haven't changed.
-        const contextUsage = contextUsageEarly;
-        const rawGetNotifParams = deps.getNotificationParams;
+        let contextUsage = contextUsageEarly;
+        const rawGetNotifParams = runNotificationParams;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({
             hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
@@ -2128,13 +2414,16 @@ export function createTransform(deps: TransformDeps) {
             db,
             sessionId,
             resolvedSessionId,
-            historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
+            historianChunkTokens:
+                historianRun?.chunkTokens ?? deps.getHistorianChunkTokens?.() ?? 20_000,
             historyBudgetTokens,
-            historianTimeoutMs: deps.historianTimeoutMs,
-            historianModel: deps.historianModel,
-            historianContextLimit: deps.historianContextLimit,
-            historianMaxOutputTokens: deps.historianMaxOutputTokens,
-            fallbackModels: deps.fallbackModels,
+            historianTimeoutMs: historianRun?.timeoutMs ?? deps.historianTimeoutMs,
+            historianModel: historianRun?.model ?? deps.historianModel,
+            historianContextLimit: historianRun?.contextLimit ?? deps.historianContextLimit,
+            historianMaxOutputTokens: historianRun
+                ? historianRun.maxOutputTokens
+                : deps.historianMaxOutputTokens,
+            fallbackModels: historianRun?.fallbackModels ?? deps.fallbackModels,
             compartmentDirectory,
             messages,
             pendingCompartmentInjection,
@@ -2150,15 +2439,15 @@ export function createTransform(deps: TransformDeps) {
             safeForBackgroundCompression:
                 historianRunnable && (isCacheBusting || schedulerDecision === "execute"),
             deferredHistoryRefreshSessions,
-            skipAwaitForThisPass: skipCompartmentAwaitForThisPass,
-            experimentalUserMemories: deps.experimentalUserMemories,
+            experimentalUserMemories:
+                historianRun?.userMemoriesEnabled ?? deps.experimentalUserMemories,
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
-            historianTwoPass: deps.historianTwoPass,
+            historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
             // Issue #44: forward memory gating so the normal historian path
             // (not just the recovery path above) honors memory.enabled and
             // memory.auto_promote.
             memoryEnabled: deps.memoryConfig?.enabled,
-            autoPromote: deps.memoryConfig?.autoPromote,
+            autoPromote: historianRun?.autoPromote ?? deps.memoryConfig?.autoPromote,
             ensureProjectRegistered: deps.ensureProjectRegistered,
             // See startRecoveryRun above for the full rationale —
             // historian/recomp publication signals history rebuild +
@@ -2210,6 +2499,7 @@ export function createTransform(deps: TransformDeps) {
             modelKey: hardModelKey,
             cacheExpired: hardCacheExpired,
             lastResponseTime: sessionMeta.lastResponseTime,
+            ...(hostCompaction ? { hostCompaction } : {}),
         };
 
         const lateActiveRunBlocksMaterialization =
@@ -2243,6 +2533,7 @@ export function createTransform(deps: TransformDeps) {
                 muralEnabled: deps.muralEnabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                historyBudgetPolicyIdentity: historyPolicyIdentity,
                 hardSignals: m0HardSignals,
             }).value;
         const protectionCacheBustingPass =
@@ -2253,6 +2544,62 @@ export function createTransform(deps: TransformDeps) {
                 deps.pendingMaterializationSessions.has(sessionId) ||
                 (canConsumeDeferredLate && deferredMaterializationSessions.has(sessionId)) ||
                 protectionFoldWillBust);
+        const calibrationBustReason = protectionFoldWillBust
+            ? "fold"
+            : contextUsage.percentage >= forceMaterializationPercentage
+              ? "force"
+              : deps.pendingMaterializationSessions.has(sessionId)
+                ? "flush"
+                : consumingDeferredEarly || compartmentPhase.justAwaitedPublication
+                  ? "refresh"
+                  : schedulerDecision === "execute"
+                    ? "execute"
+                    : "unknown";
+        sessionDecisionCalibration(db, sessionId, {
+            bustPermitted: protectionCacheBustingPass,
+            modelKey: hardModelKey || currentModelKeyForBoundary,
+            bustReason: calibrationBustReason,
+            onAdopt: (message) => sessionLog(sessionId, message),
+        });
+        // A cache-busting pass can lack input-token usage for the selected model
+        // after a switch or overflow. Estimate from the transformed payload so
+        // emergency tool-output reclaim does not skip the pass as unknown usage.
+        if (contextUsage.inputTokens <= 0 && protectionCacheBustingPass) {
+            try {
+                const pressureEstimate = estimateFinalWireInputTokens({
+                    messages,
+                    systemPromptTokens: sessionMeta.systemPromptTokens,
+                    providerID: modelForBudget?.providerID,
+                    modelID: modelForBudget?.modelID,
+                    agentName: notificationParams.agent,
+                });
+                contextUsage = resolveUnknownUsageFromWireEstimate({
+                    usage: contextUsage,
+                    pricedPass: true,
+                    wireEstimateTokens: pressureEstimate.tokens,
+                    wireEstimateTrusted: pressureEstimate.trusted,
+                    providerProvenInputTokens: providerProvenInputForRecovery,
+                    providerProvenLimitTokens: providerProvenLimitForRecovery,
+                    usableHardLimit: windowGeometry?.usableHard,
+                });
+                if (contextUsage.inputTokens > 0) {
+                    const usedProviderInput =
+                        !pressureEstimate.trusted &&
+                        providerProvenLimitForRecovery !== undefined &&
+                        providerProvenInputForRecovery !== undefined &&
+                        contextUsage.inputTokens >= providerProvenInputForRecovery;
+                    sessionLog(
+                        sessionId,
+                        `transform: unknown provider usage; using ${usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens}`,
+                    );
+                }
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
+                );
+            }
+        }
         const protectionUsableSoft = windowGeometry?.usableSoft ?? boundaryContextLimit;
         const protectionFloor = resolveEpochFloorForPass(db, sessionId, {
             configuredOverride: deps.protectedTokens,
@@ -2342,6 +2689,7 @@ export function createTransform(deps: TransformDeps) {
             protectedCount: protectionWindow.status.protectedCount,
             emergencyCeilingTokens,
             pendingCompartmentInjection,
+            prefixTrimSourceOrder,
             hiddenMessagesAtCompactionSeam,
             trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,
@@ -2363,7 +2711,7 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
-            thinkingBindingRecoveryEnabledForModel: isFable51ThinkingBindingModel(
+            thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
                 modelForBudget?.providerID,
                 modelForBudget?.modelID,
             ),
@@ -2384,6 +2732,7 @@ export function createTransform(deps: TransformDeps) {
                 memoryEnabled: deps.memoryConfig?.enabled,
                 memoryInjectionBudgetTokens: deps.memoryConfig?.injectionBudgetTokens,
                 historyBudgetTokens,
+                historyBudgetPolicyIdentity: historyPolicyIdentity,
                 temporalAwareness: deps.experimentalTemporalAwareness,
                 hardSignals: m0HardSignals,
                 muralEnabled: deps.muralEnabled,
@@ -2396,17 +2745,33 @@ export function createTransform(deps: TransformDeps) {
         // here; overflow propagates to native compaction instead of blocking.
         const finalWireTail = describeFinalWireTail(messages);
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
+        if (postTransformResult.bustedThisPass) {
+            try {
+                finalWireEstimate = estimateFinalWireInputTokens({
+                    messages,
+                    systemPromptTokens: sessionMeta.systemPromptTokens,
+                    providerID: modelForBudget?.providerID,
+                    modelID: modelForBudget?.modelID,
+                    agentName: notificationParams.agent,
+                });
+            } catch {
+                sessionLog(
+                    sessionId,
+                    "calibration: completeness=partial reason=unavailable-returned-array-count",
+                );
+            }
+        }
         if (!compactionOff) {
-            // Fresh-tokenize only in the emergency band. This estimate is telemetry,
-            // never an abort gate: provider-accurate accounting is deferred to the
-            // module-side implementation.
+            // Recovery estimates provider input even while reusing cached messages.
+            // Cache-busting passes also retain raw counts for telemetry; samples never drive decisions.
             const emergencyUsagePercentage = usagePercentageSynthetic
                 ? Math.max(95, contextUsage.percentage)
                 : windowGeometry?.usableHard && contextUsage.inputTokens > 0
                   ? (contextUsage.inputTokens / windowGeometry.usableHard) * 100
                   : contextUsage.percentage;
             finalWireEstimate =
-                emergencyUsagePercentage >= 95
+                finalWireEstimate ??
+                (emergencyUsagePercentage >= 95
                     ? estimateFinalWireInputTokens({
                           messages,
                           systemPromptTokens: sessionMeta.systemPromptTokens,
@@ -2414,11 +2779,33 @@ export function createTransform(deps: TransformDeps) {
                           modelID: modelForBudget?.modelID,
                           agentName: notificationParams.agent,
                       })
-                    : undefined;
+                    : undefined);
             if (finalWireEstimate) {
                 sessionLog(
                     sessionId,
                     `transform: final-wire telemetry estimate=${finalWireEstimate.tokens} trusted=${finalWireEstimate.trusted} conversation=${finalWireEstimate.messageTokens.conversation} tools=${finalWireEstimate.messageTokens.toolCall} system=${finalWireEstimate.systemTokens} toolDefinitions=${finalWireEstimate.toolDefinitionTokens ?? "unknown"} tail=${finalWireTail}`,
+                );
+            }
+            const timedOutHistorianFailure = compartmentPhase.historianJoinTimedOut
+                ? historianJoinFailClosedMessage({
+                      timedOut: true,
+                      budgetMs: compartmentPhase.historianJoinBudgetMs,
+                      finalWireEstimate,
+                      contextLimitTokens: boundaryContextLimit,
+                      lastHistorianError: getHistorianFailureState(db, sessionId).lastError,
+                  })
+                : null;
+            if (timedOutHistorianFailure) {
+                sessionLog(
+                    sessionId,
+                    `transform: ${timedOutHistorianFailure}; finalEstimate=${finalWireEstimate?.tokens ?? "unavailable"} estimateTrusted=${finalWireEstimate?.trusted ?? false} contextLimit=${boundaryContextLimit} emergencyReclaimed=${postTransformResult.emergencyReclaimedTokens}`,
+                );
+                throw new EmergencyFailClosedError(timedOutHistorianFailure);
+            }
+            if (compartmentPhase.historianJoinTimedOut) {
+                sessionLog(
+                    sessionId,
+                    `transform: proceeding after bounded historian join; trusted final-wire ${finalWireEstimate?.tokens} fits context limit ${boundaryContextLimit} after emergency reclaim=${postTransformResult.emergencyReclaimedTokens}`,
                 );
             }
             const currentModelKeyForRecovery = deps.getModelKey?.(sessionId);
@@ -2455,18 +2842,12 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
             if (emergencyFailClosed.shouldAbort) {
-                if (!deps.client) {
-                    throw new EmergencyFailClosedError(
-                        "Cannot fail closed: OpenCode client is unavailable",
-                    );
-                }
-                // The notice must finish before self-abort so recovery instructions survive interruption.
-                let notification: Awaited<ReturnType<typeof sendStatusNotification>>;
+                // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
-                    notification = await sendStatusNotification(
+                    await host.hostRefusalNotice(
                         deps.client,
                         sessionId,
-                        "Context full — /ctx-flush or /clear to continue.",
+                        EMERGENCY_REFUSAL_NOTICE,
                         notificationParams,
                     );
                 } catch (error) {
@@ -2474,12 +2855,8 @@ export function createTransform(deps: TransformDeps) {
                         cause: error,
                     });
                 }
-                if (notification !== "sent" && notification !== "queued") {
-                    throw new EmergencyFailClosedError(
-                        `Emergency recovery notification was ${notification}`,
-                    );
-                }
                 try {
+                    // OpenCode 2 supplies a refusal callback because it has no v1 client abort method.
                     await host.hostRefuse(deps.client, sessionId);
                 } catch (error) {
                     sessionLog(
@@ -2535,7 +2912,9 @@ export function createTransform(deps: TransformDeps) {
                 // copy is detached from live messages.
                 const capturedSlot = getInMemorySlot(sessionId);
                 if (capturedSlot) {
-                    setImmediate(() => saveLkgSlotToDb(db, sessionId, capturedSlot));
+                    withoutSqliteTransformPass(() =>
+                        setImmediate(() => saveLkgSlotToDb(db, sessionId, capturedSlot)),
+                    );
                 }
             }
             if (postTransformResult.bustedThisPass && !captured) {
@@ -2727,7 +3106,7 @@ export function createTransform(deps: TransformDeps) {
             `transform completed in ${elapsed}ms (${messages.length} messages, ${targets.size} targets, watermark: ${watermark})`,
         );
 
-        deps.maybeAutoEmbedSession?.(sessionId);
+        withoutSqliteTransformPass(() => deps.maybeAutoEmbedSession?.(sessionId));
 
         const bindingRecovery = postTransformResult.thinkingBindingRecovery;
         if (bindingRecovery) {
@@ -2738,7 +3117,7 @@ export function createTransform(deps: TransformDeps) {
             );
             sessionLog(
                 sessionId,
-                `thinking binding recovery: stripped bound reasoning from assistant ${bindingRecovery.messageId}; flag=${cleared ? "cleared" : "rearmed"}`,
+                `thinking binding recovery: stripped bound reasoning from ${bindingRecovery.messageIds.length} assistant(s) [${bindingRecovery.messageIds.join(",")}]; flag=${cleared ? "cleared" : "rearmed"}`,
             );
         }
     };

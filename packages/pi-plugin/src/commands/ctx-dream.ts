@@ -28,7 +28,10 @@ export function registerCtxDreamCommand(
 		dreamerEnabled?: boolean;
 		resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 		onProjectSeen?: (projectIdentity: string) => void;
-		ensureRegistered?: (ctx: { cwd: string }) => void | Promise<void>;
+		ensureRegistered?: (ctx: {
+			cwd: string;
+			modelRegistry?: { find(provider: string, modelId: string): unknown };
+		}) => void | Promise<void>;
 		registrationOwner: object;
 	},
 ): void {
@@ -118,6 +121,11 @@ export function registerCtxDreamCommand(
 					task,
 					deps.registrationOwner,
 				);
+				const backlogAfter = getDreamTaskBacklogs(
+					deps.db,
+					project.projectIdentity,
+					backlogTasks,
+				);
 				const lines: string[] = [];
 				if (result.ran.length > 0) lines.push(`Ran: ${result.ran.join(", ")}`);
 				if ((result.details?.length ?? 0) > 0) {
@@ -143,11 +151,11 @@ export function registerCtxDreamCommand(
 						// manual curate), not this task itself.
 						`Busy: ${result.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
 					);
-				if (Object.keys(result.backlogAfter ?? {}).length > 0) {
+				if (Object.keys(backlogAfter).length > 0) {
 					lines.push(
 						"",
 						"Backlog at run end:",
-						formatDreamTaskBacklogs(result.backlogAfter),
+						formatDreamTaskBacklogs(backlogAfter, backlogTasks),
 					);
 				}
 				if (lines.length === 0) lines.push("No enabled dream tasks to run.");

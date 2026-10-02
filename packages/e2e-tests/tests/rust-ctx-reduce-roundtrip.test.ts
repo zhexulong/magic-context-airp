@@ -29,6 +29,9 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
     beforeEach(async () => {
         h = await RustTestHarness.create({
             modelContextLimit: 30_000,
+            // The historian gets its own 128k mock model: the 30k session window
+            // builds pressure quickly but cannot hold a historian prompt.
+            historianModelContextLimit: 128_000,
             magicContextConfig: {
                 execute_threshold_percentage: 25,
                 protected_tags: 1,
@@ -104,7 +107,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
             )) as ModuleStatus;
             expect(queued.pending_drop_count ?? 0).toBeGreaterThan(0);
 
-            // Grow past the execute threshold so a bust drains the pending drop.
+            // Grow into the force band so a legitimate bust drains the pending drop.
             for (let i = 5; i <= 10; i += 1) {
                 h.mock.setDefault({
                     text: `pressure ${i}`,

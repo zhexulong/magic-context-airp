@@ -276,14 +276,14 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(DREAMER_CLASSIFIER_AGENT)?.maxSteps).toBe(4);
     });
 
-    test("base dreamer (curate) is ctx_memory-only and locked", () => {
+    test("base dreamer (curate) is memory-tool-only and locked", () => {
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([...DREAMER_CURATE_ALLOWED_TOOLS]);
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual(["ctx_memory"]);
         expect(byId(DREAMER_AGENT)?.lockPermissions).toBe(true);
         expect(byId(DREAMER_AGENT)?.maxSteps).toBe(150);
     });
 
-    test("dreamer-docs inline allow-list matches canonical (file read/write/bash, no memory) and is locked", () => {
+    test("dreamer-docs inline allow-list matches read-only canonical tools and is locked", () => {
         expect(byId(DREAMER_DOCS_AGENT)?.allowedTools).toEqual([...DREAMER_DOCS_ALLOWED_TOOLS]);
         const tools = byId(DREAMER_DOCS_AGENT)?.allowedTools ?? [];
         for (const denied of ["ctx_memory", "ctx_search", "ctx_note", "task"]) {

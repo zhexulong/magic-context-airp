@@ -175,7 +175,7 @@ async function embedAndStoreMemory(
                     result.modelId,
                     hashBeforeEmbed,
                 );
-            })();
+            }).immediate();
         }
     } catch (error) {
         sessionLog(sessionId, `memory embedding failed for memory ${memoryId}:`, error);

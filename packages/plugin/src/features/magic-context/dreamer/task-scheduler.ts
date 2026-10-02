@@ -1,12 +1,16 @@
-import type { PiThinkingLevel } from "../../../config/schema/magic-context";
+import {
+    DREAM_TASK_PROMOTION_DEFAULTS,
+    type PiThinkingLevel,
+} from "../../../config/schema/magic-context";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
+import { isUsableProjectIdentity } from "../memory/project-identity";
 import { nextDueAtMs } from "./cron";
 import {
     acquireLeaseWithAcquisition,
     type LeaseAcquisition,
-    leaseOwnershipMatches,
+    reacquireOwnedLease,
     releaseLease,
 } from "./lease";
 import { getDreamState } from "./storage-dream-state";
@@ -18,7 +22,9 @@ import {
 } from "./storage-task-schedule";
 import { evaluateTaskGate, getDreamTaskBacklogs } from "./task-gates";
 import {
+    CANONICAL_DREAM_TASKS,
     compareTaskOrder,
+    type DreamTaskBacklog,
     type DreamTaskBacklogMap,
     type DreamTaskName,
     leaseKeyFor,
@@ -37,11 +43,18 @@ export interface DreamTaskRuntimeConfig {
     schedule: string;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** Configured Pi chain contained no models in Pi's registry. */
+    modelChainUnavailable?: boolean;
     thinkingLevel?: PiThinkingLevel;
     language?: string;
     timeoutMinutes: number;
+    /** Cumulative prompt-token ceiling for one tool-loop child. */
+    tokenBudget?: number;
     /** review-user-memories */
     promotionThreshold?: number;
+    /** retrospective source lookback; old rows are skipped by advancing its content watermark. */
+    retrospectiveRecencyDays?: number;
+    docsMaxTokens?: number;
 }
 
 export interface TaskExecOutcome {
@@ -55,9 +68,13 @@ export interface TaskExecOutcome {
     failureDetail?: string;
     /** Successful task detail surfaced by a manual `/ctx-dream` run. */
     detail?: string;
+    /** Run-local backlog when a task's scope differs from its next scheduled scope. */
+    backlog?: DreamTaskBacklog;
     schedulePatch?: {
         /** retrospective content watermark (max message ts scanned this run). */
         retrospectiveWatermarkMs?: number | null;
+        /** Task-local JSON state committed only after successful execution. */
+        taskStateJson?: string;
     };
 }
 
@@ -103,23 +120,31 @@ function ensureSeeded(
     seedTaskScheduleState(db, projectIdentity, config.task, nextDueAt, lastRunAt, config.schedule);
 }
 
+function firstRepeatedCivilMinute(candidateMs: number): number | null {
+    const date = new Date(candidateMs);
+    const first = new Date(
+        date.getFullYear(),
+        date.getMonth(),
+        date.getDate(),
+        date.getHours(),
+        date.getMinutes(),
+    ).getTime();
+    return first < candidateMs ? first : null;
+}
+
 /**
- * Make the CONFIG schedule authoritative every pass: seed the row if missing,
- * then — if the persisted `schedule` no longer matches the config — recompute
- * `next_due_at` so a disable / enable / cron change takes effect IMMEDIATELY
- * (not only after the stale slot fires once). Without this the stored
- * `next_due_at` is trusted forever: a task disabled after seeding would still
- * fire once at its old slot, and a task seeded `next_due_at = NULL` (e.g. it was
- * disabled when first seen) and later enabled would never become due.
+ * Reconcile enabled worktrees without postponing an already-armed shared slot.
+ * Disabled worktrees are filtered by the caller and never mutate shared state.
  *
  * Cases (config.schedule vs persisted `schedule`):
  *  - equal → in sync, no write.
- *  - config `""` (disabled) → force `next_due_at = NULL`.
  *  - persisted `schedule IS NULL` with a live `next_due_at` → legacy row written
  *    before the column existed; it was seeded from THIS config, so just backfill
  *    the string and keep its already-correct `next_due_at`.
- *  - otherwise (genuine change, or enabling) → recompute `next_due_at` from now,
- *    reset retry_count.
+ *  - otherwise (genuine change, or enabling) → compute the new slot from the
+ *    current time and keep the earlier of it and the slot already held. Preserve
+ *    retries when retaining that slot; a schedule edit must not restart retries
+ *    or use an old successful run to re-arm an already-consumed occurrence.
  */
 function reconcileSchedule(
     db: Database,
@@ -128,25 +153,60 @@ function reconcileSchedule(
     now: number,
 ): void {
     ensureSeeded(db, projectIdentity, config, now);
-    const stored = getTaskScheduleState(db, projectIdentity, config.task);
-    if (!stored || stored.schedule === config.schedule) return;
+    if (getTaskScheduleState(db, projectIdentity, config.task)?.schedule === config.schedule)
+        return;
 
-    if (config.schedule.trim() === "") {
-        writeTaskScheduleState(db, { ...stored, schedule: config.schedule, nextDueAt: null });
-        return;
+    // Cron search can scan years for an impossible expression. Do it before
+    // taking the write lock; only the row-dependent decision belongs inside.
+    const candidate = nextDueAtMs(config.schedule, now);
+    const repeatedFirst = candidate === null ? null : firstRepeatedCivilMinute(candidate);
+    const afterRepeatedFirst =
+        repeatedFirst === null ? candidate : nextDueAtMs(config.schedule, now, repeatedFirst);
+    db.exec("BEGIN IMMEDIATE");
+    let committed = false;
+    try {
+        const stored = getTaskScheduleState(db, projectIdentity, config.task);
+        if (stored && stored.schedule !== config.schedule) {
+            if (stored.schedule === null && stored.nextDueAt !== null) {
+                // The legacy slot was seeded from this config before schedule was stored;
+                // only the missing schedule string needs backfilling.
+                writeTaskScheduleState(db, { ...stored, schedule: config.schedule });
+            } else {
+                // An advanced shared slot has already consumed the first copy of
+                // a repeated civil minute. Do not re-arm its second copy.
+                const nextDueAt =
+                    repeatedFirst !== null &&
+                    candidate !== null &&
+                    stored.nextDueAt !== null &&
+                    stored.nextDueAt > candidate &&
+                    stored.lastStatus !== null
+                        ? afterRepeatedFirst
+                        : candidate;
+                const reconciledNextDueAt =
+                    stored.nextDueAt === null
+                        ? nextDueAt
+                        : nextDueAt === null
+                          ? stored.nextDueAt
+                          : Math.min(stored.nextDueAt, nextDueAt);
+                writeTaskScheduleState(db, {
+                    ...stored,
+                    schedule: config.schedule,
+                    nextDueAt: reconciledNextDueAt,
+                    retryCount: reconciledNextDueAt === stored.nextDueAt ? stored.retryCount : 0,
+                });
+            }
+        }
+        db.exec("COMMIT");
+        committed = true;
+    } finally {
+        if (!committed) {
+            try {
+                db.exec("ROLLBACK");
+            } catch {
+                /* transaction already closed */
+            }
+        }
     }
-    if (stored.schedule === null && stored.nextDueAt !== null) {
-        // Legacy row seeded from this same config before the schedule column
-        // existed: backfill the string, keep the already-correct next_due_at.
-        writeTaskScheduleState(db, { ...stored, schedule: config.schedule });
-        return;
-    }
-    writeTaskScheduleState(db, {
-        ...stored,
-        schedule: config.schedule,
-        nextDueAt: nextDueAtMs(config.schedule, now),
-        retryCount: 0,
-    });
 }
 
 interface DueTask {
@@ -165,24 +225,18 @@ export function planDueTasks(
     tasks: readonly DreamTaskRuntimeConfig[],
     now: number,
 ): DueTask[] {
-    // GC retired task rows: improve, consolidate, and archive-stale were replaced
-    // by verify/curate, while render-mural was removed when the scheduler switched
-    // to its deterministic task set. Since `tasks` contains the full canonical set,
-    // any stored row outside it is obsolete. Cheap and idempotent.
-    const pruned = pruneNonCanonicalTaskRows(
-        db,
-        projectIdentity,
-        tasks.map((t) => t.task),
-    );
+    // GC retired task rows against the canonical registry, never the caller's
+    // execution list. Capability-filtered callers must not delete durable
+    // schedules and watermarks for canonical tasks they cannot run.
+    const pruned = pruneNonCanonicalTaskRows(db, projectIdentity, CANONICAL_DREAM_TASKS);
     if (pruned > 0) {
         log(`[dreamer] pruned ${pruned} retired task row(s) for ${projectIdentity}`);
     }
 
     const due: DueTask[] = [];
     for (const config of tasks) {
-        // Reconcile (not just seed) so the live config schedule is authoritative:
-        // a disabled task's next_due_at is forced NULL, an enabled/changed task's
-        // is recomputed — before we read it below.
+        // Disabling is local to this worktree, not a cancellation of shared work.
+        if (config.schedule.trim() === "") continue;
         reconcileSchedule(db, projectIdentity, config, now);
         const state = getTaskScheduleState(db, projectIdentity, config.task);
         if (!state || state.nextDueAt === null) continue; // disabled / impossible cron
@@ -201,23 +255,25 @@ function advanceAfterRun(
     status: "completed" | "failed" | "skipped",
     error: string | null,
     schedulePatch?: TaskExecOutcome["schedulePatch"],
+    startedAt?: number,
 ): void {
     writeTaskScheduleState(db, {
         projectPath: projectIdentity,
         task: due.config.task,
-        // last_run_at means "last SUCCESSFUL run" — the cutoff for "changed since"
-        // gates (maintain-docs). A failed or skipped run did NOT process the
-        // work, so the cutoff must NOT advance past it (mirrors v1, where
-        // last_dream_at only advanced when a task succeeded).
+        // last_run_at = the start of the last SUCCESSFUL run — the cutoff for
+        // "changed since" gates. A message/compartment that landed DURING the run
+        // (after the start) is newer than the cutoff, so it re-triggers the gate next
+        // slot instead of being silently skipped. Failed/skipped runs never advance it.
         lastRunAt:
             status === "completed"
-                ? finishedAt
+                ? (startedAt ?? finishedAt)
                 : readLastRunAt(db, projectIdentity, due.config.task),
         nextDueAt: nextDueAtMs(due.config.schedule, finishedAt, due.scheduledAt),
         schedule: due.config.schedule,
         lastStatus: status,
         lastError: error,
         retryCount: 0,
+        taskStateJson: schedulePatch?.taskStateJson,
         retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
     });
 }
@@ -245,6 +301,7 @@ function recordTransientFailure(
     due: DueTask,
     finishedAt: number,
     error: string | null,
+    schedulePatch?: TaskExecOutcome["schedulePatch"],
 ): void {
     const prior = getTaskScheduleState(db, projectIdentity, due.config.task);
     const retryCount = (prior?.retryCount ?? 0) + 1;
@@ -261,6 +318,8 @@ function recordTransientFailure(
             lastStatus: "failed",
             lastError: error,
             retryCount: 0,
+            taskStateJson: schedulePatch?.taskStateJson,
+            retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
         });
     } else {
         // Hot-retry: keep next_due_at so the timer re-attempts next tick — but a
@@ -278,6 +337,8 @@ function recordTransientFailure(
             lastStatus: "failed",
             lastError: error,
             retryCount,
+            taskStateJson: schedulePatch?.taskStateJson,
+            retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
         });
     }
 }
@@ -290,7 +351,7 @@ interface DomainGroupCallbacks {
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
     leaseWaitMs?: number;
-    onRan?: (task: DreamTaskName, detail?: string) => void;
+    onRan?: (task: DreamTaskName, detail?: string, backlog?: DreamTaskBacklog) => void;
     onFailed?: (task: DreamTaskName, error?: string) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
@@ -336,10 +397,14 @@ async function runDomainGroup(
         for (const due of [...group].sort((a, b) =>
             compareTaskOrder(a.config.task, b.config.task),
         )) {
-            if (!leaseOwnershipMatches(db, holderId, acquisition.generation, leaseKey)) {
+            // Refresh at each task boundary so setup and gated siblings cannot
+            // consume the next task's entire lease before its heartbeat starts.
+            if (!reacquireOwnedLease(db, holderId, leaseKey, acquisition.generation)) {
                 log(`[dreamer] domain lease lost (${leaseKey}) — stopping remaining task(s)`);
                 break;
             }
+
+            acquisition = { acquiredAt: Date.now(), generation: acquisition.generation };
 
             // Re-evaluate the gate now that we hold the lease: a sibling/other
             // process may have just consumed the work (critical for the global
@@ -354,7 +419,11 @@ async function runDomainGroup(
                         projectIdentity,
                         due.config.task,
                     ),
-                    promotionThreshold: due.config.promotionThreshold ?? 3,
+                    promotionThreshold:
+                        due.config.promotionThreshold ??
+                        (due.config.task === "promote-primers"
+                            ? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"]
+                            : DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"]),
                 });
                 if (!gatePass) {
                     advanceAfterRun(db, projectIdentity, due, Date.now(), "skipped", null);
@@ -363,6 +432,7 @@ async function runDomainGroup(
             }
 
             let outcome: TaskExecOutcome;
+            const startedAt = Date.now();
             try {
                 outcome = await executor(due.config, {
                     db,
@@ -385,10 +455,18 @@ async function runDomainGroup(
                     "completed",
                     null,
                     outcome.schedulePatch,
+                    startedAt,
                 );
-                cb?.onRan?.(due.config.task, outcome.detail);
+                cb?.onRan?.(due.config.task, outcome.detail, outcome.backlog);
             } else if (outcome.transient) {
-                recordTransientFailure(db, projectIdentity, due, finishedAt, outcome.error ?? null);
+                recordTransientFailure(
+                    db,
+                    projectIdentity,
+                    due,
+                    finishedAt,
+                    outcome.error ?? null,
+                    outcome.schedulePatch,
+                );
                 cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
             } else {
                 advanceAfterRun(
@@ -398,6 +476,7 @@ async function runDomainGroup(
                     finishedAt,
                     "failed",
                     outcome.error ?? null,
+                    outcome.schedulePatch,
                 );
                 cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
             }
@@ -451,6 +530,7 @@ export async function runManualDream(
         backlogAfter: {},
     };
 
+    if (!isUsableProjectIdentity(deps.projectIdentity)) return result;
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
     if (deps.task) {
@@ -490,7 +570,11 @@ export async function runManualDream(
                 deps.projectIdentity,
                 d.config.task,
             ),
-            promotionThreshold: d.config.promotionThreshold ?? 3,
+            promotionThreshold:
+                d.config.promotionThreshold ??
+                (d.config.task === "promote-primers"
+                    ? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"]
+                    : DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"]),
         });
         if (pass) gated.push(d);
         else result.skippedNoWork.push(d.config.task);
@@ -505,6 +589,7 @@ export async function runManualDream(
     }
 
     const groups = new Map<string, DueTask[]>();
+    const runLocalBacklogs: DreamTaskBacklogMap = {};
     for (const d of gated) {
         const kind = leaseKindFor(d.config.task);
         const arr = groups.get(kind) ?? [];
@@ -517,9 +602,10 @@ export async function runManualDream(
             runDomainGroup({ ...deps, executor: deps.executor }, group, {
                 forceGate,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
-                onRan: (t, detail) => {
+                onRan: (t, detail, backlog) => {
                     result.ran.push(t);
                     if (detail) result.details?.push(detail);
+                    if (backlog) runLocalBacklogs[t] = backlog;
                 },
                 onFailed: (task, error) => {
                     result.failed.push(task);
@@ -529,7 +615,10 @@ export async function runManualDream(
             }),
         ),
     );
-    result.backlogAfter = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
+    result.backlogAfter = {
+        ...getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames),
+        ...runLocalBacklogs,
+    };
     return result;
 }
 
@@ -540,6 +629,9 @@ export async function runManualDream(
  * number of tasks actually executed (for logging/tests).
  */
 export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<number> {
+    // A blank identity is an unresolved directory, not a project; running tasks
+    // for it would read and write project-scoped rows under the key "".
+    if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
     const now = deps.now ?? Date.now();
     const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
     if (due.length === 0) return 0;
@@ -557,7 +649,11 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
                 deps.projectIdentity,
                 d.config.task,
             ),
-            promotionThreshold: d.config.promotionThreshold ?? 3,
+            promotionThreshold:
+                d.config.promotionThreshold ??
+                (d.config.task === "promote-primers"
+                    ? DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"]
+                    : DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"]),
         });
         if (pass) {
             gated.push(d);

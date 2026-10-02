@@ -1,6 +1,14 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { join } from "node:path";
 import {
 	acquireCompartmentLease,
@@ -27,6 +35,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { recordChildInvocation } from "@magic-context/core/features/magic-context/subagent-token-capture";
+import {
+	clearProducerModelObservations,
+	observeProducerModelsForTest,
+} from "@magic-context/core/hooks/magic-context/producer-window-test-support";
 import * as logger from "@magic-context/core/shared/logger";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -347,6 +359,32 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
+	it("shutdown interrupts the lease wait and releases the wrapup marker", async () => {
+		const db = createDb();
+		const sessionId = "pi-wrapup-shutdown-wait";
+		const controller = new AbortController();
+		try {
+			expect(acquireCompartmentLease(db, sessionId, "foreign")).not.toBeNull();
+			const run = runPiWrapup(
+				pi().api,
+				deps(db, {
+					shutdownSignal: controller.signal,
+					wrapupLeaseWaitTimeoutMs: 60_000,
+				}),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+			await Promise.resolve();
+			controller.abort();
+			const result = await run;
+			expect(result).toContain("## Magic Wrapup — Partial");
+			expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("contains SQLITE_BUSY while releasing a wrapup compartment lease", async () => {
 		const { dir, cleanup } = createTestTempDir(
 			"mc-test-temp-dir-helper-",
@@ -647,3 +685,8 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 });
+
+beforeEach(async () => {
+	await observeProducerModelsForTest(["test/model"]);
+});
+afterEach(clearProducerModelObservations);

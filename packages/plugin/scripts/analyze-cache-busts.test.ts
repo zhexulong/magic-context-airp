@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripSystemInjection } from "../src/hooks/magic-context/system-injection-stripper";
 import { __test, analyzeOpenCodeCacheBustSession } from "./analyze-cache-busts";
+import { type CacheBustDecisionAttribution } from './cache-bust-attribution';
 import { describeBodyPair, normalizeRequestBody } from "./cache-bust-body-sources";
 
 type UsageFixture = {
@@ -71,6 +72,10 @@ function bodyWithBreakpointMessage(text: string): unknown {
     };
 }
 
+function bodyWithModelAndBreakpoint(model: string, text: string): unknown {
+    return { model, ...(bodyWithBreakpointMessage(text) as object) };
+}
+
 function bodyWithTail(text: string, tailBreakpoint = false): unknown {
     const tail = { type: "text", text } as { type: string; text: string; cache_control?: unknown };
     if (tailBreakpoint) tail.cache_control = { type: "ephemeral" };
@@ -118,6 +123,205 @@ function snapshotsFor(dir: string, session: string) {
 }
 
 describe("analyze-cache-bust dump discovery", () => {
+    test("classifies an Anthropic zero read and wire-model swap as a provider full miss", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-provider-full-miss-"));
+        tempDirs.push(dir);
+        const session = "ses_brocaFullMiss";
+        const previousAt = "2026-09-20T16:25:56.000Z";
+        const currentAt = "2026-09-20T16:26:06.000Z";
+        writeDump(
+            dir,
+            "2026-09-20T16-25-56-000Z-000001-ses_brocaFullMiss",
+            previousAt,
+            session,
+            bodyWithModelAndBreakpoint("claude-opus-5", "cached prefix"),
+            responseUsage({ input_tokens: 4_855, cache_read_input_tokens: 589_294 }),
+        );
+        writeDump(
+            dir,
+            "2026-09-20T16-26-06-000Z-000002-ses_brocaFullMiss",
+            currentAt,
+            session,
+            bodyWithModelAndBreakpoint("claude-opus-4-8", "provider fallback"),
+            responseUsage({
+                input_tokens: 4_855,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 589_294,
+            }),
+        );
+
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), [
+            {
+                timestampMs: Date.parse(currentAt),
+                decision: "defer",
+                canonicalDecision: "defer",
+                materialized: false,
+                materializeReason: null,
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 4_855,
+                flush: false,
+                source: "fixture",
+            },
+        ]);
+
+        expect(rows[1]?.divergenceClass).toBe("provider_full_miss");
+        expect(rows[1]?.previous?.wireModel).toBe("claude-opus-5");
+        expect(rows[1]?.current.wireModel).toBe("claude-opus-4-8");
+
+        const run = Bun.spawnSync([
+            process.execPath,
+            join(import.meta.dir, "analyze-cache-busts.ts"),
+            "--session",
+            session,
+            "--dir",
+            dir,
+            "--all-rows",
+        ]);
+        expect(run.exitCode).toBe(0);
+        expect(run.stdout.toString()).toContain(
+            "wireModel=claude-opus-5 → claude-opus-4-8",
+        );
+    });
+
+    test("repeated epoch HARD decisions on one session are attributed to self-inflicted epochs", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-double-epoch-"));
+        tempDirs.push(dir);
+        const session = "ses_doubleEpoch";
+        const start = Date.parse("2026-09-20T16:00:00.000Z");
+        for (const [index, text] of ["initial", "first epoch", "second epoch"].entries()) {
+            const at = new Date(start + index * 6_000).toISOString();
+            writeDump(
+                dir,
+                `2026-09-20T16-00-${String(index * 6).padStart(2, "0")}-000Z-00000${index + 1}-${session}`,
+                at,
+                session,
+                bodyWithBreakpointMessage(text),
+                responseUsage({ input_tokens: 100, cache_read_input_tokens: index === 0 ? 20_000 : 100, cache_creation_input_tokens: index === 0 ? 0 : 19_900 }),
+            );
+        }
+        const decisions = [6_000, 12_000].map((offset) => ({
+            timestampMs: start + offset,
+            decision: "defer",
+            materialized: true,
+            materializeReason: "epoch_change",
+            identityDelta: ["other"],
+            emergency: false,
+            droppedTokens: 0,
+            droppedCount: 0,
+            inputTokens: 100,
+            flush: false,
+            source: "fixture",
+        }));
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), decisions);
+        expect(rows[1]?.divergenceClass).toBe("accounted_hard_epoch");
+        expect(rows[2]?.divergenceClass).toBe("self_inflicted_epoch");
+    });
+
+    test("an epoch HARD explained by a preceding full retry stays accounted; one with nothing before it is unfaulted", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-unfaulted-epoch-"));
+        tempDirs.push(dir);
+        const session = "ses_unfaultedEpoch";
+        const start = Date.parse("2026-09-20T16:00:00.000Z");
+        // Two epoch HARDs five minutes apart, so neither counts as a repeat of the other.
+        const offsets = [0, 60_000, 360_000];
+        for (const [index, text] of ["initial", "after retry", "spontaneous"].entries()) {
+            const at = new Date(start + offsets[index]!).toISOString();
+            writeDump(
+                dir,
+                `${at.replaceAll(":", "-").replace(".", "-")}-00000${index + 1}-${session}`,
+                at,
+                session,
+                bodyWithBreakpointMessage(text),
+                responseUsage({ input_tokens: 100, cache_read_input_tokens: index === 0 ? 20_000 : 100, cache_creation_input_tokens: index === 0 ? 0 : 19_900 }),
+            );
+        }
+        const pass = (offset: number, source: string) => ({
+            timestampMs: start + offset,
+            decision: "HARD",
+            materialized: true,
+            materializeReason: "epoch_change",
+            identityDelta: ["other"],
+            emergency: false,
+            droppedTokens: 0,
+            droppedCount: 0,
+            inputTokens: 100,
+            flush: false,
+            source,
+        });
+        const decisions = [
+            pass(60_000, "rust pass log"),
+            pass(360_000, "rust pass log"),
+            {
+                ...pass(55_000, "rust adapter log"),
+                decision: "disruption",
+                materialized: false,
+                materializeReason: null,
+                disruption: "full_retry",
+            },
+        ];
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), decisions);
+        expect(rows[1]?.divergenceClass).toBe("accounted_hard_epoch");
+        expect(rows[2]?.divergenceClass).toBe("unfaulted_epoch");
+        expect(rows[2]?.decision?.identityDelta).toEqual(["other"]);
+        // The disruption marker is never joined to a request as its pass.
+        expect(rows.every((row) => row.decision?.disruption === undefined)).toBe(true);
+    });
+
+    test("skips an unmetered pass as a baseline for the next real short-read bust", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-usage-missing-baseline-"));
+        tempDirs.push(dir);
+        const session = "ses_usageMissingBaseline";
+        const body = bodyWithBreakpointMessage("changed");
+        writeDump(
+            dir,
+            "2026-09-20T16-00-00-000Z-000001-ses_usageMissingBaseline",
+            "2026-09-20T16:00:00.000Z",
+            session,
+            body,
+            responseUsage({ input_tokens: 100, cache_read_input_tokens: 20_000 }),
+        );
+        writeDump(
+            dir,
+            "2026-09-20T16-00-01-000Z-000002-ses_usageMissingBaseline",
+            "2026-09-20T16:00:01.000Z",
+            session,
+            bodyWithBreakpointMessage("in flight"),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 0 }),
+        );
+        writeDump(
+            dir,
+            "2026-09-20T16-00-02-000Z-000003-ses_usageMissingBaseline",
+            "2026-09-20T16:00:02.000Z",
+            session,
+            bodyWithBreakpointMessage("short read"),
+            responseUsage({ input_tokens: 100, cache_read_input_tokens: 100 }),
+        );
+
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), [
+            {
+                timestampMs: Date.parse("2026-09-20T16:00:02.000Z"),
+                decision: "defer",
+                canonicalDecision: "defer",
+                materialized: false,
+                materializeReason: null,
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 100,
+                flush: false,
+                source: "fixture",
+            },
+        ]);
+
+        expect(rows[1]?.verdict).toBe("UNMETERED");
+        expect(rows[1]?.divergenceClass).toBe("usage_missing");
+        expect(rows[2]?.prevTotal).toBe(20_100);
+        expect(rows[2]?.verdict).toBe("BUST");
+        expect(rows[2]?.divergenceClass).toBe("unaccounted_defer_pass");
+    });
+
     test("reminder strip golden agrees with the Rust block-strip parser", () => {
         const fixture = JSON.parse(
             readFileSync(
@@ -292,6 +496,72 @@ describe("analyze-cache-bust dump discovery", () => {
         });
 
         expect(analysis.requests.at(-1)?.divergenceClass).toBe("accounted_hard_system_hash");
+    });
+
+    test("joins slow AFT passes and wakes for an input-step epoch", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-aft-slow-pass-"));
+        tempDirs.push(dir);
+        const session = "ses_313660571ffeZTsf4koSJwk50Q";
+        const requests = [
+            ["2026-09-22T11:54:34.997Z", "baseline", 300_000],
+            ["2026-09-22T11:54:40.313Z", "coverage fold", 10_000],
+            ["2026-09-22T11:55:29.581Z", "epoch rewrite", 10_000],
+        ] as const;
+        for (const [at, text, cacheRead] of requests) {
+            const stem = `${at.replaceAll(":", "-").replace(".", "-")}-${session}`;
+            writeDump(
+                dir,
+                stem,
+                at,
+                session,
+                bodyWithBreakpointMessage(text),
+                responseUsage({
+                    input_tokens: 2,
+                    cache_read_input_tokens: cacheRead,
+                    cache_creation_input_tokens: 200_000,
+                }),
+            );
+        }
+        const decisions: CacheBustDecisionAttribution[] = [
+            {
+                timestampMs: Date.parse("2026-09-22T11:54:36.709Z"),
+                decision: "SOFT",
+                canonicalDecision: "execute",
+                materialized: true,
+                materializeReason: "coverage_fold",
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 373_959,
+                inputCount: 513,
+                flush: false,
+                source: "fixture",
+            },
+            {
+                timestampMs: Date.parse("2026-09-22T11:55:13.792Z"),
+                decision: "HARD",
+                canonicalDecision: "HARD",
+                materialized: true,
+                materializeReason: "epoch_change",
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 343_741,
+                inputCount: 12_747,
+                flush: false,
+                source: "fixture",
+            },
+        ];
+
+        const analysis = analyzeOpenCodeCacheBustSession({
+            sessionId: session,
+            anthropicDir: dir,
+            openaiDir: join(dir, "missing-openai"),
+            decisions,
+            mcLogPath: null,
+        });
+        expect(analysis.requests[1]?.divergenceClass).not.toBe("no_mc_pass_row");
+        expect(analysis.requests[2]?.divergenceClass).toBe("self_inflicted_epoch");
     });
 
     test("prints complete UTF-8 body bytes separately from reusable normalized prefix bytes", () => {
@@ -691,4 +961,153 @@ describe("analyze-cache-bust provider meter verdicts", () => {
         expect(row.byteVerdict).toBe("BUST");
         expect(row.meterVsBytes).toBe("UNMETERED");
     });
+});
+
+describe("analyze-cache-bust rotating billing header", () => {
+    // Redacted from three consecutive captured Anthropic requests. The content is
+    // replaced; the shape that produced the defect is kept: a three-block system
+    // whose first block is the auth plugin's per-request billing header, a head
+    // message carrying cache_control breakpoints, two messages appended per
+    // request, and the tail cache_control marker moving onto the newest message
+    // each time.
+    const fixtureRoot = join(
+        import.meta.dir,
+        "test-fixtures",
+        "cache-bust-bodies",
+        "anthropic-billing-header",
+    );
+    const fixtureJson = (file: string): Record<string, unknown> =>
+        JSON.parse(readFileSync(join(fixtureRoot, file), "utf8")) as Record<string, unknown>;
+
+    function billingHeaderSession(): { dir: string; session: string } {
+        const dir = mkdtempSync(join(tmpdir(), "cache-bust-billing-header-"));
+        tempDirs.push(dir);
+        const session = "ses_billingHeaderRotation";
+        for (const [index, timestamp] of [
+            [1, "2026-09-21T12:26:17.760Z"],
+            [2, "2026-09-21T12:26:31.108Z"],
+            [3, "2026-09-21T12:32:32.610Z"],
+        ] as const) {
+            writeDump(
+                dir,
+                `${timestamp.replaceAll(":", "-").replace(".", "-")}-00000${index}-${session}`,
+                timestamp,
+                session,
+                fixtureJson(`00${index}-request.json`),
+                fixtureJson(`00${index}-response.json`),
+            );
+        }
+        return { dir, session };
+    }
+
+    test("the fixture really does rotate the header, so the normalization is load-bearing", () => {
+        const headerText = (file: string): string =>
+            ((fixtureJson(file).system as Array<{ text: string }>)[0] as { text: string }).text;
+
+        expect(headerText("002-request.json")).not.toBe(headerText("003-request.json"));
+        expect(headerText("002-request.json")).toContain("x-anthropic-billing-header:");
+        // Both `cch` and `cc_prev_req` move; `cc_prompt_id` moves across an idle gap.
+        for (const field of ["cch=", "cc_prev_req=req_", "cc_prompt_id="]) {
+            expect(headerText("002-request.json").split(field)[1]).not.toBe(
+                headerText("003-request.json").split(field)[1],
+            );
+        }
+    });
+
+    test("an appended-tail request over a rotated header is STABLE, not a byte bust", () => {
+        const { dir, session } = billingHeaderSession();
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
+
+        expect(row.verdict).toBe("STABLE");
+        expect(row.byteVerdict).toBe("STABLE");
+        expect(row.meterVsBytes).toBe("AGREE");
+        // The first divergence is the appended tail, not the rotating system row.
+        expect(row.divergenceIndex).toBe(252);
+        expect(row.current.segments[row.divergenceIndex].role).toBe("assistant");
+    });
+
+    test("a short read over an unchanged reusable prefix is provider-side latency", () => {
+        const { dir, session } = billingHeaderSession();
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[2];
+
+        expect(row.verdict).toBe("LATENCY");
+        expect(row.byteVerdict).toBe("STABLE");
+        expect(row.meterVsBytes).toBe("LATENCY");
+        expect(row.divergenceClass).toBe("provider_short_read_identical_bytes");
+        // The tail cache_control marker moved from message 252 to message 254;
+        // the reusable prefix is still the one the previous request wrote.
+        expect(row.divergenceIndex).toBe(254);
+        expect(row.current.usage?.cacheRead).toBe(285_161);
+    });
+
+    test("prints no bytes-BUST cell for the whole rotated-header run", () => {
+        const { dir, session } = billingHeaderSession();
+
+        const run = Bun.spawnSync([
+            process.execPath,
+            join(import.meta.dir, "analyze-cache-busts.ts"),
+            "--session",
+            session,
+            "--dir",
+            dir,
+            "--all-rows",
+        ]);
+
+        expect(run.exitCode).toBe(0);
+        const output = run.stdout.toString();
+        expect(output).not.toContain("(bytes BUST)");
+        expect(output).not.toContain("message[0] role=system");
+        expect(output).toContain("divergence-class: provider_short_read_identical_bytes");
+        expect(output).toContain("No metered busts across 3 request(s).");
+        expect(output).toContain("1 latency-only short read(s)");
+    });
+
+    test("normalizes the rotated header into one shared system-message identity", () => {
+        const [previous, current] = ["002-request.json", "003-request.json"].map(
+            (file) => normalizeRequestBody(fixtureJson(file), "anthropic").messages[0],
+        );
+
+        expect(previous.canonical).toContain("x-anthropic-billing-header: <rotating>");
+        expect(previous.canonical).not.toContain("cc_prev_req=req_0");
+        expect(current.hash).toBe(previous.hash);
+        expect(describeBodyPair([previous], [current])).toBeUndefined();
+    });
+});
+
+
+describe("bounded sentinel dump scans", () => {
+    test("skips 20,000 old files and resumes a bounded scan without losing requests", () => {
+        const dir = mkdtempSync(join(tmpdir(), "mc-sentinel-scan-"));
+        tempDirs.push(dir);
+        for (let i = 0; i < 20_000; i++) {
+            writeFileSync(join(dir, `dump-2026-09-23T00-00-00-000Z-${String(i).padStart(5, "0")}-ses_scanfixture.meta.json`), "{}");
+        }
+        const sessionId = "ses_scanfixture";
+        const base = Date.parse("2026-09-24T12:00:00.000Z");
+        for (let i = 0; i < 40; i++) {
+            const createdAt = new Date(base + i * 1_000).toISOString();
+            const stem = `dump-${createdAt.replace(/:(\d\d):(\d\d)\.(\d\d\d)Z$/, "-$1-$2-$3Z")}-${i}-ses_scanfixture`;
+            writeDump(dir, stem, createdAt, sessionId, bodyWithBreakpointMessage(`request ${i}`));
+        }
+        const scan = (sinceExclusiveMs: number, scanCursor?: string) => analyzeOpenCodeCacheBustSession({
+            sessionId,
+            anthropicDir: dir,
+            openaiDir: join(dir, "missing"),
+            sinceExclusiveMs,
+            scanCursor,
+            scanDeadlineMs: Date.now() + 60_000,
+        });
+        const first = scan(base - 1);
+        expect(first.filesExamined).toBe(32);
+        expect(first.scanBounded).toBe(true);
+        const second = scan(base - 1, first.scanCursor);
+        expect(second.filesExamined).toBe(8);
+        expect(second.scanBounded).toBe(false);
+        expect([...first.requests, ...second.requests].map((row) => row.timestampMs)).toEqual(
+            Array.from({ length: 40 }, (_, i) => base + i * 1_000),
+        );
+        expect(scan(base + 39_000).filesExamined).toBe(0);
+    }, 30_000);
 });

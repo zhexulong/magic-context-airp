@@ -17,10 +17,12 @@ import type {
     AuthorityDrainResponse,
     AuthorityStatus,
     ChangefeedPage,
+    ChangefeedRow,
 } from "../../features/magic-context/context-authority";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { isRecord } from "../../shared/record-type-guard";
+import { storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 
 const DEFAULT_MODULE_ID = "magic-context";
 const CONNECT_BACKOFF_INITIAL_MS = 1_000;
@@ -69,7 +71,8 @@ const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
-function getDefaultConnectionFile(): string {
+/** Platform connection file used when resolved configuration has no subc block. */
+export function getDefaultSubcConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
@@ -290,12 +293,12 @@ export class SubcModuleTransport {
     }
 
     constructor(
-        connectionFile?: string,
+        connectionFile: string,
         moduleId = DEFAULT_MODULE_ID,
         requestTimeoutMs = MODULE_SEND_TIMEOUT_MS,
         routeSessionPrefix = "",
     ) {
-        this.connectionFile = connectionFile ?? getDefaultConnectionFile();
+        this.connectionFile = connectionFile;
         this.moduleId = moduleId;
         this.requestTimeoutMs = requestTimeoutMs;
         this.routeSessionPrefix = routeSessionPrefix;
@@ -480,13 +483,17 @@ export class SubcModuleTransport {
             | "authority.drain_flip"
             | "authority.drain_finish"
             | "mirror.pull"
+            | "mirror.memory"
+            | "memory.identity.ack"
             | "ctx_note"
             | "ctx_memory"
             | "note.evaluate"
-            | "transform.ack"
-            | "transform.nack"
             | "dreamer.run_task"
-            | "memory.set_classification";
+            | "memory.set_classification"
+            | "historian.pending"
+            | "historian.claim"
+            | "historian.heartbeat"
+            | "historian.complete";
         body: unknown;
         /** Per-call durations; responseWait includes the client's opaque receive and decode. */
         onTimings?: (timings: ModuleCallTimings) => void;
@@ -497,6 +504,12 @@ export class SubcModuleTransport {
         timeoutMs?: number;
         /** Distinguishes cheap page admission from the cold execute on the completed series. */
         attemptClass?: "transform_page_upload" | "transform_series_execute";
+        /**
+         * Bypass the per-session correctness lane only for a health probe or a
+         * content-addressed transform resend. The ordinary request keeps owning
+         * the lane while the probe determines whether the module is alive.
+         */
+        bypassSessionLane?: boolean;
     }): Promise<unknown> {
         const callStartedAt = performance.now();
         const timings: ModuleCallTimings = {
@@ -532,13 +545,21 @@ export class SubcModuleTransport {
             else this.wrapupSessions.delete(args.sessionId);
         };
         const laneDeadlineMs = Date.now() + attemptTimeoutMs;
-        let releaseLane: (() => void) | undefined;
+        let releaseLane: () => void = () => {};
         try {
-            releaseLane = await this.acquireCorrectnessLane(
-                args.sessionId,
-                args.signal,
-                laneDeadlineMs,
-            );
+            // The historian claim ops are addressed by run id, not by a session's
+            // place in its message stream, so they have nothing to order against. They
+            // must also never queue behind a transform: a heartbeat that waited out a
+            // 15 s pass would let the lease lapse and hand a live run to a second
+            // claimant, which is the exact failure the lease exists to prevent.
+            const outsideSessionOrder = args.method.startsWith("historian.");
+            if (!args.bypassSessionLane && !outsideSessionOrder) {
+                releaseLane = await this.acquireCorrectnessLane(
+                    args.sessionId,
+                    args.signal,
+                    laneDeadlineMs,
+                );
+            }
         } catch (error) {
             finishWrapupTracking();
             if (args.method === "state_sync" && isDeadlineFailure(error)) {
@@ -624,6 +645,11 @@ export class SubcModuleTransport {
                     return response;
                 } catch (error) {
                     if (args.signal?.aborted) throw args.signal.reason ?? error;
+                    // One typed error for every caller: the transform, the tools and the
+                    // historian lane all have to recognize this refusal, and none of them
+                    // should have to know how the subc client shapes an error frame.
+                    const storeAhead = storeAheadOfBinaryFailure(error);
+                    if (storeAhead) throw storeAhead;
                     if (args.method === "state_sync" && isDeadlineFailure(error)) {
                         const body = isRecord(args.body) ? args.body : {};
                         throw Object.assign(
@@ -707,8 +733,11 @@ export class SubcModuleTransport {
             | "authority.drain_reconcile"
             | "authority.drain_verify"
             | "authority.drain_finish"
-            | "mirror.pull",
+            | "mirror.pull"
+            | "mirror.memory"
+            | "memory.identity.ack",
         body: Record<string, unknown>,
+        timeoutMs?: number,
     ): Promise<Record<string, unknown>> {
         // The transport serializes the body verbatim; the module dispatches on the
         // body's own method field, so it must always be present and canonical here.
@@ -717,6 +746,7 @@ export class SubcModuleTransport {
             projectRoot,
             method,
             body: { ...body, method, v: 1 },
+            timeoutMs,
         })) as unknown;
         if (isRecord(response) && isRecord(response.result)) return response.result;
         if (isRecord(response)) return response;
@@ -735,12 +765,15 @@ export class SubcModuleTransport {
         context_store_uuid: string;
         project: string;
         projectRoot?: string;
+        sessionId?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }> {
         this.authorityProjectRoot = args.project;
-        const { projectRoot, ...body } = args;
+        const { projectRoot, sessionId, ...body } = args;
         const response = await this.authorityRequest(
-            args.project,
+            // A tool call already has a real session route. Reusing it avoids asking the
+            // daemon to resolve the project identity as though it were an OpenCode session.
+            sessionId ?? args.project,
             projectRoot ?? this.bindRootForAuthority(),
             "authority.status",
             body,
@@ -820,6 +853,40 @@ export class SubcModuleTransport {
         );
         if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
         return { page: response.page as unknown as ChangefeedPage };
+    }
+
+    async mirrorMemory(args: {
+        module_row_id: number;
+        projectRoot?: string;
+    }): Promise<{ row: ChangefeedRow | null }> {
+        const { projectRoot, ...body } = args;
+        const response = await this.authorityRequest(
+            `mirror-memory:${args.module_row_id}`,
+            projectRoot ?? this.bindRootForAuthority(),
+            "mirror.memory",
+            body,
+            1_900,
+        );
+        return {
+            row: isRecord(response.row) ? (response.row as unknown as ChangefeedRow) : null,
+        };
+    }
+
+    async memoryIdentityAck(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }> {
+        const { projectRoot, ...body } = args;
+        const response = await this.authorityRequest(
+            `memory-identity:${args.project}`,
+            projectRoot ?? this.bindRootForAuthority(),
+            "memory.identity.ack",
+            body,
+        );
+        return {
+            acknowledged: typeof response.acknowledged === "number" ? response.acknowledged : 0,
+        };
     }
 
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {

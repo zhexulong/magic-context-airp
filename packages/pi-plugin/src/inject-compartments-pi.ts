@@ -18,7 +18,7 @@
  *   - `prepareCompartmentInjection` honors its own injection cache. On
  *     defer passes (`isCacheBusting=false`) the cached prepared block is
  *     replayed, the boundary trim is re-applied, and we just re-write the
- *     cached block into Pi message[0]. Provider prompt cache stays stable.
+ *     cached block after the leading system entries. Provider prompt cache stays stable.
  *   - On cache-busting passes (historian/compressor publish, /ctx-flush)
  *     the cache is rebuilt and the new block is written. Caller is
  *     responsible for setting `isCacheBusting` correctly via the shared
@@ -35,6 +35,7 @@ import {
 	factCategoriesForDomain,
 	type MemoryDomain,
 } from "@magic-context/core/features/magic-context/memory/domain";
+import { MEMORY_MURAL_BLOCK } from "@magic-context/core/agents/magic-context-prompt";
 import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
@@ -77,6 +78,10 @@ import {
 	COMPARTMENT_RENDER_EPOCH,
 	decodeCachedM0UpgradeIdentity,
 	encodeCachedM0UpgradeIdentity,
+	MEMORY_RENDER_FORMAT_EPOCH,
+	renderBudgetIdentityChanged,
+	renderedBudgetShrinkReason,
+	renderedBudgetSnapshot,
 } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import {
 	DEFAULT_HISTORY_BUDGET_TOKENS,
@@ -84,6 +89,7 @@ import {
 	renderCompartmentAtTier,
 	renderDecayedCompartments,
 } from "@magic-context/core/hooks/magic-context/decay-render";
+import { historyLocalBudget } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import {
 	DEFAULT_MEMORY_BUDGET_TOKENS,
 	DEFAULT_USER_PROFILE_BUDGET_TOKENS,
@@ -106,6 +112,11 @@ import {
 	renderGameBuddyVolatileContextBlock,
 } from "./gamebuddy-stable-context-source";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
+import {
+	isPiSystemEntry,
+	type PiSystemEntry,
+	placePiInitialSystemAtHead,
+} from "./system-entry-pi";
 
 /**
  * Pi message shapes — kept structurally compatible with
@@ -129,7 +140,11 @@ type PiToolResultMessage = {
 	content: unknown[];
 	timestamp?: number;
 };
-type PiAgentMessage = PiUserMessage | PiAssistantMessage | PiToolResultMessage;
+type PiAgentMessage =
+	| PiUserMessage
+	| PiAssistantMessage
+	| PiToolResultMessage
+	| PiSystemEntry;
 
 /** Resolve a live Pi message to the stable ID stored with its compartment boundary. */
 function resolveStableId(
@@ -141,8 +156,8 @@ function resolveStableId(
 }
 
 /**
- * Mutate `piMessages` in place: remove every message whose synthesized
- * id appears at or before the cutoff. Preserves the rest of the array.
+ * Mutate `piMessages` in place: remove non-system messages whose synthesized
+ * id appears at or before the cutoff. Preserve all system entries and the tail.
  *
  * Mirrors the `messages.splice(0, cutoffIndex+1)` behavior the shared
  * `prepareCompartmentInjection` does on its (OpenCode) MessageLike[].
@@ -170,6 +185,7 @@ function trimPiMessagesToBoundary(
 	entryIds: readonly (string | undefined)[] | undefined,
 	cutoffMessageId: string,
 	trimMutableEntryIds = false,
+	sessionId?: string,
 ): number {
 	if (cutoffMessageId.length === 0) return 0;
 	// Resolve a synthetic-user (folded toolResult) cutoff to the real entry id
@@ -198,7 +214,16 @@ function trimPiMessagesToBoundary(
 	// preserves the non-contiguous same-turn cleanup while avoiding cross-turn
 	// over-removal.
 	const remove = new Set<number>();
-	for (let i = 0; i <= cutoffIndex; i++) remove.add(i);
+	let preserved = 0;
+	for (let i = 0; i <= cutoffIndex; i++) {
+		if (isPiSystemEntry(piMessages[i])) preserved++;
+		else remove.add(i);
+	}
+	if (preserved > 0)
+		logSession(
+			sessionId ?? "unknown",
+			`pi system entries preserved across fold: ${preserved}`,
+		);
 
 	let changed = true;
 	while (changed) {
@@ -330,14 +355,9 @@ export const __test = {
 const PI_M1_PLACEHOLDER =
 	"<session-history-since>(no new content since last materialization)</session-history-since>";
 const MAX_FORCED_MEMORIES_PER_DELTA = 10;
-// Pi uses a STATIC upgrade-state marker, intentionally diverging from OpenCode's
-// dynamic getUpgradeState(db, sessionId). OpenCode flips this per-session when a
-// `/ctx-session-upgrade` recomp transitions legacy→v2, forcing an m[0] refold.
-// Pi has no equivalent per-session upgrade-state transition wired into the m[0]
-// markers yet, so a static const is internally consistent (stored marker and
-// current marker always match → never falsely triggers, never misses a real Pi
-// transition because there is none). Revisit if Pi gains a session-upgrade flow
-// that must invalidate m[0].
+// Pi prefixes its dynamic legacy/ready marker with this stable renderer identity.
+// readCurrentMarkers adds the compartment-derived suffix so a session upgrade
+// invalidates m[0] exactly once.
 const PI_M0_UPGRADE_STATE = "pi-m0m1-v2";
 const EMPTY_MAX_COMPARTMENT_SEQ = -1;
 
@@ -419,6 +439,7 @@ export interface PiM0M1State {
 	 *  Distinct from injectionBudgetTokens — using the memory budget here would
 	 *  over-demote every compartment. */
 	historyBudgetTokens?: number;
+	historyBudgetPolicyIdentity?: string;
 	/** User-profile block budget (~4K). The m[1] new-user-profile delta is
 	 *  trimmed to 25% of this (matches OpenCode renderM1). Defaults when unset. */
 	userProfileBudgetTokens?: number;
@@ -564,10 +585,12 @@ export interface PiM0SnapshotMarkers {
 	materializedAt: number;
 	upgradeState: string;
 	compartmentRenderEpoch: string | null;
+	/** Records the renderer used by cached bytes; written on a natural HARD but never triggers one. */
+	memoryRenderEpoch: string | null;
 	lastBaselineEndMessageId: string | null;
-	// HARD-bust markers (parity with OpenCode M0SnapshotMarkers): provider-side
-	// cache-eviction signals. systemHash/modelKey come from runtime; Pi has no
-	// Captured from PiM0HardSignals at the injection call site.
+	// HARD-bust markers (parity with OpenCode M0SnapshotMarkers) are captured
+	// from PiM0HardSignals. Pi has no tool-set hash because it has no equivalent
+	// tool-definition hook.
 	systemHash: string;
 	modelKey: string;
 	// Pi sessions can switch projects in-process (`/cd`). NULL on legacy cached
@@ -575,6 +598,8 @@ export interface PiM0SnapshotMarkers {
 	projectIdentity: string | null;
 	muralEnabled: boolean;
 	renderBudgetIdentity: string;
+	/** Numeric allowances used by the cached render; absent on older baselines. */
+	renderedBudgets?: string | null;
 }
 
 /**
@@ -598,7 +623,7 @@ const EMPTY_PI_HARD_SIGNALS: PiM0HardSignals = {
 };
 
 function renderBudgetIdentityPi(state: PiM0M1State): string {
-	return `m${state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+	return `m${state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${state.historyBudgetPolicyIdentity ?? state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
 }
 
 export interface PiMaterializeMismatch {
@@ -773,10 +798,10 @@ export interface PiM0M1InjectionResult extends PiInjectionResult {
 	 */
 	m1RenderedCoverage: PiRenderedCompartmentBoundary | null;
 	/**
-	 * Number of synthetic, id-less messages prepended at the FRONT of the array
-	 * by this injection (the m[0] + m[1] pair). These never resolve to a real
-	 * SessionEntry id, so downstream anchor-GC must exclude them from its
-	 * "all messages resolved" denominator or pruning never runs.
+	 * Length of the non-reclaimable leading span: native system entries followed
+	 * by the injected m[0] + m[1] pair. Anchor-GC skips this span because the
+	 * injected users and native compaction snapshot have no message-entry id.
+	 * LKG ownership still retains real ids for native system entries.
 	 */
 	syntheticLeadingCount: number;
 }
@@ -970,6 +995,7 @@ function getCachedMarkers(
 		materializedAt: meta.cachedM0MaterializedAt,
 		upgradeState: cachedUpgradeIdentity.upgradeState ?? "",
 		compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
+		memoryRenderEpoch: cachedUpgradeIdentity.memoryRenderEpoch,
 		// The boundary that was persisted WITH these cached m[0] bytes (may be
 		// null for a legitimately-boundaryless baseline — see the guard above).
 		lastBaselineEndMessageId: cachedBoundary,
@@ -978,6 +1004,7 @@ function getCachedMarkers(
 		projectIdentity: meta.cachedM0ProjectIdentity ?? null,
 		muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
 		renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
+		renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
 	};
 }
 
@@ -1056,14 +1083,15 @@ function readCurrentMarkersFromCompartments(
 		sessionFactsVersion: getSessionFactsVersion(db, state.sessionId),
 		materializedAt: Date.now(),
 		// Dynamic upgrade state (parity with OpenCode getUpgradeState): suffix
-		// "legacy" when any legacy=1 compartment remains, else "ready". This makes
-		// `/ctx-session-upgrade` (legacy→v2 conversion) flip the marker so m[0]
-		// re-materializes with the upgraded tiered content. A static const would
-		// leave Pi serving stale legacy-rendered m[0] after an upgrade.
+		// "legacy" when any legacy=1 compartment remains, else "ready". A recomp
+		// that rebuilds legacy rows into tiered ones flips the marker so m[0]
+		// re-materializes with the rebuilt content. A static const would leave Pi
+		// serving stale legacy-rendered m[0] after the rebuild.
 		upgradeState: `${PI_M0_UPGRADE_STATE}:${
 			compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
 		}`,
 		compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+		memoryRenderEpoch: MEMORY_RENDER_FORMAT_EPOCH,
 		lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
 		systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
 		modelKey: piModelRefToCanonical(
@@ -1072,6 +1100,10 @@ function readCurrentMarkersFromCompartments(
 		projectIdentity: state.projectIdentity,
 		muralEnabled: state.muralEnabled === true,
 		renderBudgetIdentity: renderBudgetIdentityPi(state),
+		renderedBudgets: renderedBudgetSnapshot(
+			state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+			state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		),
 	};
 }
 
@@ -1118,8 +1150,9 @@ export function mustMaterializePi(
 	if (cached === null) {
 		return { value: true, reason: "cache_invalid" };
 	}
-	// A renderer-format change must fold cached m[0] exactly once. The fold
-	// persists this component with the rendered bytes, consuming the trigger.
+	// Compartment byte-shape changes fold cached m[0] exactly once. Memory
+	// selection epochs are ride-only: they persist on the next natural HARD so a
+	// defer pass cannot change an existing session's frozen prefix.
 	if (cached.compartmentRenderEpoch !== current.compartmentRenderEpoch) {
 		return piMaterializeMismatch(
 			"compartment_render_epoch",
@@ -1130,18 +1163,35 @@ export function mustMaterializePi(
 	}
 	if (cached.muralEnabled !== current.muralEnabled) {
 		return piMaterializeMismatch(
-			"render_config",
+			`render_config:mural(${cached.muralEnabled}→${current.muralEnabled})`,
 			"muralEnabled",
 			cached.muralEnabled,
 			current.muralEnabled,
 		);
 	}
-	if (cached.renderBudgetIdentity !== current.renderBudgetIdentity) {
+	if (
+		renderBudgetIdentityChanged(
+			cached.renderBudgetIdentity,
+			current.renderBudgetIdentity,
+		)
+	) {
 		return piMaterializeMismatch(
-			"render_config",
+			`render_config:budget(${cached.renderBudgetIdentity}→${current.renderBudgetIdentity})`,
 			"renderBudgetIdentity",
 			cached.renderBudgetIdentity,
 			current.renderBudgetIdentity,
+		);
+	}
+	const budgetShrinkReason = renderedBudgetShrinkReason(
+		cached.renderedBudgets,
+		current.renderedBudgets,
+	);
+	if (budgetShrinkReason) {
+		return piMaterializeMismatch(
+			budgetShrinkReason,
+			"renderedBudgets",
+			cached.renderedBudgets ?? null,
+			current.renderedBudgets ?? null,
 		);
 	}
 	// ── HARD: provider-side cache eviction (the cache was already dead) ──
@@ -1363,8 +1413,10 @@ export function renderM0Pi(
 	// budget (lower budget → higher curve pressure → more demotion), keeping the
 	// shared decay-curve as the single source of pressure math — same approach as
 	// OpenCode renderM0. The materialize loop escalates it when m[0] is over budget.
-	const baseHistoryBudget =
-		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+	const baseHistoryBudget = historyLocalBudget(
+		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		piModelRefToCanonical(state.hardSignals?.modelKey ?? ""),
+	);
 	const decayed = renderDecayedCompartments({
 		compartments:
 			compartmentsOverride ?? getRenderableCompartmentsPi(db, state),
@@ -1411,9 +1463,7 @@ export function renderM0Pi(
 	if (memoryBlock) sections.push(memoryBlock);
 	// Sibling layout parity with OpenCode renderM0: mural marker after memories.
 	if (mural?.enabled && mural.supportsVision && mural.dataUrl) {
-		sections.push(
-			"<memory-mural>\nThe project memory mural image follows.\n</memory-mural>",
-		);
+		sections.push(MEMORY_MURAL_BLOCK);
 	}
 	return sections.join("\n\n").trim();
 }
@@ -1554,6 +1604,7 @@ function readFrozenM0InputsPi(
 				compartments.some((c) => c.legacy === 1) ? "legacy" : "ready"
 			}`,
 			compartmentRenderEpoch: COMPARTMENT_RENDER_EPOCH,
+			memoryRenderEpoch: MEMORY_RENDER_FORMAT_EPOCH,
 			lastBaselineEndMessageId: lastBaselineEndMessageId(compartments),
 			systemHash: (state.hardSignals ?? EMPTY_PI_HARD_SIGNALS).systemHash,
 			modelKey: piModelRefToCanonical(
@@ -1563,10 +1614,14 @@ function readFrozenM0InputsPi(
 			muralEnabled:
 				state.memoryEnabled !== false && state.muralEnabled === true,
 			renderBudgetIdentity: renderBudgetIdentityPi(state),
+			renderedBudgets: renderedBudgetSnapshot(
+				state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+				state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+			),
 		};
 		return { docs, markers, compartments, memories, userProfile, workspace };
 	});
-	return read();
+	return read.deferred();
 }
 
 function renderFreshM0PiNonPersisted(
@@ -1585,8 +1640,10 @@ function renderFreshM0PiNonPersisted(
 	// stable across consecutive fallback passes, so reuse the last persisted value
 	// (or 0 when no cached baseline exists) rather than live Date.now().
 	frozen.markers.materializedAt = cachedMaterializedAt;
-	const historyBudget =
-		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+	const historyBudget = historyLocalBudget(
+		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		piModelRefToCanonical(state.hardSignals?.modelKey ?? ""),
+	);
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
 	// Fresh fallback is a last-resort HARD-equivalent render: resolve mural once
@@ -1712,8 +1769,10 @@ export function materializeM0Pi(
 		frozen.workspace,
 		mural,
 	);
-	const historyBudget =
-		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS;
+	const historyBudget = historyLocalBudget(
+		state.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
+		piModelRefToCanonical(state.hardSignals?.modelKey ?? ""),
+	);
 	let attempts = 0;
 	while (
 		historyBudget > 0 &&
@@ -1814,6 +1873,8 @@ export function materializeM0Pi(
 				snapshotMarkers.compartmentRenderEpoch,
 				snapshotMarkers.muralEnabled,
 				snapshotMarkers.renderBudgetIdentity,
+				snapshotMarkers.memoryRenderEpoch,
+				snapshotMarkers.renderedBudgets ?? null,
 			),
 			systemHash: snapshotMarkers.systemHash,
 			modelKey: snapshotMarkers.modelKey,
@@ -2323,6 +2384,7 @@ function markersFromCachedPiRow(
 		sessionFactsVersion: row.cached_m0_session_facts_version,
 		upgradeState: cachedUpgradeIdentity.upgradeState ?? "",
 		compartmentRenderEpoch: cachedUpgradeIdentity.compartmentRenderEpoch,
+		memoryRenderEpoch: cachedUpgradeIdentity.memoryRenderEpoch,
 		lastBaselineEndMessageId:
 			typeof row.cached_m0_last_baseline_end_message_id === "string" &&
 			row.cached_m0_last_baseline_end_message_id.length > 0
@@ -2333,6 +2395,7 @@ function markersFromCachedPiRow(
 		projectIdentity: row.cached_m0_project_identity ?? null,
 		muralEnabled: cachedUpgradeIdentity.muralEnabled ?? false,
 		renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity ?? "",
+		renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
 	};
 }
 
@@ -2614,7 +2677,7 @@ function prependM0M1Messages(
 	m1: string,
 	mural?: { enabled: boolean; supportsVision: boolean; dataUrl?: string },
 	timestampHint?: number,
-): void {
+): number {
 	const firstTimestamp = timestampHint ?? piMessages[0]?.timestamp;
 	const baseTimestamp =
 		typeof firstTimestamp === "number" ? firstTimestamp : Date.now();
@@ -2629,7 +2692,10 @@ function prependM0M1Messages(
 		{ type: "text", text: m0 },
 		...(muralImage ? [muralImage] : []),
 	];
-	piMessages.unshift(
+	const insertionIndex = placePiInitialSystemAtHead(piMessages);
+	piMessages.splice(
+		insertionIndex,
+		0,
 		{
 			role: "user",
 			content: m0Content,
@@ -2641,6 +2707,7 @@ function prependM0M1Messages(
 			timestamp: baseTimestamp - 1,
 		},
 	);
+	return insertionIndex;
 }
 
 // Cached bytes and their boundary come from one row. Replaying them must not
@@ -2666,11 +2733,18 @@ function replayCompletePiPrefix(
 	if (!mural) m0 = stripMemoryMuralBlock(m0);
 	const trimBoundaryId = row.cached_m0_last_baseline_end_message_id;
 	const skippedVisibleMessages = trimBoundaryId
-		? trimPiMessagesToBoundary(messages, entryIds, trimBoundaryId)
+		? trimPiMessagesToBoundary(
+				messages,
+				entryIds,
+				trimBoundaryId,
+				false,
+				state.sessionId,
+			)
 		: 0;
 	const head: PiAgentMessage[] = [];
 	prependM0M1Messages(head, m0, m1, mural, messages[0]?.timestamp);
-	messages.unshift(...structuredClone(head));
+	const insertionIndex = placePiInitialSystemAtHead(messages);
+	messages.splice(insertionIndex, 0, ...structuredClone(head));
 	const result: PiM0M1InjectionResult = {
 		injected: true,
 		m1MaxMemoryMutationId: row.cached_m1_max_memory_mutation_id ?? 0,
@@ -2692,7 +2766,7 @@ function replayCompletePiPrefix(
 			trimBoundaryId,
 		),
 		m1RenderedCoverage: null,
-		syntheticLeadingCount: 2,
+		syntheticLeadingCount: insertionIndex + 2,
 	};
 	if (state.freezePrefixForPass)
 		state.preparedPrefix = { result, messages: head, trimBoundaryId };
@@ -2735,7 +2809,13 @@ export function injectM0M1Pi(
 	if (state.preparedPrefix) {
 		const prepared = state.preparedPrefix;
 		const skippedVisibleMessages = prepared.trimBoundaryId
-			? trimPiMessagesToBoundary(piMessages, entryIds, prepared.trimBoundaryId)
+			? trimPiMessagesToBoundary(
+					piMessages,
+					entryIds,
+					prepared.trimBoundaryId,
+					false,
+					state.sessionId,
+				)
 			: 0;
 		const head = structuredClone(prepared.messages);
 		// Timestamps are Pi envelope metadata, not cached provider content. Keep
@@ -2745,8 +2825,13 @@ export function injectM0M1Pi(
 			head[0].timestamp = timestamp - 2;
 			head[1].timestamp = timestamp - 1;
 		}
-		piMessages.unshift(...head);
-		return { ...prepared.result, skippedVisibleMessages };
+		const insertionIndex = placePiInitialSystemAtHead(piMessages);
+		piMessages.splice(insertionIndex, 0, ...head);
+		return {
+			...prepared.result,
+			skippedVisibleMessages,
+			syntheticLeadingCount: insertionIndex + 2,
+		};
 	}
 	// One snapshot for the WHOLE decision: the materialize decision and every
 	// cache replay normalize against this same publish sequence. The snapshot is
@@ -3062,7 +3147,13 @@ export function injectM0M1Pi(
 		}
 	}
 	const skippedVisibleMessages = trimBoundaryId
-		? trimPiMessagesToBoundary(piMessages, entryIds, trimBoundaryId)
+		? trimPiMessagesToBoundary(
+				piMessages,
+				entryIds,
+				trimBoundaryId,
+				false,
+				state.sessionId,
+			)
 		: 0;
 	const muralWire = m0.includes("<memory-mural>")
 		? muralForWire(state.sessionId)
@@ -3071,7 +3162,6 @@ export function injectM0M1Pi(
 	// that omission already changes provider-visible bytes, remove the false text
 	// claiming an image follows and keep the fallback internally consistent.
 	if (!muralWire) m0 = stripMemoryMuralBlock(m0);
-	prependM0M1Messages(piMessages, m0, m1, muralWire);
 	// Every branch above (fresh materialization, cached replay, contention
 	// fallback) converges here on the exact m[0] bytes that go to the provider, so
 	// this is the one place a per-presentation digest can be taken without
@@ -3097,6 +3187,7 @@ export function injectM0M1Pi(
 			parseMemoryBlockIds(readCachedPiM0M1Row(db, state.sessionId)?.memory_block_ids ?? null),
 		);
 	}
+	const insertionIndex = prependM0M1Messages(piMessages, m0, m1, muralWire);
 	logSession(
 		state.sessionId,
 		`injected m[0]/m[1] into Pi messages (${m0.length} + ${m1.length} bytes, materialized=${materialized}${decision.reason ? ` reason=${decision.reason}` : ""})`,
@@ -3191,13 +3282,16 @@ export function injectM0M1Pi(
 		contentionExhausted,
 		renderedBoundary,
 		m1RenderedCoverage,
-		// prependM0M1Messages always unshifts exactly the m[0] + m[1] pair.
-		syntheticLeadingCount: 2,
+		// Skip entries before the retained message tail and Magic Context's two
+		// synthetic history messages.
+		syntheticLeadingCount: insertionIndex + 2,
 	};
 	if (state.freezePrefixForPass)
 		state.preparedPrefix = {
 			result,
-			messages: structuredClone(piMessages.slice(0, 2)),
+			messages: structuredClone(
+				piMessages.slice(insertionIndex, insertionIndex + 2),
+			),
 			trimBoundaryId,
 		};
 	return result;

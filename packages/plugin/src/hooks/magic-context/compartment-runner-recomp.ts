@@ -1,4 +1,5 @@
 import { HISTORIAN_RECOMP_AGENT } from "../../agents/historian";
+import { deleteChunkEmbedBackoffForSession } from "../../features/magic-context/compartment-chunk-embedding";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
@@ -39,6 +40,7 @@ import {
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { invalidateAutoEmbedSession } from "./embed-session-state";
 import { clearInjectionCache } from "./inject-compartments";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -119,6 +121,7 @@ export function promoteRecompStagingWithM0Mutation(
             return null;
         }
 
+        deleteChunkEmbedBackoffForSession(db, sessionId);
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
         // v2 faithful facts: recomp does NOT write session_facts. Facts are a
         // promoted-memory concern now, and recomp must not emit facts at all
@@ -139,6 +142,7 @@ export function promoteRecompStagingWithM0Mutation(
 
         db.exec("COMMIT");
         finished = true;
+        invalidateAutoEmbedSession(sessionId);
         logSlowWriteTransaction("historian-publish:recomp", transactionStartedAt);
         return { compartments: staging.compartments, facts: staging.facts };
     } finally {
@@ -293,9 +297,10 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // Recomp deletes + reinserts every compartment, so their chunk
             // embeddings must be regenerated — otherwise the rebuilt rows have no
             // embeddings and vanish from ctx_search semantic results. Embedding is
-            // the search substrate (gated on memory-enabled), distinct from fact
-            // promotion (which recomp deliberately skips). Fire-and-forget.
-            if (deps.memoryEnabled !== false) {
+            // the search substrate (gated only by the embedding provider, not by
+            // `memory.enabled`), distinct from fact promotion (which recomp
+            // deliberately skips). Fire-and-forget.
+            {
                 const projectIdentity = resolveProjectIdentity(sessionDirectory);
                 // Register the project's embedding provider before embedding;
                 // embedBatchForProject silently no-ops for unregistered projects,
@@ -528,8 +533,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // historian_runs telemetry: one row per SUCCESSFUL recomp pass. Failure
             // early-returns above are already captured in subagent_invocations; we
             // keep recomp instrumentation to the clean per-pass success point to
-            // avoid destabilizing this delicate multi-pass path. run_kind="recomp"
-            // also covers /ctx-session-upgrade (upgrade = full recomp + migration).
+            // avoid destabilizing this delicate multi-pass path.
             {
                 const passComps = validatedPass.compartments ?? [];
                 const passFacts = validatedPass.facts ?? [];
@@ -646,9 +650,10 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // the NORMAL full-completion path (distinct from promoteAndFinalize, which
         // handles early-exit/partial cases and already embeds). Without this, a
         // fully-completed recomp leaves the rebuilt rows without chunk embeddings
-        // → they vanish from ctx_search semantic results. Gated on memory-enabled,
-        // distinct from fact promotion (recomp skips).
-        if (deps.memoryEnabled !== false) {
+        // → they vanish from ctx_search semantic results. Gated only by the
+        // embedding provider (not `memory.enabled`), distinct from fact
+        // promotion (recomp skips).
+        {
             const projectIdentity = resolveProjectIdentity(sessionDirectory);
             // Register the embedding provider first; embedBatchForProject silently
             // no-ops for unregistered projects, leaving no chunk embeddings.

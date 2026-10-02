@@ -59,6 +59,22 @@ afterEach(() => {
 });
 
 describe("findBoundaryUserMessage", () => {
+    it("skips a synthetic-only user row even when it already carries a marker", () => {
+        const dataHome = useTempDataHome("marker-synthetic-boundary-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_001_prior_user", "user", 100);
+        insertMessage(db, "msg_002_synthetic", "user", 200);
+        insertMessage(db, "msg_003_target", "assistant", 300);
+        db.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, 'msg_002_synthetic', 'ses-1', 200, 200, ?)",
+        ).run("part_notice", JSON.stringify({ type: "text", text: "notice", synthetic: true }));
+        db.prepare(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, 'msg_002_synthetic', 'ses-1', 200, 200, ?)",
+        ).run("part_marker", JSON.stringify({ type: "compaction", auto: true }));
+        closeQuietly(db);
+
+        expect(findBoundaryUserMessage("ses-1", "msg_003_target")?.id).toBe("msg_001_prior_user");
+    });
     it("anchors by endMessageId after rows before the target were deleted", () => {
         const dataHome = useTempDataHome("marker-boundary-deleted-before-");
         const db = createOpenCodeDb(dataHome);
@@ -136,6 +152,29 @@ describe("findBoundaryUserMessage", () => {
 });
 
 describe("injectCompactionMarker", () => {
+    it("writes a completed summary timestamp for OpenCode 2 conversion", () => {
+        const dataHome = useTempDataHome("marker-inject-completed-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_001_user", "user", 100);
+        insertMessage(db, "msg_002_target", "assistant", 200);
+        closeQuietly(db);
+
+        const result = injectCompactionMarker({
+            sessionId: "ses-1",
+            endOrdinal: 2,
+            endMessageId: "msg_002_target",
+            summaryText: "summary placeholder",
+            directory: dataHome,
+        });
+
+        const inspection = new Database(join(dataHome, "opencode", "opencode.db"));
+        const time = inspection
+            .prepare("SELECT json_extract(data, '$.time') AS time FROM message WHERE id = ?")
+            .get(result?.summaryMessageId) as { time: string };
+        expect(JSON.parse(time.time)).toEqual({ created: 101, completed: 101 });
+        closeQuietly(inspection);
+    });
+
     it("keeps deterministic marker ids in OpenCode's lexicographic row order", () => {
         const dataHome = useTempDataHome("marker-inject-id-order-");
         const db = createOpenCodeDb(dataHome);

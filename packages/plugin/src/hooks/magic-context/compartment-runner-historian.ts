@@ -2,16 +2,25 @@ import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HISTORIAN_AGENT, HISTORIAN_EDITOR_AGENT } from "../../agents/historian";
 import { withContentLanguageDirective } from "../../agents/language-directive";
+import {
+    forgetHistorianOutputCap,
+    rememberHistorianOutputCap,
+} from "../../config/live-child-output-cap";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import { openDatabase } from "../../features/magic-context/storage";
-import type { SubagentKind } from "../../features/magic-context/storage-subagent-invocations";
+import type {
+    SubagentInvocationStatus,
+    SubagentKind,
+} from "../../features/magic-context/storage-subagent-invocations";
 import {
+    failedInvocationStatus,
     recordChildInvocation,
     sumTokensFromChildMessages,
 } from "../../features/magic-context/subagent-token-capture";
 import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
 import {
+    extractLatestAssistantFailure,
     extractLatestAssistantText,
     hasLengthCappedOutput,
 } from "../../shared/assistant-message-extractor";
@@ -22,8 +31,10 @@ import {
 } from "../../shared/data-path";
 import { describeError, getErrorMessage } from "../../shared/error-message";
 import type { ModelInput, ResolvedModelEntry } from "../../shared/model-resolution";
+import { getSdkContextLimit, getSdkOutputLimit } from "../../shared/models-dev-cache";
 import { isRecord } from "../../shared/record-type-guard";
 import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
+import { formatRunTokenLog, type RunTokenLog, runTokenLog } from "../../shared/run-token-log";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
 import {
@@ -46,6 +57,13 @@ import {
     type HistorianValidationChunk,
     validateHistorianOutput,
 } from "./compartment-runner-validation";
+import { resolveHistorianProducerLimits } from "./derive-budgets";
+import {
+    historianProducerReserve,
+    producerInputTokenLimit,
+    producerPromptFailureReason,
+} from "./producer-window-guard";
+import { estimateTokens } from "./read-session-formatting";
 
 // Intentionally kept: historian validation failure dumps are preserved for
 // debugging. They land in the project-local historian dir
@@ -58,6 +76,7 @@ function historianResponseDumpDir(directory: string): string {
     return getProjectMagicContextHistorianDir(directory);
 }
 const MAX_HISTORIAN_RETRIES = 2;
+const unknownProducerWindows = new Set<string>();
 
 const HISTORIAN_REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 
@@ -103,11 +122,59 @@ function historianMessageCreatedAt(message: Record<string, unknown>): number {
     return typeof message.info.time.created === "number" ? message.info.time.created : 0;
 }
 
+function describeAssistantFailure(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === "string") return error;
+    if (!isRecord(error)) return String(error);
+
+    const data = isRecord(error.data) ? error.data : undefined;
+    const name = typeof error.name === "string" ? error.name : undefined;
+    const message =
+        typeof error.message === "string"
+            ? error.message
+            : typeof data?.message === "string"
+              ? data.message
+              : undefined;
+    const provider = typeof data?.providerID === "string" ? data.providerID : undefined;
+    const status =
+        typeof data?.statusCode === "number" || typeof data?.statusCode === "string"
+            ? String(data.statusCode)
+            : undefined;
+    const label = [name, message].filter(Boolean).join(": ");
+    const context = [provider ? `provider=${provider}` : null, status ? `status=${status}` : null]
+        .filter(Boolean)
+        .join(", ");
+    if (label) return context ? `${label} (${context})` : label;
+
+    try {
+        return JSON.stringify(error);
+    } catch {
+        return String(error);
+    }
+}
+
+export function resolveHiddenCompletionExecutor(
+    executor: HiddenCompletionExecutor | undefined,
+    client: PluginContext["client"] | undefined,
+    db: Database,
+    directory: string,
+    entryPoint: string,
+): HiddenCompletionExecutor {
+    if (executor) return executor;
+    if (!client) throw new Error(`${entryPoint}: v2 hidden completion executor is missing`);
+    return createV1HiddenCompletionExecutor(client, db, directory);
+}
+
 export function createV1HiddenCompletionExecutor(
     client: PluginContext["client"] | undefined,
     db: Database,
     directory: string,
 ): HiddenCompletionExecutor {
+    // Dreamer tasks run long tool loops. Their children send with prompt_async and
+    // poll for idle so no single request stays open long enough to meet the host
+    // client's request timer; the caller's slice stays the only timer. Historian
+    // runs keep the synchronous prompt.
+    const asyncChildren = new Set<string>();
     return {
         capabilities: { tools: true, harness: "opencode" },
         async open(run) {
@@ -123,10 +190,17 @@ export function createV1HiddenCompletionExecutor(
                 preferResponseOnMissingData: true,
             });
             const id = typeof created?.id === "string" ? created.id : "";
+            if (id && run.kind === "dreamer-task") asyncChildren.add(id);
+            if (id && run.kind !== "dreamer-task")
+                rememberHistorianOutputCap(id, run.maxOutputTokens);
             return { id, childSessionId: id || undefined };
         },
-        async attempt(_handle, request) {
+        async attempt(handle, request) {
             if (!client) throw new Error("Hidden completion client is unavailable");
+            if (asyncChildren.has(handle.id) && shared.supportsPromptAsync(client)) {
+                await shared.promptAsyncAndWaitForIdle(client, request);
+                return;
+            }
             await client.session.prompt(request as Parameters<typeof client.session.prompt>[0]);
         },
         async collect(handle, limit) {
@@ -138,16 +212,48 @@ export function createV1HiddenCompletionExecutor(
             const messages = shared.normalizeSDKResponse(response, [] as unknown[], {
                 preferResponseOnMissingData: true,
             });
+            const assistantFailure = extractLatestAssistantFailure(messages);
+            if (assistantFailure) {
+                const finish = assistantFailure.finish
+                    ? ` (finish=${assistantFailure.finish})`
+                    : "";
+                throw new Error(
+                    `Historian host recorded an assistant error${finish}: ${describeAssistantFailure(assistantFailure.error)}`,
+                );
+            }
             const text = extractLatestAssistantText(messages);
+            const latest = Array.isArray(messages)
+                ? messages
+                      .filter(
+                          (message): message is Record<string, unknown> =>
+                              isRecord(message) &&
+                              isRecord(message.info) &&
+                              message.info.role === "assistant",
+                      )
+                      .sort(
+                          (left, right) =>
+                              historianMessageCreatedAt(right) - historianMessageCreatedAt(left),
+                      )[0]
+                : undefined;
+            const info = latest && isRecord(latest.info) ? latest.info : {};
             return {
                 messages,
                 text,
                 reasoning: text ? null : extractLatestHistorianReasoning(messages),
                 lengthCapped: hasLengthCappedOutput(messages),
                 usage: sumTokensFromChildMessages(messages),
+                tokenLog: runTokenLog(
+                    info.tokens,
+                    undefined,
+                    info.finish ?? info.finish_reason ?? info.finishReason,
+                ),
             };
         },
         async close(handle, settlement) {
+            if (handle?.id) {
+                asyncChildren.delete(handle.id);
+                forgetHistorianOutputCap(handle.id);
+            }
             if (!client) return;
             await teardownChildSession({
                 client,
@@ -157,6 +263,13 @@ export function createV1HiddenCompletionExecutor(
             });
         },
     };
+}
+
+export function historianReasoningBudgetDiagnostic(
+    outputTokens: number,
+    tokens?: RunTokenLog,
+): string {
+    return `historian ran out of output budget while reasoning (length-capped at ${outputTokens} tokens, no text${tokens ? `; ${formatRunTokenLog(tokens)}` : ""}) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`;
 }
 
 export async function runValidatedHistorianPass(args: {
@@ -408,16 +521,20 @@ async function runHistorianPrompt(args: {
     let agentSessionId: string | null = null;
     let handle: HiddenRunHandle | null = null;
     let completion: HiddenCompletion | undefined;
-    const executor =
-        args.hiddenCompletionExecutor ??
-        createV1HiddenCompletionExecutor(client, db, sessionDirectory);
+    const executor = resolveHiddenCompletionExecutor(
+        args.hiddenCompletionExecutor,
+        client,
+        db,
+        sessionDirectory,
+        "historian",
+    );
     let promptSettled = false;
     let hadUnsettledPrompt = false;
     const startedAt = Date.now();
     let invocationRecorded = false;
 
     const recordInvocation = (params: {
-        status: "completed" | "failed" | "aborted";
+        status: SubagentInvocationStatus;
         messages?: unknown[];
         error?: unknown;
     }): number | null => {
@@ -475,6 +592,9 @@ async function runHistorianPrompt(args: {
             metadata: { dumpLabel, subagentKind },
         });
         agentSessionId = handle.id || null;
+        // The retry transport closes over the opened run; bind it once so the closure
+        // sees the resolved handle rather than the nullable slot it was assigned to.
+        const opened = handle;
 
         if (!agentSessionId) {
             recordInvocation({
@@ -509,9 +629,80 @@ async function runHistorianPrompt(args: {
                     },
                     {
                         transport: Object.assign(
-                            (request: import("../../shared/model-suggestion-retry").PromptArgs) =>
-                                executor.attempt(handle!, request),
-                            { childSessionId: handle.childSessionId },
+                            (request: import("../../shared/model-suggestion-retry").PromptArgs) => {
+                                const selected = request.body?.model;
+                                const modelKey = selected
+                                    ? `${selected.providerID}/${selected.modelID}`
+                                    : undefined;
+                                const system = withContentLanguageDirective(
+                                    agentId === HISTORIAN_EDITOR_AGENT
+                                        ? HISTORIAN_EDITOR_SYSTEM_PROMPT
+                                        : COMPARTMENT_AGENT_SYSTEM_PROMPT,
+                                    args.language,
+                                );
+                                const contextLimitTokens = selected
+                                    ? getSdkContextLimit(
+                                          selected.providerID,
+                                          selected.modelID,
+                                          undefined,
+                                          { reservation: "none" },
+                                      )
+                                    : undefined;
+                                const producerLimits = selected
+                                    ? resolveHistorianProducerLimits(modelKey)
+                                    : {};
+                                const producerContext =
+                                    producerLimits.context ??
+                                    (producerLimits.input === undefined
+                                        ? contextLimitTokens
+                                        : undefined);
+                                const reserve = historianProducerReserve(
+                                    producerContext,
+                                    args.maxOutputTokens,
+                                    selected
+                                        ? getSdkOutputLimit(selected.providerID, selected.modelID)
+                                        : undefined,
+                                );
+                                if (
+                                    contextLimitTokens !== undefined &&
+                                    producerInputTokenLimit(
+                                        producerContext,
+                                        reserve,
+                                        producerLimits.input,
+                                    ) === undefined &&
+                                    modelKey &&
+                                    !unknownProducerWindows.has(modelKey)
+                                ) {
+                                    unknownProducerWindows.add(modelKey);
+                                    shared.sessionLog(
+                                        parentSessionId,
+                                        `producer window inconsistent for ${modelKey}: window=${contextLimitTokens} reserve=${reserve}; sending unguarded`,
+                                    );
+                                }
+                                const failure = producerPromptFailureReason({
+                                    sourceLocal: estimateTokens(prompt),
+                                    systemLocal: estimateTokens(system),
+                                    toolsLocal: 0,
+                                    modelKey,
+                                    contextLimitTokens: producerContext,
+                                    inputLimitTokens: producerLimits.input,
+                                    maxOutputTokens: reserve,
+                                });
+                                if (failure) throw new Error(failure);
+                                if (
+                                    modelKey &&
+                                    contextLimitTokens === undefined &&
+                                    !unknownProducerWindows.has(modelKey)
+                                ) {
+                                    unknownProducerWindows.add(modelKey);
+                                    shared.sessionLog(
+                                        parentSessionId,
+                                        `producer window unknown for ${modelKey}: sending unguarded`,
+                                    );
+                                }
+                                return executor.attempt(opened, request);
+                            },
+                            { childSessionId: opened.childSessionId },
                         ),
                         timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
                         // When modelOverride is set we're already in the last-ditch retry
@@ -551,31 +742,46 @@ async function runHistorianPrompt(args: {
         }
 
         completion = await executor.collect(handle, 50);
-        const invocationId = recordInvocation({
-            status: "completed",
-            messages: completion.messages,
-        });
         const lengthCapped = completion.lengthCapped;
+        const tokens = {
+            ...runTokenLog(undefined, args.maxOutputTokens),
+            ...completion.tokenLog,
+            max_tokens: args.maxOutputTokens ?? null,
+        };
+        shared.sessionLog(
+            parentSessionId,
+            `historian response_chars=${(completion.text ?? completion.reasoning ?? "").length} ${formatRunTokenLog(tokens)}`,
+        );
         const textResult = completion.text;
         const reasoningResult = textResult ? null : completion.reasoning;
-        if (!textResult && reasoningResult && lengthCapped) {
-            const outputTokens = completion.usage.output;
-            return {
-                ok: false,
-                error: `historian output length-capped at ${outputTokens} tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant`,
-                invocationId: invocationId ?? undefined,
-            };
+        const emptyError =
+            !textResult && reasoningResult && lengthCapped
+                ? historianReasoningBudgetDiagnostic(completion.usage.output, tokens)
+                : !textResult && !reasoningResult
+                  ? "Historian returned no assistant output."
+                  : !textResult
+                    ? "Historian returned reasoning but no assistant text."
+                    : lengthCapped
+                      ? `Historian returned length-capped output. ${formatRunTokenLog(tokens)}`
+                      : null;
+        const invocationId = recordInvocation({
+            status: emptyError ? "empty" : "completed",
+            messages: completion.messages,
+            error: emptyError,
+        });
+        if (emptyError && (!reasoningResult || lengthCapped)) {
+            return { ok: false, error: emptyError, invocationId: invocationId ?? undefined };
         }
 
+        // The empty-output guard above returns when neither text nor reasoning came back.
         const result = textResult ?? reasoningResult;
-        if (!result) {
+        if (result == null) {
             return {
                 ok: false,
-                error: "Historian returned no assistant output.",
+                error: emptyError ?? "Historian returned no assistant output.",
                 invocationId: invocationId ?? undefined,
             };
         }
-
         const dumpPath = dumpHistorianResponse(
             parentSessionId,
             sessionDirectory,
@@ -589,7 +795,10 @@ async function runHistorianPrompt(args: {
             parentSessionId,
             `historian prompt failed: ${desc.brief} promptLength=${prompt.length}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`,
         );
-        recordInvocation({ status: "failed", error: modelError });
+        recordInvocation({
+            status: failedInvocationStatus(modelError),
+            error: modelError,
+        });
         return {
             ok: false,
             error: `Historian failed while processing this session: ${desc.brief}`,

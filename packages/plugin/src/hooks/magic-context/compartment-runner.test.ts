@@ -33,30 +33,52 @@ import {
     recordOverflowDetected,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { rebaseSessionCoordinates } from "../../features/magic-context/store-generation-rebase";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
-import { Database } from "../../shared/sqlite";
+import { Database, withPrivilegedWriter, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
-    executeContextRecomp,
-    executeContextRecompWithResult,
+    executeContextRecomp as executeContextRecompImpl,
+    executeContextRecompWithResult as executeContextRecompWithResultImpl,
     getActiveCompartmentRun,
     registerActiveCompartmentRun,
-    runCompartmentAgent,
-    startCompartmentAgent,
+    runCompartmentAgent as runCompartmentAgentImpl,
+    startCompartmentAgent as startCompartmentAgentImpl,
 } from "./compartment-runner";
+import {
+    clearProducerModelObservations,
+    observeProducerModelsForTest,
+    prepareProducerFixture,
+} from "./producer-window-test-support";
 import {
     hasRunnableCompartmentWindow,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
+import { readRawSessionMessages } from "./read-session-chunk";
 import { __ignoredNotificationTest } from "./send-session-notification";
 import { tagMessages } from "./tag-messages";
+
+const runCompartmentAgent: typeof runCompartmentAgentImpl = async (deps) =>
+    runCompartmentAgentImpl(await prepareProducerFixture(deps));
+const executeContextRecomp: typeof executeContextRecompImpl = async (deps, options) =>
+    executeContextRecompImpl(await prepareProducerFixture(deps), options);
+const executeContextRecompWithResult: typeof executeContextRecompWithResultImpl = async (
+    deps,
+    options,
+) => executeContextRecompWithResultImpl(await prepareProducerFixture(deps), options);
+const startCompartmentAgent: typeof startCompartmentAgentImpl = (deps, runAgent) =>
+    startCompartmentAgentImpl(
+        runAgent ? deps : { ...deps, model: deps.model ?? "test/fixture-historian" },
+        runAgent,
+    );
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
-beforeEach(() => {
+beforeEach(async () => {
+    await observeProducerModelsForTest(["test/fixture-historian"]);
     // These fixtures end on real user rows, so the notice hold would queue.
     // This file tests recomp behavior, not that gate.
     __ignoredNotificationTest.setHoldDetector(() => false);
@@ -75,6 +97,7 @@ async function runCompartmentAgentWithLease(
 }
 
 afterEach(() => {
+    clearProducerModelObservations();
     __ignoredNotificationTest.reset();
     __resetNotificationStateForTests();
     closeDatabase();
@@ -1158,6 +1181,48 @@ function _getHistorianDumpContents(sessionId: string): string[] {
 }
 
 describe("runCompartmentAgent", () => {
+    it("keeps historian writes outside the foreground pass that launched it", async () => {
+        useTempDataHome("compartment-runner-background-scope-");
+        const db = openDatabase();
+        const sessionId = "ses-background-scope";
+        getOrCreateSessionMeta(db, sessionId);
+        let attempts = 0;
+        let callbacks = 0;
+        let failure: unknown;
+        await withSqliteTransformPass(async () => {
+            startCompartmentAgent(
+                {
+                    client: {} as PluginContext["client"],
+                    db,
+                    sessionId,
+                    historianChunkTokens: 10000,
+                    directory: "/tmp",
+                },
+                async () => {
+                    await Promise.resolve();
+                    const exec = spyOn(db, "exec").mockImplementation(() => {
+                        attempts++;
+                        throw Object.assign(new Error("background busy"), { code: "SQLITE_BUSY" });
+                    });
+                    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+                    try {
+                        withPrivilegedWriter(db, () => {
+                            callbacks++;
+                        });
+                    } catch (error) {
+                        failure = error;
+                    } finally {
+                        exec.mockRestore();
+                        wait.mockRestore();
+                    }
+                },
+            );
+            await getActiveCompartmentRun(sessionId)?.promise;
+        });
+        expect(attempts).toBe(1);
+        expect(callbacks).toBe(0);
+        expect((failure as Error).message).toBe("background busy");
+    });
     it("clears compartment-in-progress when another process holds the lease", () => {
         useTempDataHome("compartment-runner-lease-denied-");
         const db = openDatabase();
@@ -1691,7 +1756,7 @@ describe("runCompartmentAgent", () => {
             db,
             sessionId: "ses-window-refuse",
             historianChunkTokens: 100_000,
-            historianContextLimit: 32_001,
+            historianContextLimit: 33_000,
             historianMaxOutputTokens: 32_000,
             model: "test/model",
             directory: "/tmp",
@@ -1699,9 +1764,8 @@ describe("runCompartmentAgent", () => {
 
         expect(createSession).toHaveBeenCalledTimes(0);
         expect(promptSession).toHaveBeenCalledTimes(0);
-        expect(getHistorianFailureState(db, "ses-window-refuse").lastError).toContain(
-            "producer_source_exceeds_window",
-        );
+        expect(getHistorianFailureState(db, "ses-window-refuse").lastError).toBeNull();
+        expect(loadProtectedTailMeta(db, "ses-window-refuse").protectedTailDrainTokens).toBe(0);
 
         await runCompartmentAgentWithLease({
             client,
@@ -1716,6 +1780,46 @@ describe("runCompartmentAgent", () => {
 
         expect(createSession).toHaveBeenCalledTimes(1);
         expect(promptSession).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reserve an unsent default output cap for a 32k producer", async () => {
+        // With no configured output cap and no catalog output metadata, the
+        // hidden carrier sends no cap; reserving 32k would reject every run.
+        useTempDataHome("compartment-runner-producer-window-default-");
+        createOpenCodeDb("ses-window-default", [
+            { id: "default-1", role: "user", text: "producer source token ".repeat(2_000) },
+            { id: "default-2", role: "assistant", text: "Second eligible message" },
+            { id: "default-3", role: "user", text: "protected 1" },
+            { id: "default-4", role: "user", text: "protected 2" },
+            { id: "default-5", role: "user", text: "protected 3" },
+            { id: "default-6", role: "user", text: "protected 4" },
+            { id: "default-7", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        const createSession = mock(async () => ({ data: { id: "ses-agent-window-default" } }));
+        const promptSession = mock(async () => ({}));
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/producer-window-default" } })),
+                create: createSession,
+                prompt: promptSession,
+                messages: mock(async () => ({ data: [] })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId: "ses-window-default",
+            historianChunkTokens: 100_000,
+            historianContextLimit: 32_001,
+            model: "test/model",
+            directory: "/tmp",
+        });
+
+        expect(createSession).toHaveBeenCalledTimes(1);
+        expect(getHistorianFailureState(db, "ses-window-default").lastError).toBeNull();
     });
 
     it("records length-capped reasoning-only output with the actionable error and drain backoff", async () => {
@@ -1768,7 +1872,7 @@ describe("runCompartmentAgent", () => {
         });
 
         const error =
-            "historian output length-capped at 8192 tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant";
+            'historian ran out of output budget while reasoning (length-capped at 8192 tokens, no text; tokens={"input":null,"output":8192,"reasoning":null,"cache_read":null,"cache_write":null,"max_tokens":null,"finish_reason":"length"}) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant';
         expect(getCompartments(db, sessionId)).toHaveLength(0);
         expect(getHistorianFailureState(db, sessionId)).toMatchObject({
             failureCount: 1,
@@ -2044,9 +2148,15 @@ describe("runCompartmentAgent", () => {
         const calls = promptSession.mock.calls as unknown as Array<
             [{ body?: { model?: { providerID: string; modelID: string } } }]
         >;
-        // Call 0 (primary) + call 1 (repair): no model override (agent default).
-        expect(calls[0]?.[0]?.body?.model).toBeUndefined();
-        expect(calls[1]?.[0]?.body?.model).toBeUndefined();
+        // Primary and repair use an explicitly selected model with a known window; an unspecified agent default has no observable window for admission.
+        expect(calls[0]?.[0]?.body?.model).toEqual({
+            providerID: "test",
+            modelID: "fixture-historian",
+        });
+        expect(calls[1]?.[0]?.body?.model).toEqual({
+            providerID: "test",
+            modelID: "fixture-historian",
+        });
         // Call 2: the FIRST configured fallback (sonnet), not the session model.
         expect(calls[2]?.[0]?.body?.model).toEqual({
             providerID: "anthropic",
@@ -3008,4 +3118,221 @@ it("rolls back protected-tail drain reservation when publish throws after histor
     });
 
     expect(loadProtectedTailMeta(db, "ses-drain-rollback").protectedTailDrainTokens).toBe(0);
+});
+
+describe("stored compartments a store-projection rebase left unresolved", () => {
+    const twelveMessages = Array.from({ length: 12 }, (_, index) => ({
+        id: `m-${index + 1}`,
+        // The last five user turns form the protected tail, leaving 1-7 eligible.
+        role: index >= 7 || index % 2 === 0 ? "user" : "assistant",
+        text: index >= 7 ? `protected ${index + 1}` : `message ${index + 1}`,
+    }));
+
+    /**
+     * The issue 531 shape at small scale: the middle compartment's start anchor
+     * was a native-compaction boundary the host's store conversion removed, so
+     * the rebase marked it unresolved and left its stale end (5) overlapping
+     * the next compartment, which the rebase moved to start at 5.
+     */
+    function seedStuckCompartments(
+        db: ReturnType<typeof openDatabase>,
+        sessionId: string,
+        middle: { start: number; end: number; startId: string; endId: string },
+        next: { start: number; end: number; startId: string; endId: string },
+    ): void {
+        replaceAllCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m-1",
+                endMessageId: "m-2",
+                title: "first",
+                content: "first summary",
+            },
+            {
+                sequence: 1,
+                startMessage: middle.start,
+                endMessage: middle.end,
+                startMessageId: middle.startId,
+                endMessageId: middle.endId,
+                title: "middle",
+                content: "middle summary",
+            },
+            {
+                sequence: 2,
+                startMessage: next.start,
+                endMessage: next.end,
+                startMessageId: next.startId,
+                endMessageId: next.endId,
+                title: "next",
+                content: "next summary",
+            },
+        ]);
+        db.prepare(
+            "UPDATE compartments SET rebase_status = 'unresolved' WHERE session_id = ? AND sequence = 1",
+        ).run(sessionId);
+        db.prepare(
+            "UPDATE session_meta SET coordinate_generation = 'v2', coordinate_rebase_notice = ? WHERE session_id = ?",
+        ).run(
+            JSON.stringify({
+                generation: "v2",
+                previousGeneration: "v1",
+                at: 1,
+                unresolvedCompartments: 1,
+            }),
+            sessionId,
+        );
+    }
+
+    function historianClient(label: string, output: string) {
+        const prompt = mock(async () => ({}));
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: `/tmp/${label}` } })),
+                create: mock(async () => ({ data: { id: `ses-agent-${label}` } })),
+                prompt,
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [{ type: "text", text: output }],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+        return { client, prompt };
+    }
+
+    const nextCompartmentMarkup =
+        '<compartment start="7" end="7" title="Seventh"><p1>Seventh summary</p1></compartment>';
+
+    it("places the unresolved compartment from its neighbours before the run and publishes", async () => {
+        useTempDataHome("compartment-runner-531-repair-");
+        const sessionId = "ses-531-historian-repair";
+        createOpenCodeDb(sessionId, twelveMessages);
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        seedStuckCompartments(
+            db,
+            sessionId,
+            { start: 3, end: 5, startId: "m-native-compaction-boundary", endId: "m-4" },
+            { start: 5, end: 6, startId: "m-5", endId: "m-6" },
+        );
+        const { client } = historianClient("531-repair", nextCompartmentMarkup);
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(
+            getCompartments(db, sessionId).map((row) => [
+                row.startMessage,
+                row.endMessage,
+                row.rebaseStatus,
+            ]),
+        ).toEqual([
+            [1, 2, "ok"],
+            [3, 4, "ok"],
+            [5, 6, "ok"],
+            [7, 7, "ok"],
+        ]);
+        expect(getHistorianFailureState(db, sessionId).failureCount).toBe(0);
+    });
+
+    it("publishes on a session the stamped-session repair already fixed", async () => {
+        useTempDataHome("compartment-runner-531-healed-");
+        const sessionId = "ses-531-historian-healed";
+        createOpenCodeDb(sessionId, twelveMessages);
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        seedStuckCompartments(
+            db,
+            sessionId,
+            { start: 3, end: 5, startId: "m-native-compaction-boundary", endId: "m-4" },
+            { start: 5, end: 6, startId: "m-5", endId: "m-6" },
+        );
+
+        // The first transform pass after the upgrade runs the one-time repair.
+        const repair = rebaseSessionCoordinates({
+            db,
+            sessionId,
+            generation: "v2",
+            readMessages: readRawSessionMessages,
+        });
+        expect(repair.status).toBe("repaired");
+        expect(
+            getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
+        ).toEqual([
+            [1, 2],
+            [3, 4],
+            [5, 6],
+        ]);
+
+        const { client } = historianClient("531-healed", nextCompartmentMarkup);
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        expect(getCompartments(db, sessionId).map((row) => row.endMessage)).toEqual([2, 4, 6, 7]);
+        expect(getHistorianFailureState(db, sessionId).failureCount).toBe(0);
+    });
+
+    it("names /ctx-recomp when the neighbours cannot place it, and backs off instead of retrying every trigger", async () => {
+        useTempDataHome("compartment-runner-531-unrecoverable-");
+        const sessionId = "ses-531-historian-unrecoverable";
+        createOpenCodeDb(sessionId, twelveMessages);
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        // Both anchors are gone and the neighbours abut (2 then 3), so the only
+        // range the neighbours allow is empty: the row cannot be placed.
+        seedStuckCompartments(
+            db,
+            sessionId,
+            { start: 3, end: 5, startId: "m-gone-start", endId: "m-gone-end" },
+            { start: 3, end: 6, startId: "m-3", endId: "m-6" },
+        );
+        const { client, prompt } = historianClient("531-unrecoverable", nextCompartmentMarkup);
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+
+        const failure = getHistorianFailureState(db, sessionId);
+        expect(failure.failureCount).toBe(1);
+        expect(failure.lastError).toBe("invalid range 3-2");
+        expect(getHistorianPromptCount(prompt)).toBe(0);
+        const notices = getRpcNotificationTexts(prompt);
+        expect(notices.some((text) => text.includes("(MC-H03)"))).toBe(true);
+        expect(notices.some((text) => text.includes("Run /ctx-recomp to rebuild them."))).toBe(
+            true,
+        );
+        expect(notices.some((text) => text.includes("retry automatically"))).toBe(false);
+        expect(loadProtectedTailMeta(db, sessionId).historianDrainFailureAt).toBeGreaterThan(0);
+
+        // The next trigger inside the backoff does not fail again.
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+        });
+        expect(getHistorianFailureState(db, sessionId).failureCount).toBe(1);
+        expect(getHistorianPromptCount(prompt)).toBe(0);
+    });
 });

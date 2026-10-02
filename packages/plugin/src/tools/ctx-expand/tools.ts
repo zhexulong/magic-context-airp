@@ -4,6 +4,7 @@ import type { ContextDatabase } from "../../features/magic-context/storage";
 import { readSessionChunk } from "../../hooks/magic-context/read-session-chunk";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
+import { resolveCtxExpandMode } from "./mode";
 import { renderMessageByOrdinal, renderVerboseRange } from "./render";
 import type { CtxExpandArgs } from "./types";
 
@@ -18,25 +19,23 @@ const ctxExpandArgsShape = {
         .number()
         .optional()
         .describe(
-            'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
+            "First ordinal of the range — a compartment's start, or an ordinal from a ctx_search hit.",
         ),
     end: tool.schema
         .number()
         .optional()
-        .describe(
-            'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
-        ),
+        .describe("Last ordinal of the range, inclusive — a compartment's end."),
     verbose: tool.schema
         .boolean()
         .optional()
         .describe(
-            "With start/end: list each message separately with its ordinal [N] and per-part preview (each tool call shown with its output size), so you can pick one to recover in full by ordinal.",
+            "With start/end: one entry per message with ordinal and per-part preview instead of the transcript.",
         ),
     message: tool.schema
         .number()
         .optional()
         .describe(
-            "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
+            "Recover ONE message in full by ordinal (all text, all tool inputs and outputs). Use alone, without start/end.",
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
@@ -58,29 +57,14 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 message: "number",
             });
             const sessionId = toolContext.sessionID;
-
-            // By-ordinal mode: full recovery of a single message from stored history.
-            if (args.message !== undefined) {
-                if (
-                    typeof args.message !== "number" ||
-                    !Number.isInteger(args.message) ||
-                    args.message < 1
-                ) {
-                    return "Error: message must be a positive integer.";
-                }
-                return renderMessageByOrdinal(sessionId, args.message);
+            const mode = resolveCtxExpandMode(args, "positive");
+            if (mode.kind === "error") {
+                return mode.message;
             }
-
-            if (
-                !args.start ||
-                !args.end ||
-                !Number.isInteger(args.start) ||
-                !Number.isInteger(args.end) ||
-                args.start < 1 ||
-                args.end < args.start
-            ) {
-                return "Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).";
+            if (mode.kind === "message") {
+                return renderMessageByOrdinal(sessionId, mode.message);
             }
+            const { start, end, verbose } = mode;
 
             // Clamp the range to the last compartment boundary, mirroring
             // ctx_search: anything after that boundary is the live tail the
@@ -88,25 +72,24 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             // tokens and duplicates visible content. -1 means "no compartments
             // yet" → nothing is compacted, so don't clamp.
             const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, sessionId);
-            if (lastCompartmentEnd >= 0 && args.start > lastCompartmentEnd) {
-                return `Range ${args.start}-${args.end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`;
+            if (lastCompartmentEnd >= 0 && start > lastCompartmentEnd) {
+                return `Range ${start}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`;
             }
-            const effectiveEnd =
-                lastCompartmentEnd >= 0 ? Math.min(args.end, lastCompartmentEnd) : args.end;
+            const effectiveEnd = lastCompartmentEnd >= 0 ? Math.min(end, lastCompartmentEnd) : end;
 
             // Verbose mode: each message separate, with ids + per-part previews.
-            if (args.verbose === true) {
+            if (verbose) {
                 const v = renderVerboseRange(
                     sessionId,
-                    args.start,
+                    start,
                     effectiveEnd,
                     CTX_EXPAND_TOKEN_BUDGET,
                 );
                 if (!v.text) {
-                    return `No messages found in range ${args.start}-${effectiveEnd}. The range may be outside this session's history.`;
+                    return `No messages found in range ${start}-${effectiveEnd}. The range may be outside this session's history.`;
                 }
                 const out = [
-                    `Messages ${args.start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
+                    `Messages ${start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
                     "",
                     v.text,
                 ];
@@ -122,12 +105,12 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             const chunk = readSessionChunk(
                 sessionId,
                 CTX_EXPAND_TOKEN_BUDGET,
-                args.start,
+                start,
                 effectiveEnd + 1, // readSessionChunk uses exclusive end
             );
 
             if (!chunk.text || chunk.messageCount === 0) {
-                return `No messages found in range ${args.start}-${args.end}. The range may be outside this session's history.`;
+                return `No messages found in range ${start}-${end}. The range may be outside this session's history.`;
             }
 
             const lines: string[] = [];

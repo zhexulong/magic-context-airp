@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
+    describeUnresolvedProjectIdentity,
     isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -55,6 +56,15 @@ describe("resolveProjectIdentity directory fallback", () => {
     test("refuses the exact canonical home directory unless the user opts in", () => {
         expect(resolveProjectIdentityForSession(homedir())).toBeUndefined();
         expect(resolveProjectIdentityForSession(join(homedir(), "a-project"))).not.toBeUndefined();
+    });
+
+    // Agents read this text; it must name the home-directory rule and the opt-in,
+    // not leave them to guess "no git repo" (which resolves fine).
+    test("explains the home-directory refusal with the opt-in", () => {
+        const reason = describeUnresolvedProjectIdentity(homedir());
+        expect(reason).toContain("home directory");
+        expect(reason).toContain("allow_home_project");
+        expect(reason).not.toContain("git");
     });
 
     test("uses the canonical home directory's stable dir identity when opted in", () => {
@@ -123,10 +133,8 @@ describe("resolveProjectIdentity directory fallback", () => {
                 execFileSync: returningRootCommit("def5678"),
                 homeDirectory: () => fakeHome,
             });
-            const expectedHomeIdentity = `dir:${createHash("md5")
-                .update(realpathSync.native(fakeHome), "utf8")
-                .digest("hex")
-                .slice(0, 12)}`;
+            // Opt-in permits memory, not a second identity for the home repository.
+            const expectedHomeIdentity = "git:def5678";
 
             expect(resolveProjectIdentityForSession(fakeHome)).toBeUndefined();
             expect(resolveProjectIdentityForSession(child)).toBeUndefined();

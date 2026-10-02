@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -12,6 +13,7 @@ import {
 	acquireLease,
 	releaseLease,
 } from "@magic-context/core/features/magic-context/dreamer/lease";
+import { getDreamRuns } from "@magic-context/core/features/magic-context/dreamer/storage-dream-runs";
 import { getTaskScheduleState } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { leaseKeyFor } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory";
@@ -22,16 +24,19 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
+import * as logger from "@magic-context/core/shared/logger";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
 import { PiSubagentRunner } from "../subagent-runner";
 import {
 	__test,
+	abortInFlightDreamers,
 	awaitInFlightDreamers,
 	registerPiDreamerProject,
 	runPiDreamForProject,
 	unregisterPiDreamerProject,
+	validatePiDreamerModels,
 } from ".";
 
 let db: Database | null = null;
@@ -153,6 +158,304 @@ afterEach(() => {
 });
 
 describe("Pi dreamer wiring", () => {
+	test("shutdown aborts an owner-bound dreamer child and ps finds no survivor", async () => {
+		db = createDb();
+		const owner = {};
+		const identity = "git:pi-dream-shutdown-child";
+		let client!: CapturedDreamClient;
+		let pid = 0;
+		__test.setStartDreamScheduleTimerFactory(async (registration) => {
+			client = registration.client as CapturedDreamClient;
+			return () => {};
+		});
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: ({ signal }: { signal: AbortSignal }) =>
+						new Promise((resolve) => {
+							const child = spawn(
+								process.execPath,
+								["-e", "setInterval(() => {}, 1000)"],
+								{ stdio: "ignore", windowsHide: true },
+							);
+							pid = child.pid ?? 0;
+							signal.addEventListener("abort", () => child.kill("SIGTERM"), {
+								once: true,
+							});
+							child.once("close", () =>
+								resolve({ ok: false, reason: "abort", error: "cancelled" }),
+							);
+						}),
+				}) as never,
+		);
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: process.cwd(),
+				registrationOwner: owner,
+				config: DreamerConfigSchema.parse({
+					pi: { model: "test/model" },
+					tasks: { curate: { schedule: "0 4 * * *" } },
+				}),
+			}),
+		);
+		await flushMicrotasks();
+		const session = (await client.session.create({})) as { id: string };
+		const prompt = client.session.prompt({
+			path: { id: session.id },
+			body: { parts: [{ text: "dream" }] },
+		});
+		await flushMicrotasks();
+		expect(pid).toBeGreaterThan(0);
+		abortInFlightDreamers(owner);
+		await expect(prompt).rejects.toThrow("abort");
+		await awaitInFlightDreamers(owner);
+		expect(() =>
+			execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+				windowsHide: true,
+			}),
+		).toThrow();
+	});
+	test("manual dreamer uses the cap sampled for each child run", async () => {
+		db = createDb();
+		const identity = "git:pi-live-dreamer-cap";
+		const owner = {};
+		const caps: Array<number | undefined> = [];
+		let liveCap = 4096;
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { maxOutputTokens?: number }) => {
+						caps.push(args.maxOutputTokens);
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const config = DreamerConfigSchema.parse({
+			maxTokens: 2048,
+			pi: { model: "test/model" },
+			tasks: { curate: { schedule: "0 4 * * *" } },
+		});
+		insertMemory(db, {
+			projectPath: identity,
+			category: "PROJECT_RULES",
+			content: "Keep run-local caps.",
+		});
+		registerPiDreamerProject({
+			...dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: process.cwd(),
+				registrationOwner: owner,
+				config,
+			}),
+			sampleDreamRun: () => ({
+				dreamerConfig: { ...config, maxTokens: liveCap },
+			}),
+		});
+		await runPiDreamForProject(identity, "curate", owner);
+		liveCap = 8192;
+		await runPiDreamForProject(identity, "curate", owner);
+		expect(caps).toEqual([4096, 8192]);
+	});
+	test("drops an unknown fallback with a warning while the valid primary runs", async () => {
+		db = createDb();
+		const identity = "git:pi-model-validation";
+		const attempted: string[] = [];
+		const warning = spyOn(logger, "log");
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { model: string }) => {
+						attempted.push(args.model);
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const registry = {
+			find: (provider: string, model: string) =>
+				provider === "test" && model === "model" ? {} : undefined,
+		};
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity: identity,
+			projectDir: process.cwd(),
+			config: {
+				...DreamerConfigSchema.parse({
+					tasks: { curate: { schedule: "0 4 * * *" } },
+				}),
+				pi: {
+					model: "test/model",
+					fallback_models: ["ollama-cloud/unknown-dreamer"],
+				},
+			} as never,
+		});
+		insertMemory(db, {
+			projectPath: identity,
+			category: "PROJECT_RULES",
+			content: "Keep valid primary.",
+		});
+		try {
+			registerPiDreamerProject({ ...opts, modelRegistry: registry });
+			const result = await runPiDreamForProject(
+				identity,
+				"curate",
+				opts.registrationOwner,
+			);
+			expect(result.failed).toEqual([]);
+			expect(attempted).toEqual(["test/model"]);
+			expect(
+				warning.mock.calls.some(([message]) =>
+					String(message).includes(
+						"dropping Pi model not found: ollama-cloud/unknown-dreamer",
+					),
+				),
+			).toBe(true);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	test("defers OMP primary and fallback role validation to the host only", () => {
+		const find = mock((provider: string, model: string) =>
+			provider === "mock" && model === "known" ? {} : undefined,
+		);
+		const registry = { find };
+		const task = {
+			task: "classify-memories" as const,
+			schedule: "",
+			timeoutMinutes: 20,
+			model: "@dreamer",
+			fallbackModels: [
+				{ model: "@cheap", qualifier: "low" },
+				"mock/missing",
+				"mock/known",
+			],
+		};
+		expect(validatePiDreamerModels([task], registry, "omp")[0]).toMatchObject({
+			model: "@dreamer",
+			fallbackModels: [{ model: "@cheap", qualifier: "low" }, "mock/known"],
+			modelChainUnavailable: false,
+		});
+		expect(find.mock.calls).toEqual([
+			["mock", "missing"],
+			["mock", "known"],
+		]);
+		expect(validatePiDreamerModels([task], registry, "pi")[0]).toMatchObject({
+			model: "mock/known",
+			fallbackModels: [],
+		});
+		expect(validatePiDreamerModels([task], registry, "omp")[0].model).toBe(
+			"@dreamer",
+		);
+	});
+
+	test("marks a chain with no Pi-resolvable models unavailable", () => {
+		const tasks = validatePiDreamerModels(
+			[
+				{
+					task: "classify-memories",
+					schedule: "0 4 * * *",
+					timeoutMinutes: 20,
+					model: "ollama-cloud/unknown-dreamer",
+				},
+			],
+			{ find: () => undefined },
+		);
+		expect(tasks[0].model).toBeUndefined();
+		expect(tasks[0].modelChainUnavailable).toBe(true);
+	});
+
+	test("does not register the filesystem root or home for dreaming", () => {
+		db = createDb();
+		let starts = 0;
+		__test.setStartDreamScheduleTimerFactory(async () => {
+			starts++;
+			return () => {};
+		});
+		for (const dir of ["/", homedir()])
+			registerPiDreamerProject(
+				dreamerOptions({
+					database: db,
+					projectIdentity: `dir:${dir}`,
+					projectDir: dir,
+				}),
+			);
+		expect(starts).toBe(0);
+	});
+
+	// A directory the identity resolver refuses (the home directory, or a folder
+	// inside a dotfiles repository rooted at home) resolves to no identity. The
+	// empty string must never become a dreamer project key: every task would run
+	// against project "" and log "registered project " with a blank name.
+	test("does not register a project with an empty identity", () => {
+		db = createDb();
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-dreamer-empty-identity-"));
+		try {
+			let starts = 0;
+			__test.setStartDreamScheduleTimerFactory(async () => {
+				starts++;
+				return () => {};
+			});
+			for (const projectIdentity of ["", "   "])
+				registerPiDreamerProject(
+					dreamerOptions({ database: db, projectIdentity, projectDir: dir }),
+				);
+			expect(starts).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	test("classifies a provider refusal surfaced by a Pi child runner", async () => {
+		db = createDb();
+		const projectIdentity = "git:pi-dreamer-provider-refusal";
+		const providerText =
+			"UnknownError: custody accounts exhausted: provider=synthetic accounts=main:cooldown";
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async () => ({
+						ok: false,
+						reason: "provider_error",
+						error: providerText,
+						transient: true,
+					})),
+				}) as never,
+		);
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity,
+			config: DreamerConfigSchema.parse({
+				model: "test/model",
+				tasks: { curate: { schedule: "0 4 * * *" } },
+			}),
+		});
+		insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "PROJECT_RULES",
+			content: "Keep this rule intact.",
+		});
+		registerPiDreamerProject(opts);
+
+		await runPiDreamForProject(
+			projectIdentity,
+			"curate",
+			opts.registrationOwner,
+		);
+
+		const run = getDreamRuns(db, projectIdentity)[0];
+		const task = JSON.parse(run?.tasks_json ?? "[]")[0] as {
+			failure?: { failure_class: string; provider_error: string | null };
+		};
+		expect(task.failure?.failure_class).toBe("provider_error");
+		expect(task.failure?.provider_error).toContain(
+			"custody accounts exhausted",
+		);
+	});
 	test("disable=true config is a no-op", () => {
 		db = createDb();
 
@@ -394,14 +697,84 @@ describe("Pi dreamer wiring", () => {
 			deferredBusy: [],
 			failed: [],
 			failureDetails: [],
-			details: [],
-			backlogBefore: { curate: { pending: 1, total: 1 } },
-			backlogAfter: { curate: { pending: 1, total: 1 } },
+			details: ["curate: ARCHITECTURE (1)"],
+			backlogBefore: {
+				curate: { pending: 1, total: 1, category: "ARCHITECTURE" },
+			},
+			backlogAfter: {
+				curate: { pending: 1, total: 1, category: "ARCHITECTURE" },
+			},
 		});
 
 		expect(capturedSystem).toContain(
 			"Write human-readable prose you author in: Spanish (Español).",
 		);
+	});
+
+	test("rotates the shared curate category scope in Pi prompts", async () => {
+		db = createDb();
+		const projectIdentity = "git:pi-curate-rotation";
+		const prompts: string[] = [];
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { userMessage?: string }) => {
+						prompts.push(args.userMessage ?? "");
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const projectRule = insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "PROJECT_RULES",
+			content: "Pi project rule scope fixture.",
+		});
+		const architecture = insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "ARCHITECTURE",
+			content: "Pi architecture scope fixture.",
+		});
+		for (const category of [
+			"CONSTRAINTS",
+			"CONFIG_VALUES",
+			"NAMING",
+		] as const) {
+			insertMemory(db, {
+				projectPath: projectIdentity,
+				category,
+				content: `Pi ${category} scope fixture.`,
+			});
+		}
+		const opts = dreamerOptions({
+			database: db,
+			projectDir: process.cwd(),
+			projectIdentity,
+			config: DreamerConfigSchema.parse({
+				model: "test/model",
+				tasks: { curate: { schedule: "0 4 * * *" } },
+			}),
+		});
+		registerPiDreamerProject(opts);
+
+		await runPiDreamForProject(
+			projectIdentity,
+			"curate",
+			opts.registrationOwner,
+		);
+		await runPiDreamForProject(
+			projectIdentity,
+			"curate",
+			opts.registrationOwner,
+		);
+
+		expect(prompts).toHaveLength(2);
+		expect(prompts[0]).toContain("whole of the `PROJECT_RULES` category");
+		expect(prompts[0]).toContain(`[${projectRule.id}] PROJECT_RULES`);
+		expect(prompts[0]).not.toContain(`[${architecture.id}] ARCHITECTURE`);
+		expect(prompts[1]).toContain("whole of the `ARCHITECTURE` category");
+		expect(prompts[1]).toContain(`[${architecture.id}] ARCHITECTURE`);
+		expect(prompts[1]).not.toContain(`[${projectRule.id}] PROJECT_RULES`);
 	});
 
 	test("persists an OMP 18.1.11 dreamer task stream with tokens and task label", async () => {
@@ -542,7 +915,7 @@ describe("Pi dreamer wiring", () => {
 		expect(result.failed).toEqual([]);
 		expect(result.ran).toEqual(["curate"]);
 		expect(result.details).toEqual([
-			"curate: 1 memory operation applied (archive)",
+			"curate: PROJECT_RULES (1); curate: 1 memory operation applied (archive)",
 		]);
 	});
 
@@ -1119,6 +1492,12 @@ describe("Pi dreamer wiring", () => {
 		const owner = {};
 		const leaseKey = leaseKeyFor("curate", projectIdentity);
 		const blocker = "manual-lease-blocker";
+		insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "PROJECT_RULES",
+			content:
+				"Keep the owner-drain lease test scoped to runnable curate work.",
+		});
 		expect(acquireLease(db, blocker, leaseKey)).toBe(true);
 		registerPiDreamerProject(
 			dreamerOptions({

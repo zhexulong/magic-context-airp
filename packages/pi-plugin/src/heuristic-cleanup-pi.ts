@@ -33,6 +33,7 @@
  */
 
 import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
+import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	type ContextDatabase,
 	getActiveTagsBySession,
@@ -43,11 +44,17 @@ import {
 import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import {
+	applyNewToolDrop,
+	hasSmallToolInput,
+} from "@magic-context/core/hooks/magic-context/apply-operations";
+import {
 	applyCavemanCleanup,
 	type CavemanCleanupConfig,
 } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
+import type { DroppedTokenReduction } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
 import {
 	type EmergencyDropTag,
+	measureEmergencyTag,
 	planEmergencyDrop,
 } from "@magic-context/core/hooks/magic-context/emergency-drop";
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
@@ -113,6 +120,7 @@ export interface PiHeuristicCleanupResult {
 	emergencyDroppedTools: number;
 	compressedTextTags: number;
 	mutatedTextTags: number;
+	droppedTokenReductions: DroppedTokenReduction[];
 }
 
 /**
@@ -335,6 +343,7 @@ export function applyPiHeuristicCleanup(
 	let deduplicatedTools = 0;
 	let droppedInjections = 0;
 	let droppedStaleReduceCalls = 0;
+	const droppedTokenReductions: DroppedTokenReduction[] = [];
 
 	// ── Pass 1: tiered target-headroom emergency drop ─────────────────
 	// Replaces the old need-blind aged-drop + dropAllTools nuke. Runs only when
@@ -347,7 +356,7 @@ export function applyPiHeuristicCleanup(
 		// Plan ONLY over tags in the live window that would ACTUALLY reclaim
 		// bytes (canDrop, not mere drop() presence) — keeps the floor math equal
 		// to the on-wire tail and avoids phantom under-evict. Mirrors OpenCode.
-		const droppableTags = tags.filter(
+		const candidateTags = tags.filter(
 			(t) =>
 				t.status === "active" &&
 				t.type === "tool" &&
@@ -356,7 +365,34 @@ export function applyPiHeuristicCleanup(
 		// Floor accounting needs the FULL active live-window set (all types) —
 		// narrowing it to the droppable subset folds real conversation/
 		// reasoning tail into the "irreducible prefix" and under-evicts.
-		const activeTags = tags.filter((t) => t.status === "active");
+		const recentTags = new Set(
+			candidateTags
+				.slice()
+				.sort((a, b) => b.tagNumber - a.tagNumber)
+				.slice(0, 20)
+				.map((tag) => tag.tagNumber),
+		);
+		const calibration = sessionDecisionCalibration(db, sessionId);
+		const activeTags = tags
+			.filter((t) => t.status === "active")
+			.map((tag) =>
+				measureEmergencyTag(
+					tag,
+					targets.get(tag.tagNumber),
+					calibration,
+					targets.get(tag.tagNumber)?.requiresToolArcSkeleton === true ||
+						((emergency.usagePercentage ?? 0) < 95 &&
+							recentTags.has(tag.tagNumber) &&
+							hasSmallToolInput(targets.get(tag.tagNumber))),
+				),
+			);
+		const byTag = new Map(activeTags.map((tag) => [tag.tagNumber, tag]));
+		const droppableTags = candidateTags
+			.flatMap((tag) => {
+				const measured = byTag.get(tag.tagNumber);
+				return measured ? [measured] : [];
+			})
+			.filter((tag) => (tag.reclaimableTokens ?? 0) > 0);
 		sessionLog(
 			sessionId,
 			`emergency candidates: loaded=${tags.length} active=${activeTags.length} activeTools=${activeTags.filter((tag) => tag.type === "tool").length} visibleCompleteTools=${droppableTags.length} windowYields=${(emergency.usagePercentage ?? 0) >= 95} cutoff=${protectedCutoff}`,
@@ -374,13 +410,7 @@ export function applyPiHeuristicCleanup(
 		});
 		if (plan.shouldDrop) {
 			const toDrop = new Set(plan.tagNumbers);
-			const newestEmergencyTags = new Set(
-				droppableTags
-					.slice()
-					.sort((left, right) => right.tagNumber - left.tagNumber)
-					.slice(0, 20)
-					.map((tag) => tag.tagNumber),
-			);
+			const newestEmergencyTags = recentTags;
 			db.transaction(() => {
 				for (const tag of tags) {
 					if (!toDrop.has(tag.tagNumber)) continue;
@@ -390,25 +420,23 @@ export function applyPiHeuristicCleanup(
 						(emergency.usagePercentage ?? 0) < 95 &&
 						newestEmergencyTags.has(tag.tagNumber);
 					// Removing the result separator beside native reasoning lets Anthropic
-					// merge signed assistant turns, so this safety case always keeps the pair.
-					const reasoningSafeSkeleton =
-						target?.requiresToolArcSkeleton === true;
-					const skeleton = recent || reasoningSafeSkeleton;
-					const result = reasoningSafeSkeleton
-						? (target?.truncate?.() ?? "absent")
-						: recent
-							? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
-							: (target?.drop?.() ?? "absent");
+					// merge signed assistant turns, so this safety case always keeps the
+					// pair, with its real arguments.
+					const { result, mode } = applyNewToolDrop(target, {
+						inWindow: recent,
+						keepSkeleton: target?.requiresToolArcSkeleton === true,
+					});
 					if (result === "removed" || result === "truncated") {
+						// Persist the mode applied (including drop() keeping the
+						// call whose result ends the request) so replays match.
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-						updateTagDropMode(
-							db,
-							sessionId,
-							tag.tagNumber,
-							skeleton ? "truncated" : "full",
-						);
+						updateTagDropMode(db, sessionId, tag.tagNumber, mode);
 						droppedTools++;
 						emergencyDroppedTools++;
+						droppedTokenReductions.push({
+							tagNumber: tag.tagNumber,
+							mode: mode === "full" ? "full" : "truncated",
+						});
 					}
 				}
 			}).immediate();
@@ -450,9 +478,10 @@ export function applyPiHeuristicCleanup(
 					: staleReduce.bareCallIds.has(tag.messageId);
 				if (!matched) continue;
 				const target = targets.get(tag.tagNumber);
-				const result = target?.drop?.() ?? "absent";
+				if (target?.canDrop?.() === false) continue;
+				const { result, mode } = applyNewToolDrop(target, { inWindow: false });
 				if (result === "incomplete") continue;
-				updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+				updateTagDropMode(db, sessionId, tag.tagNumber, mode);
 				updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 				if (result === "removed" || result === "truncated") {
 					droppedStaleReduceCalls++;
@@ -489,6 +518,10 @@ export function applyPiHeuristicCleanup(
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 						if (dropResult === "removed" || didReplace) {
 							droppedInjections++;
+							droppedTokenReductions.push({
+								tagNumber: tag.tagNumber,
+								mode: "full",
+							});
 						}
 					}
 				} else {
@@ -500,7 +533,17 @@ export function applyPiHeuristicCleanup(
 							tag.messageId,
 						)
 					) {
-						if (target.setContent(stripped)) droppedInjections++;
+						if (target.setContent(stripped)) {
+							droppedInjections++;
+							droppedTokenReductions.push({
+								tagNumber: tag.tagNumber,
+								mode: "partial",
+								removedCharacters: Math.max(
+									0,
+									content.length - stripped.length,
+								),
+							});
+						}
 					}
 				}
 			}
@@ -539,13 +582,21 @@ export function applyPiHeuristicCleanup(
 				for (let i = 0; i < group.length - 1; i++) {
 					const tag = group[i];
 					const target = targets.get(tag.tagNumber);
-					// Deduplication stays full-drop; only emergency recent arcs keep skeletons.
-					const result = target?.drop?.() ?? "absent";
+					if (target?.canDrop?.() === false) continue;
+					// Deduplication stays full-drop; only emergency recent arcs keep
+					// skeletons. A call that cannot be removed keeps real arguments.
+					const { result, mode } = applyNewToolDrop(target, {
+						inWindow: false,
+					});
 					if (result === "incomplete") continue;
-					updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+					updateTagDropMode(db, sessionId, tag.tagNumber, mode);
 					updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 					if (result === "removed" || result === "truncated") {
 						deduplicatedTools++;
+						droppedTokenReductions.push({
+							tagNumber: tag.tagNumber,
+							mode: mode === "full" ? "full" : "truncated",
+						});
 					}
 				}
 			}
@@ -578,6 +629,15 @@ export function applyPiHeuristicCleanup(
 			cavemanResult.compressedToFull +
 			cavemanResult.compressedToUltra;
 		mutatedTextTags = cavemanResult.mutatedTextTags;
+		if (cavemanResult.textReductions) {
+			for (const r of cavemanResult.textReductions) {
+				droppedTokenReductions.push({
+					tagNumber: r.tagNumber,
+					mode: "partial",
+					removedCharacters: r.removedCharacters,
+				});
+			}
+		}
 	}
 
 	return {
@@ -588,6 +648,7 @@ export function applyPiHeuristicCleanup(
 		emergencyDroppedTools,
 		compressedTextTags,
 		mutatedTextTags,
+		droppedTokenReductions,
 	};
 }
 

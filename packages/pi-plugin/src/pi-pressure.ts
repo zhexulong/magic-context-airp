@@ -28,6 +28,7 @@
  * OpenCode's `resolveContextLimit()` path.
  */
 
+import { sessionLog } from "@magic-context/core/shared/logger";
 import { MIN_PLAUSIBLE_CONTEXT_LIMIT } from "@magic-context/core/shared/window-geometry";
 
 export interface PiAssistantUsage {
@@ -185,6 +186,136 @@ export function resolvePiPressureSnapshot(
 		percentage: validInferredLimit ? (inputTokens / inferredLimit) * 100 : 0,
 		...(validInferredLimit ? { contextLimit: inferredLimit } : {}),
 	};
+}
+
+// Sessions whose current run of set-aside estimates has already been logged.
+// Cleared when a usable reading arrives, so each run logs exactly once.
+const estimateSetAsideLogged = new Set<string>();
+
+/** A usable reading ends the set-aside episode for the session. */
+export function notePiUsageReadingUsed(sessionId: string): void {
+	estimateSetAsideLogged.delete(sessionId);
+}
+
+function entryUsageTokens(usage: unknown): number {
+	if (!usage || typeof usage !== "object") return 0;
+	const u = usage as Record<string, unknown>;
+	const n = (value: unknown) =>
+		typeof value === "number" && Number.isFinite(value) ? value : 0;
+	return (
+		n(u.totalTokens) ||
+		n(u.input) + n(u.output) + n(u.cacheRead) + n(u.cacheWrite)
+	);
+}
+
+/**
+ * Whether Pi's `getContextUsage().tokens` is currently a character-count
+ * estimate of the whole raw session branch rather than a figure anchored on
+ * recorded provider usage.
+ *
+ * Pi (0.87, `estimateProjectedContextTokens`) trusts the last assistant usage
+ * only while no `context_edit` or `compaction` entry follows it. When one does
+ * (Pi appends a `context_edit` to hide a failed attempt before an automatic
+ * retry, e.g. after a WebSocket close), it re-estimates every message on the
+ * branch at chars/4. Pi's branch is the unreduced session file, so that figure
+ * ignores everything Magic Context removed from the served request and says
+ * nothing about what the provider actually receives.
+ *
+ * Mirrors Pi's rule on the raw branch: the newest assistant entry with usable
+ * usage (not aborted or errored, non-zero) against the newest invalidating
+ * entry.
+ */
+export function isPiLiveUsageRawBranchEstimate(
+	branchEntries: readonly unknown[] | null | undefined,
+): boolean {
+	if (!branchEntries) return false;
+	for (let index = branchEntries.length - 1; index >= 0; index -= 1) {
+		const entry = branchEntries[index] as
+			| { type?: unknown; message?: unknown }
+			| null
+			| undefined;
+		if (!entry || typeof entry !== "object") continue;
+		if (entry.type === "context_edit" || entry.type === "compaction")
+			return true;
+		if (entry.type !== "message") continue;
+		const message = entry.message as
+			| { role?: unknown; stopReason?: unknown; usage?: unknown }
+			| undefined;
+		if (
+			message?.role === "assistant" &&
+			message.stopReason !== "aborted" &&
+			message.stopReason !== "error" &&
+			entryUsageTokens(message.usage) > 0
+		) {
+			return false;
+		}
+	}
+	return false;
+}
+
+/** Log a set-aside raw-branch estimate once per episode for the session. */
+export function noteRawBranchEstimateSetAside(
+	sessionId: string,
+	reading: number,
+	source: string,
+): void {
+	if (estimateSetAsideLogged.has(sessionId)) return;
+	estimateSetAsideLogged.add(sessionId);
+	sessionLog(
+		sessionId,
+		`usage reading ${reading} set aside (${source}): Pi re-estimated its whole unreduced session branch because a context edit or compaction follows the last recorded usage (for example after a retried request); keeping the previous reading until provider usage arrives`,
+	);
+}
+
+/**
+ * `resolvePiPressureSnapshot` for the pressure decision, with Pi's raw-branch
+ * estimate (see isPiLiveUsageRawBranchEstimate) left out at any size: it is
+ * Pi's own figure, not a provider report, and it ignores everything Magic
+ * Context removed from the served request. The previous provider reading
+ * stands instead, and the first set-aside figure of an episode is logged.
+ *
+ * No reading is compared with the model window. A provider report is the size
+ * of a request the provider accepted, and the window is a configured figure
+ * that can be smaller than what the model serves, so a reading past it is real
+ * overflow for the scheduler to handle.
+ */
+export function resolvePiPressureSnapshotWithEstimateGuard(
+	args: ResolvePiPressureSnapshotArgs & {
+		sessionId: string;
+		source: string;
+		/** Pi's live figure is a raw-branch estimate (see isPiLiveUsageRawBranchEstimate). */
+		liveIsRawBranchEstimate?: boolean;
+		/**
+		 * `persistedInputTokens` is itself Pi's live figure (the caller had no
+		 * persisted provider reading and fell back to `getContextUsage()`), so
+		 * it is set aside together with the live figure.
+		 */
+		persistedFromLive?: boolean;
+	},
+): PiPressureSnapshot {
+	const live =
+		typeof args.liveInputTokens === "number" &&
+		Number.isFinite(args.liveInputTokens)
+			? args.liveInputTokens
+			: 0;
+	const setAsideEstimate = args.liveIsRawBranchEstimate === true && live > 0;
+	const snapshot = resolvePiPressureSnapshot(
+		setAsideEstimate
+			? {
+					...args,
+					liveInputTokens: undefined,
+					...(args.persistedFromLive
+						? { persistedInputTokens: 0, persistedPercentage: 0 }
+						: {}),
+				}
+			: args,
+	);
+	if (setAsideEstimate) {
+		noteRawBranchEstimateSetAside(args.sessionId, live, args.source);
+	} else if (snapshot.inputTokens > 0) {
+		notePiUsageReadingUsed(args.sessionId);
+	}
+	return snapshot;
 }
 
 export function formatPiPressureForLog(snapshot: PiPressureSnapshot): string {

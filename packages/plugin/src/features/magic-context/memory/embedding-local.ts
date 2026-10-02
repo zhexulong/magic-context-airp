@@ -9,6 +9,7 @@ import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-
 import { classifyLocalEmbeddingFailure, type EmbeddingFailure } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
+import { configureTransformersRemoteHost } from "./transformers-remote-host";
 
 /** The dtype enum values accepted by @huggingface/transformers' feature-extraction
  *  pipeline (keyof typeof DATA_TYPES in transformers/types/utils/dtypes.d.ts).
@@ -194,11 +195,25 @@ function startLockHeartbeat(lockPath: string): () => void {
 
 type TransformersModule = Record<string, unknown>;
 
+type WasmOrtModule = {
+    env?: {
+        wasm?: {
+            numThreads?: number;
+            wasmPaths?: string | Record<string, string>;
+        };
+    };
+    default?: unknown;
+};
+
+type ImportWasmOrtModule = (specifier: string) => Promise<WasmOrtModule>;
+
 type LocalEmbeddingRuntimeMode = "native" | "wasm" | "disabled";
 
 type LocalEmbeddingTestHooks = {
     host?: () => LocalEmbeddingHost;
     injectWasmOrt?: () => Promise<boolean>;
+    resolveWasmOrt?: () => string | undefined;
+    importWasmOrt?: ImportWasmOrtModule;
     importTransformers?: () => Promise<TransformersModule>;
     importTransformersWasmFallback?: () => Promise<TransformersModule>;
     importTransformersNodeWasmFallback?: () => Promise<TransformersModule>;
@@ -206,25 +221,38 @@ type LocalEmbeddingTestHooks = {
     log?: (message: string, data?: unknown) => void;
 };
 
+const ONNX_RUNTIME_WEB_SPECIFIER = "onnxruntime-web";
+
 let localEmbeddingRuntimeMode: LocalEmbeddingRuntimeMode = "native";
 let localEmbeddingProcessFailure: EmbeddingFailure | null = null;
 let wasmRuntimeInjected = false;
 let localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
+let resolveWasmOrtForRuntime = (): string | undefined => {
+    try {
+        return typeof import.meta.resolve === "function"
+            ? import.meta.resolve(ONNX_RUNTIME_WEB_SPECIFIER)
+            : undefined;
+    } catch {
+        return undefined;
+    }
+};
+const importWasmOrtModule = async (specifier: string): Promise<WasmOrtModule> =>
+    (await import(specifier)) as WasmOrtModule;
+let importWasmOrtModuleForRuntime: ImportWasmOrtModule = importWasmOrtModule;
 let importWasmOrtForRuntime = async (): Promise<{
-    module: {
-        env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-        default?: unknown;
-    };
+    module: WasmOrtModule;
     entryPath: string;
 }> => {
     const { createRequire: createRequireFn } = await import("node:module");
     const requireFn = createRequireFn(import.meta.url);
-    const ortEntry = requireFn.resolve("onnxruntime-web");
+    const ortEntry = requireFn.resolve(ONNX_RUNTIME_WEB_SPECIFIER);
+
+    // Resolve before importing because a host loader may rewrite a bare
+    // specifier with a reload tag; a second query-free import of the same file
+    // would otherwise create another identity and register the CPU backend twice.
+    const ortSpecifier = resolveWasmOrtForRuntime() ?? ONNX_RUNTIME_WEB_SPECIFIER;
     return {
-        module: (await import("onnxruntime-web")) as {
-            env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-            default?: unknown;
-        },
+        module: await importWasmOrtModuleForRuntime(ortSpecifier),
         entryPath: ortEntry,
     };
 };
@@ -312,6 +340,8 @@ export function getLocalEmbeddingNativeMemoryStats(): LocalEmbeddingNativeMemory
 export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): void {
     localEmbeddingHostForRuntime = hooks.host ?? (() => ({ isElectron: false, isBun: false }));
     injectWasmOrtForRuntime = hooks.injectWasmOrt ?? injectWasmOrt;
+    resolveWasmOrtForRuntime = hooks.resolveWasmOrt ?? resolveWasmOrtForRuntimeDefault;
+    importWasmOrtModuleForRuntime = hooks.importWasmOrt ?? importWasmOrtModuleForRuntimeDefault;
     importTransformersForRuntime = hooks.importTransformers ?? importTransformersForRuntimeDefault;
     importTransformersWasmFallbackForRuntime =
         hooks.importTransformersWasmFallback ?? importTransformersWasmFallbackForRuntimeDefault;
@@ -329,6 +359,8 @@ export function __resetLocalEmbeddingForTests(): void {
     localEmbeddingProcessFailure = null;
     wasmRuntimeInjected = false;
     localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
+    resolveWasmOrtForRuntime = resolveWasmOrtForRuntimeDefault;
+    importWasmOrtModuleForRuntime = importWasmOrtModuleForRuntimeDefault;
     importWasmOrtForRuntime = importWasmOrtForRuntimeDefault;
     importTransformersForRuntime = importTransformersForRuntimeDefault;
     importTransformersWasmFallbackForRuntime = importTransformersWasmFallbackForRuntimeDefault;
@@ -340,6 +372,8 @@ export function __resetLocalEmbeddingForTests(): void {
     loadedLocalEmbeddingRuntimes.clear();
 }
 
+const resolveWasmOrtForRuntimeDefault = resolveWasmOrtForRuntime;
+const importWasmOrtModuleForRuntimeDefault = importWasmOrtModuleForRuntime;
 const importWasmOrtForRuntimeDefault = importWasmOrtForRuntime;
 const importTransformersForRuntimeDefault = importTransformersForRuntime;
 const importTransformersWasmFallbackForRuntimeDefault = importTransformersWasmFallbackForRuntime;
@@ -364,9 +398,13 @@ async function injectWasmOrt(): Promise<boolean> {
     try {
         const { module: ortWeb, entryPath } = await importWasmOrtForRuntime();
 
-        // Prefer package-local assets so first use works offline instead of
-        // requiring the default CDN path.
         if (ortWeb.env?.wasm) {
+            // ORT's WASM worker threads can spin between runs and cannot currently
+            // be terminated. A single thread keeps the host event loop idle.
+            ortWeb.env.wasm.numThreads = 1;
+
+            // Prefer package-local assets so first use works offline instead of
+            // requiring the default CDN path.
             ortWeb.env.wasm.wasmPaths = `${pathToFileURL(dirname(entryPath)).href}/`;
         }
 
@@ -726,9 +764,9 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
             provider: "local",
             model,
             local_runtime: runtimePreference,
-            // Only fold non-default dtype into identity so the default config
-            // produces the byte-identical identity string as before this field
-            // existed (no forced re-embed on upgrade). See issue #259.
+            // Only fold non-default dtype into identity. The runtime fingerprint
+            // separately changes the identity when vector-producing dependencies
+            // change, while fp32 remains the stable default within one runtime.
             ...(dtype && dtype !== DEFAULT_LOCAL_DTYPE ? { local_dtype: dtype } : {}),
         });
     }
@@ -769,9 +807,11 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 const env = transformersModule.env as {
                     logLevel?: unknown;
                     cacheDir?: string;
+                    remoteHost?: string;
                     useFS?: boolean;
                     useFSCache?: boolean;
                 };
+                configureTransformersRemoteHost(env);
                 const LogLevel = transformersModule.LogLevel as Record<string, unknown> | undefined;
                 if (LogLevel && "ERROR" in LogLevel) {
                     env.logLevel = LogLevel.ERROR;

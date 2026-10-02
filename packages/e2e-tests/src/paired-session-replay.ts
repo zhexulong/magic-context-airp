@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { readReplayDocument } from "../../plugin/src/features/magic-context/storage-replay-document";
 import type { MockResponse } from "./mock-provider/server";
 import { RustTestHarness } from "./rust-harness";
 
@@ -740,13 +741,11 @@ async function driveTrailingBlankLane(
     });
     const targetMessageId = harness.prepareTrailingBlankReplay(sessionId);
     const readDecision = (): string | null => {
-        const row = harness
-            .contextDb()
-            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
-        if (!row?.trailing_blank_decisions) return null;
-        const decisions = JSON.parse(row.trailing_blank_decisions) as Record<string, string>;
-        return decisions[targetMessageId] ?? null;
+        // TTL policy shares the trailing_blank_decisions column and can wrap its decisions
+        // in a versioned replay document before this assistant's first replay pass.
+        return (
+            readReplayDocument(harness.contextDb(), sessionId).trailingBlank[targetMessageId] ?? null
+        );
     };
     const sourceParts = async (): Promise<string[]> =>
         (await harness.listMessages(sessionId))
@@ -808,10 +807,18 @@ async function driveTrailingBlankLane(
         )?.info?.id;
         if (!addedUser) throw new Error(`replay stage ${stage} did not persist its user turn`);
         await harness.revertMessage(sessionId, addedUser);
-        await harness.waitFor(async () => {
-            const messages = await harness.listMessages(sessionId);
-            return messages.some((message) => message.info?.id === addedUser) ? null : true;
-        });
+        // OpenCode's revert sets `session.revert` and leaves the rows in place; the rows
+        // are deleted lazily by the next prompt, before it creates its own user message.
+        // So the durable proof that the revert landed is the marker, not the row's
+        // absence. (The absence wait passed for months only because the harness never
+        // awaited async predicates; once it did, this could never hold.)
+        await harness.waitFor(
+            async () => {
+                const session = await harness.getSession(sessionId);
+                return session?.revert?.messageID === addedUser ? true : null;
+            },
+            { timeoutMs: 30_000, label: `replay stage ${stage} revert marker recorded` },
+        );
     }
     return captures;
 }

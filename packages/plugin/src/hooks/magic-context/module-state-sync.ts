@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 
 import type { Compartment } from "../../features/magic-context/compartment-storage";
+import { getModuleNoteEvaluationBridge } from "../../features/magic-context/context-authority";
 import {
     buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
@@ -49,10 +50,12 @@ import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
+import { invalidateAutoEmbedSession } from "./embed-session-state";
 import { StateSyncTiming, timedStateSyncDatabase } from "./module-state-sync-timing";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
 import {
+    readRawSessionMessageIdOrdinalsForRange,
     readRawSessionMessageOrdinalById,
     readRawSessionMessagePartsById,
     readRawSessionSeedTail,
@@ -72,6 +75,7 @@ export interface ModuleWatermarks {
      * state-sync markers are still valid. */
     workspace_fingerprint?: string | null;
     reasoning_cleared_through_tag?: number;
+    note_evaluation_available?: boolean;
 }
 
 export interface ModuleWorkspacePayload {
@@ -79,7 +83,13 @@ export interface ModuleWorkspacePayload {
     members: Array<{ project_path: string; share_categories: string[] }>;
 }
 
-export type ModuleDropMode = "full" | "truncated" | "edit_marker";
+export type ModuleDropMode =
+    | "full"
+    | "truncated"
+    | "skeleton_real"
+    | "skeleton_stripped"
+    | "edit_marker"
+    | "edit_marker_stripped";
 
 export interface ModuleDropSeed {
     block_id: string;
@@ -140,6 +150,7 @@ export interface ModuleStateSyncPayload {
     method: "state_sync";
     params: {
         session_id?: string;
+        note_evaluation_available?: boolean;
         shadow_generation: number;
         expected_shadow_seq: number;
         seed_id?: string;
@@ -213,6 +224,7 @@ export interface ModuleStateSyncOptions {
      * This bypasses both capability and own-store reads; force/restart seeds ignore it.
      */
     knownWatermarksUnchanged?: boolean;
+    noteEvaluationProjectPath?: string;
 }
 
 export interface ModuleCompartmentMirrorRow {
@@ -442,34 +454,37 @@ async function resyncModuleCompartmentsFromAuthoritative(args: {
              harness = excluded.harness`,
     );
     const now = Date.now();
-    args.db.transaction(() => {
-        if (divergentSequence !== undefined) {
-            args.db
-                .prepare("DELETE FROM compartments WHERE session_id = ? AND sequence >= ?")
-                .run(args.sessionId, divergentSequence);
-        }
-        for (const compartment of authoritative) {
-            upsert.run(
-                args.sessionId,
-                compartment.sequence,
-                compartment.start_message,
-                compartment.end_message,
-                compartment.start_message_id,
-                compartment.end_message_id,
-                compartment.title,
-                compartment.content,
-                compartment.p1 ?? null,
-                compartment.p2 ?? null,
-                compartment.p3 ?? null,
-                compartment.p4 ?? null,
-                compartment.importance ?? 50,
-                compartment.episode_type ?? null,
-                compartment.legacy ?? (compartment.p1 ? 0 : 1),
-                compartment.created_at ?? now,
-                getHarness(),
-            );
-        }
-    })();
+    args.db
+        .transaction(() => {
+            if (divergentSequence !== undefined) {
+                args.db
+                    .prepare("DELETE FROM compartments WHERE session_id = ? AND sequence >= ?")
+                    .run(args.sessionId, divergentSequence);
+            }
+            for (const compartment of authoritative) {
+                upsert.run(
+                    args.sessionId,
+                    compartment.sequence,
+                    compartment.start_message,
+                    compartment.end_message,
+                    compartment.start_message_id,
+                    compartment.end_message_id,
+                    compartment.title,
+                    compartment.content,
+                    compartment.p1 ?? null,
+                    compartment.p2 ?? null,
+                    compartment.p3 ?? null,
+                    compartment.p4 ?? null,
+                    compartment.importance ?? 50,
+                    compartment.episode_type ?? null,
+                    compartment.legacy ?? (compartment.p1 ? 0 : 1),
+                    compartment.created_at ?? now,
+                    getHarness(),
+                );
+            }
+        })
+        .immediate();
+    invalidateAutoEmbedSession(args.sessionId);
     rememberCompartmentMirrorCursor(
         args.sessionId,
         maxSequence,
@@ -606,6 +621,7 @@ export function loadModuleWatermarks(args: {
     workspace?: ModuleWorkspaceContext;
     /** Reuse the enclosing pass's session_meta projection. */
     sessionMeta?: ReturnType<typeof getOrCreateSessionMeta>;
+    noteEvaluationProjectPath?: string;
 }): ModuleWatermarks {
     const workspace = args.workspace ?? resolveModuleWorkspaceContext(args.db, args.projectPath);
     const sessionMeta = args.sessionMeta ?? getOrCreateSessionMeta(args.db, args.sessionId);
@@ -628,6 +644,7 @@ export function loadModuleWatermarks(args: {
     const memoryMutationId = args.projectPath
         ? (getMaxMemoryMutationIdForProjects(args.db, workspace.expandedIdentities) ?? 0)
         : 0;
+    const evaluationProject = args.noteEvaluationProjectPath ?? args.projectPath;
     return {
         compartment_sequence: compartmentRow?.max_sequence ?? -1,
         memory_id: memoryId,
@@ -642,6 +659,9 @@ export function loadModuleWatermarks(args: {
             0,
         workspace_fingerprint: workspace.workspace?.fingerprint ?? null,
         reasoning_cleared_through_tag: sessionMeta.clearedReasoningThroughTag ?? 0,
+        note_evaluation_available: evaluationProject
+            ? getModuleNoteEvaluationBridge(evaluationProject) !== undefined
+            : false,
     };
 }
 
@@ -659,7 +679,8 @@ export function moduleWatermarksEqual(
         left.project_memory_epoch === right.project_memory_epoch &&
         left.project_user_profile_version === right.project_user_profile_version &&
         (left.workspace_fingerprint ?? null) === (right.workspace_fingerprint ?? null) &&
-        (left.reasoning_cleared_through_tag ?? 0) === (right.reasoning_cleared_through_tag ?? 0)
+        (left.reasoning_cleared_through_tag ?? 0) === (right.reasoning_cleared_through_tag ?? 0) &&
+        (left.note_evaluation_available ?? false) === (right.note_evaluation_available ?? false)
     );
 }
 
@@ -698,46 +719,71 @@ export function canonicalOrdinalForMessageId(args: {
     return canonical;
 }
 
-function serializeCompartment(args: {
+let boundaryDiagnosticObserverForTest: ((message: string) => void) | null = null;
+
+function logBoundaryDiagnostic(sessionId: string, message: string): void {
+    sessionLog(sessionId, message);
+    boundaryDiagnosticObserverForTest?.(message);
+}
+
+interface CompartmentBoundaryResolution {
+    startRaw: RawMessageParts | null;
+    endRaw: RawMessageParts | null;
+    startOrdinal: number | null | "mismatch";
+    endOrdinal: number | null | "mismatch";
+}
+
+function readCompartmentBoundaryResolution(args: {
     compartment: ReturnType<typeof getCompartments>[number];
     sessionId: string;
     readRawById: (messageId: string) => RawMessageParts | null;
     state: ModuleStateSyncState;
-}): unknown | null | "mismatch" {
+}): CompartmentBoundaryResolution {
     const startRaw = args.readRawById(args.compartment.startMessageId);
     const endRaw = args.readRawById(args.compartment.endMessageId);
-    const startOrdinal = canonicalOrdinalForMessageId({
-        sessionId: args.sessionId,
-        raw: startRaw,
-        messageId: args.compartment.startMessageId,
-        generation: args.state.moduleGeneration,
-        state: args.state,
-    });
-    const endOrdinal = canonicalOrdinalForMessageId({
-        sessionId: args.sessionId,
-        raw: endRaw,
-        messageId: args.compartment.endMessageId,
-        generation: args.state.moduleGeneration,
-        state: args.state,
-    });
-    if (startOrdinal === "mismatch" || endOrdinal === "mismatch") return "mismatch";
-    if (startOrdinal === null || endOrdinal === null) return null;
-    const startCreatedAt = startRaw?.createdAt;
-    const endCreatedAt = endRaw?.createdAt;
+    return {
+        startRaw,
+        endRaw,
+        startOrdinal: canonicalOrdinalForMessageId({
+            sessionId: args.sessionId,
+            raw: startRaw,
+            messageId: args.compartment.startMessageId,
+            generation: args.state.moduleGeneration,
+            state: args.state,
+        }),
+        endOrdinal: canonicalOrdinalForMessageId({
+            sessionId: args.sessionId,
+            raw: endRaw,
+            messageId: args.compartment.endMessageId,
+            generation: args.state.moduleGeneration,
+            state: args.state,
+        }),
+    };
+}
+
+function serializeCompartment(args: {
+    compartment: ReturnType<typeof getCompartments>[number];
+    startRaw: RawMessageParts | null;
+    endRaw: RawMessageParts | null;
+    startOrdinal: number;
+    endOrdinal: number;
+}): unknown {
+    const startCreatedAt = args.startRaw?.createdAt;
+    const endCreatedAt = args.endRaw?.createdAt;
     const dateRange =
         typeof startCreatedAt === "number" && typeof endCreatedAt === "number"
             ? { start_date: formatDate(startCreatedAt), end_date: formatDate(endCreatedAt) }
             : {};
     return {
         sequence: args.compartment.sequence,
-        start_message: startOrdinal,
-        end_message: endOrdinal,
+        start_message: args.startOrdinal,
+        end_message: args.endOrdinal,
         start_message_id: flatBlockIdForRawMessage(
             args.compartment.startMessageId,
-            startRaw,
+            args.startRaw,
             "start",
         ),
-        end_message_id: flatBlockIdForRawMessage(args.compartment.endMessageId, endRaw, "end"),
+        end_message_id: flatBlockIdForRawMessage(args.compartment.endMessageId, args.endRaw, "end"),
         ...dateRange,
         title: args.compartment.title,
         content: args.compartment.content,
@@ -750,6 +796,25 @@ function serializeCompartment(args: {
         legacy: args.compartment.legacy,
         created_at: args.compartment.createdAt,
     };
+}
+
+function adjacentCompartmentBoundaryId(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    sequence: number;
+    direction: "previous" | "next";
+}): string | null {
+    const previous = args.direction === "previous";
+    const row = args.db
+        .prepare(
+            `SELECT ${previous ? "end_message_id" : "start_message_id"} AS message_id
+               FROM compartments
+              WHERE session_id = ? AND sequence ${previous ? "<" : ">"} ?
+              ORDER BY sequence ${previous ? "DESC" : "ASC"}
+              LIMIT 1`,
+        )
+        .get(args.sessionId, args.sequence) as { message_id?: unknown } | undefined;
+    return typeof row?.message_id === "string" && row.message_id.length > 0 ? row.message_id : null;
 }
 
 function seedBoundaryFromSerializedCompartments(compartments: unknown[]): string | null {
@@ -822,7 +887,7 @@ function dropSeedForTag(args: {
                 block_id: `${tag.toolOwnerMessageId}#${call.blockIndex}`,
                 ...(related.length > 0 ? { related_block_ids: related } : {}),
                 drop_mode: tag.dropMode,
-                ...(tag.dropMode === "edit_marker"
+                ...(tag.dropMode === "edit_marker" || tag.dropMode === "edit_marker_stripped"
                     ? { payload: editMarkerSeedPayload(call.toolInput) }
                     : {}),
             },
@@ -1026,7 +1091,8 @@ function readCompartmentsAfterSequence(
         .prepare(
             `SELECT id, session_id, sequence, start_message, end_message,
                     start_message_id, end_message_id, title, content,
-                    p1, p2, p3, p4, importance, episode_type, legacy, created_at
+                    p1, p2, p3, p4, importance, episode_type, legacy, created_at,
+                    rebase_status
                FROM compartments
               WHERE session_id = ? AND sequence > ?
               ORDER BY sequence ASC`,
@@ -1064,6 +1130,9 @@ function readCompartmentsAfterSequence(
             episodeType: typeof row.episode_type === "string" ? row.episode_type : null,
             legacy: typeof row.legacy === "number" ? row.legacy : 0,
             createdAt: row.created_at as number,
+            rebaseStatus: (row.rebase_status === "unresolved" ? "unresolved" : "ok") as
+                | "ok"
+                | "unresolved",
         }));
 }
 
@@ -1249,6 +1318,7 @@ export function buildPagedModuleStateSyncPayloads(
                       project_memory_epoch: args.watermarks.project_memory_epoch,
                       user_profile_version: args.watermarks.project_user_profile_version,
                       acked_watermarks: args.watermarks,
+                      note_evaluation_available: args.watermarks.note_evaluation_available ?? false,
                       ...(args.dropSeedSkipped !== undefined
                           ? { drop_seed_skipped: args.dropSeedSkipped }
                           : {}),
@@ -1377,6 +1447,7 @@ export async function buildModuleStateSyncPayload(args: {
         projectPath: args.pass.projectPath,
         workspace,
         sessionMeta,
+        noteEvaluationProjectPath: args.options?.noteEvaluationProjectPath,
     });
     if (
         !args.force &&
@@ -1504,18 +1575,129 @@ export async function buildModuleStateSyncPayload(args: {
                   acked.compartment_sequence,
               )
         : [];
-    for (const compartment of compartmentsToSerialize) {
-        args.options?.beforeSerializeCompartment?.();
-        if (args.options?.shouldAbortSeed?.()) return "seed_budget";
-        const serialized = serializeCompartment({
+    const boundaryResolutions = new Map<number, CompartmentBoundaryResolution>();
+    const resolveBoundary = (
+        compartment: (typeof compartmentsToSerialize)[number],
+    ): CompartmentBoundaryResolution => {
+        const cached = boundaryResolutions.get(compartment.sequence);
+        if (cached) return cached;
+        const resolved = readCompartmentBoundaryResolution({
             compartment,
             sessionId: args.pass.sessionId,
             readRawById,
             state: args.state,
         });
-        if (serialized === "mismatch") return "mismatch";
-        if (serialized === null) return "unresolved";
-        compartments.push(serialized);
+        boundaryResolutions.set(compartment.sequence, resolved);
+        return resolved;
+    };
+    const canonicalOrdinalForAdjacentId = (
+        messageId: string | null,
+    ): number | null | "mismatch" => {
+        if (!messageId) return null;
+        const raw = readRawById(messageId);
+        return canonicalOrdinalForMessageId({
+            sessionId: args.pass.sessionId,
+            raw,
+            messageId,
+            generation: args.state.moduleGeneration,
+            state: args.state,
+        });
+    };
+    let firstRawOrdinal: number | null | undefined;
+    for (const [index, compartment] of compartmentsToSerialize.entries()) {
+        args.options?.beforeSerializeCompartment?.();
+        if (args.options?.shouldAbortSeed?.()) return "seed_budget";
+        const boundary = resolveBoundary(compartment);
+        if (boundary.startOrdinal === "mismatch" || boundary.endOrdinal === "mismatch") {
+            return "mismatch";
+        }
+        const startMissing = boundary.startOrdinal === null;
+        const endMissing = boundary.endOrdinal === null;
+        if (startMissing && endMissing) {
+            logBoundaryDiagnostic(
+                args.pass.sessionId,
+                `state-sync compartment skipped session=${args.pass.sessionId} sequence=${compartment.sequence} missing_start_id=${compartment.startMessageId} missing_end_id=${compartment.endMessageId} method=both_boundaries_dangling`,
+            );
+            continue;
+        }
+
+        let startOrdinal = boundary.startOrdinal;
+        if (startOrdinal === null) {
+            const previous = compartmentsToSerialize[index - 1];
+            const previousBoundaryId = previous
+                ? previous.endMessageId
+                : adjacentCompartmentBoundaryId({
+                      db: args.pass.db,
+                      sessionId: args.pass.sessionId,
+                      sequence: compartment.sequence,
+                      direction: "previous",
+                  });
+            const previousEnd = previous
+                ? resolveBoundary(previous).endOrdinal
+                : canonicalOrdinalForAdjacentId(previousBoundaryId);
+            if (previousEnd === "mismatch") return "mismatch";
+            if (typeof previousEnd === "number") {
+                startOrdinal = previousEnd + 1;
+                logBoundaryDiagnostic(
+                    args.pass.sessionId,
+                    `state-sync boundary repaired session=${args.pass.sessionId} sequence=${compartment.sequence} side=start missing_id=${compartment.startMessageId} resolved_ordinal=${startOrdinal} method=previous_compartment_end_plus_one`,
+                );
+            } else if (previousBoundaryId === null) {
+                if (firstRawOrdinal === undefined) {
+                    firstRawOrdinal =
+                        readRawSessionMessageIdOrdinalsForRange(args.pass.sessionId, 1, 1)
+                            .values()
+                            .next().value ?? null;
+                }
+                startOrdinal = firstRawOrdinal;
+                if (startOrdinal !== null) {
+                    logBoundaryDiagnostic(
+                        args.pass.sessionId,
+                        `state-sync boundary repaired session=${args.pass.sessionId} sequence=${compartment.sequence} side=start missing_id=${compartment.startMessageId} resolved_ordinal=${startOrdinal} method=raw_store_first_ordinal`,
+                    );
+                }
+            }
+        }
+
+        let endOrdinal = boundary.endOrdinal;
+        if (endOrdinal === null) {
+            const next = compartmentsToSerialize[index + 1];
+            const nextStart = next
+                ? resolveBoundary(next).startOrdinal
+                : canonicalOrdinalForAdjacentId(
+                      adjacentCompartmentBoundaryId({
+                          db: args.pass.db,
+                          sessionId: args.pass.sessionId,
+                          sequence: compartment.sequence,
+                          direction: "next",
+                      }),
+                  );
+            if (nextStart === "mismatch") return "mismatch";
+            if (typeof nextStart === "number") {
+                endOrdinal = nextStart - 1;
+                logBoundaryDiagnostic(
+                    args.pass.sessionId,
+                    `state-sync boundary repaired session=${args.pass.sessionId} sequence=${compartment.sequence} side=end missing_id=${compartment.endMessageId} resolved_ordinal=${endOrdinal} method=next_compartment_start_minus_one`,
+                );
+            }
+        }
+
+        if (startOrdinal === null || endOrdinal === null || startOrdinal > endOrdinal) {
+            logBoundaryDiagnostic(
+                args.pass.sessionId,
+                `state-sync compartment skipped session=${args.pass.sessionId} sequence=${compartment.sequence} missing_start_id=${startMissing ? compartment.startMessageId : "none"} missing_end_id=${endMissing ? compartment.endMessageId : "none"} method=${startOrdinal !== null && endOrdinal !== null ? "invalid_repaired_range" : "no_adjacent_canonical_boundary"}`,
+            );
+            continue;
+        }
+        compartments.push(
+            serializeCompartment({
+                compartment,
+                startRaw: boundary.startRaw,
+                endRaw: boundary.endRaw,
+                startOrdinal,
+                endOrdinal,
+            }),
+        );
         serializedCount += 1;
         const yieldEvery = Math.max(1, args.options?.yieldEveryCompartments ?? 10);
         if (serializedCount % yieldEvery === 0) {
@@ -1759,6 +1941,7 @@ export async function buildModuleStateSyncPayload(args: {
             project_memory_epoch: currentWatermarks.project_memory_epoch,
             user_profile_version: currentWatermarks.project_user_profile_version,
             acked_watermarks: currentWatermarks,
+            note_evaluation_available: currentWatermarks.note_evaluation_available ?? false,
             ...(pendingCompactionMarker !== undefined
                 ? { pending_compaction_marker: pendingCompactionMarker }
                 : {}),
@@ -1798,12 +1981,16 @@ export interface ModuleStateSyncClient {
             | "ctx_note"
             | "ctx_memory"
             | "note.evaluate"
-            | "transform.ack"
-            | "transform.nack";
+            | "historian.pending"
+            | "historian.claim"
+            | "historian.heartbeat"
+            | "historian.complete";
         body: unknown;
         signal?: AbortSignal;
         generationSensitive?: boolean;
         attemptClass?: "transform_page_upload" | "transform_series_execute";
+        /** Health probes and content-addressed resend attempts must not queue behind the silent request they diagnose. */
+        bypassSessionLane?: boolean;
         timeoutMs?: number;
     }): Promise<unknown>;
 }
@@ -1901,7 +2088,9 @@ export async function syncModuleState(args: {
         if (
             !force &&
             args.options?.knownWatermarksUnchanged === true &&
-            args.state.lastAckedWatermarks !== null
+            args.state.lastAckedWatermarks !== null &&
+            (args.state.lastAckedWatermarks.note_evaluation_available ?? false) ===
+                (getModuleNoteEvaluationBridge(args.projectRoot) !== undefined)
         ) {
             return { status: "no_change" };
         }
@@ -1969,7 +2158,11 @@ export async function syncModuleState(args: {
                 state: args.state,
                 pass: args.pass,
                 force,
-                options: { ...args.options, stateSyncDeltas },
+                options: {
+                    ...args.options,
+                    stateSyncDeltas,
+                    noteEvaluationProjectPath: args.projectRoot,
+                },
             });
             timing.serialize += Math.max(
                 0,
@@ -2143,6 +2336,9 @@ export async function syncModuleState(args: {
 }
 
 export const __moduleStateSyncTest = {
+    setBoundaryDiagnosticObserver(observer: ((message: string) => void) | null): void {
+        boundaryDiagnosticObserverForTest = observer;
+    },
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     canonicalOrdinalForMessageId,

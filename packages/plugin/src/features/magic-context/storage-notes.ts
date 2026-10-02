@@ -1,5 +1,6 @@
 import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
+import { managedAuthorityNoteRow } from "./migrations";
 
 export type NoteType = "session" | "smart";
 export type NoteStatus = "active" | "pending" | "ready" | "dismissed";
@@ -228,9 +229,49 @@ function noteCheckColumnsExist(db: Database): boolean {
     }
 }
 
+const PENDING_SESSION_NOTE_HEAL =
+    "UPDATE notes SET status = 'active', surface_condition = NULL WHERE type = 'session' AND status = 'pending' AND surface_condition IS NOT NULL";
+
+/**
+ * Return session notes that an older update parked as pending with a condition
+ * to active. Runs on every note read.
+ *
+ * Rows of a project whose notes the Rust module owns are skipped. In that
+ * table they are a read model the module mirrors from its own store; the module
+ * heals the same rows when its store opens and mirrors the result back, and the
+ * notes authority triggers abort any unprivileged write to them. Touching one
+ * here made every note read fail while the mirror still held an unhealed row,
+ * including the note-nudge check a Rust-mode transform pass runs.
+ */
+function healPendingSessionNotes(db: Database): void {
+    try {
+        db.prepare(
+            `${PENDING_SESSION_NOTE_HEAL} AND NOT ${managedAuthorityNoteRow("notes")}`,
+        ).run();
+    } catch (error) {
+        // A database without the authority tables has no module-owned rows and
+        // no authority triggers, so every row is ours to heal.
+        if (!(error instanceof Error) || !error.message.includes("no such table")) throw error;
+        db.prepare(PENDING_SESSION_NOTE_HEAL).run();
+    }
+}
+
+export const SESSION_NOTE_CONDITION_ERROR =
+    "Only a note created with a condition can have one. Write a new note with surface_condition, and dismiss this one.";
+
 function getNoteById(db: Database, noteId: number): Note | null {
+    healPendingSessionNotes(db);
     const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(noteId);
     return isNoteRow(row) ? toNote(row) : null;
+}
+
+export function getNoteByIdInScope(
+    db: Database,
+    noteId: number,
+    scope: NoteMutationScope,
+): Note | null {
+    const note = getNoteById(db, noteId);
+    return note && noteBelongsToScope(note, scope) ? note : null;
 }
 
 function noteBelongsToScope(note: Note, scope: NoteMutationScope): boolean {
@@ -260,6 +301,7 @@ function buildStatusClause(status: GetNotesOptions["status"]): {
 }
 
 export function getNotes(db: Database, options: GetNotesOptions = {}): Note[] {
+    healPendingSessionNotes(db);
     const clauses: string[] = [];
     const params: Array<string | NoteStatus> = [];
 
@@ -366,8 +408,11 @@ export function updateNote(
     updates: UpdateNoteOptions,
     scope: NoteMutationScope,
 ): Note | null {
-    const existing = getNoteById(db, noteId);
-    if (!existing || !noteBelongsToScope(existing, scope)) {
+    const existing = getNoteByIdInScope(db, noteId, scope);
+    if (!existing) {
+        return null;
+    }
+    if (updates.surfaceCondition !== undefined && existing.type !== "smart") {
         return null;
     }
 
@@ -473,28 +518,30 @@ export function dismissNotes(
     scope: NoteMutationScope,
 ): DismissNoteResult[] {
     const now = Date.now();
-    return db.transaction(() =>
-        noteIds.map((noteId): DismissNoteResult => {
-            const existing = getNoteById(db, noteId);
-            if (!existing) return { noteId, outcome: "not_found" };
-            if (!noteBelongsToScope(existing, scope)) {
-                return { noteId, outcome: "not_owned" };
-            }
-            if (existing.status === "dismissed") {
-                return { noteId, outcome: "already_dismissed" };
-            }
+    return db
+        .transaction(() =>
+            noteIds.map((noteId): DismissNoteResult => {
+                const existing = getNoteById(db, noteId);
+                if (!existing) return { noteId, outcome: "not_found" };
+                if (!noteBelongsToScope(existing, scope)) {
+                    return { noteId, outcome: "not_owned" };
+                }
+                if (existing.status === "dismissed") {
+                    return { noteId, outcome: "already_dismissed" };
+                }
 
-            const result = db
-                .prepare(
-                    "UPDATE notes SET status = 'dismissed', updated_at = ? WHERE id = ? AND status != 'dismissed'",
-                )
-                .run(now, noteId);
-            return {
-                noteId,
-                outcome: result.changes > 0 ? "dismissed" : "already_dismissed",
-            };
-        }),
-    )();
+                const result = db
+                    .prepare(
+                        "UPDATE notes SET status = 'dismissed', updated_at = ? WHERE id = ? AND status != 'dismissed'",
+                    )
+                    .run(now, noteId);
+                return {
+                    noteId,
+                    outcome: result.changes > 0 ? "dismissed" : "already_dismissed",
+                };
+            }),
+        )
+        .immediate();
 }
 
 export function dismissNote(db: Database, noteId: number, scope: NoteMutationScope): boolean {
@@ -530,5 +577,5 @@ export function replaceAllSessionNotes(db: Database, sessionId: string, notes: s
         for (const note of notes) {
             insert.run(note, sessionId, now, now, getHarness());
         }
-    })();
+    }).immediate();
 }

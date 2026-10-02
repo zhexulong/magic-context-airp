@@ -9,6 +9,15 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+
+# The host and hermetic e2e lanes spawn `opencode serve` from PATH. The official
+# installer puts the binary under ~/.opencode/bin, which login shells add to PATH but
+# tool/daemon shells often do not (v0.42.6 r9: the same box that passed r8 lost the
+# entry when the tool daemon restarted). Prefer the ambient PATH; fall back to the
+# installer location before declaring it missing.
+if ! command -v opencode >/dev/null 2>&1 && [ -x "$HOME/.opencode/bin/opencode" ]; then
+  export PATH="$HOME/.opencode/bin:$PATH"
+fi
 E2E_DIR="$REPO_ROOT/packages/e2e-tests"
 MANIFEST_VALIDATOR="$E2E_DIR/scripts/validate-mode-manifest.ts"
 PREREQUISITE_DETECTOR="$E2E_DIR/scripts/check-rust-prerequisites.ts"
@@ -92,7 +101,11 @@ if ! command -v opencode >/dev/null 2>&1; then
 fi
 echo "  [e2e:rust:prerequisites:end] status=pass"
 
-RUST_E2E_FILES=$(bun "$MANIFEST_VALIDATOR" --mode rust --harness all | tr '\n' ' ')
+if [[ -n "${MC_E2E_SHARD:-}" ]]; then
+    RUST_E2E_FILES=$(bun "$E2E_DIR/scripts/select-rust-shard.ts" "$MC_E2E_SHARD" | tr '\n' ' ')
+else
+    RUST_E2E_FILES=$(bun "$MANIFEST_VALIDATOR" --mode rust --harness all | tr '\n' ' ')
+fi
 if [[ -z "$RUST_E2E_FILES" ]]; then
     echo "Error: Rust e2e manifest selected zero test files" >&2
     exit 1

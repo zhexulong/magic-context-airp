@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -22,7 +23,10 @@ import {
     normalizeVerificationFiles,
     recordMemoryMapping,
 } from "../memory";
-import { recordChildInvocation } from "../subagent-token-capture";
+import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
+import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
+import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import {
@@ -40,6 +44,7 @@ import {
     type DreamerModuleRoute,
     getModuleMemoryIdentities,
 } from "./module-apply";
+import { DreamTokenBudgetExceeded } from "./token-budget";
 
 /**
  * map-memories: ONE-TIME-style backfill that locates the backing file(s) for
@@ -86,7 +91,8 @@ export const MAX_INDEPENDENT_REQUEUE_PER_RUN = MAP_BATCH_SIZE;
 
 export interface MapMemoriesArgs {
     db: Database;
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     projectIdentity: string;
     parentSessionId: string | undefined;
     sessionDirectory: string;
@@ -96,6 +102,8 @@ export interface MapMemoriesArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number) => void;
 }
@@ -138,10 +146,10 @@ export function computeMapBatchSliceMs(remainingMs: number, batchesRemaining: nu
     );
 }
 
-/** The shared prompt helper uses this exact error shape for a deadline expiry.
- * Validation and provider failures remain ordinary per-batch retries. */
+/** Our own slice expiry and the host client's request timer both count as
+ * timeouts. Validation and provider failures remain ordinary per-batch retries. */
 function isTimeoutClassError(error: unknown): boolean {
-    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+    return shared.isPromptTimeoutError(error);
 }
 
 /** Re-queue predicate: a file-independent mapping (sentinel, no real files)
@@ -230,7 +238,7 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
         args.db,
         args.holderId,
         args.leaseKey,
-        () => abortController.abort(),
+        (reason) => abortController.abort(new Error(reason)),
         args.leaseAcquisition,
     );
 
@@ -312,10 +320,11 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
 }
 
 /**
- * Map ONE batch in its OWN child session. Per-batch try/finally retires a settled
- * child inline and leaves an unsettled child to the age-gated sweep. An unclosed
- * manifest records nothing, while a closed manifest can safely bank its valid
- * subset before a targeted retry handles any omissions.
+ * Map one batch in its own child session. Cleanup deletes a finished session;
+ * unfinished sessions are left for the stale-child cleanup job. A manifest missing
+ * its closing XML root writes nothing. Complete XML may commit a subset and retry
+ * only omitted ids once. If the token guard asked the child to stop investigating,
+ * omitted ids wait for the next run rather than spending another child budget.
  */
 async function mapOneBatch(
     args: MapMemoriesArgs,
@@ -326,9 +335,54 @@ async function mapOneBatch(
     let agentSessionId: string | null = null;
     let promptSettled = false;
     const startedAt = Date.now();
+    let budgetFinalized = false;
+    const onBudgetUpdate: NonNullable<MapMemoriesArgs["onBudgetUpdate"]> = (state) => {
+        budgetFinalized ||= state.finalizeFired;
+        args.onBudgetUpdate?.(state);
+    };
     try {
+        const prompt = buildMapMemoriesPrompt(args.projectIdentity, batch);
+        if (args.hiddenCompletionExecutor) {
+            const run = await runHiddenSingleShotPrompt({
+                executor: args.hiddenCompletionExecutor,
+                parentSessionId: args.parentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                agent: DREAMER_MEMORY_MAPPER_AGENT,
+                system: MAP_MEMORIES_SYSTEM_PROMPT,
+                prompt,
+                title: "magic-context-dream-map-memories",
+                callContext: "dreamer:map-memories",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate },
+                model: args.model,
+                fallbackModels: args.fallbackModels,
+                timeoutMs: sliceMs,
+                signal,
+                parse: (text) =>
+                    validateMapMemoriesManifest(text, new Set(batch.map((memory) => memory.id))),
+            });
+            recordInvocation(args, startedAt, {
+                status: "completed",
+                messages: run.completion.messages ?? [],
+            });
+            const outcome = await applyParsedBatchMappings(
+                args,
+                batch,
+                run.validated,
+                budgetFinalized,
+            );
+            const returnedIds = new Set(run.validated.map((entry) => entry.id));
+            return {
+                ...outcome,
+                requeue: budgetFinalized
+                    ? []
+                    : batch.filter((memory) => !returnedIds.has(memory.id)),
+            };
+        }
+        const client = args.client;
+        if (!client)
+            throw new Error("map-memories requires a client or hidden completion executor");
         const createResponse = await createChildSessionWithFence({
-            client: args.client,
+            client,
             db: args.db,
             parentSessionId: args.parentSessionId,
             title: "magic-context-dream-map-memories",
@@ -344,9 +398,8 @@ async function mapOneBatch(
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create map-memories session.");
 
-        const prompt = buildMapMemoriesPrompt(args.projectIdentity, batch);
         const run = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
+            client,
             {
                 path: { id: agentSessionId },
                 query: { directory: args.sessionDirectory },
@@ -358,12 +411,18 @@ async function mapOneBatch(
                 },
             },
             {
+                // Send without holding a request open for the whole batch, so the
+                // slice below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate,
+                }),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:map-memories",
                 fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
+                    const messagesResponse = await client.session.messages({
                         path: { id: agentSessionId as string },
                         query: { directory: args.sessionDirectory, limit: 100 },
                     });
@@ -387,7 +446,7 @@ async function mapOneBatch(
         promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        const outcome = await applyParsedBatchMappings(args, batch, run.validated);
+        const outcome = await applyParsedBatchMappings(args, batch, run.validated, budgetFinalized);
         const returnedIds = new Set(
             run.validated
                 .filter((entry) => batch.some((memory) => memory.id === entry.id))
@@ -395,7 +454,7 @@ async function mapOneBatch(
         );
         return {
             ...outcome,
-            requeue: batch.filter((memory) => !returnedIds.has(memory.id)),
+            requeue: budgetFinalized ? [] : batch.filter((memory) => !returnedIds.has(memory.id)),
         };
     } catch (error) {
         const desc = describeError(error);
@@ -403,8 +462,17 @@ async function mapOneBatch(
             `[dreamer] map-memories batch failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error });
-        if (error instanceof DreamerModuleFailureError) throw error;
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(error),
+            error,
+            messages: await readFailedChildMessages(
+                args.client,
+                agentSessionId,
+                args.sessionDirectory,
+            ),
+        });
+        if (error instanceof DreamerModuleFailureError || error instanceof DreamTokenBudgetExceeded)
+            throw error;
         // Swallow per-batch failures: the batch's memories stay unmapped and are
         // retried next run. Only an abort/lease-loss should stop the whole task.
         if (signal.aborted) throw error;
@@ -417,15 +485,16 @@ async function mapOneBatch(
             },
         };
     } finally {
-        await teardownChildSession({
-            client: args.client,
-            sessionId: agentSessionId,
-            sessionDirectory: args.sessionDirectory,
-            promptSettled,
-            privacySensitive: true,
-            context: "[dreamer] map-memories",
-            log,
-        });
+        if (agentSessionId && args.client)
+            await teardownChildSession({
+                client: args.client,
+                sessionId: agentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                promptSettled,
+                privacySensitive: true,
+                context: "[dreamer] map-memories",
+                log,
+            });
     }
 }
 
@@ -444,6 +513,7 @@ async function applyParsedBatchMappings(
     args: MapMemoriesArgs,
     batch: MapMemoryInput[],
     parsed: ParsedMemoryMapping[],
+    budgetFinalized = false,
 ): Promise<{ mapped: number; independent: number }> {
     const batchIds = new Set(batch.map((memory) => memory.id));
     const valid = parsed.filter((entry) => batchIds.has(entry.id));
@@ -458,12 +528,17 @@ async function applyParsedBatchMappings(
         "mappings",
     );
 
-    // A closed root rules out truncation, but fewer than half of the requested ids
-    // is more likely a confused response to another request than an ordinary tail
-    // omission. Reject before any writes so an unrelated minority cannot be banked.
-    if (valid.length * 2 < batch.length) {
+    // The token guard asks the child to stop investigating and return only ids it
+    // checked, so low coverage is expected then. Without that stop request, reject
+    // low coverage before writes: the child may have answered a different batch.
+    if (!budgetFinalized && valid.length * 2 < batch.length) {
         throw new Error(
             `mappings manifest covers ${valid.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
+        );
+    }
+    if (budgetFinalized && valid.length < batch.length) {
+        log(
+            `[dreamer] map-memories: accepted partial manifest after token budget: ${valid.length}/${batch.length}`,
         );
     }
     if (valid.length === 0) return { mapped: 0, independent: 0 };
@@ -618,7 +693,7 @@ async function applyParsedBatchMappings(
 function recordInvocation(
     args: MapMemoriesArgs,
     startedAt: number,
-    params: { status: "completed" | "failed"; messages?: unknown[]; error?: unknown },
+    params: { status: SubagentInvocationStatus; messages?: unknown[]; error?: unknown },
 ): void {
     if (!args.parentSessionId) return;
     recordChildInvocation({

@@ -37,7 +37,8 @@ export type CanonicalMaterializeReason =
     | "ttl_expiry"
     | "epoch_change"
     | "coverage_fold"
-    | "profile_transition";
+    | "profile_transition"
+    | "host_compaction";
 
 export interface PendingTransformDecision {
     tsMs: number;
@@ -78,6 +79,10 @@ export interface PendingTransformDecision {
      */
     m0ToolSetHashNew?: string | null;
     emergency: boolean;
+    /**
+     * Nonnegative estimate persisted as `transform_decisions.dropped_tokens` for
+     * diagnostics only. It does not drive budgeting or scheduler decisions.
+     */
     droppedTokens: number;
     droppedCount: number;
     inputTokens: number;
@@ -114,6 +119,7 @@ const canonicalReasons = new Set<string>([
     "epoch_change",
     "coverage_fold",
     "profile_transition",
+    "host_compaction",
 ]);
 
 const piReasonAliases: Record<string, CanonicalMaterializeReason> = {

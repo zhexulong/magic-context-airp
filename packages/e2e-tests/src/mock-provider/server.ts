@@ -21,6 +21,8 @@ export interface MockResponse {
     content?: unknown[];
     /** OpenAI Responses output items. Used only for POST /responses. */
     openaiOutput?: unknown[];
+    /** Simulate the Responses API ending at the provider's output-token limit. */
+    openaiIncomplete?: boolean;
     /** Stop reason reported to the caller. */
     stop_reason?: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
     /**
@@ -166,8 +168,10 @@ export class MockProvider {
         // Accept paths with and without /v1; AI SDK providers differ in how they join baseURL.
         const isMessages = url.pathname === "/messages" || url.pathname === "/v1/messages";
         const isResponses = url.pathname === "/responses" || url.pathname === "/v1/responses";
+        const isChat =
+            url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions";
 
-        const matched = method === "POST" && (isMessages || isResponses);
+        const matched = method === "POST" && (isMessages || isResponses || isChat);
         if (!matched) this.misses++;
         if (process.env.MC_E2E_TRACE_PROVIDER === "1") {
             console.error(`[mock-request] ${JSON.stringify({ url: req.url, method, host: req.headers.get("host"), matched, misses: this.misses })}`);
@@ -270,6 +274,9 @@ export class MockProvider {
 
             if (isResponses) {
                 return this.openAIResponsesResponse(body, scripted, usage, respModel, content);
+            }
+            if (isChat) {
+                return this.openAIChatCompletionsResponse(scripted, usage, respModel);
             }
 
             const wantsStream = body.stream === true;
@@ -499,6 +506,52 @@ export class MockProvider {
         });
     }
 
+    private openAIChatCompletionsResponse(
+        scripted: MockResponse,
+        usage: MockUsage,
+        model: string,
+    ): Response {
+        const id = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        const text = scripted.text ?? "OK";
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+            start(controller) {
+                const send = (payload: Record<string, unknown>) => {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+                };
+                send({
+                    id,
+                    object: "chat.completion.chunk",
+                    created: 1,
+                    model,
+                    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+                });
+                send({
+                    id,
+                    object: "chat.completion.chunk",
+                    created: 1,
+                    model,
+                    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+                });
+                send({
+                    id,
+                    object: "chat.completion.chunk",
+                    created: 1,
+                    model,
+                    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                    usage: {
+                        prompt_tokens: usage.input_tokens,
+                        completion_tokens: usage.output_tokens,
+                        total_tokens: usage.input_tokens + usage.output_tokens,
+                    },
+                });
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+            },
+        });
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+    }
+
     private openAIResponsesResponse(
         body: Record<string, unknown>,
         scripted: MockResponse,
@@ -546,9 +599,9 @@ export class MockProvider {
             id: responseId,
             object: "response",
             created_at: Math.floor(Date.now() / 1000),
-            status: "completed",
+            status: scripted.openaiIncomplete ? "incomplete" : "completed",
             error: null,
-            incomplete_details: null,
+            incomplete_details: scripted.openaiIncomplete ? { reason: "max_output_tokens" } : null,
             instructions: null,
             max_output_tokens: null,
             model,
@@ -670,7 +723,7 @@ export class MockProvider {
                     });
                 });
                 send({
-                    type: "response.completed",
+                    type: scripted.openaiIncomplete ? "response.incomplete" : "response.completed",
                     sequence_number: sequenceNumber,
                     response: completedResponse,
                 });

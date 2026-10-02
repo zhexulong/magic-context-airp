@@ -16,6 +16,7 @@ import {
 } from "../memory/storage-memory-verifications";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import { acquireLease } from "./lease";
 import {
     applyBatchMappings,
@@ -126,14 +127,18 @@ function successfulMapClient(onPrompt?: () => void) {
 }
 
 /** The exact timeout-class error from the shared prompt helper. */
-function timeoutMapClient(onPrompt?: () => void) {
+function timeoutMapClient(
+    onPrompt?: () => void,
+    timeoutError: () => unknown = () => new Error("prompt timed out after 99997ms"),
+) {
     return {
         session: {
             create: async () => ({ data: { id: "map-child" } }),
             prompt: async () => {
                 onPrompt?.();
-                throw new Error("prompt timed out after 99997ms");
+                throw timeoutError();
             },
+            abort: async () => ({}),
             messages: async () => ({ data: [] }),
             delete: async () => ({}),
         },
@@ -215,8 +220,8 @@ describe("map-memories authority applier", () => {
         try {
             const projectIdentity = "git:module-map-fallback";
             const dir = tempProject();
-            execFileSync("git", ["init", "-q"], { cwd: dir });
-            execFileSync("git", ["add", "src/fact.ts"], { cwd: dir });
+            execFileSync("git", ["init", "-q"], { windowsHide: true, cwd: dir });
+            execFileSync("git", ["add", "src/fact.ts"], { windowsHide: true, cwd: dir });
             writeFileSync(
                 path.join(dir, "src", "untracked.ts"),
                 "export const draft = true;",
@@ -504,6 +509,97 @@ describe("mapMemories disposition", () => {
         }
     });
 
+    test("two consecutive host request timeouts also trip the starvation circuit breaker", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-host-timeout-breaker";
+            const dir = tempProject();
+            for (let index = 0; index < 241; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Host timeout mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            // Bun's fetch rejects with this DOMException when the host client's own
+            // request timer fires on a long synchronous prompt.
+            args.client = timeoutMapClient(
+                () => {
+                    promptCalls += 1;
+                },
+                () => new DOMException("The operation timed out.", "TimeoutError"),
+            ) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(2);
+            expect(result.stopReason).toBe("timeout-circuit-breaker");
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a failed batch row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-failed-row-evidence";
+            const dir = tempProject();
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Evidence mapping fact.",
+                sourceSessionId: "ses",
+            });
+            const args = mapArgs(db, dir, projectIdentity);
+            args.parentSessionId = "ses-parent-map";
+            // A step-capped loop ends with prose instead of a manifest.
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "map-child" } }),
+                    prompt: async () => ({}),
+                    messages: async () => ({
+                        data: [
+                            {
+                                info: {
+                                    role: "assistant",
+                                    providerID: "openai",
+                                    modelID: "gpt-map",
+                                    time: { created: 1, completed: 2 },
+                                    finish: "stop",
+                                    tokens: {
+                                        input: 900,
+                                        output: 120,
+                                        cache: { read: 0, write: 0 },
+                                    },
+                                },
+                                parts: [{ type: "text", text: "I mapped most of them." }],
+                            },
+                        ],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await mapMemories(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-map", { subagent: "dreamer" });
+            expect(row).toMatchObject({
+                task: "map-memories",
+                status: "failed",
+                providerId: "openai",
+                modelId: "gpt-map",
+                inputTokens: 900,
+                outputTokens: 120,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a later run resumes the durable remainder after a floored partial run", async () => {
         const db = freshDb();
         try {
@@ -677,8 +773,8 @@ describe("mapMemories disposition", () => {
             // The host rejects both in-repo untracked paths and paths outside the
             // repository. The mixed manifest proves the fallback is all-rejected,
             // not a special case for only one rejection reason.
-            execFileSync("git", ["init", "-q"], { cwd: dir });
-            execFileSync("git", ["add", "src/fact.ts"], { cwd: dir });
+            execFileSync("git", ["init", "-q"], { windowsHide: true, cwd: dir });
+            execFileSync("git", ["add", "src/fact.ts"], { windowsHide: true, cwd: dir });
             writeFileSync(
                 path.join(dir, "src", "untracked.ts"),
                 "export const draft = true;",
@@ -1225,4 +1321,135 @@ describe("independent re-queue heal", () => {
             closeQuietly(db);
         }
     });
+});
+
+test("a budget-finalized mapping manifest banks its closed subset", async () => {
+    const db = freshDb();
+    try {
+        const projectIdentity = "git:budget-map";
+        const dir = tempProject();
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "ARCHITECTURE",
+            content: "Budgeted mapping fact.",
+        });
+        const others = Array.from({ length: 51 }, (_, index) =>
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `Another mapping fact ${index} for the next run.`,
+            }),
+        );
+        const covered = [memory, ...others.slice(0, 9)];
+        const messages: unknown[] = [];
+        let sends = 0;
+        let aborted = false;
+        const args = mapArgs(db, dir, projectIdentity);
+        args.tokenBudget = 100;
+        args.deadline = Date.now() + MAP_BATCH_FLOOR_MS + 500;
+        args.parentSessionId = "ses-parent-map";
+        args.client = {
+            session: {
+                create: async () => ({ data: { id: "map-budget-child" } }),
+                messages: async () => ({ data: [...messages] }),
+                abort: async () => {
+                    aborted = true;
+                    return { data: true };
+                },
+                status: async () => {
+                    if (sends === 1 && !aborted) {
+                        if (messages.length === 1)
+                            messages.push({
+                                info: {
+                                    id: "step",
+                                    role: "assistant",
+                                    finish: "tool-calls",
+                                    tokens: { input: 81 },
+                                    time: { created: 1, completed: 2 },
+                                },
+                                parts: [{ type: "tool" }],
+                            });
+                        return { data: { "map-budget-child": { type: "busy" } } };
+                    }
+                    if (sends === 2 && messages.length === 3)
+                        messages.push({
+                            info: {
+                                id: "final",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: 1 },
+                                time: { created: 3, completed: 4 },
+                            },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<mappings>${covered.map((item) => `<memory id="${item.id}" files="src/fact.ts"/>`).join("")}</mappings>`,
+                                },
+                            ],
+                        });
+                    return { data: {} };
+                },
+                promptAsync: async (request: { body: { parts: Array<{ text: string }> } }) => {
+                    sends++;
+                    messages.push({
+                        info: { id: `user-${sends}`, role: "user" },
+                        parts: request.body.parts,
+                    });
+                    return { data: undefined };
+                },
+                delete: async () => ({}),
+            },
+        } as never;
+        const result = await mapMemories(args);
+        expect(sends).toBe(2);
+        expect(result.mapped).toBe(10);
+        expect(result.remaining).toBe(42);
+        expect(result.complete).toBe(false);
+        expect(
+            selectMapMemoryInputs(db, projectIdentity, dir)
+                .map((item) => item.id)
+                .sort((a, b) => a - b),
+        ).toEqual(
+            others
+                .slice(9)
+                .map((item) => item.id)
+                .sort((a, b) => a - b),
+        );
+        for (const item of covered) {
+            expect(getMemoryVerifications(db, [item.id]).get(item.id)?.files).toEqual([
+                "src/fact.ts",
+            ]);
+        }
+    } finally {
+        closeQuietly(db);
+    }
+});
+
+test("non-budget mapping rejects a 10/52 manifest without writes", async () => {
+    const db = freshDb();
+    try {
+        const project = "git:non-budget-map";
+        const dir = tempProject();
+        const items = Array.from({ length: 52 }, (_, index) =>
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Fact ${index}.`,
+            }),
+        );
+        const args = mapArgs(db, dir, project);
+        await expect(
+            applyBatchMappings(
+                args,
+                selectMapMemoryInputs(db, project, dir),
+                `<mappings>${items
+                    .slice(0, 10)
+                    .map((item) => `<memory id="${item.id}" files="src/fact.ts"/>`)
+                    .join("")}</mappings>`,
+            ),
+        ).rejects.toThrow("rejecting mostly-wrong manifest");
+        expect(selectMapMemoryInputs(db, project, dir)).toHaveLength(52);
+    } finally {
+        closeQuietly(db);
+    }
 });

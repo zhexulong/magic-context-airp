@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use mc_store::RenderedCompartmentCoverage;
-use mc_store::{McStore, McStoreError, ModuleMeta, NoteDelivery, StoredMemory, StoredNote};
+use mc_store::{McStore, McStoreError, ModuleMeta, StoredMemory};
 
 use crate::compartment_coverage::{partition_by_folded_seq, resolve_coverage, CoverageGap};
 use crate::decay_render::DecayRenderCompartment;
@@ -53,7 +53,49 @@ impl From<McStoreError> for M1ComposeError {
     }
 }
 
+/// The in-session m1 revision. Only inputs that m1 actually renders belong here: a watermark
+/// that moves without changing m1 bytes would still count as pending m1 work, and at
+/// execute-band usage pending work is enough to open a cache bust.
+///
+/// Smart notes are not rendered into m1, so the note status watermark is deliberately
+/// absent. Its old slot in the v2 digest is hashed as a constant zero, which keeps every
+/// session that never had a note status change on exactly the digest it already stored.
 fn in_session_revision(
+    max_memory_id: i64,
+    max_memory_mutation_id: i64,
+    max_compartment_seq: i64,
+    user_profile_version: u64,
+) -> u64 {
+    digest_in_session_inputs(
+        max_memory_id,
+        max_memory_mutation_id,
+        max_compartment_seq,
+        0,
+        user_profile_version,
+    )
+}
+
+/// The digest older builds stored in `ModuleMeta::m1_revision`, which also hashed the note
+/// status watermark. It exists only so a stored value from those builds can be recognised
+/// as equivalent to the current revision; see
+/// [`M1RevisionSignal::equivalent_applied_revision`].
+fn in_session_revision_with_note_status(
+    max_memory_id: i64,
+    max_memory_mutation_id: i64,
+    max_compartment_seq: i64,
+    note_status_version: i64,
+    user_profile_version: u64,
+) -> u64 {
+    digest_in_session_inputs(
+        max_memory_id,
+        max_memory_mutation_id,
+        max_compartment_seq,
+        note_status_version,
+        user_profile_version,
+    )
+}
+
+fn digest_in_session_inputs(
     max_memory_id: i64,
     max_memory_mutation_id: i64,
     max_compartment_seq: i64,
@@ -81,9 +123,9 @@ fn in_session_revision(
 
 /// The cheap per-pass revision signal, split into two lanes:
 ///
-/// * `revision` is the IN-SESSION lane. Memory inserts/updates, the mutation log, note
-///   surfacing, profile-version lines, and ordinary compartment publication all become
-///   pending work. A mismatch is intentionally deferred until an independent render.
+/// * `revision` is the IN-SESSION lane. Memory inserts/updates, the mutation log,
+///   profile-version lines, and ordinary compartment publication all become pending work.
+///   Note status changes do not: m1 renders nothing about notes. A mismatch is intentionally deferred until an independent render.
 /// * `external_revision` is the EXTERNAL lane. Workspace membership/visibility changes
 ///   remain eager-HARD because they change the m0 memory universe; project memory epochs
 ///   are carried by state-sync and arm the same HARD path in durable metadata.
@@ -91,7 +133,7 @@ fn in_session_revision(
 /// This table is the ordering contract for the module's bust opportunity gate:
 ///
 /// | input | lane | no independent render | independent render |
-/// | memory/profile/note/compartment signal | in-session | defer, preserve frozen bytes | fold in HARD/SOFT |
+/// | memory/profile/compartment signal | in-session | defer, preserve frozen bytes | fold in HARD/SOFT |
 /// | workspace fingerprint | external | HARD | HARD |
 /// | project memory epoch | external | HARD on next pass | HARD |
 /// | flush/refresh, Force/Emergency, first reduction | opportunity | fold pending delta | fold pending delta |
@@ -109,8 +151,30 @@ pub struct M1RevisionSignal {
     pub max_compartment_seq: i64,
     pub max_memory_id: i64,
     pub max_memory_mutation_id: i64,
+    /// Read for [`Self::legacy_note_revision`] only; it does not feed `revision`.
     pub note_status_version: i64,
     pub user_profile_version: u64,
+    /// The digest an older build would have stored for these same inputs, when it differs
+    /// from `revision` (that is, when the note status watermark is non-zero).
+    pub legacy_note_revision: Option<u64>,
+}
+
+impl M1RevisionSignal {
+    /// The applied revision a pass should compare `revision` against.
+    ///
+    /// Builds that still hashed the note status watermark stored a digest that differs from
+    /// `revision` whenever a project has any note status history. Comparing it directly would
+    /// report pending m1 work that renders nothing, and at execute-band usage that alone opens
+    /// a cache bust. When the stored value equals the old digest of the current store inputs,
+    /// nothing m1 renders has moved since it was applied, so it is equivalent to `revision`.
+    /// Any other stored value is returned unchanged and keeps its ordinary meaning.
+    pub fn equivalent_applied_revision(&self, applied: u64) -> u64 {
+        if self.legacy_note_revision == Some(applied) {
+            self.revision
+        } else {
+            applied
+        }
+    }
 }
 
 pub fn m1_revision_signal(
@@ -137,7 +201,7 @@ pub struct M1RevisionReadTimings {
 }
 
 /// Read both signal lanes for a transform pass. The extra context is supplied by the
-/// already-loaded transform route so note/profile changes are covered without rendering.
+/// already-loaded transform route so profile changes are covered without rendering.
 pub fn m1_revision_signal_parts_for_pass(
     store: &McStore,
     project_path: &str,
@@ -195,9 +259,17 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         max_memory_id,
         max_memory_mutation_id,
         max_compartment_seq,
-        note_status_version,
         user_profile_version,
     );
+    let legacy_note_revision = (note_status_version != 0).then(|| {
+        in_session_revision_with_note_status(
+            max_memory_id,
+            max_memory_mutation_id,
+            max_compartment_seq,
+            note_status_version,
+            user_profile_version,
+        )
+    });
 
     let workspace_fingerprint =
         store.workspace_fingerprint_for_membership(snapshot.membership.as_ref());
@@ -213,6 +285,7 @@ pub fn m1_revision_signal_parts_for_pass_timed(
         max_memory_mutation_id,
         note_status_version,
         user_profile_version,
+        legacy_note_revision,
     })
 }
 
@@ -230,76 +303,28 @@ pub struct M1Composition {
     pub new_coverage: Option<(String, u64)>,
     /// Coverage of the compartment delta composed into these bytes, independent of applied meta.
     pub rendered_coverage: RenderedCompartmentCoverage,
-    pub note_deliveries: Vec<NoteDelivery>,
     /// True only when the pending profile version produced a non-empty, budgeted block.
     pub profile_rendered: bool,
-    /// The claimed-notes block alone. A pressure refold folds every other m1 section
-    /// into the recomposed m0, so rendering `body` there would duplicate memories,
-    /// mutations, and compartments across both layers for the rest of the epoch; only
-    /// the notes (which m0 never absorbs) may survive as the post-fold m1.
-    pub notes_block: String,
-}
-
-pub fn claim_and_render_notes(
-    store: &McStore,
-    project_path: &str,
-    session_id: &str,
-    delivered_pass_fingerprint: &str,
-    transform_pass_id: &str,
-    now_ms: i64,
-) -> Result<(String, Vec<NoteDelivery>), McStoreError> {
-    let deliveries = store.claim_note_delivery(
-        project_path,
-        session_id,
-        delivered_pass_fingerprint,
-        transform_pass_id,
-        now_ms,
-    )?;
-    let notes = deliveries
-        .iter()
-        .map(|(note, _)| note.clone())
-        .collect::<Vec<_>>();
-    Ok((
-        render_note_delta(&notes),
-        deliveries
-            .into_iter()
-            .map(|(_, delivery)| delivery)
-            .collect(),
-    ))
-}
-
-fn render_note_delta(notes: &[StoredNote]) -> String {
-    if notes.is_empty() {
-        return String::new();
-    }
-    let mut lines = vec!["<new-notes>".to_string()];
-    for note in notes {
-        let condition = note
-            .ready_reason
-            .as_deref()
-            .or(note.surface_condition.as_deref())
-            .unwrap_or("Condition satisfied");
-        lines.push(format!(
-            "- #{}: {}\n  Condition: {}",
-            note.id, note.content, condition
-        ));
-    }
-    lines.push("</new-notes>".to_string());
-    lines.join("\n")
 }
 
 /// EXPENSIVE bust-only: compose the m1 delta body from the store against the watermarks
 /// the last HARD froze in `meta`. `now_ms` is the frozen expiry cutoff (same as the m0
-/// compose). Reads compartments + memories; never call on a defer.
+/// compose). Reads compartments + memories; never call on a defer. `_note_project_path`
+/// is accepted for call-site stability only: ready smart notes are not rendered into m1.
+///
+/// `host_backed_memory_ids` must be the same choice the m0 render made for this request's
+/// serializer profile: true for every harness except Claude Code. It selects which id space
+/// m1 renders, and which id space `meta.rendered_memory_ids` (written by m0) is in.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_m1_from_store(
     store: &McStore,
     project_path: &str,
-    note_project_path: &str,
+    _note_project_path: &str,
     session_id: &str,
     meta: &ModuleMeta,
     now_ms: i64,
     memory_enabled: bool,
+    host_backed_memory_ids: bool,
     memory_budget_tokens: f64,
     user_profile_budget_tokens: f64,
     temporal_awareness: bool,
@@ -353,15 +378,25 @@ pub fn compose_m1_from_store(
             .map(|workspace| workspace.union_identities.clone())
             .unwrap_or_else(|| vec![project_path.to_string()]);
 
+        let baseline_module_ids = if host_backed_memory_ids {
+            let mapped = store.module_memory_ids_for_host_ids(&paths, &meta.rendered_memory_ids)?;
+            meta.rendered_memory_ids
+                .iter()
+                .filter_map(|id| mapped.get(id).copied())
+                .collect::<Vec<_>>()
+        } else {
+            meta.rendered_memory_ids.clone()
+        };
+
         // --- memory-updates (corrections to in-m0 memories, past the cursor) ---
         // The store also returns visibility-transition markers for rows omitted from m0 and
         // resolves supersede chains to their terminal target.
         let pending_mutations = store.memory_mutations_for_render(
             &paths,
             meta.memory_mutation_cursor,
-            &meta.rendered_memory_ids,
+            &baseline_module_ids,
         )?;
-        let baseline_ids: HashSet<i64> = meta.rendered_memory_ids.iter().copied().collect();
+        let baseline_ids: HashSet<i64> = baseline_module_ids.iter().copied().collect();
 
         // Read through the exact m0 visibility, lifecycle, and frozen-expiry predicate. Existing
         // merge targets and newly-visible rows may be below the folded numeric watermark.
@@ -386,7 +421,7 @@ pub fn compose_m1_from_store(
         forced_ids.sort_unstable();
         forced_ids.dedup();
         if forced_ids.len() > MAX_MERGE_REPLACEMENTS_PER_DELTA {
-            eprintln!(
+            tracing::warn!(
                 "mc-module: m1 forced-memory cap exceeded session={} memories={} cap={}",
                 session_id,
                 forced_ids.len(),
@@ -446,9 +481,61 @@ pub fn compose_m1_from_store(
                 Some(mutation)
             })
             .collect::<Vec<_>>();
-        let memory_updates_block = render_memory_updates(&mutations, &resolvable_ids);
+        let (
+            rendered_mutations,
+            rendered_resolvable_ids,
+            rendered_delta_memories,
+            rendered_sources,
+        ) = if host_backed_memory_ids {
+            let mutation_ids = mutations
+                .iter()
+                .flat_map(|mutation| [Some(mutation.target_memory_id), mutation.superseded_by_id])
+                .flatten()
+                .chain(delta_memories.iter().map(|memory| memory.id))
+                .collect::<Vec<_>>();
+            let host_ids = store.host_memory_ids_for_module_ids(&mutation_ids)?;
+            let rendered_mutations = mutations
+                .iter()
+                .filter_map(|mutation| {
+                    let target_memory_id = *host_ids.get(&mutation.target_memory_id)?;
+                    let mut rendered = mutation.clone();
+                    rendered.target_memory_id = target_memory_id;
+                    rendered.superseded_by_id = mutation
+                        .superseded_by_id
+                        .and_then(|id| host_ids.get(&id).copied());
+                    Some(rendered)
+                })
+                .collect::<Vec<_>>();
+            let rendered_resolvable_ids = resolvable_ids
+                .iter()
+                .filter_map(|id| host_ids.get(id).copied())
+                .collect::<HashSet<_>>();
+            let mut rendered_delta_memories = delta_memories.clone();
+            for memory in &mut rendered_delta_memories {
+                memory.id = memory.host_row_id.unwrap_or(0);
+            }
+            let rendered_sources = membership
+                .as_ref()
+                .map(|workspace| workspace_source_names(&rendered_delta_memories, workspace))
+                .unwrap_or_default();
+            (
+                rendered_mutations,
+                rendered_resolvable_ids,
+                rendered_delta_memories,
+                rendered_sources,
+            )
+        } else {
+            (
+                mutations.clone(),
+                resolvable_ids,
+                delta_memories,
+                source_name_by_id,
+            )
+        };
+        let memory_updates_block =
+            render_memory_updates(&rendered_mutations, &rendered_resolvable_ids);
         let new_memories_block =
-            render_memory_block(&delta_memories, "new-memories", &source_name_by_id);
+            render_memory_block(&rendered_delta_memories, "new-memories", &rendered_sources);
         (mutations, memory_updates_block, new_memories_block)
     } else {
         (Vec::new(), String::new(), String::new())
@@ -474,31 +561,14 @@ pub fn compose_m1_from_store(
             (String::new(), false)
         };
 
-    // Rendered note BYTES, claims, and deliveries do not participate in
-    // m1_revision_signal (note_status_version DOES — that is the evaluation-side
-    // signal that a note became ready). The distinction matters: a condition can
-    // become true during a defer and must ride the next natural bust rather than
-    // creating a cache bust of its own, and the applied post-fold digest must be
-    // identical whether this pass rendered notes or a placeholder. Unacknowledged
-    // ledger rows are included again, which is the honest at-least-once contract.
-    let (notes_block, note_deliveries) = claim_and_render_notes(
-        store,
-        note_project_path,
-        session_id,
-        &format!("m1:{}:{}", meta.m1_revision, now_ms),
-        &format!("m1:{}:{}", meta.m1_revision, now_ms),
-        now_ms,
-    )?;
-    let profile_and_notes = [new_user_profile_block.as_str(), notes_block.as_str()]
-        .into_iter()
-        .filter(|block| !block.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Ready smart notes are deliberately absent from m1. They reach the agent the
+    // same way in every transform mode: the host's deferred-notes reminder, then
+    // `ctx_note read`, both of which show the ids the agent can act on.
     let body = assemble_m1(
         &memory_updates_block,
         &new_compartments_block,
         &new_memories_block,
-        &profile_and_notes, // profile and project-owned notes share the existing m1 delta slot
+        &new_user_profile_block,
         M1_PLACEHOLDER,
     );
 
@@ -507,9 +577,7 @@ pub fn compose_m1_from_store(
         body,
         memory_update_count: mutations.len(),
         new_coverage,
-        note_deliveries,
         profile_rendered,
-        notes_block,
     })
 }
 
@@ -657,6 +725,48 @@ mod tests {
     }
 
     #[test]
+    fn note_status_is_not_an_m1_revision_input_and_note_free_digests_are_unchanged() {
+        // Sessions with no note status history must keep the digest older builds stored.
+        for profile_version in [0, 3] {
+            assert_eq!(
+                in_session_revision(4, 5, 6, profile_version),
+                in_session_revision_with_note_status(4, 5, 6, 0, profile_version)
+            );
+        }
+
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        let before =
+            m1_revision_signal_parts_for_pass(store, "git:proj", "git:proj", "ses", 1, true, 0)
+                .unwrap();
+        assert_eq!(before.legacy_note_revision, None);
+        store
+            .insert_note(mc_store::NoteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: "ses",
+                content: "a note",
+                surface_condition: None,
+                anchor_block_id: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        store
+            .dismiss_note("git:proj", "ses", 1, None, 2)
+            .unwrap()
+            .expect("note dismissed");
+        let after =
+            m1_revision_signal_parts_for_pass(store, "git:proj", "git:proj", "ses", 1, true, 0)
+                .unwrap();
+        assert!(after.note_status_version > before.note_status_version);
+        assert_eq!(after.revision, before.revision);
+        let legacy = after.legacy_note_revision.expect("older digest differs");
+        assert_ne!(legacy, after.revision);
+        assert_eq!(after.equivalent_applied_revision(legacy), after.revision);
+        assert_eq!(after.equivalent_applied_revision(7), 7);
+    }
+
+    #[test]
     fn profile_version_moves_the_in_session_revision_signal() {
         let fixture = FixtureBuilder::store();
         let store = &fixture.store;
@@ -684,6 +794,7 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
+            false,
             8_000.0,
             100.0,
             true,
@@ -704,6 +815,7 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
+            false,
             8_000.0,
             100.0,
             true,
@@ -724,6 +836,7 @@ mod tests {
             &profile_delta_meta(),
             0,
             true,
+            false,
             8_000.0,
             1.0,
             true,
@@ -829,6 +942,7 @@ mod tests {
             &meta,
             0,
             false,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -858,6 +972,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -885,6 +1000,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -920,6 +1036,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -976,6 +1093,7 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
+                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: false,
@@ -1014,6 +1132,7 @@ mod tests {
             &meta,
             1,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1047,6 +1166,7 @@ mod tests {
             &meta,
             1,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1063,6 +1183,7 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
+                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: false,
@@ -1087,6 +1208,7 @@ mod tests {
             &reconciled_meta,
             30,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1180,6 +1302,7 @@ mod tests {
                 &meta,
                 0,
                 true,
+                false,
                 8_000.0,
                 4_000.0,
                 true,
@@ -1234,6 +1357,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1248,6 +1372,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1301,6 +1426,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1359,6 +1485,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1434,6 +1561,7 @@ mod tests {
             &meta_after_hard(0, None, terminal, cursor, vec![source]),
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1481,6 +1609,7 @@ mod tests {
             &meta_after_hard(0, None, terminal, folded_cursor, vec![source]),
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1519,6 +1648,7 @@ mod tests {
             &meta_after_hard(0, None, cycle_target, 0, vec![cycle_source]),
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1561,6 +1691,7 @@ mod tests {
             &meta_after_hard(0, None, target, cursor, vec![source]),
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1640,6 +1771,7 @@ mod tests {
             &meta_after_hard(0, None, own_id, 0, vec![own_id]),
             100,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1672,6 +1804,7 @@ mod tests {
             &meta_after_hard(0, None, own_id, grant_cursor, vec![foreign_id, own_id]),
             100,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1726,6 +1859,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,
@@ -1771,6 +1905,7 @@ mod tests {
             &meta,
             0,
             true,
+            false,
             8_000.0,
             4_000.0,
             true,

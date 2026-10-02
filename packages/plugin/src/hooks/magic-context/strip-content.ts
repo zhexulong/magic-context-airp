@@ -7,7 +7,12 @@ import { isSentinel, makeSentinel, makeWholeMessageSentinel } from "./sentinel";
 import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 
-const DROPPED_PLACEHOLDER_PATTERN = /^\[dropped §\d+§\]$/;
+const MARKER_ONLY_PATTERN = /^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$/;
+
+export function isMarkerOnlyText(text: string): boolean {
+    const trimmed = text.trim();
+    return trimmed.length > 0 && MARKER_ONLY_PATTERN.test(trimmed);
+}
 const TAG_PREFIX_PATTERN = /^§\d+§\s*/;
 
 // Patterns that identify system-injected messages (notifications, reminders, etc.)
@@ -186,7 +191,10 @@ export function stripDroppedPlaceholderMessages(
         let hasNonDroppedContent = false;
 
         for (const part of msg.parts) {
-            if (!isRecord(part)) continue;
+            if (!isRecord(part)) {
+                hasNonDroppedContent = true;
+                break;
+            }
             const partType = part.type as string;
 
             // Skip metadata parts — they don't reach the model
@@ -198,40 +206,15 @@ export function stripDroppedPlaceholderMessages(
                 break;
             }
 
-            // Text parts: check if they're only dropped placeholders
-            if (partType === "text" && typeof part.text === "string") {
+            // Blank parts and complete markers both qualify; the sentinel below uses
+            // empty text only for Anthropic and [dropped] for other providers.
+            if (
+                (partType === "text" || partType === "reasoning") &&
+                typeof part.text === "string"
+            ) {
                 hasContentPart = true;
-                const trimmed = part.text.trim();
-                if (trimmed.length === 0) continue;
-                if (!trimmed.includes("[dropped §")) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                const allSegmentsDropped = trimmed
-                    .split(/(?=\[dropped §)/)
-                    .filter((s) => s.trim().length > 0)
-                    .every((segment) => DROPPED_PLACEHOLDER_PATTERN.test(segment.trim()));
-                if (!allSegmentsDropped) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                continue;
-            }
-
-            // Reasoning parts: check similarly
-            if (partType === "reasoning" && typeof part.text === "string") {
-                hasContentPart = true;
-                const trimmed = part.text.trim();
-                if (trimmed.length === 0) continue;
-                if (!trimmed.includes("[dropped §")) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                const allSegmentsDropped = trimmed
-                    .split(/(?=\[dropped §)/)
-                    .filter((s) => s.trim().length > 0)
-                    .every((segment) => DROPPED_PLACEHOLDER_PATTERN.test(segment.trim()));
-                if (!allSegmentsDropped) {
+                if (part.text.trim().length === 0) continue;
+                if (!isMarkerOnlyText(part.text)) {
                     hasNonDroppedContent = true;
                     break;
                 }
@@ -468,36 +451,26 @@ function hasReasoningReplayContent(message: MessageLike): boolean {
 }
 
 /**
- * Return the newest assistant that is visible in the provider replay. OpenCode may append a
- * metadata-only request shell; the adapter drops that shell, so it cannot own the exemption for
- * the completed assistant whose signed reasoning is actually replayed last.
+ * Ids of every assistant that still sends a thinking-like part, oldest first.
+ * Binding recovery strips all of them: after a prefix edit Anthropic rejects
+ * every signed block past the edit, and removing all blocks is always valid.
+ * That includes the newest assistant even when it holds an open tool round.
  */
-export function findNewestReasoningBearingAssistantId(messages: MessageLike[]): string | undefined {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
+export function findReasoningBearingAssistantIds(messages: MessageLike[]): string[] {
+    const ids = new Set<string>();
+    for (const message of messages) {
         if (message.info.role !== "assistant") continue;
+        const id = message.info.id;
+        if (typeof id !== "string" || id.length === 0) continue;
         if (
-            !message.parts.some(
+            message.parts.some(
                 (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
             )
         ) {
-            continue;
+            ids.add(id);
         }
-        const id = message.info.id;
-        if (typeof id === "string" && id.length > 0) return id;
     }
-    return undefined;
-}
-
-export function assistantHasReasoningPart(messages: MessageLike[], messageId: string): boolean {
-    return messages.some(
-        (message) =>
-            message.info.role === "assistant" &&
-            message.info.id === messageId &&
-            message.parts.some(
-                (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
-            ),
-    );
+    return [...ids];
 }
 
 export function findLatestAssistantReasoningMutationExemptMessage(

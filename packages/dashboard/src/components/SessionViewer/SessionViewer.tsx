@@ -178,9 +178,21 @@ function loadStoredValue(key: string): string {
   }
 }
 
+export const sessionHarnessOptions: { value: HarnessFilter; label: string }[] = [
+  { value: "all", label: "Harness: All" },
+  { value: "opencode", label: "OpenCode" },
+  { value: "opencode2", label: "OpenCode 2" },
+  { value: "pi", label: "Pi" },
+  { value: "omp", label: "OMP" },
+];
+
+/** The saved harness filter, or "all" when nothing (or an unknown value) is saved. */
+export function parseStoredHarnessFilter(stored: string): HarnessFilter {
+  return sessionHarnessOptions.find((option) => option.value === stored)?.value ?? "all";
+}
+
 function loadHarnessFilter(): HarnessFilter {
-  const stored = loadStoredValue(HARNESS_FILTER_KEY);
-  return stored === "opencode" || stored === "pi" || stored === "omp" ? stored : "all";
+  return parseStoredHarnessFilter(loadStoredValue(HARNESS_FILTER_KEY));
 }
 
 interface SessionViewerProps {
@@ -747,12 +759,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
             onChange={(value) => setHarnessFilter(value as HarnessFilter)}
             placeholder="Harness"
             align="right"
-            options={[
-              { value: "all", label: "Harness: All" },
-              { value: "opencode", label: "OpenCode" },
-              { value: "pi", label: "Pi" },
-              { value: "omp", label: "OMP" },
-            ]}
+            options={sessionHarnessOptions}
           />
           <label
             style={{
@@ -1195,7 +1202,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                               <span
                                 class="pill amber"
                                 style={{ "margin-left": "6px" }}
-                                title="Legacy pre-v2 compartment — no paraphrase tiers; renders degraded. Run /ctx-session-upgrade to rebuild."
+                                title="Legacy pre-v2 compartment — no paraphrase tiers; renders degraded. Run /ctx-recomp to rebuild."
                               >
                                 legacy
                               </span>
@@ -1717,7 +1724,13 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                         <td>{formatDateTime(row.started_at)}</td>
                         <td>{row.parent_invocation_id ? `↳ ${row.subagent}` : row.subagent}</td>
                         <td>{row.model_id ?? row.provider_id ?? "—"}</td>
-                        <td>{row.status}</td>
+                        <td>
+                          {row.status === "timed_out"
+                            ? "Timed out"
+                            : row.status === "empty"
+                              ? "Empty output"
+                              : row.status}
+                        </td>
                         <td>
                           {row.ended_at
                             ? `${Math.max(0, row.ended_at - row.started_at).toLocaleString()}ms`

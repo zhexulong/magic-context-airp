@@ -71,9 +71,29 @@ describe("createCtxNoteTools", () => {
         const readResult = await tools.ctx_note.execute({ action: "read" }, toolContext());
 
         expect(writeResult).toContain("Saved session note #1");
-        expect(readResult).toContain("## Session Notes");
+        expect(readResult).toContain("## Notes");
         expect(readResult).toContain("#1");
         expect(readResult).toContain("Remember the user prefers build on integrate.");
+    });
+
+    it("refuses a condition on a session note and heals a previously parked row", async () => {
+        await tools.ctx_note.execute({ action: "write", content: "session" }, toolContext());
+        const reply = await tools.ctx_note.execute(
+            { action: "update", note_ids: [1], surface_condition: "tomorrow" },
+            toolContext(),
+        );
+        expect(reply).toContain("Only a note created with a condition can have one");
+        expect(
+            db.prepare("SELECT status, surface_condition FROM notes WHERE id = 1").get(),
+        ).toEqual({ status: "active", surface_condition: null });
+        db.prepare(
+            "UPDATE notes SET status = 'pending', surface_condition = 'orphan' WHERE id = 1",
+        ).run();
+        const read = await tools.ctx_note.execute({ action: "read" }, toolContext());
+        expect(read).toContain("session");
+        expect(
+            db.prepare("SELECT status, surface_condition FROM notes WHERE id = 1").get(),
+        ).toEqual({ status: "active", surface_condition: null });
     });
 
     it("routes notes only when the notes domain reports module authority", async () => {
@@ -123,6 +143,42 @@ describe("createCtxNoteTools", () => {
         expect(result).toBe(
             "Note changes are paused while the engine syncs. Retry in a moment. (MC-C03)",
         );
+        expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
+    });
+
+    it("names both store versions and the fix when the module refuses a store ahead of it", async () => {
+        const storeAhead = () =>
+            Object.assign(new Error("store_ahead_of_binary"), {
+                code: "store_ahead_of_binary",
+                detail: { reason_code: "store_ahead_of_binary", db_version: 63, binary_max: 62 },
+            });
+        // Both places the module is asked: the authority probe, and the tool call itself.
+        for (const rustToolBackends of [
+            {
+                authorityState: async () => {
+                    throw storeAhead();
+                },
+            },
+            {
+                authorityState: async () => "MODULE" as const,
+                note: async () => {
+                    throw storeAhead();
+                },
+            },
+        ]) {
+            tools = createCtxNoteTools({
+                db,
+                resolveProjectPath: () => "git:project-a",
+                rustToolBackends,
+            });
+            const result = await tools.ctx_note.execute(
+                { action: "write", content: "must not be written" },
+                toolContext(),
+            );
+            expect(result).toBe(
+                "Magic Context refused to start: its store (store.db) is at schema v63 but this ck-mc build only knows up to v62. Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup. (MC-C13)",
+            );
+        }
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
     });
 
@@ -422,7 +478,7 @@ describe("createCtxNoteTools", () => {
         );
 
         expect(result).not.toContain("'content' is required");
-        expect(result).toContain("## Session Notes");
+        expect(result).toContain("## Notes");
         expect(result).toContain("An existing note");
     });
 
@@ -435,7 +491,11 @@ describe("createCtxNoteTools", () => {
             { action: "write", content: "Anchored decision" },
             toolContext(),
         );
-        const readResult = await tools.ctx_note.execute({ action: "read" }, toolContext());
+        // The anchor belongs to the full body, so read the note by id.
+        const readResult = await tools.ctx_note.execute(
+            { action: "read", note_ids: [1] },
+            toolContext(),
+        );
 
         expect(readResult).toContain("↳ @msg 512");
         expect(readResult).toContain("ctx_expand(start=N-x, end=N)");
@@ -446,7 +506,10 @@ describe("createCtxNoteTools", () => {
             { action: "write", content: "Unanchored decision" },
             toolContext(),
         );
-        const readResult = await tools.ctx_note.execute({ action: "read" }, toolContext());
+        const readResult = await tools.ctx_note.execute(
+            { action: "read", note_ids: [1] },
+            toolContext(),
+        );
 
         expect(readResult).not.toContain("↳ @msg");
         expect(readResult).not.toContain("ctx_expand(start=N-x");
@@ -459,10 +522,24 @@ describe("createCtxNoteTools", () => {
         expect(result).toContain("'content' is required");
     });
 
+    it("reports the active tray on the write reply", async () => {
+        const first = await tools.ctx_note.execute(
+            { action: "write", content: "first tray item" },
+            toolContext(),
+        );
+        const second = await tools.ctx_note.execute(
+            { action: "write", content: "second tray item" },
+            toolContext(),
+        );
+
+        expect(first).toBe("Saved session note #1. 1 active, oldest 0m.");
+        expect(second).toBe("Saved session note #2. 2 active, oldest 0m.");
+    });
+
     it("dismisses session notes and can still inspect them with filter='all'", async () => {
         await tools.ctx_note.execute({ action: "write", content: "First note" }, toolContext());
         const dismissResult = await tools.ctx_note.execute(
-            { action: "dismiss", note_id: 1 },
+            { action: "dismiss", note_ids: [1] },
             toolContext(),
         );
         const readResult = await tools.ctx_note.execute({ action: "read" }, toolContext());
@@ -490,7 +567,7 @@ describe("createCtxNoteTools", () => {
             { action: "write", content: "Owned note two" },
             toolContext("ses-a"),
         );
-        await tools.ctx_note.execute({ action: "dismiss", note_id: 3 }, toolContext("ses-a"));
+        await tools.ctx_note.execute({ action: "dismiss", note_ids: [3] }, toolContext("ses-a"));
 
         const result = await tools.ctx_note.execute(
             { action: "dismiss", note_ids: [1, 2, 3, 999] },
@@ -500,7 +577,7 @@ describe("createCtxNoteTools", () => {
         expect(result).toBe(
             "Dismissed 1 of 4 notes.\n" +
                 "- Note #1: dismissed\n" +
-                "- Note #2: not_owned\n" +
+                "- Note #2: not_found\n" +
                 "- Note #3: already_dismissed\n" +
                 "- Note #999: not_found",
         );
@@ -511,23 +588,40 @@ describe("createCtxNoteTools", () => {
         ]);
     });
 
-    it("rejects note_ids outside dismiss and rejects note_id conflicts", async () => {
-        const outsideDismiss = await tools.ctx_note.execute(
-            { action: "update", note_ids: [1], content: "not allowed" },
+    it("ignores note_ids on write, reads owned ids, and hides foreign ids as missing", async () => {
+        // Required-all tool surfaces make the model fill every declared
+        // property on write; read uses IDs intentionally and must not disclose
+        // whether an inaccessible ID exists.
+        const writeWithFiller = await tools.ctx_note.execute(
+            { action: "write", content: "Filler-tolerant note", note_ids: [1] },
             toolContext(),
         );
-        const conflict = await tools.ctx_note.execute(
-            { action: "dismiss", note_id: 1, note_ids: [1] },
+        await tools.ctx_note.execute(
+            { action: "write", content: "Foreign note body" },
+            toolContext("ses-foreign"),
+        );
+        const targetedRead = await tools.ctx_note.execute(
+            { action: "read", note_ids: [1, 2, 999] },
             toolContext(),
         );
-        const nonDismissConflict = await tools.ctx_note.execute(
-            { action: "update", note_id: 1, note_ids: [1] },
+        const updateTwo = await tools.ctx_note.execute(
+            { action: "update", note_ids: [1, 2], content: "two ids" },
             toolContext(),
         );
+        const updateNone = await tools.ctx_note.execute(
+            { action: "update", content: "no ids" },
+            toolContext(),
+        );
+        const dismissNone = await tools.ctx_note.execute({ action: "dismiss" }, toolContext());
 
-        expect(outsideDismiss).toContain("'note_ids' is only valid");
-        expect(conflict).toContain("'note_id' and 'note_ids'");
-        expect(nonDismissConflict).toContain("'note_id' and 'note_ids'");
+        expect(writeWithFiller).toContain("Saved session note #1");
+        expect(targetedRead).toContain("Filler-tolerant note");
+        expect(targetedRead).toContain("- Note #2: not_found");
+        expect(targetedRead).toContain("- Note #999: not_found");
+        expect(targetedRead).not.toContain("Foreign note body");
+        expect(updateTwo).toContain("exactly one positive integer id when action is 'update'");
+        expect(updateNone).toContain("exactly one positive integer id when action is 'update'");
+        expect(dismissNone).toContain("1 to 50 positive integer ids when action is 'dismiss'");
     });
 
     it("rejects dismissing another session's session note", async () => {
@@ -537,7 +631,7 @@ describe("createCtxNoteTools", () => {
         );
 
         const dismissResult = await tools.ctx_note.execute(
-            { action: "dismiss", note_id: 1 },
+            { action: "dismiss", note_ids: [1] },
             toolContext("ses-a"),
         );
         const readOtherResult = await tools.ctx_note.execute(
@@ -557,11 +651,11 @@ describe("createCtxNoteTools", () => {
         );
 
         const ownUpdate = await tools.ctx_note.execute(
-            { action: "update", note_id: 1, content: "Updated session note" },
+            { action: "update", note_ids: [1], content: "Updated session note" },
             toolContext("ses-a"),
         );
         const otherUpdate = await tools.ctx_note.execute(
-            { action: "update", note_id: 1, content: "Hijacked session note" },
+            { action: "update", note_ids: [1], content: "Hijacked session note" },
             toolContext("ses-b"),
         );
         const readResult = await tools.ctx_note.execute(
@@ -593,11 +687,11 @@ describe("createCtxNoteTools", () => {
         );
 
         const wrongProjectDismiss = await tools.ctx_note.execute(
-            { action: "dismiss", note_id: 1 },
+            { action: "dismiss", note_ids: [1] },
             toolContext("ses-a", "/workspace/project-a"),
         );
         const ownProjectDismiss = await tools.ctx_note.execute(
-            { action: "dismiss", note_id: 1 },
+            { action: "dismiss", note_ids: [1] },
             toolContext("ses-a", "/workspace/project-b"),
         );
 
@@ -623,7 +717,7 @@ describe("createCtxNoteTools", () => {
         );
 
         const wrongProjectUpdate = await tools.ctx_note.execute(
-            { action: "update", note_id: 1, content: "Project A hijack" },
+            { action: "update", note_ids: [1], content: "Project A hijack" },
             toolContext("ses-a", "/workspace/project-a"),
         );
         const readProjectB = await tools.ctx_note.execute(
@@ -655,14 +749,15 @@ describe("createCtxNoteTools", () => {
         const updateResult = await tools.ctx_note.execute(
             {
                 action: "update",
-                note_id: 1,
+                note_ids: [1],
                 content: "Implement the cleanup after the schema settles.",
                 surface_condition: "When PR #108 is merged",
             },
             toolContext(),
         );
+        // The condition lives on the full body, so read the note by id.
         const readAllResult = await tools.ctx_note.execute(
-            { action: "read", filter: "all" },
+            { action: "read", note_ids: [1] },
             toolContext(),
         );
 
@@ -671,7 +766,38 @@ describe("createCtxNoteTools", () => {
         expect(readAllResult).toContain("When PR #108 is merged");
     });
 
-    it("pages read newest-first with limit/offset and a continuation footer", async () => {
+    it("lists parked smart notes in the default view and drops them under filter='active'", async () => {
+        tools = createCtxNoteTools({
+            db,
+            dreamerEnabled: true,
+            resolveProjectPath: () => "git:project-a",
+        });
+        await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "Parked smart note",
+                surface_condition: "When the release lands",
+            },
+            toolContext(),
+        );
+        await tools.ctx_note.execute(
+            { action: "write", content: "Plain session note" },
+            toolContext(),
+        );
+
+        const defaultView = await tools.ctx_note.execute({ action: "read" }, toolContext());
+        const activeOnly = await tools.ctx_note.execute(
+            { action: "read", filter: "active" },
+            toolContext(),
+        );
+
+        expect(defaultView).toContain("Parked smart note · pending");
+        expect(defaultView).toContain("Plain session note");
+        expect(activeOnly).toContain("Plain session note");
+        expect(activeOnly).not.toContain("Parked smart note");
+    });
+
+    it("pages the glance with limit/offset and a continuation footer", async () => {
         for (let i = 1; i <= 30; i += 1) {
             await tools.ctx_note.execute(
                 { action: "write", content: `note number ${i}` },
@@ -685,7 +811,7 @@ describe("createCtxNoteTools", () => {
         expect(firstPage).toContain("note number 6"); // 25th newest present
         expect(firstPage).not.toContain("note number 5\n"); // older than page 1
         expect(firstPage).toContain(
-            'Showing 25 of 30 (newest first) — 5 older: ctx_note(action="read", offset=25)',
+            'Showing 25 of 30 — 5 older: ctx_note(action="read", offset=25)',
         );
 
         // Older page via offset.
@@ -718,7 +844,7 @@ describe("createCtxNoteTools", () => {
             { action: "read", limit: 5, offset: 100 },
             toolContext(),
         );
-        expect(page).toContain("## 🔔 Ready Smart Notes");
+        expect(page).toContain("## Notes");
         expect(page).toContain("ready note 5");
         expect(page).toContain("ready note 1");
         expect(page).not.toContain("ready note 6\n");

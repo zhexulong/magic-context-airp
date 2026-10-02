@@ -6,12 +6,14 @@
  *   setup           Interactive setup wizard for OpenCode, Pi, or OMP.
  *   doctor          Health-check + auto-fix for installed harnesses.
  *     --force         Force-clear plugin cache.
+ *     --fix           Repair safe, Magic Context-owned store rows.
  *     --issue         Bundle a sanitized issue report and submit/open.
  *     --clear         Interactive picker to clear plugin caches.
  *   doctor migrate  Migrate OpenCode session content to Pi/OMP JSONL.
  *   doctor migrate-session  Re-home an OpenCode session to another directory/project.
  *   doctor merge-identity   Merge all project-scoped rows between identities.
  *   doctor repair-db        Back up and salvage a corrupted shared database.
+ *   doctor list-hidden-sessions  List reusable OpenCode 2 historian/Dreamer roots.
  *
  * Common flags:
  *   --harness opencode|pi|omp   Target one harness (default: auto-detect / prompt)
@@ -19,6 +21,7 @@
  *   --help, -h              Print help and exit
  */
 import { createRequire } from "node:module";
+import { subcommandHelp } from "./lib/cli-help";
 import { isPromptCancelledError } from "./lib/prompts";
 import { runSqlitePreflight } from "./lib/sqlite-preflight";
 
@@ -59,6 +62,7 @@ function printUsage(): void {
     console.log("    setup            Interactive setup wizard");
     console.log("    doctor           Check and fix configuration issues");
     console.log("    doctor --force   Force-clear plugin cache");
+    console.log("    doctor --fix     Repair safe, Magic Context-owned store rows");
     console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
     console.log("    doctor --issue --report <path>  Write diagnostics without prompting");
     console.log("    doctor --clear   Interactive cache cleanup picker");
@@ -74,6 +78,7 @@ function printUsage(): void {
         "    doctor merge-identity   Merge project rows (--from ID --to ID [--dry-run] [--yes])",
     );
     console.log("    doctor repair-db   Back up and salvage a corrupted shared database");
+    console.log("    doctor list-hidden-sessions   List Magic Context OpenCode 2 roots");
     console.log("");
     console.log("  Harness selection:");
     console.log("    --harness opencode    Target OpenCode only");
@@ -82,6 +87,9 @@ function printUsage(): void {
     console.log("    (default: auto-detect, prompt if multiple installed)");
     console.log("");
     console.log("  Usage:");
+    console.log(
+        "    npx @cortexkit/magic-context@latest <command> --help   # help for one command",
+    );
     console.log("    npx @cortexkit/magic-context@latest setup");
     console.log("        # add --dry-run to preview the wizard without writing any files");
     console.log("    npx @cortexkit/magic-context@latest doctor");
@@ -104,6 +112,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
     const command = argv[0];
     const rest = argv.slice(1);
+
+    // Answer `<command> --help` before any command runs: without this, a help
+    // flag was ignored and `doctor --help` ran the whole doctor.
+    const help = subcommandHelp(argv);
+    if (help !== null) {
+        console.log(help);
+        return 0;
+    }
 
     try {
         if (command === "setup") {
@@ -131,13 +147,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
                     join(getMagicContextStorageDir(), "context.db"),
                 );
             }
-            if (rest[0] === "merge-identity") {
+            if (rest[0] === "merge-identities" || rest[0] === "merge-identity") {
                 const { runMergeIdentityCli } = await import("./commands/doctor-merge-identity");
                 return runMergeIdentityCli(rest.slice(1));
             }
             if (rest[0] === "repair-db") {
                 const { runRepairDbCli } = await import("./commands/doctor-repair-db");
                 return runRepairDbCli(rest.slice(1));
+            }
+            if (rest[0] === "list-hidden-sessions") {
+                const { runListHiddenSessions } = await import("./commands/doctor-hidden-sessions");
+                return runListHiddenSessions();
             }
             if (rest[0] === "migrate") {
                 const { runMigrateCli } = await import("./commands/migrate");
@@ -152,6 +172,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
             const report = valueAfter(rest, "--report");
             return runDoctor({
                 force: rest.includes("--force"),
+                fix: rest.includes("--fix"),
                 issue: rest.includes("--issue") || report !== null,
                 ...(report !== null ? { report } : {}),
                 clear: rest.includes("--clear"),

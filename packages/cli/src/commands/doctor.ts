@@ -2,7 +2,7 @@
  * Unified `doctor` command.
  *
  * Dispatches to the per-harness doctor based on `--harness` or auto-detection.
- * Supports `--force`, `--issue`, and `--clear` flags identically across both.
+ * Supports shared diagnostic flags and dispatches harness-specific repairs.
  *
  * `--clear` is special: it presents an interactive picker that lets the user
  * choose which caches to clear across all installed harnesses. It does NOT
@@ -13,7 +13,7 @@ import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { getInstalledAdapters } from "../adapters";
-import type { HarnessAdapter } from "../adapters/types";
+import type { HarnessAdapter, PluginCacheClearResult } from "../adapters/types";
 import {
     openExistingContextDatabase,
     openExistingContextDatabaseForMutation,
@@ -25,12 +25,14 @@ import {
     runV22BackfillCommands,
     type V22BackfillCommandArgs,
 } from "../lib/v22-backfill-commands";
+import { diagnoseIdentitySplits } from "./doctor-identity-splits";
 import { runDoctor as runOmpDoctor } from "./doctor-omp";
 import { runDoctor as runOpenCodeDoctor } from "./doctor-opencode";
 import { doctor as runPiDoctor } from "./doctor-pi";
 
 export interface RunDoctorOptions extends V22BackfillCommandArgs {
     force?: boolean;
+    fix?: boolean;
     issue?: boolean;
     report?: string;
     clear?: boolean;
@@ -78,6 +80,14 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
             options,
         );
         if (result.handled) return result.exitCode;
+    }
+
+    try {
+        for (const line of diagnoseIdentitySplits()) log.warn(line);
+    } catch (error) {
+        log.warn(
+            `Identity split check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
     }
 
     // Reconcile interrupted cross-harness session migrations. The journal lives
@@ -132,6 +142,7 @@ async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions
         case "opencode": {
             return runOpenCodeDoctor({
                 force: options.force,
+                fix: options.fix,
                 issue: options.issue,
             });
         }
@@ -165,11 +176,24 @@ async function runClear(): Promise<number> {
         return 0;
     }
 
-    const items: { adapter: HarnessAdapter; path: string; sizeBytes: number }[] = [];
+    const items: {
+        adapter: HarnessAdapter;
+        path: string;
+        sizeBytes: number;
+        label?: string;
+        clear?: () => PluginCacheClearResult;
+    }[] = [];
     for (const adapter of installed) {
-        const cache = adapter.getPluginCacheInfo();
-        if (cache.path && cache.exists) {
-            items.push({ adapter, path: cache.path, sizeBytes: cache.sizeBytes });
+        for (const cache of adapter.getPluginCacheInfo()) {
+            if (cache.path && cache.exists) {
+                items.push({
+                    adapter,
+                    path: cache.path,
+                    sizeBytes: cache.sizeBytes,
+                    label: cache.label,
+                    clear: cache.clear,
+                });
+            }
         }
     }
 
@@ -182,7 +206,7 @@ async function runClear(): Promise<number> {
     const picks = await selectMany(
         "Select caches to clear:",
         items.map((item, idx) => ({
-            label: `${item.adapter.displayName}: ${formatSize(item.sizeBytes)} — ${item.path}`,
+            label: `${item.adapter.displayName}${item.label ? ` (${item.label})` : ""}: ${formatSize(item.sizeBytes)} — ${item.path}`,
             value: String(idx),
         })),
     );
@@ -211,7 +235,17 @@ async function runClear(): Promise<number> {
         const s = spinner();
         s.start(`Clearing ${item.path}`);
         try {
-            if (existsSync(item.path)) {
+            if (item.clear) {
+                // The adapter's own removal carries its guard (for OpenCode 2,
+                // never while OpenCode may be using the slot).
+                const result = item.clear();
+                if (!result.cleared) {
+                    s.stop(`Left in place: ${item.path}`);
+                    log.warn(result.reason);
+                    failed += 1;
+                    continue;
+                }
+            } else if (existsSync(item.path)) {
                 rmSync(item.path, { recursive: true, force: true });
             }
             s.stop(`Cleared ${item.path}`);

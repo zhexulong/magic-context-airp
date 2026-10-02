@@ -1,3 +1,5 @@
+import { log } from "../../shared/logger";
+
 export interface ParsedCompartment {
     startMessage: number;
     endMessage: number;
@@ -53,6 +55,8 @@ export interface ParsedPrimerCandidate {
 export interface ParsedCompartmentOutput {
     compartments: ParsedCompartment[];
     facts: ParsedFact[];
+    droppedFactBlocks: number;
+    droppedFacts: number;
     events: ParsedEvent[];
     unprocessedFrom: number | null;
     userObservations: string[];
@@ -99,6 +103,7 @@ const DEFAULT_FACT_CATEGORIES = [
     "CONFIG_VALUES",
     "NAMING",
 ] as const;
+const CATEGORY_BLOCK_REGEX = /<([A-Za-z_][A-Za-z0-9_-]*)>(.*?)<\/\1>/gs;
 const FACT_ITEM_REGEX = /^\s*\*\s*(.+)$/gm;
 const UNPROCESSED_REGEX = /<unprocessed_from>(\d+)<\/unprocessed_from>/;
 const USER_OBSERVATIONS_REGEX = /<user_observations>(.*?)<\/user_observations>/s;
@@ -171,19 +176,14 @@ export function extractTiersFromInner(inner: string): {
     };
 }
 
-function factCategoryRegex(categories: readonly string[]): RegExp {
-    const alternatives = categories
-        .map((category) => category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        .join("|");
-    return new RegExp(`<(${alternatives})>(.*?)<\\/\\1>`, "gs");
-}
-
 export function parseCompartmentOutput(
     text: string,
     factCategories: readonly string[] = DEFAULT_FACT_CATEGORIES,
 ): ParsedCompartmentOutput {
     const compartments: ParsedCompartment[] = [];
     const facts: ParsedFact[] = [];
+    let droppedFactBlocks = 0;
+    let droppedFacts = 0;
 
     for (const match of text.matchAll(COMPARTMENT_REGEX)) {
         const attrs = match[1];
@@ -251,23 +251,35 @@ export function parseCompartmentOutput(
     const factsBlockMatch = text.match(FACTS_BLOCK_REGEX);
     // When a <facts> block is present (the v2 norm), scope extraction to it.
     // The fallback (legacy/transition outputs with bare category blocks) strips
-    // BOTH the events block AND every <compartment> body first — otherwise a
-    // category-shaped tag living inside a compartment's P1-P4 prose (or its
-    // attributes) would be misread as a promotable fact.
+    // events, compartment bodies and side channels first — otherwise a category
+    // tag in narrative prose or metadata would be misread as a fact.
     const factsScope = factsBlockMatch
         ? factsBlockMatch[1]
         : text
               .replace(EVENTS_BLOCK_REGEX, "")
               .replace(/<compartment\s+[^>]*?\s*>.*?<\/compartment>/gs, "");
-    for (const categoryMatch of factsScope.matchAll(factCategoryRegex(factCategories))) {
+    // The current domain's allowlist (defaults to the coding-project taxonomy;
+    // the ongoing-interaction domain passes its own).
+    const acceptedCategories = new Set(factCategories);
+    for (const categoryMatch of factsScope.matchAll(CATEGORY_BLOCK_REGEX)) {
         const category = categoryMatch[1];
         const blockContent = categoryMatch[2];
-        for (const itemMatch of blockContent.matchAll(FACT_ITEM_REGEX)) {
-            const content = unescapeXml(itemMatch[1].trim());
-            if (content) {
-                facts.push({ category, content });
-            }
+        const items = [...blockContent.matchAll(FACT_ITEM_REGEX)]
+            .map((match) => unescapeXml(match[1].trim()))
+            .filter(Boolean);
+        // Domain-aware acceptance: the ongoing-interaction domain supplies its
+        // own allowlist via `factCategories`, so semantic interaction facts are
+        // not treated as (and cannot crowd out) coding-project rules. Blocks in
+        // the current domain's taxonomy are dropped and reported, never parsed
+        // as facts.
+        if (!acceptedCategories.has(category)) {
+            if (items.length === 0) continue;
+            droppedFactBlocks++;
+            droppedFacts += items.length;
+            log(`[historian] Dropped <facts> category ${category} (${items.length} facts)`);
+            continue;
         }
+        for (const content of items) facts.push({ category, content });
     }
 
     const unprocessedMatch = text.match(UNPROCESSED_REGEX);
@@ -312,7 +324,16 @@ export function parseCompartmentOutput(
 
     compartments.sort((a, b) => a.startMessage - b.startMessage);
 
-    return { compartments, facts, events, unprocessedFrom, userObservations, primerCandidates };
+    return {
+        compartments,
+        facts,
+        droppedFactBlocks,
+        droppedFacts,
+        events,
+        unprocessedFrom,
+        userObservations,
+        primerCandidates,
+    };
 }
 
 /**

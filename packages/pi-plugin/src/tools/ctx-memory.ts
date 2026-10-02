@@ -10,16 +10,16 @@
  *    - update: rewrite a memory's content (recomputes normalized_hash + queues re-embed)
  *    - merge: combine N memories into one canonical, supersede the rest
  *
- *  Dreamer-only (gated on `allowDreamerActions: true`):
- *    - list: list active memories for the current project
+ *  Dreamer-only:
+ *    - ctx_memory_list: list active memories for the current project through a separate tool
  *  (memory verification + classification are no longer tool actions — the verify
  *   and classify dreamer tasks apply them host-side from a manifest.)
  *
  * Allowlist gating mirrors OpenCode's `allowedActions` deps field. In OpenCode,
  * the dreamer subagent gets the full action surface because `toolContext.agent
- * === DREAMER_AGENT`. Pi has no agent identity inside child processes, so we
- * use an explicit flag (`--magic-context-dreamer-actions`) wired through the
- * subagent extension entry. Same effective behavior, different transport.
+ * === DREAMER_AGENT`. Pi has no agent identity inside child processes, so the
+ * lean subagent extension registers ctx_memory_list only when the parent passes
+ * `--magic-context-dreamer-actions`. Same effective behavior, different transport.
  *
  * Parity reference (OpenCode):
  *   - `tools/ctx-memory/types.ts` for action enum
@@ -33,6 +33,11 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+	curateCategoryForMemoryCategory,
+	getActiveCurateCategory,
+	getCurateCategoryScopeRefusal,
+} from "@magic-context/core/features/magic-context/dreamer/curate-category-rotation";
 import {
 	assessCurateMutationSafety,
 	recordCurateSafetyRefusal,
@@ -78,31 +83,28 @@ import {
 	storedPathBelongsToWorkspace,
 } from "@magic-context/core/features/magic-context/workspaces";
 import { log } from "@magic-context/core/shared/logger";
-import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
+import {
+	CTX_MEMORY_DESCRIPTION,
+	CTX_MEMORY_LIST_DESCRIPTION,
+} from "@magic-context/core/tools/ctx-memory/constants";
 import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/verification-recording";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
 const DEFAULT_LIST_LIMIT = 10;
 
-// Mirrors OpenCode CTX_MEMORY_DREAMER_ACTIONS. `delete` was removed — it was an
-// exact alias of `archive` (both soft-archive); `archive` is the single
-// soft-remove action. Primary agents get write/archive/update/merge/get on the
-// memories they already see (with ids) in the injected project-memory block;
-// `list` (bulk enumeration) stays dreamer-only. `get` is the id-shaped read
+// Mirrors OpenCode's internal action vocabulary. `delete` was removed — it was
+// an exact alias of `archive` (both soft-archive); `archive` is the single
+// soft-remove action. ctx_memory advertises write/update/archive/merge/get on the
+// memories agents already see; `list` remains internal so ctx_memory_list can
+// reuse the handler without advertising bulk enumeration on ctx_memory. `get` is the id-shaped read
 // that the user-facing <project-memory> ids imply but no other primary action
 // covered — the agent is given a memory id (dashboard, guidance) and there is
 // no other way to look it up. Memory verification (file mapping) and
 // classification are no longer tool actions — the verify and classify dreamer
 // tasks apply them host-side from a manifest.
-const ALL_ACTIONS = [
-	"write",
-	"archive",
-	"update",
-	"merge",
-	"get",
-	"list",
-] as const;
+const PRIMARY_ACTIONS = ["write", "update", "archive", "merge", "get"] as const;
+const ALL_ACTIONS = [...PRIMARY_ACTIONS, "list"] as const;
 type CtxMemoryAction = (typeof ALL_ACTIONS)[number];
 
 const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
@@ -112,16 +114,16 @@ const GET_MAX_IDS = 20;
 const ParamsShape = {
 	action: Type.Optional(
 		Type.Union(
-			ALL_ACTIONS.map((a) => Type.Literal(a)),
+			PRIMARY_ACTIONS.map((a) => Type.Literal(a)),
 			{
-				description: "What to do: write, update, archive, merge, get, or list",
+				description: "write | update | archive | merge | get",
 			},
 		),
 	),
 	content: Type.Optional(
 		Type.String({
 			description:
-				"The memory text — one standalone fact (required for write, update, merge)",
+				"The memory text — one standalone fact (write, update, merge).",
 		}),
 	),
 	category: Type.Optional(
@@ -129,27 +131,46 @@ const ParamsShape = {
 			V2_MEMORY_CATEGORIES.map((c) => Type.Literal(c)),
 			{
 				description:
-					"What kind of fact this is (required for write; optional merge override)",
+					"Kind of fact (required for write; on update/merge optional, omitted keeps the current category).",
 			},
 		),
 	),
 	ids: Type.Optional(
 		Type.Array(Type.Number(), {
 			description:
-				"Target memory id(s) from <project-memory>: update takes exactly one, archive one or more, merge two or more, get one to twenty",
+				"Memory ids from <project-memory>: one for update, one or more for archive, two or more for merge, 1–20 for get.",
 		}),
 	),
 	limit: Type.Optional(
 		Type.Number({
-			description: "Max results for list (default: 10)",
+			description: "Max results for list (default 10).",
 		}),
 	),
 	reason: Type.Optional(
 		Type.String({
-			description: "Why the memory is being archived (optional, recommended)",
+			description: "Why it is being archived (optional).",
 		}),
 	),
 };
+const ListParamsSchema = Type.Object(
+	{
+		category: Type.Optional(
+			Type.Union(
+				V2_MEMORY_CATEGORIES.map((category) => Type.Literal(category)),
+				{
+					description:
+						"Kind of fact (required for write; on update/merge optional, omitted keeps the current category).",
+				},
+			),
+		),
+		limit: Type.Optional(
+			Type.Number({ description: "Max results for list (default 10)." }),
+		),
+	},
+	{ additionalProperties: true },
+);
+type CtxMemoryListParams = Static<typeof ListParamsSchema>;
+
 const PrimaryParamsSchema = Type.Object(ParamsShape, {
 	additionalProperties: true,
 });
@@ -181,7 +202,7 @@ function err(text: string) {
 }
 
 function normalizeLimit(limit?: number): number {
-	if (typeof limit !== "number" || !Number.isFinite(limit))
+	if (typeof limit !== "number" || !Number.isFinite(limit) || limit === 0)
 		return DEFAULT_LIST_LIMIT;
 	return Math.max(1, Math.floor(limit));
 }
@@ -233,8 +254,10 @@ function formatMemoryList(memories: Memory[]): string {
 			r.updated.padEnd(widths.updated),
 			r.content,
 		].join(" | ");
+	// `get` returns rows of any status; claim "active" only when every row is.
+	const allActive = memories.every((memory) => memory.status === "active");
 	return [
-		`Found ${rows.length} active ${rows.length === 1 ? "memory" : "memories"}:`,
+		`Found ${rows.length} ${allActive ? "active " : ""}${rows.length === 1 ? "memory" : "memories"}:`,
 		"",
 		fmt(headers),
 		[
@@ -292,10 +315,11 @@ function updateMemoryContentInCurrentTransaction(
 	memory: Memory,
 	content: string,
 	normalizedHash: string,
+	category: MemoryCategory,
 ): void {
 	db.prepare(
-		"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-	).run(content, normalizedHash, Date.now(), memory.id);
+		"UPDATE memories SET content = ?, normalized_hash = ?, category = ?, updated_at = ? WHERE id = ?",
+	).run(content, normalizedHash, category, Date.now(), memory.id);
 	// The classify `shareable` verdict was scored against the OLD content; new
 	// content invalidates it. Fail closed → private; the dreamer re-scores later.
 	if (hasMemoryShareableColumn(db)) {
@@ -354,9 +378,8 @@ export interface CtxMemoryToolDeps {
 	embeddingEnabled?: boolean;
 	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
 	resolveProjectIdentity?: (directory: string) => string | undefined;
-	/** When true, the dreamer-only `list` action is exposed. Set by the subagent
-	 *  extension entry when the parent passes `--magic-context-dreamer-actions`.
-	 *  Default: false (primary set only: write/archive/update/merge). */
+	/** When true, Curate-only execution fields and guards are enabled. The separate
+	 *  ctx_memory_list registration uses this mode to reuse the list handler. */
 	allowDreamerActions?: boolean;
 }
 
@@ -366,14 +389,10 @@ export function createCtxMemoryTool(
 	const dreamerAllowed = deps.allowDreamerActions === true;
 	const resolveProject =
 		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
-	const description = dreamerAllowed
-		? `${CTX_MEMORY_DESCRIPTION}\n- list: enumerate stored memories (maintenance sessions).`
-		: CTX_MEMORY_DESCRIPTION;
-
 	return {
 		name: "ctx_memory",
 		label: "Magic Context: Memory",
-		description,
+		description: CTX_MEMORY_DESCRIPTION,
 		parameters: dreamerAllowed ? DreamerParamsSchema : PrimaryParamsSchema,
 		async execute(
 			_toolCallId,
@@ -409,6 +428,37 @@ export function createCtxMemoryTool(
 				);
 			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
+			const activeCurateCategory = dreamerAllowed
+				? getActiveCurateCategory(deps.db, projectIdentity)
+				: null;
+			if (activeCurateCategory) {
+				const usesCategory = ["write", "update", "merge", "list"].includes(
+					params.action,
+				);
+				const usesIds = ["update", "archive", "merge", "get"].includes(
+					params.action,
+				);
+				const usesSuccessor =
+					params.action === "update" || params.action === "archive";
+				const scopeRefusal = getCurateCategoryScopeRefusal({
+					scope: activeCurateCategory,
+					action: params.action,
+					requestedCategory: usesCategory ? params.category : undefined,
+					ids: usesIds
+						? [
+								...(params.ids ?? []),
+								...(usesSuccessor && Number.isInteger(params.superseded_by)
+									? [params.superseded_by as number]
+									: []),
+							]
+						: [],
+					categoryForId: (id) => {
+						const category = getMemoryById(deps.db, id)?.category;
+						return category ? curateCategoryForMemoryCategory(category) : null;
+					},
+				});
+				if (scopeRefusal) return err(scopeRefusal);
+			}
 			const workspaceIdentitySet = resolveWorkspaceIdentitySet(
 				deps.db,
 				projectIdentity,
@@ -577,9 +627,15 @@ export function createCtxMemoryTool(
 				const limit = normalizeLimit(params.limit);
 				const filtered = getMemoriesByProject(deps.db, projectIdentity);
 				const category = params.category;
-				const filtered2 = category
-					? filtered.filter((m) => m.category === category)
-					: filtered;
+				const filtered2 = activeCurateCategory
+					? filtered.filter(
+							(memory) =>
+								curateCategoryForMemoryCategory(memory.category) ===
+								activeCurateCategory,
+						)
+					: category
+						? filtered.filter((memory) => memory.category === category)
+						: filtered;
 				return ok(formatMemoryList(filtered2.slice(0, limit)));
 			}
 
@@ -639,11 +695,12 @@ export function createCtxMemoryTool(
 				}
 
 				const normalizedHash = computeNormalizedHash(content);
+				const targetCategory = params.category ?? memory.category;
 				const targetIdentity = targetIdentityForStoredPath(memory.projectPath);
 				const duplicate = getMemoryByHash(
 					deps.db,
 					targetIdentity,
-					memory.category,
+					targetCategory,
 					normalizedHash,
 				);
 				if (duplicate && duplicate.id !== memory.id) {
@@ -658,12 +715,13 @@ export function createCtxMemoryTool(
 						memory,
 						content,
 						normalizedHash,
+						targetCategory,
 					);
 					queueMemoryMutation(deps.db, {
 						projectPath: targetIdentity,
 						mutationType: "update",
 						targetMemoryId: memory.id,
-						category: memory.category,
+						category: targetCategory,
 						newContent: content,
 					});
 				});
@@ -673,7 +731,7 @@ export function createCtxMemoryTool(
 					memoryId: memory.id,
 					content,
 				});
-				return ok(`Updated memory [ID: ${memory.id}] in ${memory.category}.`);
+				return ok(`Updated memory [ID: ${memory.id}] in ${targetCategory}.`);
 			}
 
 			if (params.action === "merge") {
@@ -817,74 +875,76 @@ export function createCtxMemoryTool(
 					: "active";
 
 				let canonicalMemory!: Memory;
-				deps.db.transaction(() => {
-					let canonicalContentChanged = false;
-					if (canonicalExisting) {
-						// One of the source memories already has the merged content.
-						// Update it in place to absorb stats from the others.
-						canonicalMemory = canonicalExisting;
-						canonicalContentChanged =
-							canonicalMemory.content !== content ||
-							canonicalMemory.normalizedHash !== normalizedHash;
-						if (canonicalContentChanged) {
-							updateMemoryContent(
-								deps.db,
-								canonicalMemory.id,
+				deps.db
+					.transaction(() => {
+						let canonicalContentChanged = false;
+						if (canonicalExisting) {
+							// One of the source memories already has the merged content.
+							// Update it in place to absorb stats from the others.
+							canonicalMemory = canonicalExisting;
+							canonicalContentChanged =
+								canonicalMemory.content !== content ||
+								canonicalMemory.normalizedHash !== normalizedHash;
+							if (canonicalContentChanged) {
+								updateMemoryContent(
+									deps.db,
+									canonicalMemory.id,
+									content,
+									normalizedHash,
+								);
+							}
+						} else {
+							// Insert a fresh canonical memory with the merged content.
+							canonicalMemory = insertMemory(deps.db, {
+								projectPath: projectIdentity,
+								category,
 								content,
-								normalizedHash,
-							);
+								sourceSessionId: sessionId,
+								sourceType: dreamerAllowed ? "dreamer" : "agent",
+							});
 						}
-					} else {
-						// Insert a fresh canonical memory with the merged content.
-						canonicalMemory = insertMemory(deps.db, {
-							projectPath: projectIdentity,
-							category,
-							content,
-							sourceSessionId: sessionId,
-							sourceType: dreamerAllowed ? "dreamer" : "agent",
-						});
-					}
 
-					mergeMemoryStats(
-						deps.db,
-						canonicalMemory.id,
-						mergedSeenCount,
-						mergedRetrievalCount,
-						mergedFrom,
-						mergedStatus,
-					);
+						mergeMemoryStats(
+							deps.db,
+							canonicalMemory.id,
+							mergedSeenCount,
+							mergedRetrievalCount,
+							mergedFrom,
+							mergedStatus,
+						);
 
-					for (const memory of sourceMemories) {
-						if (memory.id === canonicalMemory.id) {
-							continue;
+						for (const memory of sourceMemories) {
+							if (memory.id === canonicalMemory.id) {
+								continue;
+							}
+							supersededMemory(deps.db, memory.id, canonicalMemory.id);
+							queueMemoryMutation(deps.db, {
+								// Normalize the stored path to the resolved identity
+								// before queueing — the render-side mutation-log reader
+								// matches exact project_path, and OpenCode + dashboard
+								// both normalize first. A legacy raw filesystem path here
+								// would write a row that normalized git:/dir: sessions
+								// never read (the supersede delta would silently vanish).
+								projectPath: normalizeStoredProjectPath(memory.projectPath),
+								mutationType: "superseded",
+								targetMemoryId: memory.id,
+								supersededById: canonicalMemory.id,
+							});
 						}
-						supersededMemory(deps.db, memory.id, canonicalMemory.id);
-						queueMemoryMutation(deps.db, {
-							// Normalize the stored path to the resolved identity
-							// before queueing — the render-side mutation-log reader
-							// matches exact project_path, and OpenCode + dashboard
-							// both normalize first. A legacy raw filesystem path here
-							// would write a row that normalized git:/dir: sessions
-							// never read (the supersede delta would silently vanish).
-							projectPath: normalizeStoredProjectPath(memory.projectPath),
-							mutationType: "superseded",
-							targetMemoryId: memory.id,
-							supersededById: canonicalMemory.id,
-						});
-					}
 
-					if (canonicalExisting && canonicalContentChanged) {
-						queueMemoryMutation(deps.db, {
-							projectPath: normalizeStoredProjectPath(
-								canonicalMemory.projectPath,
-							),
-							mutationType: "update",
-							targetMemoryId: canonicalMemory.id,
-							category,
-							newContent: content,
-						});
-					}
-				})();
+						if (canonicalExisting && canonicalContentChanged) {
+							queueMemoryMutation(deps.db, {
+								projectPath: normalizeStoredProjectPath(
+									canonicalMemory.projectPath,
+								),
+								mutationType: "update",
+								targetMemoryId: canonicalMemory.id,
+								category,
+								newContent: content,
+							});
+						}
+					})
+					.immediate();
 
 				queueEmbedding({
 					deps,
@@ -968,6 +1028,36 @@ export function createCtxMemoryTool(
 			}
 
 			return err("Error: Unknown action.");
+		},
+	};
+}
+
+export function createCtxMemoryListTool(
+	deps: CtxMemoryToolDeps,
+): ToolDefinition<typeof ListParamsSchema> {
+	const memoryTool = createCtxMemoryTool({
+		...deps,
+		allowDreamerActions: true,
+	});
+	return {
+		name: "ctx_memory_list",
+		label: "Magic Context: Memory List",
+		description: CTX_MEMORY_LIST_DESCRIPTION,
+		parameters: ListParamsSchema,
+		async execute(
+			toolCallId,
+			params: CtxMemoryListParams,
+			signal,
+			onUpdate,
+			ctx,
+		) {
+			return memoryTool.execute(
+				toolCallId,
+				{ ...params, action: "list" } as never,
+				signal,
+				onUpdate,
+				ctx,
+			);
 		},
 	};
 }

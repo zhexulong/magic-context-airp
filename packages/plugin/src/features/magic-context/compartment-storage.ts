@@ -1,6 +1,8 @@
+import { invalidateAutoEmbedSession } from "../../hooks/magic-context/embed-session-state";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
 import { isCompartmentLeaseHeld } from "./compartment-lease";
 import { getIncrementDepthStatement } from "./compression-depth-storage";
 import { isNoContentCompartment } from "./no-content-compartment";
@@ -54,6 +56,16 @@ export interface Compartment {
     /** 1 = pre-v2 flat compartment (no tiers); 0 = v2 tiered. */
     legacy: number;
     createdAt: number;
+    /**
+     * `unresolved` when the store-projection rebase could not re-derive this
+     * compartment's ordinals, because the message its endpoint id names does not
+     * exist in the projection the running host serves. Such a row keeps its
+     * summary text (readable by id) but is excluded from anything that treats
+     * its ordinals as positions: range recovery, injection, and the boundary.
+     * Re-evaluated on every later projection change, so an endpoint that comes
+     * back returns the row to `ok`.
+     */
+    rebaseStatus: "ok" | "unresolved";
 }
 
 export interface SessionFact {
@@ -83,6 +95,7 @@ interface CompartmentRow {
     episode_type: string | null;
     legacy: number | null;
     created_at: number;
+    rebase_status?: string | null;
 }
 
 interface SessionFactRow {
@@ -192,6 +205,7 @@ function insertCompartmentRows(
             getHarness(),
         );
     }
+    if (compartments.length > 0) invalidateAutoEmbedSession(sessionId);
 }
 
 function insertFactRows(
@@ -225,6 +239,7 @@ function toCompartment(row: CompartmentRow): Compartment {
         episodeType: row.episode_type ?? null,
         legacy: typeof row.legacy === "number" ? row.legacy : 0,
         createdAt: row.created_at,
+        rebaseStatus: row.rebase_status === "unresolved" ? "unresolved" : "ok",
     };
 }
 
@@ -249,9 +264,22 @@ export function getCompartments(db: Database, sessionId: string): Compartment[] 
     return rows.map(toCompartment);
 }
 
+/**
+ * Highest message ordinal any compartment covers — the line between compacted
+ * history and the live tail.
+ *
+ * Rows the projection rebase could not re-derive are excluded: their stored
+ * ordinals are positions in a message list the running host no longer serves,
+ * so using one as the boundary would clamp recovery ranges and the protected
+ * tail against an arbitrary message. Excluding them moves the boundary back to
+ * the newest compartment that still resolves, which is recoverable, instead of
+ * pointing confidently at the wrong place.
+ */
 export function getLastCompartmentEndMessage(db: Database, sessionId: string): number {
     const row = db
-        .prepare("SELECT MAX(end_message) as max_end FROM compartments WHERE session_id = ?")
+        .prepare(
+            "SELECT MAX(end_message) as max_end FROM compartments WHERE session_id = ? AND rebase_status != 'unresolved'",
+        )
         .get(sessionId) as { max_end: number | null } | null;
     return row?.max_end ?? -1;
 }
@@ -267,7 +295,7 @@ export function getLastCompartmentEndMessage(db: Database, sessionId: string): n
 export function getLastCompartmentEndMessageId(db: Database, sessionId: string): string | null {
     const row = db
         .prepare(
-            "SELECT end_message_id FROM compartments WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
+            "SELECT end_message_id FROM compartments WHERE session_id = ? AND rebase_status != 'unresolved' ORDER BY sequence DESC LIMIT 1",
         )
         .get(sessionId) as { end_message_id: string | null } | undefined;
     const id = row?.end_message_id;
@@ -305,9 +333,11 @@ export function replaceAllCompartments(
 ): void {
     const now = Date.now();
     db.transaction(() => {
+        deleteChunkEmbedBackoffForSession(db, sessionId);
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        invalidateAutoEmbedSession(sessionId);
         insertCompartmentRows(db, sessionId, compartments, now);
-    })();
+    }).immediate();
 }
 
 /**
@@ -324,7 +354,7 @@ export function appendCompartments(
     const now = Date.now();
     db.transaction(() => {
         insertCompartmentRows(db, sessionId, compartments, now);
-    })();
+    }).immediate();
 }
 
 /**
@@ -342,7 +372,7 @@ export function replaceSessionFacts(
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
         insertFactRows(db, sessionId, facts, now);
         clearCachedM0M1(db, sessionId);
-    })();
+    }).immediate();
 }
 
 export function getSessionFacts(db: Database, sessionId: string): SessionFact[] {
@@ -361,14 +391,16 @@ export function replaceAllCompartmentState(
 ): void {
     const now = Date.now();
     db.transaction(() => {
+        deleteChunkEmbedBackoffForSession(db, sessionId);
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        invalidateAutoEmbedSession(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, compartments, now);
         insertFactRows(db, sessionId, facts, now);
 
         clearCachedM0M1(db, sessionId);
-    })();
+    }).immediate();
 }
 
 export function replaceAllCompartmentStateAndBumpDepth(
@@ -391,7 +423,9 @@ export function replaceAllCompartmentStateAndBumpDepth(
             return false;
         }
 
+        deleteChunkEmbedBackoffForSession(db, sessionId);
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        invalidateAutoEmbedSession(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, compartments, now);
@@ -522,7 +556,7 @@ export function saveRecompStagingPass(
         for (const f of facts) {
             factStmt.run(sessionId, f.category, f.content, passNumber, now, getHarness());
         }
-    })();
+    }).immediate();
 }
 
 /** Read existing staging data for resume. Returns null if no staging exists. */
@@ -577,19 +611,23 @@ export function promoteRecompStaging(
 } | null {
     const now = Date.now();
     if (!holderId) {
-        return db.transaction(() => {
-            const staging = getRecompStaging(db, sessionId);
-            if (!staging || staging.compartments.length === 0) return null;
+        return db
+            .transaction(() => {
+                const staging = getRecompStaging(db, sessionId);
+                if (!staging || staging.compartments.length === 0) return null;
 
-            db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
-            db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
-            insertCompartmentRows(db, sessionId, staging.compartments, now);
-            insertFactRows(db, sessionId, staging.facts, now);
-            db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
-            db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
-            clearCachedM0M1(db, sessionId);
-            return { compartments: staging.compartments, facts: staging.facts };
-        })();
+                deleteChunkEmbedBackoffForSession(db, sessionId);
+                db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+                invalidateAutoEmbedSession(sessionId);
+                db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
+                insertCompartmentRows(db, sessionId, staging.compartments, now);
+                insertFactRows(db, sessionId, staging.facts, now);
+                db.prepare("DELETE FROM recomp_compartments WHERE session_id = ?").run(sessionId);
+                db.prepare("DELETE FROM recomp_facts WHERE session_id = ?").run(sessionId);
+                clearCachedM0M1(db, sessionId);
+                return { compartments: staging.compartments, facts: staging.facts };
+            })
+            .immediate();
     }
 
     const transactionStartedAt = performance.now();
@@ -609,7 +647,9 @@ export function promoteRecompStaging(
             return null;
         }
         // Replace real tables
+        deleteChunkEmbedBackoffForSession(db, sessionId);
         db.prepare("DELETE FROM compartments WHERE session_id = ?").run(sessionId);
+        invalidateAutoEmbedSession(sessionId);
         db.prepare("DELETE FROM session_facts WHERE session_id = ?").run(sessionId);
 
         insertCompartmentRows(db, sessionId, staging.compartments, now);
@@ -651,7 +691,7 @@ export function clearRecompStaging(db: Database, sessionId: string): void {
         } catch {
             // column missing in very old schemas — ignore
         }
-    })();
+    }).immediate();
 }
 
 // ── Partial recomp range marker ─────────────────────────────────────────────

@@ -10,8 +10,11 @@ function createMockDb() {
         run: mock((..._args: unknown[]) => {}),
     }));
 
+    // Mirrors bun:sqlite: the wrapper runs deferred when called and exposes
+    // `.immediate()` for writers that take the write lock at BEGIN.
     const transaction = mock((callback: () => void) => {
-        return () => callback();
+        const run = () => callback();
+        return Object.assign(run, { immediate: run });
     });
 
     return {
@@ -82,11 +85,11 @@ describe("storage-meta", () => {
             clearSession(toDatabase(db), "session-1");
 
             //#then
-            // The shared deleter prepares and executes every table inside one
-            // encompassing transaction; message-index rows no longer need a
-            // separate nested cleanup transaction.
+            // clearSession deletes all owned tables inside one transaction.
+            // Retry marks are deleted before their compartment IDs disappear;
+            // the session activity mark is removed after the table rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(31);
+            expect(db.prepare).toHaveBeenCalledTimes(33);
         });
     });
 });

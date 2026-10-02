@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { hostExtractCache } from '../host-extract-cache';
 import { prepareContextDatabase } from "../prepare-context-db";
 import { assertMockEndpoint, assertMockProviders, pinMockAgents } from "../mock-routing";
 import {
@@ -63,6 +64,7 @@ export interface IsolatedEnv {
 export interface SpawnedOpencode {
     url: string;
     port: number;
+    pid: number;
     env: IsolatedEnv;
     kill: () => Promise<void>;
     stdout: () => string;
@@ -86,8 +88,33 @@ export interface SpawnOptions {
     magicContextConfig?: Record<string, unknown>;
     /** Extra opencode.json provider/model config, merged with defaults. */
     openCodeConfigExtra?: Record<string, unknown>;
+    /**
+     * Extra config written to OpenCode's GLOBAL config directory
+     * (`$XDG_CONFIG_HOME/opencode/opencode.json`) instead of the
+     * `$OPENCODE_CONFIG_DIR` layer everything else uses.
+     *
+     * The harness points both env vars at the same isolated tree but at
+     * DIFFERENT directories, so this reproduces the real-user shape where a
+     * launcher exports `OPENCODE_CONFIG_DIR` and the user's own settings still
+     * live in the global directory. OpenCode reads both and lets the
+     * `$OPENCODE_CONFIG_DIR` layer win ties. Default: nothing extra.
+     */
+    openCodeGlobalConfigExtra?: Record<string, unknown>;
+    /**
+     * Drop the harness's default `compaction` block from the
+     * `$OPENCODE_CONFIG_DIR` layer, leaving `openCodeGlobalConfigExtra` as the
+     * only place compaction is configured. Default: keep it.
+     */
+    omitConfigDirCompaction?: boolean;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /**
+     * Register a second model on the mock provider and pin the historian to it,
+     * so a scenario can keep a small window on the session model while the
+     * historian gets a window large enough to hold its prompt, as it does for
+     * real users. Default: the historian uses the session model.
+     */
+    historianMockModel?: { id: string; contextLimit: number };
     /** Pre-create the isolated Magic Context DB unless the test expects the plugin to stay disabled. */
     prepareContextDatabase?: boolean;
     /** Expected Magic Context state after startup; readiness waits for this state. Defaults to enabled. */
@@ -264,13 +291,26 @@ function writeConfigs(
     mockProviderURL: string,
     opts: SpawnOptions,
 ): void {
-    const pluginSpec = `file://${PLUGIN_ENTRY}`;
+    const pluginSpec = `file://${process.env.MC_E2E_PLUGIN_ENTRY ?? PLUGIN_ENTRY}`;
     const mockProviderID = opts.mockProviderID ?? "mock-anthropic";
     const mockProviderAPI = opts.mockProviderAPI ?? "@ai-sdk/anthropic";
     const mockModelID = opts.mockModelID ?? "mock-sonnet";
+    const mockModel = (modelID: string, contextLimit: number): Record<string, unknown> => ({
+        id: modelID,
+        name: `Mock ${modelID}`,
+        cost: { input: 0, output: 0 },
+        limit: { context: contextLimit, output: 8192 },
+        modalities: {
+            input: ["text", "image", "pdf"],
+            output: ["text"],
+        },
+        options: {},
+    });
+    const historianModel = opts.historianMockModel;
     const providerConfig = (
         api: "@ai-sdk/anthropic" | "@ai-sdk/openai",
         modelID: string,
+        withHistorianModel = false,
     ): Record<string, unknown> => ({
         api,
         name: api === "@ai-sdk/openai" ? "Mock OpenAI Responses" : "Mock Anthropic",
@@ -281,17 +321,10 @@ function writeConfigs(
             baseURL: mockProviderURL,
         },
         models: {
-            [modelID]: {
-                id: modelID,
-                name: `Mock ${modelID}`,
-                cost: { input: 0, output: 0 },
-                limit: { context: opts.modelContextLimit ?? 200000, output: 8192 },
-                modalities: {
-                    input: ["text", "image", "pdf"],
-                    output: ["text"],
-                },
-                options: {},
-            },
+            [modelID]: mockModel(modelID, opts.modelContextLimit ?? 200000),
+            ...(withHistorianModel && historianModel
+                ? { [historianModel.id]: mockModel(historianModel.id, historianModel.contextLimit) }
+                : {}),
         },
     });
 
@@ -305,7 +338,7 @@ function writeConfigs(
         // detector disables itself and the plugin becomes a no-op.
         compaction: { auto: false, prune: false },
         provider: {
-            [mockProviderID]: providerConfig(mockProviderAPI, mockModelID),
+            [mockProviderID]: providerConfig(mockProviderAPI, mockModelID, true),
             ...(mockProviderAPI === "@ai-sdk/openai"
                 ? {
                       "mock-anthropic-setup": providerConfig(
@@ -342,11 +375,18 @@ function writeConfigs(
         execute_threshold_percentage: 40,
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
-        ...pinMockAgents(opts.magicContextConfig, `${mockProviderID}/${mockModelID}`),
+        ...pinMockAgents(
+            opts.magicContextConfig,
+            `${mockProviderID}/${mockModelID}`,
+            "opencode",
+            historianModel ? { historian: `${mockProviderID}/${historianModel.id}` } : {},
+        ),
     };
     if (opts.userSubcConnectionFile) {
         magicContext.subc = { connection_file: opts.userSubcConnectionFile };
     }
+
+    if (opts.omitConfigDirCompaction) delete opencodeConfig.compaction;
 
     writeFileSync(join(env.configDir, "opencode.json"), JSON.stringify(opencodeConfig, null, 2));
     if (process.env.MC_E2E_TRACE_PROVIDER === "1") {
@@ -366,6 +406,19 @@ function writeConfigs(
         join(userConfigDir, "magic-context.jsonc"),
         JSON.stringify(magicContext, null, 2),
     );
+
+    // Same directory, but this file is OpenCode's own global config — the layer
+    // a launcher's OPENCODE_CONFIG_DIR sits on top of rather than replacing.
+    if (opts.openCodeGlobalConfigExtra) {
+        writeFileSync(
+            join(userConfigDir, "opencode.json"),
+            JSON.stringify(
+                { $schema: "https://opencode.ai/config.json", ...opts.openCodeGlobalConfigExtra },
+                null,
+                2,
+            ),
+        );
+    }
 
     // Project-tier config: written to the hard-cutover location the loader reads,
     // `<workdir>/.cortexkit/magic-context.jsonc`. Rust mode is opted in here via
@@ -645,6 +698,11 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     childEnv.XDG_CONFIG_HOME = env.configDir;
     childEnv.XDG_DATA_HOME = env.dataDir;
     childEnv.XDG_CACHE_HOME = env.cacheDir;
+    childEnv.XDG_STATE_HOME = join(env.dataDir, "state");
+    childEnv.XDG_RUNTIME_DIR = join(env.dataDir, "runtime");
+    childEnv.OPENCODE_DB = join(env.dataDir, "opencode", "opencode.db");
+    // The child must not inherit a storage override pointing outside its per-test data home.
+    childEnv.MAGIC_CONTEXT_STORAGE_DIR = join(env.dataDir, "cortexkit", "magic-context");
     // Ensure anthropic doesn't bail for missing env vars — we use a fake key.
     childEnv.ANTHROPIC_API_KEY = "test-key-not-real";
     // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
@@ -653,6 +711,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
         childEnv[key] = value;
     }
+    childEnv.TMPDIR = hostExtractCache();
     const pluginLogPath =
         childEnv.MAGIC_CONTEXT_LOG_PATH?.trim() ||
         join(env.dataDir, "cortexkit", "magic-context-e2e.log");
@@ -754,6 +813,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     return {
         url,
         port,
+        pid: child.pid!,
         env,
         stdout: () => stdoutBuf,
         stderr: () => stderrBuf,

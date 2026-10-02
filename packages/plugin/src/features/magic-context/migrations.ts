@@ -2,6 +2,7 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -52,6 +53,47 @@ function tableExists(db: Database, name: string): boolean {
         db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
     );
 }
+
+/**
+ * Session-scoped (and singleton cursor) tables whose `harness` column the
+ * OpenCode 1.x/2.x relabel touches. Named so a structural test can prove every
+ * DDL-declared harness table is covered: a table added later without being
+ * listed goes red.
+ *
+ * The name records history — v85 rewrote every one of these to `opencode` — but
+ * the list is now consumed by v87, which decides each session's label from the
+ * OpenCode store instead of assuming one direction.
+ */
+
+export const V85_OPENCODE2_RELABEL_TABLES = [
+    "tags",
+    "pending_ops",
+    "source_contents",
+    "compartments",
+    "compartment_chunk_embeddings",
+    "session_projects",
+    "compartment_events",
+    "compression_depth",
+    "session_facts",
+    "primer_candidates",
+    "notes",
+    "message_history_index",
+    "message_history_source",
+    "pending_session_cleanup",
+    "message_history_orphan_sweep",
+    "session_meta",
+    "subagent_invocations",
+    "historian_runs",
+    "transform_decisions",
+    "recomp_compartments",
+    "recomp_facts",
+] as const;
+
+/**
+ * Runtime-created singleton (not part of initializeDatabase), carried in the
+ * relabel set so a live upgrade sees it when it exists.
+ */
+export const V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"] as const;
 
 /**
  * Heal compartments stranded by a mismatched tier closing tag (issue #246).
@@ -144,7 +186,13 @@ function authorityPrivilegeCheck(): string {
     return "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 }
 
-function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
+/**
+ * SQL predicate that is true when a `notes` row belongs to a project whose notes the
+ * Rust module owns. `row` names the row being tested: `OLD`/`NEW` inside the
+ * authority triggers, or the table name when an ordinary statement must skip the
+ * rows those triggers would refuse.
+ */
+export function managedAuthorityNoteRow(row: "OLD" | "NEW" | "notes"): string {
     return `(
         EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
         OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)
@@ -2923,6 +2971,189 @@ export const MIGRATIONS: Migration[] = [
             if (!tableExists(db, "session_meta")) return;
             ensureColumn(db, "session_meta", "protected_tokens_effective", "INTEGER");
             ensureColumn(db, "session_meta", "protected_tokens_pre_snapshot", "TEXT");
+        },
+    },
+    {
+        version: 85,
+        description:
+            "relabel OpenCode 1.x mis-tagged opencode2 session rows (inert; superseded by v87)",
+        up(): void {
+            // INERT since v87. This migration used to rewrite EVERY harness='opencode2'
+            // row to 'opencode', on the premise that no released Magic Context had run
+            // on a real OpenCode 2 host, so such a row could only be the OpenCode 1.x
+            // mislabel (an ungated setup() on a 1.18.x seat locked the harness to
+            // "opencode2"). Early adopters broke that premise: issue #475 reported a
+            // genuine OpenCode 2.0.7 server whose 2,788 tags and 32 session_meta rows
+            // were relabelled away from the host that was still writing them, which
+            // hid every earlier drop decision from it.
+            //
+            // The body is empty rather than deleted so the version keeps its place in
+            // the ledger: an install that has not reached 85 still records it and then
+            // gets the evidence-based decision from v87, and an install that already
+            // applied 85 is repaired by v87 in the direction its own OpenCode store
+            // supports. A hand-inserted schema_migrations row for 85 (the workaround
+            // in #475) is equivalent to running this no-op.
+        },
+    },
+    {
+        version: 86,
+        description: "track tag identity changes per session",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta") || !tableExists(db, "tags")) return;
+            ensureColumn(db, "session_meta", "tags_version", "INTEGER NOT NULL DEFAULT 0");
+            // Clone/import paths can write tags before session bootstrap, so a trigger-created
+            // metadata row must carry the same explicit defaults as ensureSessionMetaRow.
+            db.exec(`
+                CREATE TRIGGER IF NOT EXISTS tags_version_ai AFTER INSERT ON tags BEGIN
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    ) VALUES(NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS tags_version_ad AFTER DELETE ON tags BEGIN
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS tags_version_au
+                AFTER UPDATE OF session_id, message_id, tag_number, type, tool_owner_message_id, status
+                ON tags BEGIN
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    )
+                    SELECT NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0
+                    WHERE NEW.session_id != OLD.session_id
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                END;
+            `);
+        },
+    },
+    {
+        version: 87,
+        description: "repair OpenCode harness labels from host-store evidence",
+        up(db: Database): void {
+            // Issue #475. Decide each session's harness label from the OpenCode store
+            // the runtime reads — the generation that wrote the session most recently
+            // owns the label — and move rows in whichever direction that evidence
+            // points. This both guards installs that never applied v85 and repairs the
+            // ones it already rewrote. With no readable store nothing moves: the
+            // affected sessions are recorded for doctor instead of guessed at.
+            repairOpenCode2HarnessLabels(db, {
+                tables: [...V85_OPENCODE2_RELABEL_TABLES, ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES],
+            });
+        },
+    },
+    {
+        version: 88,
+        description: "record the store projection each session's coordinates were derived against",
+        up(db: Database): void {
+            // Issue 492 finding 1. Every conversational coordinate Magic Context
+            // saves (compartment endpoints, note anchors, search-index ordinals,
+            // the protected-tail floor) is a POSITION in the message list the
+            // running OpenCode host serves. OpenCode 2 converts a 1.x store into a
+            // second projection of the same conversation while keeping the 1.x
+            // tables, so the same session can be served under either projection
+            // depending on which host opens it — and the two number the messages
+            // differently. These columns give the rebase something durable to
+            // compare against and somewhere to record what it could not re-derive.
+            //
+            // coordinate_generation is NULLABLE with no default on purpose: an
+            // existing session has never recorded one, and "not recorded" must stay
+            // distinguishable from "recorded as v1".
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(db, "session_meta", "coordinate_generation", "TEXT");
+                ensureColumn(db, "session_meta", "coordinate_rebase_notice", "TEXT");
+            }
+            // Existing rows are 'ok': they were written against the projection that
+            // was live at the time, and the first rebase pass decides them properly.
+            if (tableExists(db, "compartments")) {
+                ensureColumn(db, "compartments", "rebase_status", "TEXT NOT NULL DEFAULT 'ok'");
+            }
+            if (tableExists(db, "recomp_compartments")) {
+                ensureColumn(
+                    db,
+                    "recomp_compartments",
+                    "rebase_status",
+                    "TEXT NOT NULL DEFAULT 'ok'",
+                );
+            }
+        },
+    },
+    {
+        version: 89,
+        description: "persist indexed message creation times for date-bounded search",
+        up(db: Database): void {
+            if (!tableExists(db, "message_fts_rowid_map")) return;
+            ensureColumn(db, "message_fts_rowid_map", "message_time_ms", "INTEGER");
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_message_fts_rowid_map_session_time
+                    ON message_fts_rowid_map(session_id, message_time_ms);
+                CREATE TABLE IF NOT EXISTS message_time_backfill_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    cursor_session_id TEXT NOT NULL DEFAULT '',
+                    cursor_ordinal INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO message_time_backfill_state
+                    (id, cursor_session_id, cursor_ordinal, completed, updated_at)
+                VALUES (1, '', 0, 0, 0);
+            `);
+        },
+    },
+    {
+        version: 90,
+        description: "record compartment lease owner pids",
+        up(db: Database): void {
+            if (!tableExists(db, "compartment_state_lease")) return;
+            ensureColumn(db, "compartment_state_lease", "owner_pid", "INTEGER");
+        },
+    },
+    {
+        version: 91,
+        description: "per-project embedding high-water mark for memories written outside this host",
+        up(db: Database): void {
+            // Vectors are computed by host code, not by a database trigger: a memory
+            // row inserted by another writer arrives with no embedding and nothing
+            // asks for one. The Rust module writes project memories directly in
+            // single-store mode, so it records the highest memory id it wrote here
+            // and the host's ordinary backfill loop drains everything above the
+            // embedded mark. A high-water mark rather than a per-row column keeps
+            // the memories table untouched, so a row written by either writer is
+            // byte-identical.
+            //
+            // embedded_memory_id is what the host has already handed to the embedder;
+            // written_memory_id is what the other writer has produced. Equal values
+            // mean there is nothing to drain.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS memory_embedding_watermarks (
+                    project_path TEXT PRIMARY KEY,
+                    written_memory_id INTEGER NOT NULL DEFAULT 0,
+                    embedded_memory_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+            `);
         },
     },
 ];

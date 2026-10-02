@@ -43,6 +43,8 @@ import {
     normalizeRequestBody,
 } from "./cache-bust-body-sources";
 
+import { withSchedulerLogFallback } from "./cache-bust-scheduler-log";
+
 type Json = Record<string, unknown>;
 type ByteVerdict = "BUST" | "STABLE";
 type MeterVerdict = ByteVerdict | "LATENCY" | "UNMETERED";
@@ -68,6 +70,7 @@ interface Args {
     allBusts: boolean;
     allRows: boolean;
     help: boolean;
+    mcLogPath?: string;
 }
 
 interface MeterUsage {
@@ -89,6 +92,7 @@ interface Snapshot {
     session: string;
     messagesCount: number;
     provider: BodyProvider;
+    wireModel?: string;
     sourceDir: string;
     segments: Segment[];
     usage?: MeterUsage;
@@ -120,6 +124,11 @@ export interface OpenCodeCacheBustAnalysisOptions {
     anthropicDir?: string;
     openaiDir?: string;
     decisions?: readonly CacheBustDecisionAttribution[];
+    /** Use scheduler lines when a pass has no DB row; null disables this additional evidence source. */
+    mcLogPath?: string | null;
+    scanCursor?: string;
+    scanDeadlineMs?: number;
+    scanNow?: () => number;
 }
 
 interface DumpCandidate {
@@ -144,6 +153,7 @@ function parseArgs(argv: string[]): Args {
     };
     const valueOptions = new Set([
         "--session",
+        "--mc-log",
         "--dir",
         "--anthropic-dir",
         "--openai-dir",
@@ -187,6 +197,7 @@ function parseArgs(argv: string[]): Args {
           ];
     return {
         sessionPrefix: getOpt("--session") ?? positionalSession,
+        mcLogPath: getOpt("--mc-log"),
         sources,
         since: getOpt("--since"),
         until: getOpt("--until"),
@@ -246,6 +257,10 @@ function buildSegments(
             id: `message[${index}] ${describeNormalizedMessage(message)}`,
         })),
     };
+}
+
+function wireModel(body: Json): string | undefined {
+    return typeof body.model === "string" && body.model.length > 0 ? body.model : undefined;
 }
 
 function asJson(value: unknown): Json | undefined {
@@ -461,11 +476,11 @@ function discoverDumpCandidates(opts: Args): DumpCandidate[] {
     );
 }
 
-function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args): Snapshot[] {
+function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args, selectedFiles?: readonly string[]): Snapshot[] {
     const since = resolveTimeBound(opts.since);
     const until = resolveTimeBound(opts.until);
     const snapshots: Snapshot[] = [];
-    for (const metaFile of readdirSync(candidate.source.dir).filter((file) =>
+    for (const metaFile of selectedFiles ?? readdirSync(candidate.source.dir).filter((file) =>
         file.endsWith(".meta.json"),
     )) {
         const dumpName = parseDumpFilename(metaFile);
@@ -499,6 +514,7 @@ function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args): Snapshot[
                 session: candidate.session,
                 messagesCount: normalized.segments.length,
                 provider: normalized.provider,
+                wireModel: wireModel(body),
                 sourceDir: candidate.source.dir,
                 segments: normalized.segments,
                 usage: loadMeterUsage(responsePath, normalized.provider),
@@ -553,6 +569,7 @@ function openCodeAnalyzerCommand(
         "--show-diff",
         "--all-rows",
     ];
+    if (options.mcLogPath) args.push("--mc-log", shellQuote(options.mcLogPath));
     if (options.anthropicDir) {
         args.push("--anthropic-dir", shellQuote(options.anthropicDir));
     }
@@ -565,7 +582,7 @@ function openCodeAnalyzerCommand(
 /** Analyze one exact OpenCode session without printing or mutating any source store. */
 export function analyzeOpenCodeCacheBustSession(
     options: OpenCodeCacheBustAnalysisOptions,
-): CacheBustSessionAnalysis {
+): CacheBustSessionAnalysis & { filesExamined: number; scanBounded: boolean; scanCursor?: string } {
     const sources: DumpSource[] = [
         {
             provider: "anthropic",
@@ -592,18 +609,57 @@ export function analyzeOpenCodeCacheBustSession(
         allRows: true,
         help: false,
     };
-    const snapshots = discoverDumpCandidates(args)
-        .filter((candidate) => candidate.session === options.sessionId)
-        .flatMap((candidate) => loadCandidateSnapshots(candidate, args));
+    const scanNow = options.scanNow ?? Date.now;
+    let filesExamined = 0;
+    let nextCursor: string | undefined;
+    let scanBounded = false;
+    const snapshots = options.scanDeadlineMs === undefined
+        ? discoverDumpCandidates(args)
+            .filter((candidate) => candidate.session === options.sessionId)
+            .flatMap((candidate) => loadCandidateSnapshots(candidate, args))
+        : (() => {
+            // Filenames carry session and request time; only open new files and two
+            // preceding requests needed for the first comparison in the batch.
+            const indexed = sources.flatMap((source) => existsSync(source.dir)
+                ? readdirSync(source.dir).flatMap((file) => {
+                    if (!file.endsWith(".meta.json")) return [];
+                    const parsed = parseDumpFilename(file);
+                    if (!parsed || parsed.session !== options.sessionId) return [];
+                    return [{ source, file, timestamp: Date.parse(parsed.createdAt), sequence: parsed.sequence }];
+                }) : []);
+            indexed.sort((a, b) => a.timestamp - b.timestamp || a.sequence - b.sequence ||
+                a.file.localeCompare(b.file) || a.source.provider.localeCompare(b.source.provider));
+            const key = (entry: typeof indexed[number]) => `${String(entry.timestamp).padStart(16, "0")}:${String(entry.sequence).padStart(8, "0")}:${entry.file}:${entry.source.provider}`;
+            const pending = indexed.filter((entry) => entry.timestamp <= (options.untilInclusiveMs ?? Infinity) &&
+                (options.scanCursor ? key(entry) > options.scanCursor : entry.timestamp > (options.sinceExclusiveMs ?? -Infinity)));
+            const chosen: typeof indexed = [];
+            for (const entry of pending) {
+                if (chosen.length && (chosen.length >= 32 || scanNow() >= options.scanDeadlineMs!)) {
+                    scanBounded = true;
+                    break;
+                }
+                chosen.push(entry);
+            }
+            filesExamined = chosen.length;
+            if (chosen.length) nextCursor = key(chosen.at(-1)!);
+            const first = indexed.indexOf(chosen[0]);
+            const selected = first < 0 ? [] : [...indexed.slice(Math.max(0, first - 2), first), ...chosen];
+            return sources.flatMap((source) => loadCandidateSnapshots(
+                { source, session: options.sessionId, latestMtimeMs: 0, totalBytes: 0, dumpCount: 0 },
+                args, selected.filter((entry) => entry.source === source).map((entry) => entry.file),
+            ));
+        })();
     snapshots.sort(
         (left, right) =>
             left.orderCreatedAt.localeCompare(right.orderCreatedAt) ||
             left.sequence - right.sequence ||
             left.file.localeCompare(right.file),
     );
-    const inWindow = (timestampMs: number): boolean =>
-        (options.sinceExclusiveMs === undefined || timestampMs > options.sinceExclusiveMs) &&
-        (options.untilInclusiveMs === undefined || timestampMs <= options.untilInclusiveMs);
+    const inWindow = (snapshot: Snapshot): boolean =>
+        (options.scanCursor
+            ? `${String(Date.parse(snapshot.createdAt)).padStart(16, "0")}:${String(snapshot.sequence).padStart(8, "0")}:${snapshot.file}:${sources.find((source) => source.dir === snapshot.sourceDir)?.provider}` > options.scanCursor
+            : options.sinceExclusiveMs === undefined || Date.parse(snapshot.createdAt) > options.sinceExclusiveMs) &&
+        (options.untilInclusiveMs === undefined || Date.parse(snapshot.createdAt) <= options.untilInclusiveMs);
     const boundedSnapshots = snapshots.filter((snapshot) => {
         const timestampMs = Date.parse(snapshot.createdAt);
         return (
@@ -612,7 +668,7 @@ export function analyzeOpenCodeCacheBustSession(
         );
     });
     const firstNewIndex = boundedSnapshots.findIndex((snapshot) =>
-        inWindow(Date.parse(snapshot.createdAt)),
+        inWindow(snapshot),
     );
     const analysisSnapshots =
         firstNewIndex < 0
@@ -620,10 +676,10 @@ export function analyzeOpenCodeCacheBustSession(
             : boundedSnapshots.slice(
                   options.sinceExclusiveMs === undefined ? 0 : Math.max(0, firstNewIndex - 2),
               );
-    const rows = analyzeSnapshots(analysisSnapshots, options.decisions);
+    const rows = analyzeSnapshots(analysisSnapshots, withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath));
     const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
         const timestampMs = Date.parse(row.current.createdAt);
-        if (!Number.isFinite(timestampMs) || !inWindow(timestampMs)) return [];
+            if (!Number.isFinite(timestampMs) || !inWindow(row.current)) return [];
         const segment =
             row.divergenceIndex < 0
                 ? undefined
@@ -642,17 +698,29 @@ export function analyzeOpenCodeCacheBustSession(
                         ? "(first request)"
                         : (segment?.id ?? "(identical normalized prefix)"),
                 analyzerCmd: openCodeAnalyzerCommand(row, options),
+                ...(row.decision?.identityDelta
+                    ? { identityDelta: row.decision.identityDelta }
+                    : {}),
             },
         ];
     });
     const analyzedRequestTimestamps = boundedSnapshots
-        .map((snapshot) => Date.parse(snapshot.createdAt))
-        .filter(inWindow);
+        .filter((snapshot) => !isUsageMissing(snapshot))
+        .filter(inWindow)
+        .map((snapshot) => Date.parse(snapshot.createdAt));
     return {
         requests,
         highWaterMarkMs:
             analyzedRequestTimestamps.length > 0 ? Math.max(...analyzedRequestTimestamps) : null,
+        filesExamined,
+        scanBounded,
+        scanCursor: scanBounded ? nextCursor : undefined,
     };
+}
+
+function isUsageMissing(snapshot: Snapshot): boolean {
+    const usage = snapshot.usage;
+    return usage === undefined || (usage.cacheRead === 0 && usage.input === 0);
 }
 
 /** First wire-order segment index where prev/cur diverge (added/removed/changed). */
@@ -688,32 +756,76 @@ function lastBreakpointIndex(segs: Segment[]): number {
     return last;
 }
 
+/**
+ * Does the divergence land inside the prefix the previous request left cached?
+ *
+ * Anthropic writes the cache at the breakpoints of the request that was sent, so
+ * the reusable prefix ends at the PREVIOUS request's last breakpoint. Measuring
+ * against the CURRENT request's last breakpoint instead made every appended
+ * message look like a bust: this client moves its tail cache_control marker onto
+ * the newest message, so the marker always sat at or after the append and the
+ * append always looked like it fell inside a cached prefix that did not yet
+ * exist. OpenAI has no breakpoints — its prefix cache is implicit, so only an
+ * in-place change or removal inside the previous prompt busts it.
+ */
+function bustsReusablePrefix(
+    previous: Snapshot,
+    current: Snapshot,
+    divergenceIndex: number,
+): boolean {
+    if (divergenceIndex < 0) return false;
+    return current.provider === "openai"
+        ? divergenceIndex < previous.segments.length
+        : divergenceIndex <= lastBreakpointIndex(previous.segments);
+}
+
 export function analyzeSnapshots(
     snaps: readonly Snapshot[],
-    decisions: readonly CacheBustDecisionAttribution[] = [],
+    decisionsAndMarkers: readonly CacheBustDecisionAttribution[] = [],
 ): AnalysisRow[] {
+    // Disruption markers explain a following epoch HARD but never serve a request, so
+    // they stay out of every request join.
+    const decisions = decisionsAndMarkers.filter((record) => record.disruption === undefined);
+    const disruptions = decisionsAndMarkers.filter(
+        (record) =>
+            record.disruption !== undefined ||
+            ["error", "need_full_sync", "parked"].includes(record.decision.toLowerCase()),
+    );
+    // Only an adapter log that recorded this session's passes can show that nothing
+    // disrupted it; without one the disruption question stays unanswered.
+    const disruptionEvidence = decisionsAndMarkers.some(
+        (record) => record.source === "rust pass log",
+    );
+    const precedingDisruption = (
+        pass: CacheBustDecisionAttribution | undefined,
+    ): string | null | undefined => {
+        if (!pass || !disruptionEvidence) return undefined;
+        const latest = disruptions
+            .filter(
+                (record) =>
+                    record.timestampMs <= pass.timestampMs &&
+                    pass.timestampMs - record.timestampMs <= 60_000,
+            )
+            .sort((left, right) => left.timestampMs - right.timestampMs)
+            .at(-1);
+        return latest ? (latest.disruption ?? latest.decision.toLowerCase()) : null;
+    };
     let previousShortRead = false;
     let previousBustDivergenceIndex: number | undefined;
+    let previousMetered: Snapshot | undefined;
     const rows: AnalysisRow[] = [];
     for (let index = 0; index < snaps.length; index += 1) {
         const current = snaps[index];
-        if (index === 0) {
-            rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
-            continue;
-        }
-        const previous = snaps[index - 1];
-        const divergenceIndex = firstDivergence(previous.segments, current.segments);
-        // Anthropic exposes explicit breakpoints. OpenAI's cache is an implicit prefix,
-        // so an in-place change/removal busts while ordinary appended input does not.
-        const byteBust =
-            current.provider === "openai"
-                ? divergenceIndex >= 0 && divergenceIndex < previous.segments.length
-                : divergenceIndex !== -1 &&
-                  divergenceIndex <= lastBreakpointIndex(current.segments);
-        const byteVerdict: ByteVerdict = byteBust ? "BUST" : "STABLE";
-        if (!current.usage || !previous.usage) {
-            previousShortRead = false;
-            previousBustDivergenceIndex = undefined;
+        if (isUsageMissing(current)) {
+            const previous = previousMetered;
+            const divergenceIndex = previous
+                ? firstDivergence(previous.segments, current.segments)
+                : -1;
+            const byteVerdict = previous
+                ? bustsReusablePrefix(previous, current, divergenceIndex)
+                    ? "BUST"
+                    : "STABLE"
+                : undefined;
             rows.push({
                 current,
                 previous,
@@ -721,10 +833,22 @@ export function analyzeSnapshots(
                 byteVerdict,
                 verdict: "UNMETERED",
                 meterVsBytes: "UNMETERED",
+                divergenceClass: "usage_missing",
             });
             continue;
         }
-        const prevTotal = previous.usage.total;
+        if (!previousMetered) {
+            rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
+            previousMetered = current;
+            continue;
+        }
+        const previous = previousMetered;
+        if (!previous.usage || !current.usage) continue;
+        const divergenceIndex = firstDivergence(previous.segments, current.segments);
+        const byteVerdict: ByteVerdict = bustsReusablePrefix(previous, current, divergenceIndex)
+            ? "BUST"
+            : "STABLE";
+        const prevTotal = previous.usage!.total;
         const epsilon = Math.max(64, previous.usage.input);
         const meterFloor = prevTotal - epsilon;
         // Anthropic separates direct input from cache writes, so it belongs in the
@@ -765,9 +889,12 @@ export function analyzeSnapshots(
             divergenceIndex < 0
                 ? undefined
                 : (current.segments[divergenceIndex] ?? previous.segments[divergenceIndex]);
+        // A LATENCY row is also classified: a short read over an unchanged reusable
+        // prefix is a provider-side fact and deserves a name, not a blank cell.
         const divergenceClass =
-            verdict === "BUST"
+            verdict === "BUST" || verdict === "LATENCY"
                 ? classifyCacheBust({
+                      providerShortReadWithIdenticalPrefix: verdict === "LATENCY",
                       divergenceIndex,
                       previousMessageCount: previous.segments.length,
                       previousBustDivergenceIndex,
@@ -775,10 +902,30 @@ export function analyzeSnapshots(
                       currentProvider: current.provider,
                       firstDivergenceRole: divergentSegment?.role,
                       firstDivergenceSize: divergentSegment?.bytes,
-                      rewrittenTokens,
-                      cacheCreationTokens: current.usage.cacheCreation,
-                      promptTokens: prevTotal,
-                      inheritedFold: attributionDecision !== decision,
+                       rewrittenTokens,
+                       cacheCreationTokens: current.usage.cacheCreation,
+                       promptTokens: prevTotal,
+                       providerComparableRead: current.usage.cacheRead,
+                       directInput: current.usage.input,
+                       previousTotal: prevTotal,
+                       previousModel: previous.wireModel,
+                       currentModel: current.wireModel,
+                       ocInputStepRatio: (() => {
+                           if (attributionDecision?.inputCount === undefined) return undefined;
+                           const recentCounts = decisions
+                               .filter(
+                                   (candidate) =>
+                                       candidate.inputCount !== undefined &&
+                                       candidate.inputCount > 0 &&
+                                       candidate.timestampMs < attributionDecision.timestampMs &&
+                                       attributionDecision.timestampMs - candidate.timestampMs <= 120_000,
+                               )
+                               .map((candidate) => candidate.inputCount as number);
+                           return recentCounts.length > 0
+                               ? attributionDecision.inputCount / Math.min(...recentCounts)
+                               : undefined;
+                       })(),
+                        inheritedFold: attributionDecision !== decision,
                       contentEvidence: [previous, current]
                           .flatMap((snapshot) =>
                               snapshot.segments.slice(
@@ -789,9 +936,21 @@ export function analyzeSnapshots(
                           .map((segment) => segment.canonical)
                           .join("\n"),
                       decision: attributionDecision,
+                      previousEpochHard: attributionDecision
+                          ? decisions
+                                .filter(
+                                    (candidate) =>
+                                        candidate.timestampMs < attributionDecision.timestampMs &&
+                                        candidate.materialized &&
+                                        candidate.materializeReason?.toLowerCase() === "epoch_change",
+                                )
+                                .at(-1)
+                          : undefined,
+                      precedingDisruption: precedingDisruption(attributionDecision),
                   })
                 : undefined;
         previousBustDivergenceIndex = verdict === "BUST" ? divergenceIndex : undefined;
+        previousMetered = current;
         rows.push({
             current,
             previous,
@@ -863,7 +1022,13 @@ function meterCell(row: AnalysisRow): string {
         row.current.provider === "openai"
             ? `cached=${read.toLocaleString()}`
             : `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}`;
-    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}`;
+    const wireModel =
+        row.previous?.wireModel &&
+        row.current.wireModel &&
+        row.previous.wireModel !== row.current.wireModel
+            ? `; wireModel=${row.previous.wireModel} → ${row.current.wireModel}`
+            : "";
+    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-cache-busts.ts --session <prefix> [options]
@@ -877,6 +1042,7 @@ Sources (both searched by default):
              WebSocket captures can have no response file and are UNMETERED.
 
 Options:
+  --mc-log <path>       scheduler log fallback (default: MAGIC_CONTEXT_LOG_PATH or harness log)
   --dir <path>          inspect one explicit directory (legacy override)
   --anthropic-dir <p>   override the Anthropic source
   --openai-dir <path>   override the OpenAI source
@@ -915,7 +1081,7 @@ function main(): void {
         );
         console.log("");
     }
-    const rows = analyzeSnapshots(snaps);
+    const rows = analyzeSnapshots(snaps, withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath));
     const provider = snaps[0].provider;
     const meterRule =
         snaps.find((snapshot) => snapshot.usage)?.usage?.rule ??

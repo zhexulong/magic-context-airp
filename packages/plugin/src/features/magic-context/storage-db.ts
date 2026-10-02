@@ -17,10 +17,15 @@ import {
     getMagicContextStorageDir,
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
+    type AsyncProcessInspection,
     classifyProcessKind,
     inspectLivePiProcesses,
+    inspectProcessesAsync,
+    inspectWindowsProcessesSync,
+    isOwnRpcServerRecord,
     isPidAlive,
     isPidIdentityPlausible,
     parseRpcPortFile,
@@ -105,7 +110,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 84;
+export const LATEST_SUPPORTED_VERSION = 91;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -523,7 +528,21 @@ function classifyJunkDiscovery(
  * evidence is fail-closed because it could be a concurrent write or an I/O
  * permission problem.
  */
-export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscovery {
+export function inspectRpcServerDiscovery(
+    storageDir: string,
+    processes?: AsyncProcessInspection,
+    options?: {
+        /** Give up after this many milliseconds. Only interactive CLI callers set it. */
+        deadlineMs?: number;
+        /** Report progress on long scans. Plugin hosts pass nothing, so nothing reaches their stderr. */
+        onProgress?: (checked: number, total: number) => void;
+    },
+): RpcServerDiscovery {
+    const deadline =
+        options?.deadlineMs === undefined
+            ? Number.POSITIVE_INFINITY
+            : Date.now() + options.deadlineMs;
+    let progressAt = Date.now() + 3_000;
     const rpcRoot = join(storageDir, "rpc");
     let projectEntries: Dirent[];
     try {
@@ -556,11 +575,20 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
         return { state: "absent", serverPids: [], staleFiles: [] };
     }
 
+    if (!processes && process.platform === "win32") processes = inspectWindowsProcessesSync();
     const pids = new Set<number>();
     const processByPid = new Map<number, FailClosedBlockingProcess>();
     const staleFiles: string[] = [];
     const inconclusivePids = new Set<number>();
-    for (const portFile of portFiles) {
+    for (const [index, portFile] of portFiles.entries()) {
+        if (Date.now() >= deadline)
+            throw new Error(
+                `RPC holder inspection timed out after ${Math.round((options?.deadlineMs ?? 0) / 1000)} seconds (${index}/${portFiles.length} records checked). Close OpenCode and Pi, then retry.`,
+            );
+        if (options?.onProgress && Date.now() >= progressAt) {
+            options.onProgress(index, portFiles.length);
+            progressAt = Date.now() + 3_000;
+        }
         let raw: string;
         try {
             raw = rpcDiscoveryFs.readFileSync(portFile, "utf8");
@@ -577,12 +605,18 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (junk) return junk;
             continue;
         }
-        const liveness = isPidAlive(record.pid);
+        // This process's own RPC server runs this build, so it can never be a host
+        // still holding an older one. Skipped before the liveness check so the file
+        // is neither reported as a blocker nor deleted as stale.
+        if (isOwnRpcServerRecord(record)) continue;
+        const liveness = processes ? processes.liveness(record.pid) : isPidAlive(record.pid);
         if (liveness === "dead") {
             staleFiles.push(portFile);
             continue;
         }
-        const evidence = readProcessProbeEvidence(record.pid);
+        const evidence = processes
+            ? processes.evidence(record.pid)
+            : readProcessProbeEvidence(record.pid);
         const identity = isPidIdentityPlausible(record, evidence);
         if (identity === "plausible") {
             pids.add(record.pid);
@@ -597,7 +631,14 @@ export function inspectRpcServerDiscovery(storageDir: string): RpcServerDiscover
             if (!previous || (previous.kind === "process" && detected.kind !== "process")) {
                 processByPid.set(record.pid, detected);
             }
-        } else if (identity === "implausible") {
+        } else if (
+            identity === "implausible" &&
+            !(
+                (processes?.processSnapshot?.source === "cim" ||
+                    processes?.processSnapshot?.source === "tasklist") &&
+                liveness === "alive"
+            )
+        ) {
             staleFiles.push(portFile);
         } else {
             inconclusivePids.add(record.pid);
@@ -739,21 +780,32 @@ function enforceMigrationOnOpenGuard(
     dbPath: string,
     dbDir: string,
     latestSupportedVersion: number,
+    processes?: AsyncProcessInspection,
 ): boolean {
     const persistedVersion = getPersistedSchemaVersion(db);
     if (persistedVersion >= latestSupportedVersion) {
         lastMigrationOnOpenRefusal = null;
         return true;
     }
-    const discovery = inspectRpcServerDiscovery(dbDir);
-    const piDiscovery = inspectLivePiProcesses();
+    const discovery = inspectRpcServerDiscovery(dbDir, processes);
+    const piDiscovery = processes?.pi ?? inspectLivePiProcesses();
     const piPids = migrationBlockingPiPids(dbPath, discovery, piDiscovery.processIds);
     const serverProcesses =
         discovery.serverProcesses ??
         (discovery.state === "live"
             ? discovery.serverPids.map((pid) => ({ kind: "process" as const, pid }))
             : []);
-    const blockingProcesses = [...serverProcesses, ...piPids.map(createPiBlockingProcess)];
+    const blockingProcesses = [
+        ...serverProcesses,
+        ...piPids.map((pid) =>
+            processes
+                ? attachFailClosedBlockingProcessEvidence(
+                      { kind: "Pi", pid },
+                      processes.evidence(pid),
+                  )
+                : createPiBlockingProcess(pid),
+        ),
+    ];
     if (
         (discovery.state === "absent" ||
             discovery.state === "stale" ||
@@ -865,20 +917,47 @@ function finishDatabaseOpen(
     // SQLite errors, and per-session failures are logged but
     // never fail-close the plugin. Lazy adoption covers rows the backfill could
     // not reach.
+    //
+    // The tool-owner and message-time backfills fill context.db rows from
+    // OpenCode's session store, which only an OpenCode process may read. In a Pi
+    // process they would walk every OpenCode session of every project, and the
+    // message-time pass would also advance its shared durable cursor past rows
+    // that the OpenCode process still has to fill. The rowid-map backfill reads
+    // only context.db and runs in every harness.
     if (!explicitDbPath) {
+        const readsOpenCodeStore = harnessOwnsOpenCodeStore();
         const runBackfills = () => {
-            try {
-                runToolOwnerBackfill(db);
-            } catch (error) {
-                log(
-                    `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
-                );
+            if (readsOpenCodeStore) {
+                try {
+                    runToolOwnerBackfill(db);
+                } catch (error) {
+                    log(
+                        `[magic-context] tool-owner backfill failed (continuing with lazy adoption fallback): ${getErrorMessage(error)}`,
+                    );
+                }
             }
-            void startMessageFtsRowidMapBackfill(db).catch((error) => {
-                log(
-                    `[magic-context] message FTS rowid-map backfill failed (will resume next startup): ${getErrorMessage(error)}`,
-                );
-            });
+            void startMessageFtsRowidMapBackfill(db)
+                .then(async () => {
+                    if (!readsOpenCodeStore) return;
+                    const [
+                        { readRawSessionMessagePage, readRawSessionMessages },
+                        { startMessageTimeBackfill },
+                    ] = await Promise.all([
+                        import("../../hooks/magic-context/read-session-chunk"),
+                        import("./message-time-backfill"),
+                    ]);
+                    await startMessageTimeBackfill(
+                        db,
+                        Object.assign(readRawSessionMessages, {
+                            readPage: readRawSessionMessagePage,
+                        }),
+                    );
+                })
+                .catch((error) => {
+                    log(
+                        `[magic-context] message-index backfill failed (will resume next startup): ${getErrorMessage(error)}`,
+                    );
+                });
         };
         if (bootQuietRemainingMs() > 0) scheduleAfterBootQuiet(runBackfills);
         else runBackfills();
@@ -947,7 +1026,7 @@ export function initializeDatabase(
       tag_id INTEGER,
       session_id TEXT,
       content TEXT,
-      created_at INTEGER,
+      created_at INTEGER, -- epoch ms; Date.now() on source writes, preserved on session clones
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, tag_id)
     );
@@ -971,7 +1050,7 @@ export function initializeDatabase(
       p1_embedding BLOB,
       p1_embedding_model_id TEXT,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -990,7 +1069,7 @@ export function initializeDatabase(
       model_id TEXT NOT NULL,
       dims INTEGER NOT NULL,
       vector BLOB NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(compartment_id, model_id, window_index)
     );
     CREATE INDEX IF NOT EXISTS idx_cce_session ON compartment_chunk_embeddings(session_id);
@@ -1013,7 +1092,7 @@ export function initializeDatabase(
       kind TEXT NOT NULL,
       at_compartment INTEGER,
       fields_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
     CREATE INDEX IF NOT EXISTS idx_compartment_events_session
@@ -1022,6 +1101,7 @@ export function initializeDatabase(
     CREATE TABLE IF NOT EXISTS compartment_state_lease (
       session_id TEXT PRIMARY KEY NOT NULL,
       holder_id TEXT NOT NULL,
+      owner_pid INTEGER,
       acquired_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL
     );
@@ -1042,7 +1122,7 @@ export function initializeDatabase(
       session_id TEXT NOT NULL,
       category TEXT NOT NULL,
       content TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL,
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
@@ -1061,7 +1141,7 @@ export function initializeDatabase(
       source_message_time INTEGER NOT NULL,
       question_embedding BLOB,
       question_embedding_model_id TEXT,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       UNIQUE(project_path, harness, session_id, source_start_message_id, source_end_message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_primer_candidates_project_time
@@ -1084,7 +1164,7 @@ export function initializeDatabase(
       answer_refreshed_at INTEGER,
       source_candidate_ids TEXT NOT NULL DEFAULT '[]',
       source_candidate_provenance TEXT,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_primers_project_status_observed
@@ -1197,7 +1277,7 @@ export function initializeDatabase(
       job_id TEXT,
       cursor TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       updated_at INTEGER NOT NULL DEFAULT 0,
       UNIQUE(session_id, request_key)
     );
@@ -1238,7 +1318,7 @@ export function initializeDatabase(
       shadow_epoch INTEGER NOT NULL DEFAULT 0,
       corpus_hash TEXT NOT NULL DEFAULT '',
       coverage_json TEXT NOT NULL DEFAULT '{}',
-      created_at INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL DEFAULT 0, -- epoch ms (Date.now())
       UNIQUE(dedup_key, cohort_key)
     );
     CREATE INDEX IF NOT EXISTS idx_embedding_measurement_session
@@ -1449,6 +1529,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       session_id TEXT NOT NULL,
       message_ordinal INTEGER NOT NULL,
       fts_rowid INTEGER NOT NULL,
+      message_time_ms INTEGER,
       PRIMARY KEY(session_id, message_ordinal)
     );
 
@@ -1461,6 +1542,26 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
       (id, watermark_rowid, completed, updated_at)
     VALUES (1, 0, 0, 0);
+
+    CREATE TABLE IF NOT EXISTS message_time_backfill_state (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      cursor_session_id TEXT NOT NULL DEFAULT '',
+      cursor_ordinal INTEGER NOT NULL DEFAULT 0,
+      completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO message_time_backfill_state
+      (id, cursor_session_id, cursor_ordinal, completed, updated_at)
+    VALUES (1, '', 0, 0, 0);
+
+    -- Highest memory id another writer (the Rust module in single-store mode) put
+    -- into memories for a project, and how far this host has embedded. Migration v91.
+    CREATE TABLE IF NOT EXISTS memory_embedding_watermarks (
+      project_path TEXT PRIMARY KEY,
+      written_memory_id INTEGER NOT NULL DEFAULT 0,
+      embedded_memory_id INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
 
     CREATE TABLE IF NOT EXISTS message_history_index (
       session_id TEXT PRIMARY KEY,
@@ -1516,6 +1617,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       last_response_time INTEGER,
       cache_ttl TEXT,
       counter INTEGER DEFAULT 0,
+      tags_version INTEGER NOT NULL DEFAULT 0,
       last_nudge_tokens INTEGER DEFAULT 0,
       last_nudge_band TEXT DEFAULT '',
       last_nudge_undropped INTEGER DEFAULT 0,
@@ -1670,7 +1772,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance_avg REAL,
       discarded_last INTEGER NOT NULL DEFAULT 0,
       legacy INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL -- epoch ms (Date.now())
     );
     CREATE INDEX IF NOT EXISTS idx_historian_runs_session
       ON historian_runs(session_id, created_at DESC);
@@ -1702,6 +1804,50 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
 
     CREATE INDEX IF NOT EXISTS idx_tags_session_tag_number ON tags(session_id, tag_number);
     CREATE INDEX IF NOT EXISTS idx_tags_session_message_id ON tags(session_id, message_id);
+
+    -- Clone/import paths can write tags before session bootstrap. Keep trigger-created
+    -- metadata rows aligned with the explicit defaults in ensureSessionMetaRow.
+    CREATE TRIGGER IF NOT EXISTS tags_version_ai AFTER INSERT ON tags BEGIN
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      ) VALUES(NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS tags_version_ad AFTER DELETE ON tags BEGIN
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS tags_version_au
+    AFTER UPDATE OF session_id, message_id, tag_number, type, tool_owner_message_id, status ON tags BEGIN
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+      INSERT INTO session_meta(
+        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+        system_prompt_hash, cleared_reasoning_through_tag
+      )
+      SELECT NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0
+      WHERE NEW.session_id != OLD.session_id
+      ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+    END;
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session ON pending_ops(session_id);
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session_tag_id ON pending_ops(session_id, tag_id);
     CREATE INDEX IF NOT EXISTS idx_source_contents_session ON source_contents(session_id);
@@ -1723,7 +1869,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       importance INTEGER NOT NULL DEFAULT 50,
       episode_type TEXT,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
@@ -1734,7 +1880,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       category TEXT NOT NULL,
       content TEXT NOT NULL,
       pass_number INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL, -- epoch ms (Date.now())
       harness TEXT NOT NULL DEFAULT 'opencode'
     );
 
@@ -1746,6 +1892,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     CREATE INDEX IF NOT EXISTS idx_memories_project_category_hash ON memories(project_path, category, normalized_hash);
     CREATE INDEX IF NOT EXISTS idx_message_history_index_updated_at ON message_history_index(updated_at);
   `);
+
+    ensureColumn(db, "message_fts_rowid_map", "message_time_ms", "INTEGER");
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_message_fts_rowid_map_session_time
+        ON message_fts_rowid_map(session_id, message_time_ms);
+    `);
 
     ensureColumn(db, "primer_candidates", "harness", "TEXT NOT NULL DEFAULT 'opencode'");
     ensureColumn(db, "primer_candidates", "source_start_message_id", "TEXT NOT NULL DEFAULT ''");
@@ -1833,6 +1985,16 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "historian_last_failure_at", "INTEGER DEFAULT NULL");
     ensureColumn(db, "session_meta", "system_prompt_hash", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "cleared_reasoning_through_tag", "INTEGER DEFAULT 0");
+    // The tags_version_* triggers above are DURABLE schema: their bodies write this
+    // column on every tag write, and SQLite re-resolves a trigger body whenever it
+    // reparses the schema (any ALTER TABLE ... RENAME does). A database whose
+    // session_meta predates the column therefore carries a trigger that cannot be
+    // compiled, and the migration chain that would eventually add the column has to
+    // get past its own table rebuilds first — the embedding rebuild dropped
+    // memory_embeddings and then could not rename its replacement into place. Heal
+    // the column here, alongside every other column those trigger bodies name, so
+    // the schema is always compilable before any migration runs.
+    ensureColumn(db, "session_meta", "tags_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "tool_reclaim_watermark", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "stripped_placeholder_ids", "TEXT DEFAULT ''");
     // Frozen replay watermark for the stale-ctx_reduce strip: message ids whose
@@ -1845,6 +2007,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
+    ensureColumn(db, "compartment_state_lease", "owner_pid", "INTEGER");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "memory_embeddings", "model_id", "TEXT");
@@ -2056,6 +2219,17 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
+    // v88 (issue 492). The OpenCode host store exists in two projections and a
+    // user can move between them in both directions, which renumbers the
+    // positional ordinals every saved coordinate is expressed in. These columns
+    // record which projection a session's coordinates were last derived against
+    // and which compartments could not be re-derived from a surviving message id.
+    // coordinate_generation is deliberately NULLABLE with no default: NULL means
+    // "never recorded", which is not the same as either projection.
+    ensureColumn(db, "session_meta", "coordinate_generation", "TEXT");
+    ensureColumn(db, "session_meta", "coordinate_rebase_notice", "TEXT");
+    ensureColumn(db, "compartments", "rebase_status", "TEXT NOT NULL DEFAULT 'ok'");
+    ensureColumn(db, "recomp_compartments", "rebase_status", "TEXT NOT NULL DEFAULT 'ok'");
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS project_state (
@@ -2388,7 +2562,13 @@ export async function openDatabaseAsync(
                 closeQuietly(db);
                 return null;
             }
-            if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
+            const processes =
+                getPersistedSchemaVersion(db) < latestSupportedVersion
+                    ? await inspectProcessesAsync()
+                    : undefined;
+            if (
+                !enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion, processes)
+            ) {
                 guardMs = performance.now() - guardStartedAt;
                 closeQuietly(db);
                 return null;

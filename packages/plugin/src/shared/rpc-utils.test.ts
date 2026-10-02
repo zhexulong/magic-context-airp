@@ -12,6 +12,7 @@ import {
     inspectLivePiProcesses,
     isPidAlive,
     isPidIdentityPlausible,
+    parseTasklistOutput,
     type RpcPortFileRecord,
     readProcessProbeEvidence,
 } from "./rpc-utils";
@@ -183,6 +184,32 @@ describe("discoverLivePiProcessIds", () => {
 });
 
 describe("#411 Windows OMP/Pi live-process scan", () => {
+    test("reuses a Windows snapshot briefly, then refreshes process discovery", () => {
+        let now = PLUGIN_BUILD_MS;
+        const calls: string[] = [];
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            nowMs: () => now,
+            processListExecFileSync: windowsProcessListExec((file) => {
+                calls.push(file);
+                return cimOutput([
+                    {
+                        ProcessId: WINDOWS_FOREIGN_PID,
+                        ParentProcessId: 4,
+                        CommandLine: OMP_PI_ARC_COMMAND,
+                        CreationDate: wmiCreationDate(OLDER_THAN_PLUGIN_MS),
+                    },
+                ]);
+            }),
+        });
+        expect(inspectLivePiProcesses().processIds).toEqual([WINDOWS_FOREIGN_PID]);
+        now += 1_999;
+        expect(inspectLivePiProcesses().processIds).toEqual([WINDOWS_FOREIGN_PID]);
+        expect(calls).toEqual(["powershell"]);
+        now += 1;
+        inspectLivePiProcesses();
+        expect(calls).toEqual(["powershell", "powershell"]);
+    });
     test("(a) tasklist-only fallback skips a parent omp.exe as an ancestor", () => {
         const calls: string[] = [];
         __setRpcIdentityTestHooks({
@@ -415,7 +442,7 @@ describe("isPidAlive", () => {
         expect(calls).toEqual([
             {
                 file: "tasklist",
-                args: ["/FO", "CSV", "/FI", `PID eq ${PID}`],
+                args: ["/FO", "CSV", "/NH", "/FI", `PID eq ${PID}`],
                 stdio: ["ignore", "pipe", "pipe"],
             },
         ]);
@@ -597,7 +624,9 @@ describe("isPidIdentityPlausible", () => {
         });
 
         expect(isPidIdentityPlausible(record(0))).toBe("plausible");
-        expect(calls).toEqual([{ file: "tasklist", args: ["/FO", "CSV", "/FI", `PID eq ${PID}`] }]);
+        expect(calls).toEqual([
+            { file: "tasklist", args: ["/FO", "CSV", "/NH", "/FI", `PID eq ${PID}`] },
+        ]);
 
         calls.length = 0;
         expect(isPidIdentityPlausible(record(NOW_MS))).toBe("inconclusive");
@@ -607,9 +636,31 @@ describe("isPidIdentityPlausible", () => {
                 args: [
                     "-NoProfile",
                     "-Command",
-                    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress",
+                    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress",
                 ],
             },
         ]);
     });
+});
+
+test("Spanish tasklist no-match is not running", () => {
+    const output =
+        "INFORMACIÓN: no hay tareas ejecutándose que coincidan con los\ncriterios especificados.";
+    expect(parseTasklistOutput(output)).toEqual([]);
+    __setRpcIdentityTestHooks({ platform: "win32", execFileSync: psOutput(output) });
+    expect(isPidAlive(PID)).toBe("dead");
+});
+
+test("German tasklist no-match is not running", () => {
+    expect(
+        parseTasklistOutput(
+            "INFORMATION: Es werden keine Aufgaben mit den angegebenen Kriterien ausgeführt.",
+        ),
+    ).toEqual([]);
+});
+
+test("tasklist CSV live process is running", () => {
+    expect(parseTasklistOutput('"opencode.exe","1234","Console","1","10,000 K"')).toEqual([
+        { pid: 1234, command: "opencode.exe" },
+    ]);
 });

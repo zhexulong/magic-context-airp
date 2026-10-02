@@ -14,6 +14,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use crate::historian_runner::{resolve_runner, HistorianRunnerKind, ResolvedRunner};
 use crate::scheduler::{self, ExecuteThresholdConfig};
 
 /// Default execute threshold percentage (65.0). The Rust module reads config without the
@@ -80,9 +81,22 @@ impl Default for CavemanConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct McModuleConfig {
-    pub model_chain: Vec<String>,
+    // No model chain lives here. The host resolves the historian's and each dreamer
+    // task's model chain from its own config and sends it with every request; the
+    // module refuses a request that carries none rather than guessing from disk.
     /// Optional trusted user-configured sampling temperature for historian requests.
     pub historian_temperature: Option<f64>,
+    /// Which side runs the historian's completion, when the user tier names one.
+    /// USER-tier only, for the same reason the model is: it decides whose provider
+    /// account and whose process pays for the call, so a cloned repository must not
+    /// be able to redirect it. `None` means the harness that sent the request decides
+    /// (see [`McModuleConfig::historian_runner_for`]).
+    pub historian_runner: Option<HistorianRunnerKind>,
+    /// Which side runs the module-routed dreamer completions (classify), when the
+    /// user tier names one. USER-tier only, like `historian_runner`. `None` falls
+    /// back to `historian_runner`, so an install that already set only the
+    /// historian runner keeps its dreamer completions where they were.
+    pub dreamer_runner: Option<HistorianRunnerKind>,
     /// Trusted user-configured language for hidden-agent prose. Project config is deliberately
     /// excluded because the language directive becomes provider-visible prompt text.
     pub language: Option<String>,
@@ -127,13 +141,20 @@ pub struct McModuleConfig {
     /// Per-model TTL overrides from the object config shape. Resolution uses the
     /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
+    /// Whether the module writes the host's context.db domain tables directly.
+    ///
+    /// User-tier only for the same reason the model chain is: it decides which database
+    /// file this process writes, and a cloned repository must not be able to redirect
+    /// that. `off` leaves the existing mirror as the only path.
+    pub single_store: crate::host_store::SingleStoreMode,
 }
 
 impl Default for McModuleConfig {
     fn default() -> Self {
         Self {
-            model_chain: Vec::new(),
             historian_temperature: None,
+            historian_runner: None,
+            dreamer_runner: None,
             language: None,
             execute_threshold_percentage: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
             execute_threshold_user_config: None,
@@ -157,6 +178,7 @@ impl Default for McModuleConfig {
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
+            single_store: crate::host_store::SingleStoreMode::Off,
         }
     }
 }
@@ -344,6 +366,57 @@ impl ConfigCache {
     }
 }
 
+impl McModuleConfig {
+    /// The runner the historian uses for a request from `harness`: the user-tier
+    /// `historian.runner` when set, otherwise the harness default.
+    pub fn historian_runner_for(&self, harness: &str) -> ResolvedRunner {
+        resolve_runner(self.historian_runner, harness)
+    }
+
+    /// The runner module-routed dreamer completions use for a request from
+    /// `harness`: `dreamer.runner`, then `historian.runner`, then the harness default.
+    pub fn dreamer_runner_for(&self, harness: &str) -> ResolvedRunner {
+        resolve_runner(self.dreamer_runner.or(self.historian_runner), harness)
+    }
+
+    /// The runners the user tier names, without any harness applied.
+    pub fn configured_runners(&self) -> ConfiguredRunners {
+        ConfiguredRunners {
+            historian: self.historian_runner,
+            dreamer: self.dreamer_runner.or(self.historian_runner),
+        }
+    }
+}
+
+/// The runners the user tier names for each role, with the dreamer's fallback to
+/// the historian's value already applied. `None` means "decided per request by the
+/// harness".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfiguredRunners {
+    pub historian: Option<HistorianRunnerKind>,
+    pub dreamer: Option<HistorianRunnerKind>,
+}
+
+/// The runners the user tier names.
+///
+/// Both runner settings are read from the user tier only, so the answer is the same
+/// for every project this process serves. That is what lets the boot manifest
+/// declare its routes from it. The harness default is per request, and a Claude
+/// Code request with nothing configured still goes to Broca, so the Broca route is
+/// declared unless BOTH roles are configured to the host runner.
+pub fn user_configured_runners() -> ConfiguredRunners {
+    user_configured_runners_at(&user_config_path())
+}
+
+/// [`user_configured_runners`] against an explicit user config file.
+pub fn user_configured_runners_at(user_path: &Path) -> ConfiguredRunners {
+    let mut tier = TierConfig::default();
+    let user = read_tier_cached(&mut tier, user_path.to_path_buf());
+    let (config, warnings) = merge_tiers_with_warnings(user.as_ref(), None);
+    emit_warnings(warnings);
+    config.configured_runners()
+}
+
 fn user_config_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         return PathBuf::from(xdg)
@@ -380,7 +453,7 @@ fn merge_tiers(user: Option<&Value>, project: Option<&Value>) -> McModuleConfig 
 
 fn emit_warnings(warnings: Vec<String>) {
     for warning in warnings {
-        eprintln!("mc-module: config warning: {warning}");
+        tracing::warn!("mc-module: config warning: {warning}");
     }
 }
 
@@ -484,57 +557,40 @@ fn merge_tiers_with_warnings(
     let mut warnings = Vec::new();
 
     if let Some(user) = user {
-        // Module-leg model override. The shared config file serves two consumers whose
-        // model namespaces differ: the TS plugin resolves harness-namespace ids (e.g.
-        // OpenCode's auth plugins register "google/antigravity-gemini-3.5-flash"),
-        // while this module drives llm-runner, whose catalog uses canonical ids
-        // ("google/gemini-3.5-flash" + a vault auth method). When module_model is
-        // present it REPLACES the plugin-namespace chain entirely (no mixing — a
-        // half-translated chain would burn permanent-classified advances every fire);
-        // when absent, fall back to the plugin keys so single-namespace setups keep
-        // working with one set of keys.
-        let module_model = user
-            .pointer("/historian/module_model")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(model) = module_model {
-            cfg.model_chain.push(model.to_string());
-            if let Some(fallbacks) = user
-                .pointer("/historian/module_fallback_models")
-                .and_then(Value::as_array)
-            {
-                cfg.model_chain.extend(
-                    fallbacks
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToOwned::to_owned),
-                );
-            }
-        } else {
-            if let Some(model) = user.pointer("/historian/model").and_then(Value::as_str) {
-                if !model.trim().is_empty() {
-                    cfg.model_chain.push(model.trim().to_string());
-                }
-            }
-            if let Some(fallbacks) = user
-                .pointer("/historian/fallback_models")
-                .and_then(Value::as_array)
-            {
-                cfg.model_chain.extend(
-                    fallbacks
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToOwned::to_owned),
-                );
-            }
-        }
         if let Some(temperature) = number_at(user, "/historian/temperature") {
             cfg.historian_temperature = Some(temperature);
+        }
+        for (pointer, name, slot) in [
+            (
+                "/historian/runner",
+                "historian.runner",
+                &mut cfg.historian_runner,
+            ),
+            ("/dreamer/runner", "dreamer.runner", &mut cfg.dreamer_runner),
+        ] {
+            if let Some(runner) = user.pointer(pointer).and_then(Value::as_str) {
+                match HistorianRunnerKind::parse(runner) {
+                    Some(kind) => *slot = Some(kind),
+                    // An unreadable value keeps the harness default rather than refusing
+                    // to fire. A typo then leaves completions running exactly where an
+                    // unconfigured install runs them, instead of sending every completion
+                    // somewhere the user never asked for.
+                    None => warnings.push(format!(
+                        "ignoring {name} {runner:?}; expected one of {}",
+                        HistorianRunnerKind::ACCEPTED_VALUES.join(", ")
+                    )),
+                }
+            }
+        }
+        if let Some(raw) = user.pointer("/single_store").and_then(Value::as_str) {
+            match crate::host_store::SingleStoreMode::parse(raw) {
+                Some(mode) => cfg.single_store = mode,
+                // A typo must not read as "off": that is the value a user would get
+                // silently, and it looks exactly like the feature simply not working.
+                None => warnings.push(format!(
+                    "ignoring single_store value {raw:?}; expected \"off\", \"shadow\", or \"on\""
+                )),
+            }
         }
         if let Some(language) = user
             .pointer("/language")
@@ -656,6 +712,7 @@ fn merge_tiers_with_warnings(
         warn_ignored_project_key(project, "/memory/budget_tokens", &mut warnings);
         warn_ignored_project_key(project, "/memory/user_profile_budget_tokens", &mut warnings);
         warn_ignored_project_key(project, "/historian/context_limit_tokens", &mut warnings);
+        warn_ignored_project_key(project, "/historian/runner", &mut warnings);
         if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
             cfg.smart_drops = enabled;
         }
@@ -671,6 +728,7 @@ fn merge_tiers_with_warnings(
         {
             cfg.temporal_awareness = enabled;
         }
+        warn_ignored_project_key(project, "/single_store", &mut warnings);
         warn_ignored_project_key(
             project,
             "/prompt_surface/guidance_override_text",
@@ -688,7 +746,6 @@ fn merge_tiers_with_warnings(
             DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
         ));
     cfg.execute_threshold_percentage = cfg.resolve_execute_threshold(None).percentage;
-    cfg.model_chain.dedup();
     (cfg, warnings)
 }
 
@@ -1001,19 +1058,138 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tier_policy_ignores_project_models_and_rejects_project_lowering() {
+    fn an_unconfigured_runner_is_left_to_the_harness_and_only_the_user_may_set_it() {
+        use crate::historian_runner::RunnerSource;
+
+        let unconfigured = merge_tiers(None, None);
+        assert_eq!(unconfigured.historian_runner, None);
+        assert_eq!(unconfigured.dreamer_runner, None);
+        for (harness, kind) in [
+            ("opencode", HistorianRunnerKind::Host),
+            ("opencode2", HistorianRunnerKind::Host),
+            ("claude-code", HistorianRunnerKind::Broca),
+            ("pi", HistorianRunnerKind::Broca),
+        ] {
+            for resolved in [
+                unconfigured.historian_runner_for(harness),
+                unconfigured.dreamer_runner_for(harness),
+            ] {
+                assert_eq!(resolved.kind, kind, "{harness}");
+                assert_eq!(resolved.source, RunnerSource::HarnessDefault, "{harness}");
+            }
+        }
+
+        let user = serde_json::json!({ "historian": { "runner": "broca" } });
+        let configured = merge_tiers(Some(&user), None);
+        assert_eq!(
+            configured.historian_runner,
+            Some(HistorianRunnerKind::Broca)
+        );
+        for resolved in [
+            configured.historian_runner_for("opencode"),
+            configured.dreamer_runner_for("opencode2"),
+        ] {
+            assert_eq!(resolved.kind, HistorianRunnerKind::Broca);
+            assert_eq!(resolved.source, RunnerSource::Configured);
+        }
+
+        // A cloned repository must not be able to move either completion to a
+        // different process or provider account.
+        let project = serde_json::json!({
+            "historian": { "runner": "broca" },
+            "dreamer": { "runner": "broca" },
+        });
+        let from_project = merge_tiers(None, Some(&project));
+        assert_eq!(from_project.historian_runner, None);
+        assert_eq!(from_project.dreamer_runner, None);
+        let user = serde_json::json!({ "historian": { "runner": "host" } });
+        assert_eq!(
+            merge_tiers(Some(&user), Some(&project)).historian_runner,
+            Some(HistorianRunnerKind::Host),
+            "the project tier cannot move the runner in either direction"
+        );
+    }
+
+    #[test]
+    fn the_dreamer_runner_falls_back_to_the_historian_runner_then_the_harness() {
+        let historian_only = merge_tiers(
+            Some(&serde_json::json!({ "historian": { "runner": "broca" } })),
+            None,
+        );
+        assert_eq!(
+            historian_only.dreamer_runner_for("opencode").kind,
+            HistorianRunnerKind::Broca
+        );
+        let split = merge_tiers(
+            Some(&serde_json::json!({
+                "historian": { "runner": "broca" },
+                "dreamer": { "runner": "host" },
+            })),
+            None,
+        );
+        assert_eq!(
+            split.historian_runner_for("opencode").kind,
+            HistorianRunnerKind::Broca
+        );
+        assert_eq!(
+            split.dreamer_runner_for("claude-code").kind,
+            HistorianRunnerKind::Host
+        );
+    }
+
+    #[test]
+    fn the_boot_runners_are_read_from_the_user_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("magic-context.jsonc");
+        assert_eq!(
+            user_configured_runners_at(&path),
+            ConfiguredRunners {
+                historian: None,
+                dreamer: None,
+            }
+        );
+        std::fs::write(
+            &path,
+            r#"{ // user tier
+            "historian": { "runner": "host" } }"#,
+        )
+        .expect("write user config");
+        assert_eq!(
+            user_configured_runners_at(&path),
+            ConfiguredRunners {
+                historian: Some(HistorianRunnerKind::Host),
+                dreamer: Some(HistorianRunnerKind::Host),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_runner_value_leaves_the_choice_to_the_harness() {
+        for value in [serde_json::json!("hosted"), serde_json::json!("")] {
+            let user = serde_json::json!({
+                "historian": { "runner": value.clone() },
+                "dreamer": { "runner": value.clone() },
+            });
+            let cfg = merge_tiers(Some(&user), None);
+            assert_eq!(cfg.historian_runner, None, "value {value}");
+            assert_eq!(cfg.dreamer_runner, None, "value {value}");
+        }
+        // A non-string is not a runner name at all and is ignored the same way.
+        let user = serde_json::json!({ "historian": { "runner": 7 } });
+        assert_eq!(merge_tiers(Some(&user), None).historian_runner, None);
+    }
+
+    #[test]
+    fn tier_policy_rejects_project_lowering() {
         let user = serde_json::json!({
-            "historian": { "model": "cheap", "fallback_models": ["fallback"] },
             "execute_threshold_percentage": 80,
             "memory": { "enabled": false }
         });
         let project = serde_json::json!({
-            "historian": { "model": "expensive", "fallback_models": ["expensive2"] },
             "execute_threshold_percentage": 40,
             "memory": { "enabled": true }
         });
         let cfg = merge_tiers(Some(&user), Some(&project));
-        assert_eq!(cfg.model_chain, vec!["cheap", "fallback"]);
         assert_eq!(cfg.execute_threshold_percentage, 80.0);
         assert!(cfg.memory_enabled);
     }
@@ -1319,6 +1495,39 @@ mod tests {
     }
 
     #[test]
+    fn single_store_is_user_tier_only_and_defaults_off() {
+        use crate::host_store::SingleStoreMode;
+
+        assert_eq!(merge_tiers(None, None).single_store, SingleStoreMode::Off);
+
+        let user = serde_json::json!({ "single_store": "shadow" });
+        let project = serde_json::json!({ "single_store": "on" });
+        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
+        assert_eq!(cfg.single_store, SingleStoreMode::Shadow);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("/single_store")),
+            "a project tier attempt must warn, not take effect: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_single_store_value_warns_instead_of_reading_as_off() {
+        use crate::host_store::SingleStoreMode;
+
+        let user = serde_json::json!({ "single_store": "enabled" });
+        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), None);
+        assert_eq!(cfg.single_store, SingleStoreMode::Off);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("single_store") && warning.contains("enabled")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn historian_budget_derivation_clamps_at_both_bounds() {
         assert_eq!(derive_historian_chunk_tokens(1), 8_000);
         assert_eq!(derive_historian_chunk_tokens(32_000), 8_000);
@@ -1466,81 +1675,17 @@ mod tests {
     }
 
     #[test]
-    fn module_model_replaces_plugin_chain_entirely() {
-        let user = serde_json::json!({
-            "historian": {
-                "model": "google/antigravity-gemini-3.5-flash",
-                "fallback_models": ["google/antigravity-claude-opus-4-6-thinking"],
-                "module_model": "google/gemini-3.5-flash",
-                "module_fallback_models": ["ollama-cloud/kimi-k2.7-code"]
-            }
-        });
-        let cfg = merge_tiers(Some(&user), None);
-        // No plugin-namespace ids may leak into the module chain — a mixed chain
-        // burns a permanent-classified advance on every historian fire.
-        assert_eq!(
-            cfg.model_chain,
-            vec!["google/gemini-3.5-flash", "ollama-cloud/kimi-k2.7-code"]
-        );
-    }
-
-    #[test]
-    fn module_model_absent_falls_back_to_plugin_keys() {
-        let user = serde_json::json!({
-            "historian": {
-                "model": "deepseek/deepseek-v4-flash",
-                "fallback_models": ["ollama-cloud/kimi-k2.7-code"],
-                "module_fallback_models": ["ignored/without-module-model"]
-            }
-        });
-        let cfg = merge_tiers(Some(&user), None);
-        assert_eq!(
-            cfg.model_chain,
-            vec!["deepseek/deepseek-v4-flash", "ollama-cloud/kimi-k2.7-code"]
-        );
-    }
-
-    #[test]
-    fn module_model_blank_is_treated_as_absent() {
-        let user = serde_json::json!({
-            "historian": {
-                "model": "deepseek/deepseek-v4-flash",
-                "module_model": "   "
-            }
-        });
-        let cfg = merge_tiers(Some(&user), None);
-        assert_eq!(cfg.model_chain, vec!["deepseek/deepseek-v4-flash"]);
-    }
-
-    #[test]
-    fn module_model_is_user_tier_only() {
-        let user = serde_json::json!({
-            "historian": { "module_model": "google/gemini-3.5-flash" }
-        });
-        let project = serde_json::json!({
-            "historian": {
-                "module_model": "evil/expensive-model",
-                "module_fallback_models": ["evil/other"]
-            }
-        });
-        let cfg = merge_tiers(Some(&user), Some(&project));
-        assert_eq!(cfg.model_chain, vec!["google/gemini-3.5-flash"]);
-    }
-
-    #[test]
     fn historian_temperature_is_optional_and_user_tier_only() {
         let project = serde_json::json!({ "historian": { "temperature": 0.9 } });
         assert_eq!(merge_tiers(None, None).historian_temperature, None);
         for temperature in [0.1, 0.0] {
             let user = serde_json::json!({
                 "historian": {
-                    "temperature": temperature,
-                    "module_model": "module/historian"
+                    "temperature": temperature
                 }
             });
             let resolved = merge_tiers(Some(&user), Some(&project));
             assert_eq!(resolved.historian_temperature, Some(temperature));
-            assert_eq!(resolved.model_chain, vec!["module/historian"]);
         }
         assert_eq!(
             merge_tiers(None, Some(&project)).historian_temperature,
@@ -1565,7 +1710,7 @@ mod tests {
         let project = dir.path().join("project");
         std::fs::create_dir_all(project.join(".cortexkit")).unwrap();
 
-        std::fs::write(&user, r#"{ "historian": { "model": "model-a" } }"#).unwrap();
+        std::fs::write(&user, r#"{ "historian": { "temperature": 0.1 } }"#).unwrap();
         std::fs::write(
             project.join(".cortexkit/magic-context.jsonc"),
             r#"{ "memory": { "enabled": true } }"#,
@@ -1574,17 +1719,17 @@ mod tests {
 
         let mut cache = ConfigCache::default();
         let first = cache.effective_for_paths(&user, &project);
-        assert_eq!(first.model_chain, vec!["model-a"]);
+        assert_eq!(first.historian_temperature, Some(0.1));
 
         // Without an mtime change, a different file body is intentionally ignored.
         let original_mtime = std::fs::metadata(&user).unwrap().modified().unwrap();
-        std::fs::write(&user, r#"{ "historian": { "model": "model-b" } }"#).unwrap();
+        std::fs::write(&user, r#"{ "historian": { "temperature": 0.2 } }"#).unwrap();
         filetime::set_file_mtime(&user, filetime::FileTime::from_system_time(original_mtime))
             .unwrap();
         let unchanged = cache.effective_for_paths(&user, &project);
-        assert_eq!(unchanged.model_chain, vec!["model-a"]);
+        assert_eq!(unchanged.historian_temperature, Some(0.1));
 
-        // Once mtime changes, the cache reloads and picks up the new user-tier model.
+        // Once mtime changes, the cache reloads and picks up the new user-tier value.
         let newer = filetime::FileTime::from_unix_time(
             original_mtime
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1595,6 +1740,6 @@ mod tests {
         );
         filetime::set_file_mtime(&user, newer).unwrap();
         let reloaded = cache.effective_for_paths(&user, &project);
-        assert_eq!(reloaded.model_chain, vec!["model-b"]);
+        assert_eq!(reloaded.historian_temperature, Some(0.2));
     }
 }

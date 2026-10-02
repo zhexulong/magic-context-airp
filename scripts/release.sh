@@ -18,9 +18,20 @@ set -euo pipefail
 #   8. CI takes over: test → build → publish npm + GitHub release
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+# The host and hermetic e2e lanes spawn `opencode serve` from PATH. The official
+# installer puts the binary under ~/.opencode/bin, which login shells add to PATH but
+# tool/daemon shells often do not (v0.42.6 r9: the same box that passed r8 lost the
+# entry when the tool daemon restarted). Prefer the ambient PATH; fall back to the
+# installer location before declaring it missing.
+if ! command -v opencode >/dev/null 2>&1 && [ -x "$HOME/.opencode/bin/opencode" ]; then
+  export PATH="$HOME/.opencode/bin:$PATH"
+fi
 VERSION=""
 DRY=""
 FORCE_E2E_HOST=0
+SKIP_RUST_E2E=0
+CI_GATE_SHA=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -30,15 +41,29 @@ for arg in "$@"; do
     --e2e-host)
       FORCE_E2E_HOST=1
       ;;
+    --ci-gate=*)
+      # Use a green master CI run as the test gate instead of re-running the
+      # unit and host e2e suites locally (they are load-sensitive on a busy
+      # machine). Names the CI-verified commit; checked below. The tag workflow
+      # still runs its own full gate before anything publishes.
+      CI_GATE_SHA="${arg#--ci-gate=}"
+      ;;
+    --skip-rust-e2e)
+      # One-off operator decision to release without the experimental Rust-mode
+      # suite. Requires the repo variable RELEASE_SKIP_RUST_E2E to name this exact
+      # tag, so the tag workflow skips the same suite and the skip can never carry
+      # over to a later release.
+      SKIP_RUST_E2E=1
+      ;;
     --*)
       echo "Error: unknown option '$arg'"
-      echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host]"
+      echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--skip-rust-e2e] [--ci-gate=<sha>]"
       exit 1
       ;;
     *)
       if [[ -n "$VERSION" ]]; then
         echo "Error: more than one version was supplied"
-        echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host]"
+        echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--skip-rust-e2e] [--ci-gate=<sha>]"
         exit 1
       fi
       VERSION="$arg"
@@ -47,7 +72,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$VERSION" ]]; then
-  echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host]"
+  echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--skip-rust-e2e] [--ci-gate=<sha>]"
   echo "  e.g. ./scripts/release.sh 0.1.0"
   exit 1
 fi
@@ -58,6 +83,40 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?
 fi
 
 TAG="v$VERSION"
+
+if [[ -n "$CI_GATE_SHA" ]]; then
+  CI_GATE_SHA=$(git rev-parse --verify "$CI_GATE_SHA^{commit}") || { echo "Error: --ci-gate names no commit"; exit 1; }
+  if ! git merge-base --is-ancestor "$CI_GATE_SHA" HEAD; then
+    echo "Error: --ci-gate commit $CI_GATE_SHA is not an ancestor of HEAD"; exit 1
+  fi
+  # Only release tooling and release notes may differ from the CI-verified commit.
+  CI_GATE_DRIFT=$(git diff --name-only "$CI_GATE_SHA" HEAD | grep -vE '^(scripts/release[^/]*\.sh|\.cortexkit/)' || true)
+  if [[ -n "$CI_GATE_DRIFT" ]]; then
+    echo "Error: HEAD differs from the CI-verified commit outside release tooling:"; echo "$CI_GATE_DRIFT"; exit 1
+  fi
+  CI_RESULT=$(gh api "repos/cortexkit/magic-context/actions/runs?head_sha=$CI_GATE_SHA&event=push" \
+    -q '[.workflow_runs[] | select(.name=="CI")][0] | "\(.status)/\(.conclusion)"' 2>/dev/null || true)
+  if [[ "$CI_RESULT" != "completed/success" ]]; then
+    echo "Error: master CI for $CI_GATE_SHA is '${CI_RESULT:-missing}', not completed/success"; exit 1
+  fi
+  echo ""
+  echo "  NOTE: test gate = master CI run on $CI_GATE_SHA (completed/success);"
+  echo "        local unit and host e2e suites are skipped. Lint, typecheck and builds still run."
+  echo ""
+fi
+
+if [[ "$SKIP_RUST_E2E" -eq 1 ]]; then
+  SKIP_VAR=$(gh api repos/cortexkit/magic-context/actions/variables/RELEASE_SKIP_RUST_E2E -q .value 2>/dev/null || true)
+  if [[ "$SKIP_VAR" != "$TAG" ]]; then
+    echo "Error: --skip-rust-e2e needs the repo variable RELEASE_SKIP_RUST_E2E set to '$TAG' (found '${SKIP_VAR}'),"
+    echo "       so the tag workflow skips the same suite: gh variable set RELEASE_SKIP_RUST_E2E --body $TAG"
+    exit 1
+  fi
+  echo ""
+  echo "  WARNING: releasing $TAG WITHOUT the Rust hermetic e2e suite (operator decision)."
+  echo "  This release does not claim Rust transform mode passed its behaviour suite."
+  echo ""
+fi
 
 # Check if tag already exists
 if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -130,6 +189,10 @@ manifest_files() {
 # and was green (the Bun-panic case).
 run_package_tests() {
   local label="$1" dir="$2" output status
+  if [[ -n "$CI_GATE_SHA" ]]; then
+    echo "  [$label] tests: covered by master CI on $CI_GATE_SHA"
+    return 0
+  fi
   echo "  [$label] bun run test..."
   # `set -e` would abort the script at this assignment the instant the package
   # test command exits non-zero — BEFORE `status=$?` and the panic-tolerance
@@ -147,11 +210,19 @@ run_package_tests() {
   fail_lines=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* fail" || true)
   echo "  [$label] test process exit=$status summary_pass_lines=$pass_lines summary_fail_lines=$fail_lines output_lines=$(printf '%s\n' "$output" | wc -l | tr -d ' ')"
   echo "$output"
-  if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+  # Decide from the counts computed above, never from `echo | grep -q`: under
+  # `set -o pipefail`, grep -q exits on its first match and closes the pipe while
+  # echo is still writing the remaining lines, echo dies with SIGPIPE (141), and
+  # the pipeline reports failure for a suite that printed "4851 pass" (v0.42.5 r1).
+  # `grep -c` consumes the whole stream, so the counts carry no such race.
+  # The counts above are anchored to Bun's summary lines (`^ *N pass` / `^ *N fail`);
+  # an unanchored "N fail" also matches test names such as "keeps below-95 failures",
+  # which the old grep -q form only hid because of the SIGPIPE race.
+  if [ "$fail_lines" -gt 0 ]; then
     echo "Error: $label tests failed (fail count > 0)"
     exit 1
   fi
-  if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+  if [ "$pass_lines" -eq 0 ]; then
     echo "Error: $label tests produced no passing-test summary (crash, timeout, or zero tests collected)"
     exit 1
   fi
@@ -185,6 +256,9 @@ run_package_tests "pi-plugin" "$PI_DIR"
 echo "  [pi-plugin] bun build..."
 bun run --cwd "$PI_DIR" build 2>&1 || { echo "Error: Pi-plugin build failed"; exit 1; }
 
+echo "  [packages] auditing packed consumer dependency graphs..."
+bun run --cwd "$REPO_ROOT" audit:packed-packages 2>&1 || { echo "Error: Packed-package audit failed"; exit 1; }
+
 echo "  [cli] bun lint..."
 bun run --cwd "$CLI_DIR" lint 2>&1 || { echo "Error: CLI lint failed"; exit 1; }
 
@@ -216,12 +290,16 @@ run_e2e_group() {
   # This matches the dedicated test:rust-e2e script's serial invocation.
   output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 --max-concurrency=1 $files 2>&1) || status=$?
   echo "$output"
-  if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+  # Same SIGPIPE-safe counting as run_package_tests (see the note there).
+  local e2e_fail e2e_pass
+  e2e_fail=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* fail" || true)
+  e2e_pass=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* pass" || true)
+  if [ "$e2e_fail" -gt 0 ]; then
     echo "Error: e2e ($mode/$label) failed (fail count > 0)"
     echo "  [e2e:$mode:$label:end] status=fail"
     return 1
   fi
-  if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+  if [ "$e2e_pass" -eq 0 ]; then
     echo "Error: e2e ($mode/$label) produced no passing-test summary (crash, timeout, or zero tests collected)"
     echo "  [e2e:$mode:$label:end] status=fail"
     return 1
@@ -355,11 +433,19 @@ run_host_e2e() {
   run_e2e_group "ts" "pi" "$E2E_PI_FILES"
 }
 
-# Rust stays on the host: its daemon and private sibling path dependencies cross
-# the container boundary. The shared executable owns the exact manifest selection,
-# prerequisites, and true-green summary check used by release CI as well.
-run_host_e2e
-"$SCRIPT_DIR/run-rust-hermetic-e2e.sh"
+# Rust stays on the host because its daemon and sibling path dependencies cross
+# the container boundary. The shared runner selects the manifest tests, checks
+# prerequisites, and requires a positive test summary just like release CI.
+if [[ -n "$CI_GATE_SHA" ]]; then
+  echo "  [e2e] host legs: covered by master CI on $CI_GATE_SHA"
+else
+  run_host_e2e
+fi
+if [[ "$SKIP_RUST_E2E" -eq 1 ]]; then
+  echo "  [e2e:rust] SKIPPED by operator for $TAG (--skip-rust-e2e)"
+else
+  "$SCRIPT_DIR/run-rust-hermetic-e2e.sh"
+fi
 
 echo "  ✓ All checks passed"
 echo ""
@@ -388,8 +474,37 @@ bun scripts/version-sync.mjs "$VERSION"
 echo ""
 
 # Step 4: Commit (skip if versions were already at target)
+# Stage only what this script produced (the version sync and the regenerated
+# artifacts the lint step just checked). `git add -A` once swept unrelated files
+# edited in the checkout during the long gate phase into a release commit
+# (v0.42.4); anything else dirty at this point is a foreign change and aborts.
 echo "→ Committing version bump..."
-git add -A
+git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
+  assets/magic-context.schema.json \
+  packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
+# Cargo.lock is the common dirty file here: the rust e2e lane builds against the
+# sibling subc checkout, so a sibling crate release that lands while the gates run
+# resolves into the lock. The gates just ran on that resolved graph, so the tested
+# artifact IS the drifted lock; committing it on its own (never folded into the
+# release commit) is what the deploy doctrine requires, and re-running two hours of
+# gates for a sibling patch bump the gates already exercised is pure waste. Only a
+# lock that still builds --locked qualifies; anything else dirty is foreign and aborts.
+unrelated="$(git status --porcelain --untracked-files=no | grep -v '^[MARC] ' || true)"
+if [ "$unrelated" = " M Cargo.lock" ]; then
+  echo "  Cargo.lock drifted during the gates (sibling crate release); verifying it builds --locked..."
+  if cargo build --locked --release -p mc-module >/dev/null 2>&1; then
+    versions="$(git diff Cargo.lock | grep -E '^[-+]version' | sed -E 's/^([-+])version = "([^"]+)"/\1\2/' | paste -sd' ' -)"
+    git commit -q -o Cargo.lock -m "cargo: reconcile lock to the sibling graph the release gates ran on (lock-only: ${versions})"
+    echo "  committed lock reconciliation: $(git log --oneline -1)"
+    unrelated=""
+  fi
+fi
+if [ -n "$unrelated" ]; then
+  echo "Error: unrelated modified files present at bump time; refusing to fold them into the release commit:"
+  echo "$unrelated"
+  git reset -q
+  exit 1
+fi
 if git diff --cached --quiet; then
   echo "  (no changes — version already at $VERSION)"
 else

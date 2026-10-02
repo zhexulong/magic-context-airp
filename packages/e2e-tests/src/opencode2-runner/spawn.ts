@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readSync,
 	realpathSync,
 	statSync,
@@ -14,7 +15,17 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { MockProvider } from "../mock-provider/server";
+import { hostExtractCache } from '../host-extract-cache';
+import { pinMockAgents } from "../mock-routing";
+import { prepareContextDatabase } from "../prepare-context-db";
+import { pinnedOpenCode2Version, resolveOpenCode2CLI, sharedOpenCode2Root } from "./cli-resolution";
+import { isolateStoreDirectories } from "./store-directories";
+import { assertWriteFenceUnchanged, snapshotWriteFence } from "./write-fence";
+import { MockProvider, type MockResponse } from "../mock-provider/server";
+import {
+	awaitPluginActivation,
+	type PluginActivationClient,
+} from "./plugin-activation";
 
 export const OPENCODE2_NO_BACKGROUND_SERVICE_FLAG: string = "--standalone";
 export const ROOT_KEYS = [
@@ -23,12 +34,45 @@ export const ROOT_KEYS = [
 	"XDG_DATA_HOME",
 	"XDG_STATE_HOME",
 	"XDG_CACHE_HOME",
+	"XDG_RUNTIME_DIR",
+	"CARGO_HOME",
+	"RUSTUP_HOME",
 ] as const;
-export const CLI = resolve(
-	import.meta.dir,
-	"../../../plugin/node_modules/.bin/opencode2",
-);
+// The GA CLI is a devDependency of packages/plugin. Bun's isolated linker puts its
+// bin under the package's own node_modules; the hoisted linker (the release e2e
+// container installs with --linker=hoisted) puts it under the workspace root. Take
+// whichever exists so the lane does not depend on the linker choice.
+//
+// Before node_modules, local runs prefer the shared per-version install created by
+// scripts/ensure-shared-opencode2.ts (see cli-resolution.ts for why). It is used only
+// when its manifest reports exactly the pinned version; CI never creates it, so CI
+// and the Docker lane keep resolving from node_modules.
+//
+// MC_E2E_OPENCODE2_CLI points the lane at a different GA build than the pinned
+// devDependency. Host-behavior findings are version-specific — a defect that the
+// pinned build tolerates can be fatal two patch releases later — so the lane has to
+// be runnable against an arbitrary installed binary without touching node_modules.
+function resolveCLI(): string {
+	let pinnedVersion: string | null = null;
+	try {
+		pinnedVersion = pinnedOpenCode2Version();
+	} catch {
+		// Without a readable exact pin there is no version to match a shared install
+		// against, so resolution falls through to node_modules as it always did.
+	}
+	return resolveOpenCode2CLI({
+		override: process.env.MC_E2E_OPENCODE2_CLI,
+		pinnedVersion,
+		sharedRoot: sharedOpenCode2Root(),
+		nodeModulesCandidates: [
+			resolve(import.meta.dir, "../../../plugin/node_modules/.bin/opencode2"),
+			resolve(import.meta.dir, "../../../../node_modules/.bin/opencode2"),
+		],
+	});
+}
+export const CLI = resolveCLI();
 export const PLUGIN = resolve(import.meta.dir, "../../../plugin");
+const SCHEMA_GUARD = resolve(import.meta.dir, "schema-guard");
 const groups = new Set<number>();
 function killGroup(pid: number): void {
 	try {
@@ -46,15 +90,20 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 		process.exit(1);
 	});
 }
-export function isolation(): {
+export interface OpenCode2Isolation {
 	root: string;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
-} {
+	/** Original project directories from the store, retained to detect writes outside the test root after host shutdown. */
+	referencedDirectories?: string[];
+}
+
+export function isolation(): OpenCode2Isolation {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "mc-opencode2-")));
 	const env: NodeJS.ProcessEnv = {
 		PATH: process.env.PATH,
 		OPENCODE_DB: "opencode2.db",
+		TMPDIR: hostExtractCache(),
 		OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
 	};
 	for (const key of ROOT_KEYS) {
@@ -63,6 +112,7 @@ export function isolation(): {
 	}
 	const cwd = join(root, "work");
 	mkdirSync(cwd);
+	env.MAGIC_CONTEXT_STORAGE_DIR = join(env.XDG_DATA_HOME!, "cortexkit", "magic-context");
 	return { root, env, cwd };
 }
 export function assertIsolation(root: string, env: NodeJS.ProcessEnv): void {
@@ -72,8 +122,8 @@ export function assertIsolation(root: string, env: NodeJS.ProcessEnv): void {
 		);
 	if (env.OPENCODE_DB !== "opencode2.db")
 		throw new Error("OPENCODE_DB must be opencode2.db before boot");
-	// The five private roots are the safety boundary (AFT playbook:46-48,62).
-	// GA CLI 2.0.3 also honours OPENCODE_DB as observed by the placement probe.
+	// Private roots isolate host state, cache, runtime files, and native toolchain state.
+	// GA CLI 2.0.5 also honours OPENCODE_DB as observed by the placement probe.
 	const base = realpathSync(root);
 	for (const key of ROOT_KEYS) {
 		const value = env[key];
@@ -83,6 +133,8 @@ export function assertIsolation(root: string, env: NodeJS.ProcessEnv): void {
 		if (!suffix || suffix.startsWith("..") || resolve(value) === homedir())
 			throw new Error(`${key} is not a throwaway directory before boot`);
 	}
+	if (!env.MAGIC_CONTEXT_STORAGE_DIR || relative(base, resolve(env.MAGIC_CONTEXT_STORAGE_DIR)).startsWith(".."))
+		throw new Error("MAGIC_CONTEXT_STORAGE_DIR must be under the throwaway root");
 	if (env.OPENCODE_DISABLE_DEFAULT_PLUGINS !== "true")
 		throw new Error("Default plugins must be disabled");
 }
@@ -138,45 +190,179 @@ export function handoff(
 	return match ? { url: match[1]!, password: match[2]! } : undefined;
 }
 
+/** Path the OpenCode client resolves the local service from; only `serve --service` writes it. */
+export function serviceRegistrationPath(env: NodeJS.ProcessEnv): string {
+	return join(env.XDG_STATE_HOME!, "opencode", "service.json");
+}
+
+/**
+ * A service-mode host keeps its password out of stdout and puts it in the registration file
+ * instead, so that file is where the handoff comes from.
+ */
+export function serviceHandoff(
+	env: NodeJS.ProcessEnv,
+): { url: string; password: string } | undefined {
+	const path = serviceRegistrationPath(env);
+	if (!existsSync(path)) return undefined;
+	try {
+		const info = JSON.parse(readFileSync(path, "utf8")) as {
+			url?: string;
+			password?: string;
+		};
+		return info.url && info.password
+			? { url: info.url, password: info.password }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** OpenCode 2.0.5 removed awaitActivation; inventory is authoritative and plugin.updated invalidates it. */
+export async function waitForPluginActive(
+	client: PluginActivationClient,
+	directory: string,
+	pluginID = "opencode-magic-context",
+	timeoutMs = 60_000,
+): Promise<void> {
+	await awaitPluginActivation(client, directory, pluginID, timeoutMs);
+}
+
+
+export interface OpenCode2SpawnOptions {
+	probePlugin?: string;
+	providerID?: string;
+	probeStandalone?: boolean;
+	defaultModelID?: string;
+    visionModel?: boolean;
+	additionalModelIDs?: string[];
+	mockResponse?: MockResponse;
+	extraConfig?: Record<string, unknown>;
+	magicContextConfig?: Record<string, unknown>;
+	includeMagicContext?: boolean;
+	modelContextLimit?: number;
+	modelOutputLimit?: number;
+	/**
+	 * Register a second mock model and pin the historian to it, so a scenario can
+	 * keep a small window on the session model while the historian gets a window
+	 * large enough to hold its prompt, as it does for real users. Its output limit
+	 * follows `modelOutputLimit`. Default: the historian uses the session model.
+	 */
+	historianModel?: { id: string; contextLimit: number };
+	compactionAuto?: boolean;
+	existingIsolation?: OpenCode2Isolation;
+	existingMock?: { mock: MockProvider; baseURL: string };
+	/**
+	 * Boot the way a user's TUI boots its host: `serve --service`, which registers the endpoint in
+	 * the client's discovery file. Only this mode writes that file.
+	 */
+	serviceMode?: boolean;
+	/**
+	 * False leaves the isolated context.db exactly as the test seeded it, for a
+	 * scenario that needs the host itself to meet an older schema.
+	 */
+	prepareContextDatabase?: boolean;
+}
+
 /** Event-driven, bounded startup; no readiness polling. CLI contract: AFT playbook:54-64. */
-export async function spawnOpencode2(
-	options: {
-		probePlugin?: string;
-		providerID?: string;
-		probeStandalone?: boolean;
-	} = {},
-) {
+export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	const providerID = options.providerID ?? "openai";
-	const fixture = isolation();
-	const snapshotReason = activeV1Host()
-		? "live snapshot skipped: active v1 opencode serve writes operator store"
-		: undefined;
-	const before = snapshotReason ? undefined : snapshotLive();
+	const fixture = options.existingIsolation ?? isolation();
 	assertIsolation(fixture.root, fixture.env);
-	if (!existsSync(join(PLUGIN, "dist/v2/server.js"))) {
+	const references = isolateStoreDirectories(fixture.root, join(fixture.env.XDG_DATA_HOME!, "opencode", fixture.env.OPENCODE_DB!), join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR ?? join(fixture.env.XDG_DATA_HOME!, "cortexkit", "magic-context"), "context.db"));
+	fixture.referencedDirectories = [...new Set([...(fixture.referencedDirectories ?? []), ...references])];
+	const fence = snapshotWriteFence(fixture.referencedDirectories);
+	// Do not open the operator's live database, even for a read-only snapshot.
+	// Check the host's writable descriptors and protected directory metadata instead.
+	if (options.prepareContextDatabase !== false)
+		prepareContextDatabase(fixture.env.XDG_DATA_HOME!);
+	if (
+		options.includeMagicContext !== false &&
+		!existsSync(join(PLUGIN, "dist/v2/server.js"))
+	) {
 		throw new Error("Build the plugin before booting v2");
 	}
-	const mock = new MockProvider();
-	const provider = await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
+	const mock = options.existingMock?.mock ?? new MockProvider();
+	const provider = options.existingMock ?? await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
+	// 2.0.5 title generation hits the mock on session.create, before tests
+	// install matchers, and uses a host title model rather than mock-model.
+    if (!options.existingMock) {
+        mock.setDefault({
+            text: "fixture reply",
+            usage: { input_tokens: 100, output_tokens: 10 },
+        });
+        if (options.mockResponse) mock.setDefault(options.mockResponse);
+    }
+	const schemaTrace = join(fixture.root, "llm-schema-guard.jsonl");
+	fixture.env.MC_E2E_SCHEMA_TRACE_PATH = schemaTrace;
+	const defaultModelID = options.defaultModelID ?? "mock-model";
+	const modelIDs = new Set([
+		defaultModelID,
+		...(options.additionalModelIDs ?? []),
+		...(options.historianModel ? [options.historianModel.id] : []),
+	]);
 	writeFileSync(
 		join(fixture.cwd, "opencode.json"),
 		JSON.stringify({
-			plugins: [PLUGIN, ...(options.probePlugin ? [options.probePlugin] : [])],
-			model: `${providerID}/mock-model`,
-			compaction: { auto: true, buffer: 1024, keep: { tokens: 1024 } },
+			...options.extraConfig,
+			plugins: [
+				...(options.includeMagicContext === false ? [] : [PLUGIN]),
+				...(options.probePlugin ? [options.probePlugin] : []),
+				SCHEMA_GUARD,
+			],
+			model: `${providerID}/${defaultModelID}`,
+			compaction: { auto: options.compactionAuto ?? true, buffer: 1024, keep: { tokens: 1024 } },
 			providers: {
 				[providerID]: {
 					settings: { baseURL: provider.baseURL, apiKey: "mock-key" },
-					models: {
-						"mock-model": {
-							name: "Mock",
-							limit: { context: 16000, output: 1024 },
-						},
-					},
+					models: Object.fromEntries(
+						[...modelIDs].map((id) => [
+							id,
+							{
+								name: id,
+                                ...(options.visionModel ? { modalities: { input: ["text", "image"], output: ["text"] } } : {}),
+								limit: {
+									// 2.0.5 required() is unchanged, but 16k minus a 32k output
+									// makes the first-request ceiling negative. Ordinary turns
+									// stay large; fold scenarios pass 16k/1024 explicitly.
+									context:
+										id === options.historianModel?.id
+											? options.historianModel.contextLimit
+											: (options.modelContextLimit ?? 200_000),
+									output: options.modelOutputLimit ?? 32768,
+								},
+							},
+						]),
+					),
 				},
 			},
 		}),
 	);
+	if (options.magicContextConfig !== undefined) {
+		const configDir = join(fixture.env.XDG_CONFIG_HOME!, "cortexkit");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "magic-context.jsonc"),
+			JSON.stringify(
+				{
+					auto_update: false,
+					execute_threshold_percentage: 40,
+					history_budget_percentage: 0.15,
+					embedding: { provider: "off" },
+					...pinMockAgents(
+						options.magicContextConfig,
+						`${providerID}/${defaultModelID}`,
+						// Both OpenCode host generations use the `agents.*.opencode` config block.
+						"opencode",
+						options.historianModel
+							? { historian: `${providerID}/${options.historianModel.id}` }
+							: {},
+					),
+				},
+				null,
+				2,
+			),
+		);
+	}
 	// serve owns its server directly; --standalone is a TUI/run flag, not a serve option.
 	const child = spawn(
 		CLI,
@@ -189,6 +375,7 @@ export async function spawnOpencode2(
 			...(options.probeStandalone
 				? [OPENCODE2_NO_BACKGROUND_SERVICE_FLAG]
 				: []),
+			...(options.serviceMode ? ["--service"] : []),
 			"--print-logs",
 		],
 		{
@@ -204,7 +391,10 @@ export async function spawnOpencode2(
 	const exited = new Promise<void>((resolveExit) =>
 		child.once("close", () => resolveExit()),
 	);
-	const stop = async () => {
+	let hostStopped = false;
+	const stopHost = async () => {
+		if (hostStopped) return;
+		hostStopped = true;
 		let safetyError: unknown;
 		try {
 			if (child.pid && child.exitCode === null && child.signalCode === null)
@@ -215,9 +405,19 @@ export async function spawnOpencode2(
 		if (child.pid) killGroup(child.pid);
 		await exited;
 		if (child.pid) groups.delete(child.pid);
-		await mock.stop();
-		if (before) assertLiveUnchanged(before);
+		assertWriteFenceUnchanged(fence);
 		if (safetyError) throw safetyError;
+		if (existsSync(schemaTrace)) {
+			const failures = readFileSync(schemaTrace, "utf8").split("\n").filter((line) => line.startsWith("FAIL "));
+			if (failures.length) throw new Error(`OC2 LLM schema guard rejected returned drafts:\n${failures.join("\n")}`);
+		}
+	};
+	const stop = async () => {
+		try {
+			await stopHost();
+		} finally {
+			await mock.stop();
+		}
 	};
 	try {
 		const ready = await new Promise<{ url: string; password: string }>(
@@ -226,12 +426,23 @@ export async function spawnOpencode2(
 					() => reject(new Error(`v2 handoff timed out\n${stdout}\n${stderr}`)),
 					30000,
 				);
+				let poll: ReturnType<typeof setInterval> | undefined;
 				const finish = (error?: Error) => {
 					clearTimeout(timer);
+					if (poll) clearInterval(poll);
 					if (error) reject(error);
 				};
+				if (options.serviceMode) {
+					poll = setInterval(() => {
+						const value = serviceHandoff(fixture.env);
+						if (!value) return;
+						finish();
+						resolveReady(value);
+					}, 25);
+				}
 				child.stdout.on("data", (chunk) => {
 					stdout += chunk.toString();
+					if (options.serviceMode) return;
 					const value = handoff(stdout);
 					if (value) {
 						finish();
@@ -251,8 +462,10 @@ export async function spawnOpencode2(
 		return {
 			...ready,
 			...fixture,
-			snapshotReason,
+			pid: child.pid,
 			mock,
+			mockBaseURL: provider.baseURL,
+			stopHost,
 			stop,
 			stdout: () => stdout,
 			stderr: () => stderr,
@@ -263,48 +476,38 @@ export async function spawnOpencode2(
 	}
 }
 
-function activeV1Host(): boolean {
-	const result = spawnSync("pgrep", ["-f", "opencode serve"], {
-		encoding: "utf8",
-	});
-	if (result.error || (result.status !== 0 && result.status !== 1))
-		throw new Error("Cannot determine whether a live v1 host owns the store");
-	return result.status === 0;
-}
-
 export function assertOpenPaths(
 	paths: string[],
 	root: string,
 	allowed: string[] = [],
+	writable: string[] = [],
 ): void {
 	const under = (path: string, base: string) =>
 		path === base || path.startsWith(`${base}/`);
-	const live = join(homedir(), ".local/share/opencode");
+	const home = homedir();
+	const protectedRoots = [
+		join(home, ".local/share/opencode"),
+		join(home, ".local/share/cortexkit/magic-context"),
+		join(home, ".config/opencode"),
+		join(home, ".config/cortexkit"),
+		join(home, ".local/state/opencode"),
+	];
 	for (const path of paths) {
 		if (!path.startsWith("/")) continue; // lsof socket/pipe labels are not filesystem paths.
-		const bunLibrary =
-			/^\/private\/tmp\/\.bun-\d+-[a-f0-9]+\.(dylib|node)$/.test(path);
-		if (
-			under(path, live) ||
-			(!bunLibrary &&
-				![
-					root,
-					...allowed,
-					"/dev",
-					"/System",
-					"/usr/lib",
-					"/usr/share",
-					"/private/etc",
-					"/Library/Apple/System",
-					"/private/var/db/diagnostics",
-					"/private/var/db/uuidtext",
-					"/private/var/db/timezone",
-					"/private/var/db/mds/messages",
-					"/private/var/db/analyticsd/events.allowlist",
-				].some((base) => under(path, base)))
-		) {
+		if (protectedRoots.some((base) => under(path, base)) ||
+			(/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(path) && !under(path, root)) ||
+			// Config and state live under the home XDG roots; a source file that merely sits
+			// in a directory named `config` (the plugin's own src/config/index.ts, which the
+			// TUI loads) is not operator configuration.
+			((under(path, join(home, ".config")) ||
+				under(path, join(home, ".local/state"))) &&
+				!under(path, root)))
 			throw new Error(`v2 process holds a forbidden open path: ${path}`);
-		}
+	}
+	for (const path of writable) {
+		if (!path.startsWith("/")) continue;
+		if (![root, ...allowed].some((base) => under(path, base)))
+			throw new Error(`v2 process holds a forbidden writable path: ${path}`);
 	}
 }
 
@@ -329,14 +532,21 @@ export function inspectOpenFiles(
 	});
 	if (result.status !== 0)
 		throw new Error(`Cannot inspect v2 open files: ${result.stderr}`);
-	const paths = result.stdout
-		.split("\n")
-		.filter((line) => line.startsWith("n"))
-		.map((line) => line.slice(1));
-	assertOpenPaths(paths, root, [
-		realpathSync(resolve(PLUGIN, "../../node_modules")),
-		realpathSync(CLI),
-	]);
+	let fd = "";
+	const paths: string[] = [];
+	const writable: string[] = [];
+	for (const line of result.stdout.split("\n")) {
+		if (line.startsWith("f")) fd = line.slice(1);
+		if (!line.startsWith("n")) continue;
+		const path = line.slice(1);
+		paths.push(path);
+		// lsof's fd suffix is r, w or u (read/write). Program text, cwd,
+		// shared libraries and TUI source files are read-only inputs, not leaks.
+		if (/[0-9]+[wu]$/.test(fd)) writable.push(path);
+	}
+	// Mapped libraries and terminal-interface source files are read-only inputs.
+	// Check database/config paths even when their descriptors are read-only.
+	assertOpenPaths(paths, root, [], writable);
 	const db = join(env.XDG_DATA_HOME!, "opencode", env.OPENCODE_DB!);
 	const expected = statSync(db);
 	let inode: number | undefined;

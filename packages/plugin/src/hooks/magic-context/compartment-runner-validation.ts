@@ -10,6 +10,10 @@ import type {
     StoredCompartmentRange,
     ValidatedHistorianPassResult,
 } from "./compartment-runner-types";
+import {
+    finishHistorianPublishStage,
+    startHistorianPublishStage,
+} from "./historian-publish-stage-logger";
 import { completedToolArcCrossesBoundary } from "./read-session-true-raw-tokens";
 
 const MIN_RECOMP_CHUNK_TOKEN_BUDGET = 20;
@@ -123,18 +127,45 @@ export function shouldDiscardLastHistorianCompartment(
 
 export function validateHistorianOutput(
     text: string,
-    _sessionId: string,
+    sessionId: string,
     chunk: HistorianValidationChunk,
     _priorCompartments: StoredCompartmentRange[],
     sequenceOffset: number,
     domain: MemoryDomain = "coding-project",
 ): ValidatedHistorianPassResult {
     const parsed = parseCompartmentOutput(text, factCategoriesForDomain(domain));
+    const parseStarted = startHistorianPublishStage(
+        sessionId,
+        "parse",
+        `response_chars=${text.length}`,
+    );
+    finishHistorianPublishStage(
+        sessionId,
+        "parse",
+        parseStarted,
+        "completed",
+        `compartments=${parsed.compartments.length} dropped_fact_blocks=${parsed.droppedFactBlocks} dropped_facts=${parsed.droppedFacts}`,
+    );
+
+    const validationStarted = startHistorianPublishStage(sessionId, "validate");
+    const finish = (result: ValidatedHistorianPassResult): ValidatedHistorianPassResult => {
+        finishHistorianPublishStage(
+            sessionId,
+            "validate",
+            validationStarted,
+            result.ok ? "completed" : "failed",
+            result.ok
+                ? `compartments=${result.compartments.length}`
+                : `reason=${JSON.stringify(result.error)}`,
+        );
+        return result;
+    };
+
     if (parsed.compartments.length === 0) {
-        return {
+        return finish({
             ok: false,
             error: "Historian returned no usable compartments.",
-        };
+        });
     }
 
     // Heal only proven tool-only gaps. Narrative gaps reject before publication, so
@@ -149,10 +180,10 @@ export function validateHistorianOutput(
 
     const mapped = mapParsedCompartmentsToChunk(parsed.compartments, chunk, sequenceOffset);
     if (!mapped.ok) {
-        return {
+        return finish({
             ok: false,
             error: `Historian returned invalid compartment output: ${mapped.error}`,
-        };
+        });
     }
 
     const parsedValidationError = validateParsedCompartments(
@@ -162,30 +193,33 @@ export function validateHistorianOutput(
         parsed.unprocessedFrom,
     );
     if (parsedValidationError) {
-        return {
+        return finish({
             ok: false,
             error: `Historian returned invalid compartment output: ${parsedValidationError}`,
-        };
+        });
     }
 
     const last = parsed.compartments[parsed.compartments.length - 1];
     if (last && boundarySplitsCompletedToolArc(last.endMessage + 1, chunk.completedToolArcs)) {
-        return {
+        return finish({
             ok: false,
             error: "Historian terminal boundary splits a completed tool invocation/result arc",
-        };
+        });
     }
 
-    return {
+    return finish({
         ok: true,
         compartments: mapped.compartments,
         facts: parsed.facts,
+        ...(parsed.droppedFactBlocks > 0
+            ? { droppedFactBlocks: parsed.droppedFactBlocks, droppedFacts: parsed.droppedFacts }
+            : {}),
         userObservations: parsed.userObservations.length > 0 ? parsed.userObservations : undefined,
         primerCandidates:
             parsed.primerCandidates.length > 0 ? parsed.primerCandidates.slice(0, 1) : undefined,
         // v2: surface events so the runner can persist them (stored, not rendered).
         events: parsed.events.length > 0 ? parsed.events : undefined,
-    };
+    });
 }
 
 /**
@@ -221,6 +255,20 @@ export function buildHistorianFailureNotice(failureCount: number, _lastError: st
     return [heading, "", renderUserFacingFailure("historian_unavailable")].join("\n");
 }
 
+/**
+ * User-facing notice for stored compartments that fail validation before the
+ * historian can run. Unlike a model failure this cannot clear on its own: the
+ * saved rows stay invalid until they are rebuilt, so the notice names the
+ * rebuild instead of promising an automatic retry.
+ */
+export function buildStoredCompartmentsInvalidNotice(): string {
+    return [
+        "## Magic Context — History compression",
+        "",
+        renderUserFacingFailure("historian_saved_history_misaligned"),
+    ].join("\n");
+}
+
 export function buildHistorianRepairPrompt(
     originalPrompt: string,
     previousOutput: string,
@@ -244,6 +292,7 @@ export function buildHistorianRepairPrompt(
 
 export function validateStoredCompartments(
     compartments: Array<{ startMessage: number; endMessage: number }>,
+    nonNarrativeGapRanges: ReadonlyArray<{ start: number; end: number }> = [],
 ): string | null {
     if (compartments.length === 0) {
         return null;
@@ -255,7 +304,13 @@ export function validateStoredCompartments(
             if (compartment.startMessage < expectedStart) {
                 return `overlap before message ${expectedStart} (saw ${compartment.startMessage}-${compartment.endMessage})`;
             }
-            return `gap before message ${compartment.startMessage} (expected ${expectedStart})`;
+            const gapEnd = compartment.startMessage - 1;
+            const safeGap = nonNarrativeGapRanges.some(
+                (range) => range.start <= expectedStart && range.end >= gapEnd,
+            );
+            if (!safeGap) {
+                return `gap before message ${compartment.startMessage} (expected ${expectedStart})`;
+            }
         }
         if (compartment.endMessage < compartment.startMessage) {
             return `invalid range ${compartment.startMessage}-${compartment.endMessage}`;

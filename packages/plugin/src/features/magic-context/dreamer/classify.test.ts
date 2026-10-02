@@ -2,12 +2,14 @@
 
 import { describe, expect, test } from "bun:test";
 
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import { Database, withPrivilegedWriter } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { installAuthorityManagedMarker } from "../context-authority";
 import { getMemoryById, insertMemory } from "../memory";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import {
     applyClassifications,
     type ClassifyArgs,
@@ -70,6 +72,38 @@ function classifyArgs(db: Database, projectIdentity: string): ClassifyArgs {
 }
 
 describe("runClassify disposition", () => {
+    test("classifies through the v2 executor without a v1 client", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-v2";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            args.client = undefined;
+            let opened = 0;
+            let manifest = "";
+            args.hiddenCompletionExecutor = {
+                capabilities: { tools: false, harness: "opencode2" },
+                open: async () => {
+                    opened++;
+                    return { id: "v2-classify" };
+                },
+                attempt: async (_handle, request) => {
+                    const prompt = request.body?.parts?.[0]?.text ?? "";
+                    const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                        Number(match[1]),
+                    );
+                    manifest = `<classify>${ids.map((id) => `<memory id="${id}" importance="80" scope="project" shareable="true"/>`).join("")}</classify>`;
+                },
+                collect: async () => ({ text: manifest, reasoning: null, lengthCapped: false }),
+                close: async () => {},
+            } satisfies HiddenCompletionExecutor;
+            const result = await runClassify(args);
+            expect(opened).toBe(1);
+            expect(result.classified).toBe(10);
+        } finally {
+            closeQuietly(db);
+        }
+    });
     test("localizes the TypeScript classifier system prompt", async () => {
         const db = freshDb();
         try {
@@ -86,6 +120,59 @@ describe("runClassify disposition", () => {
 
             expect(result.classified).toBe(10);
             expect(system).toContain("Write human-readable prose you author in: Turkish (Türkçe).");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a failed chunk row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-failed-row-evidence";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            args.parentSessionId = "ses-parent-classify";
+            // The model answered in prose instead of the classify manifest.
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "classify-child" } }),
+                    prompt: async () => ({}),
+                    messages: async () => ({
+                        data: [
+                            {
+                                info: {
+                                    role: "assistant",
+                                    providerID: "google",
+                                    modelID: "gemini-classify",
+                                    time: { created: 1, completed: 2 },
+                                    finish: "stop",
+                                    tokens: {
+                                        input: 700,
+                                        output: 90,
+                                        cache: { read: 0, write: 0 },
+                                    },
+                                },
+                                parts: [{ type: "text", text: "These all look important." }],
+                            },
+                        ],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await runClassify(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-classify", {
+                subagent: "dreamer",
+            });
+            expect(row).toMatchObject({
+                task: "classify-memories",
+                status: "failed",
+                providerId: "google",
+                modelId: "gemini-classify",
+                inputTokens: 700,
+                outputTokens: 90,
+            });
         } finally {
             closeQuietly(db);
         }
@@ -123,6 +210,25 @@ describe("runClassify disposition", () => {
             expect(result.classified).toBe(10);
             expect(result.remaining).toBe(0);
             expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("Stage 2 does not prompt for an unchanged classified pool", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-stage2-gate";
+            addMemoriesForDisposition(db, projectIdentity, 10);
+            const args = classifyArgs(db, projectIdentity);
+            let prompts = 0;
+            args.client = successfulClassifyClient(() => prompts++) as never;
+            expect((await runClassify(args)).classified).toBe(10);
+            const second = await runClassify(args);
+            expect(second.stage).toBe(2);
+            expect(second.classified).toBe(0);
+            expect(second.remaining).toBe(0);
+            expect(prompts).toBe(1);
         } finally {
             closeQuietly(db);
         }
@@ -322,6 +428,7 @@ describe("module-backed classification", () => {
                 complete: true,
             });
             const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            expect(taskCall?.timeoutMs).toBeGreaterThan(2 * 660_000);
             const applyCall = calls.find((call) => call.method === "memory.set_classification");
             expect((taskCall?.body as { model_chain: string[] }).model_chain).toEqual([
                 "anthropic/profile-dreamer",
@@ -350,6 +457,89 @@ describe("module-backed classification", () => {
             expect(
                 db.prepare("SELECT classified_at FROM memories WHERE id = ?").get(contextIds[0]),
             ).toEqual({ classified_at: null });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("runs the completion on this host when the module has no completion runner, and hands the text back", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-host-runner";
+            const contextIds = addMemories(db, projectIdentity, 10);
+            for (const [index, contextId] of contextIds.entries()) {
+                addMirrorMapping(db, projectIdentity, contextId, 9300 + index, `hash-${index}`);
+            }
+            installAuthorityManagedMarker(db, projectIdentity, "store");
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                if (call.method === "dreamer.run_task") {
+                    const completion = (call.body as { host_completion?: { text: string } })
+                        .host_completion;
+                    // The module under historian.runner = host: no runner of its own, so
+                    // it asks for the host's completion and then echoes the text it got.
+                    return completion
+                        ? { result: { ok: true, manifest_text: completion.text } }
+                        : {
+                              result: {
+                                  ok: false,
+                                  code: "host_completion_required",
+                                  system_prompt: "module classify system prompt",
+                              },
+                          };
+                }
+                const rows = (call.body as { arguments: { rows: Array<{ memory_id: number }> } })
+                    .arguments.rows;
+                return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
+            });
+            args.client = undefined;
+            args.model = "anthropic/profile-dreamer";
+            const systems: string[] = [];
+            let manifest = "";
+            args.hiddenCompletionExecutor = {
+                capabilities: { tools: false, harness: "opencode2" },
+                open: async (run) => {
+                    systems.push(run.system);
+                    return { id: "host-classify" };
+                },
+                attempt: async (_handle, request) => {
+                    const prompt = request.body?.parts?.[0]?.text ?? "";
+                    const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                        Number(match[1]),
+                    );
+                    manifest = `<classify>${ids.map((id) => `<memory id="${id}" importance="70" scope="project" shareable="false"/>`).join("")}</classify>`;
+                },
+                collect: async () => ({
+                    text: manifest,
+                    reasoning: null,
+                    lengthCapped: false,
+                    usage: { input: 12, output: 3, cacheRead: 0, cacheWrite: 0 },
+                    providerId: "anthropic",
+                    modelId: "profile-dreamer",
+                }),
+                close: async () => {},
+            } satisfies HiddenCompletionExecutor;
+
+            const result = await runClassify(args);
+
+            expect(result.classified).toBe(10);
+            expect(systems).toEqual(["module classify system prompt"]);
+            const taskCalls = calls.filter((call) => call.method === "dreamer.run_task");
+            expect(taskCalls).toHaveLength(2);
+            const [first, second] = taskCalls.map(
+                (call) => call.body as { command_id: string; host_completion?: unknown },
+            );
+            expect(first?.host_completion).toBeUndefined();
+            expect(second?.command_id).toBe(first?.command_id);
+            expect(second?.host_completion).toEqual({
+                text: manifest,
+                model: "anthropic/profile-dreamer",
+                length_capped: false,
+                usage: { input: 12, output: 3, cache_read: 0, cache_write: 0 },
+            });
+            expect(calls.at(-1)?.method).toBe("memory.set_classification");
         } finally {
             closeQuietly(db);
         }
@@ -388,6 +578,110 @@ describe("module-backed classification", () => {
             expect(itemIds).not.toContain(contextIds[10]);
         } finally {
             closeQuietly(db);
+        }
+    });
+
+    test("always sends a model_chain, even an empty one", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-empty-chain";
+            const contextIds = addMemories(db, projectIdentity, 10);
+            for (const [offset, contextId] of contextIds.entries()) {
+                addMirrorMapping(db, projectIdentity, contextId, 9400 + offset, `e-${offset}`);
+            }
+            installAuthorityManagedMarker(db, projectIdentity, "store");
+            let taskBody: Record<string, unknown> | undefined;
+            await expect(
+                runClassify(
+                    moduleArgs(db, projectIdentity, (call) => {
+                        if (call.method === "dreamer.run_task") {
+                            taskBody = call.body as Record<string, unknown>;
+                            throw new Error("stop after capturing the request");
+                        }
+                        return { result: { accepted: [], rejected: [] } };
+                    }),
+                ),
+            ).rejects.toThrow("stop after capturing the request");
+            expect(taskBody?.model_chain).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("records the module's usage and model on the invocation row", async () => {
+        const cases = [
+            {
+                response: {
+                    usage: { input: 14_039, output: 6_125, cache_read: 12, cache_write: 3 },
+                    diagnostics: { model: "antigravity/gemini-3.8-flash" },
+                },
+                expected: {
+                    provider_id: "antigravity",
+                    model_id: "gemini-3.8-flash",
+                    input_tokens: 14_039,
+                    output_tokens: 6_125,
+                    cache_read_tokens: 12,
+                    cache_write_tokens: 3,
+                },
+            },
+            // A module that predates `usage` still gets its model recorded.
+            {
+                response: { diagnostics: { model: "antigravity/gemini-3.8-flash" } },
+                expected: {
+                    provider_id: "antigravity",
+                    model_id: "gemini-3.8-flash",
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+        ];
+        for (const [index, row] of cases.entries()) {
+            const db = freshDb();
+            try {
+                const projectIdentity = `git:module-usage-${index}`;
+                const contextIds = addMemories(db, projectIdentity, 10);
+                for (const [offset, contextId] of contextIds.entries()) {
+                    addMirrorMapping(db, projectIdentity, contextId, 9300 + offset, `h-${offset}`);
+                }
+                installAuthorityManagedMarker(db, projectIdentity, "store");
+                let itemIds: number[] = [];
+                const args = moduleArgs(db, projectIdentity, (call) => {
+                    if (call.method === "dreamer.run_task") {
+                        itemIds = (
+                            call.body as { payload: { items: Array<{ memory_id: number }> } }
+                        ).payload.items.map((item) => item.memory_id);
+                        const manifest = itemIds
+                            .map(
+                                (id) =>
+                                    `<memory id="${id}" importance="80" scope="project" shareable="true"/>`,
+                            )
+                            .join("\n");
+                        return {
+                            result: {
+                                manifest_text: `<classify>${manifest}</classify>`,
+                                ...row.response,
+                            },
+                        };
+                    }
+                    return { result: { accepted: itemIds, rejected: [] } };
+                });
+                args.parentSessionId = "ses-parent";
+                await runClassify(args);
+
+                const recorded = db
+                    .prepare(
+                        `SELECT status, provider_id, model_id, input_tokens, output_tokens,
+                                cache_read_tokens, cache_write_tokens
+                           FROM subagent_invocations
+                          WHERE session_id = 'ses-parent' AND task = 'classify-memories'`,
+                    )
+                    .all();
+                expect(recorded).toEqual([{ status: "completed", ...row.expected }]);
+            } finally {
+                closeQuietly(db);
+            }
         }
     });
 

@@ -15,7 +15,10 @@ import { makeToolCompositeKey, type Tagger } from "../../features/magic-context/
 import { textMentionsRecentCommit } from "../../shared/commit-detection";
 import { isRecord } from "../../shared/record-type-guard";
 import { isReduceToolPart } from "./drop-stale-reduce-calls";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
+import {
+    estimateImageTokensFromDataUrl,
+    estimateToolAttachmentImageTokens,
+} from "./image-token-estimate";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { byteSize, isThinkingPart, prependTag } from "./tag-content-primitives";
@@ -34,6 +37,7 @@ import {
     type ToolCallIndex,
     type ToolDropResult,
     ToolMutationBatch,
+    type ToolSweepVariantResolver,
 } from "./tool-drop-target";
 import { logTransformTiming } from "./transform-stage-logger";
 
@@ -47,6 +51,33 @@ type ToolOwnerFallbackLookup =
     | { kind: "messageTimes"; messageIds: readonly string[] };
 
 const TOOL_OWNER_CACHE_KEY_SEP = "\x00";
+
+type InertWhitespaceTag = ReturnType<typeof getInertWhitespaceAssistantTags>[number];
+const inertWhitespaceCache = new WeakMap<
+    ContextDatabase,
+    Map<string, { tagsVersion: number; tags: InertWhitespaceTag[] }>
+>();
+
+function getCachedInertWhitespaceAssistantTags(
+    db: ContextDatabase,
+    sessionId: string,
+    tagger: Tagger,
+): InertWhitespaceTag[] {
+    const tagsVersion = tagger.getLoadedTagsVersion?.(sessionId, db);
+    if (tagsVersion === undefined) return getInertWhitespaceAssistantTags(db, sessionId);
+
+    let bySession = inertWhitespaceCache.get(db);
+    if (!bySession) {
+        bySession = new Map();
+        inertWhitespaceCache.set(db, bySession);
+    }
+    const cached = bySession.get(sessionId);
+    if (cached?.tagsVersion === tagsVersion) return cached.tags;
+
+    const tags = getInertWhitespaceAssistantTags(db, sessionId);
+    bySession.set(sessionId, { tagsVersion, tags });
+    return tags;
+}
 
 function makeToolOwnerCacheKey(sessionId: string, callId: string): string {
     return `${sessionId}${TOOL_OWNER_CACHE_KEY_SEP}${callId}`;
@@ -222,14 +253,40 @@ export interface TagNormalizationTarget {
 }
 
 export type TagTarget = {
+    /** Non-mutating count of current and replacement token-bearing fields for a planned drop. */
+    measureReclaim?: (skeleton: boolean) => {
+        beforeTools: number;
+        afterTools: number;
+        beforeProse: number;
+        afterProse: number;
+    };
     setContent: (content: string) => boolean;
     getContent?: () => string | null;
     drop?: () => ToolDropResult;
+    /** Legacy skeleton: arguments replaced by the `{"dropped": …}` marker.
+     * Replay-only, for `drop_mode = 'truncated'` tags not yet converted. */
     truncate?: () => ToolDropResult;
+    /** Real-argument skeleton: the call keeps the arguments the host gave it,
+     * only the output becomes `[dropped §N§]` (`drop_mode = 'skeleton_real'`). */
+    skeletonReal?: () => ToolDropResult;
+    /** New attachment-bearing skeletons omit media; legacy skeletons retain it. */
+    skeletonStripped?: () => ToolDropResult;
+    hasAttachments?: () => boolean;
+    /** Total UTF-8 bytes of the string values in the call's input (see
+     * tool-input-size.ts); null when the call is not on this pass's wire. */
+    inputStringBytes?: () => number | null;
+    /** Non-mutating: would removing this call leave the request ending on an
+     * assistant turn (given what this pass already removed)? */
+    wouldStrandConversationEnd?: () => boolean;
+    /** Non-mutating: the host adapter cannot remove this call structurally, so
+     * drop() would keep a paired shell instead. A new drop then keeps the real
+     * arguments (skeletonReal) rather than any placeholder. */
+    cannotRemove?: () => boolean;
     /** Edit-marker compression for an edit/write superseded by a later edit to
      * the same file: keep the call + filePath + a region hint of the diff,
      * output → [dropped §N§]. Used by smart-drops. */
     editMarker?: () => ToolDropResult;
+    editMarkerStripped?: () => ToolDropResult;
     /** Non-mutating: would drop()/truncate() actually reclaim bytes? Tool
      * targets only; absent on message/file targets. */
     canDrop?: () => boolean;
@@ -374,6 +431,19 @@ export interface TagMessagesOptions {
      * per session, so message shape stays stable.
      */
     skipPrefixInjection?: boolean;
+    /**
+     * Prune only tool-drop owners; callers enable this after persisting
+     * cache-safe session adoption. A resolver defers the choice to finalize
+     * time, where both candidate arrays are known (see
+     * `createPreAdoptionToolSweepResolver`).
+     */
+    scopedToolSweep?: boolean | ToolSweepVariantResolver;
+    /**
+     * The array that reaches the provider, when it is not `messages`. Passes
+     * that trim a compaction prefix tag the pre-trim copy, and the sweep has to
+     * remove its emptied rows from the served array as well.
+     */
+    servedMessages?: MessageLike[];
     /** @internal diagnostic hook used by cache-stability/perf tests. */
     onToolOwnerFallbackLookup?: (lookup: ToolOwnerFallbackLookup) => void;
 }
@@ -431,17 +501,18 @@ export function tagMessages(
     // FIFO logic and double-pop the queue. Parts are object references
     // (the same `unknown` instance walked twice in the loop).
     const ownerByPartKey = new Map<unknown, { ownerMsgId: string; callId: string }>();
-    const batch = new ToolMutationBatch(messages);
+    const batch = new ToolMutationBatch(messages, options.scopedToolSweep, options.servedMessages);
     // Inert whitespace rows are replayed by (message, whitespace rank), not by
     // session-wide number membership: after a part-id remap the ordinal fallback
     // offers whichever inert row sits at the current ordinal, and two inert parts
     // in one message would otherwise swap their `§N§` digits on the wire.
+    const tInertWhitespace = performance.now();
     const inertWhitespaceTagNumbers = new Set<number>();
     const inertWhitespaceTagsByMessage = new Map<
         string,
         Array<{ partIndex: number; tagNumber: number }>
     >();
-    for (const tag of getInertWhitespaceAssistantTags(db, sessionId)) {
+    for (const tag of getCachedInertWhitespaceAssistantTags(db, sessionId, tagger)) {
         inertWhitespaceTagNumbers.add(tag.tagNumber);
         tagger.bindTag(sessionId, tag.contentId, tag.tagNumber);
         const scoped = /^(.*):p(\d+)$/.exec(tag.contentId);
@@ -453,6 +524,7 @@ export function tagMessages(
     for (const list of inertWhitespaceTagsByMessage.values()) {
         list.sort((left, right) => left.partIndex - right.partIndex);
     }
+    logTransformTiming(sessionId, "tag.inertWhitespace", tInertWhitespace);
     const assignments = tagger.getAssignments(sessionId);
     const resolver = createExistingTagResolver(sessionId, tagger, db);
     const tGetSourceContents = performance.now();
@@ -521,15 +593,26 @@ export function tagMessages(
                 //   empty, fall back to nearest-prior persisted owner;
                 //   ultimate fallback: result's own message id.
                 const _tDerive = performance.now();
-                const ownerMsgId = deriveToolOwnerMessageId(
-                    sessionId,
-                    db,
-                    message,
-                    toolObservation,
-                    unpairedInvocations,
-                    ownerDerivationCache,
-                    onToolOwnerFallbackLookup,
-                );
+                // A completed OpenCode tool part is hosted by its invocation message.
+                // Reuse that already-loaded composite binding before attempting the
+                // result-only fallback, which otherwise performs two database probes
+                // for every historical tool part on every replay pass.
+                const boundToHostingMessage =
+                    toolObservation.kind === "result" && messageId
+                        ? tagger.getToolTag(sessionId, toolObservation.callId, messageId)
+                        : undefined;
+                const ownerMsgId =
+                    boundToHostingMessage !== undefined && messageId
+                        ? messageId
+                        : deriveToolOwnerMessageId(
+                              sessionId,
+                              db,
+                              message,
+                              toolObservation,
+                              unpairedInvocations,
+                              ownerDerivationCache,
+                              onToolOwnerFallbackLookup,
+                          );
                 accDerive += performance.now() - _tDerive;
                 const compositeKey = makeToolCompositeKey(ownerMsgId, toolObservation.callId);
                 const entry = toolCallIndex.get(compositeKey) ?? {
@@ -719,15 +802,11 @@ export function tagMessages(
                     // Resolver pre-warms any tag-id-fallback bindings (e.g. when OpenCode
                     // re-assigns part IDs); the assigned tag below uses those bindings. Inert
                     // whitespace rows are replay-only and must never migrate onto real text.
-                    const resolved = resolver.resolve(
-                        messageId,
-                        "message",
-                        contentId,
-                        textOrdinal,
-                        { accept: (tagNumber) => !inertWhitespaceTagNumbers.has(tagNumber) },
-                    );
+                    existingTagId = resolver.resolve(messageId, "message", contentId, textOrdinal, {
+                        accept: (tagNumber) => !inertWhitespaceTagNumbers.has(tagNumber),
+                    });
                     if (
-                        resolved === undefined &&
+                        existingTagId === undefined &&
                         inertWhitespaceTagNumbers.has(
                             tagger.getTag(sessionId, contentId, "message") ?? -1,
                         )
@@ -735,28 +814,28 @@ export function tagMessages(
                         tagger.unbindTag(sessionId, contentId);
                     }
                 }
-                const reasoningBytes = textOrdinal === 0 ? getReasoningByteSize(thinkingParts) : 0;
-                const reasoningTokens =
-                    textOrdinal === 0 ? getReasoningTokenCount(thinkingParts) : 0;
                 const _tAssignText = performance.now();
-                const tagId = tagger.assignTag(
-                    sessionId,
-                    contentId,
-                    "message",
-                    byteSize(textPart.text),
-                    db,
-                    reasoningBytes,
-                    null,
-                    0,
-                    null,
-                    // Lazy: only fires on fresh insert. textPart.text is still the
-                    // pre-prefix source here (prependTag runs after assign).
-                    () => ({
-                        tokenCount: estimateTextTagTokenCount(stripTagPrefix(textPart.text)),
-                        inputTokenCount: null,
-                        reasoningTokenCount: reasoningTokens,
-                    }),
-                );
+                const tagId =
+                    existingTagId ??
+                    tagger.assignTag(
+                        sessionId,
+                        contentId,
+                        "message",
+                        byteSize(textPart.text),
+                        db,
+                        textOrdinal === 0 ? getReasoningByteSize(thinkingParts) : 0,
+                        null,
+                        0,
+                        null,
+                        // Lazy: only fires on fresh insert. textPart.text is still the
+                        // pre-prefix source here (prependTag runs after assign).
+                        () => ({
+                            tokenCount: estimateTextTagTokenCount(stripTagPrefix(textPart.text)),
+                            inputTokenCount: null,
+                            reasoningTokenCount:
+                                textOrdinal === 0 ? getReasoningTokenCount(thinkingParts) : 0,
+                        }),
+                    );
                 accAssignTag += performance.now() - _tAssignText;
                 // Prefer persisted source_contents over the existingTagId
                 // signal: even if we just allocated a fresh tag (because in-
@@ -809,10 +888,6 @@ export function tagMessages(
             if (isToolPartWithOutput(part)) {
                 const toolPart = part;
                 const thinkingParts = precedingThinkingParts;
-                const reasoningBytes = getReasoningByteSize(thinkingParts);
-                const reasoningTokens = getReasoningTokenCount(thinkingParts);
-                const { toolName, inputByteSize, inputTokenCount } =
-                    extractToolTagMetadata(toolPart);
 
                 // v3.3.1 Layer C: derive owner from the FIFO memo set
                 // earlier in this same loop iteration. The first tool
@@ -836,25 +911,32 @@ export function tagMessages(
                 // largest live sessions show zero byte_size drift vs the current
                 // opencode.db output. Adding a per-part size compare here would
                 // cost every hot pass to defend an unreachable case.
-                const tagId = tagger.assignToolTag(
-                    sessionId,
-                    toolPart.callID,
-                    ownerMsgId,
-                    byteSize(toolPart.state.output),
-                    db,
-                    reasoningBytes,
-                    toolName,
-                    inputByteSize,
-                    // Lazy: fires only on fresh insert. token_count = output tokens
-                    // (mirrors byte_size=output); input/reasoning stored separately.
-                    () => ({
-                        tokenCount: estimateTextTagTokenCount(
-                            stripTagPrefix(toolPart.state.output),
-                        ),
-                        inputTokenCount,
-                        reasoningTokenCount: reasoningTokens,
-                    }),
-                );
+                const existingToolTag = tagger.getToolTag(sessionId, toolPart.callID, ownerMsgId);
+                let tagId = existingToolTag;
+                if (tagId === undefined) {
+                    const reasoningBytes = getReasoningByteSize(thinkingParts);
+                    const { toolName, inputByteSize, inputTokenCount } =
+                        extractToolTagMetadata(toolPart);
+                    tagId = tagger.assignToolTag(
+                        sessionId,
+                        toolPart.callID,
+                        ownerMsgId,
+                        byteSize(toolPart.state.output),
+                        db,
+                        reasoningBytes,
+                        toolName,
+                        inputByteSize,
+                        // Lazy: fires only on fresh insert. token_count = output tokens
+                        // (mirrors byte_size=output); input/reasoning stored separately.
+                        () => ({
+                            tokenCount:
+                                estimateTextTagTokenCount(stripTagPrefix(toolPart.state.output)) +
+                                estimateToolAttachmentImageTokens(toolPart.state),
+                            inputTokenCount,
+                            reasoningTokenCount: getReasoningTokenCount(thinkingParts),
+                        }),
+                    );
+                }
                 invalidateCachedCandidateToolOwnersIfNewOwner(
                     ownerDerivationCache,
                     sessionId,
@@ -887,22 +969,24 @@ export function tagMessages(
                 const contentId = `${messageId}:file${partIndex}`;
                 const existingTagId = resolver.resolve(messageId, "file", contentId, fileOrdinal);
                 const _tAssignFile = performance.now();
-                const tagId = tagger.assignTag(
-                    sessionId,
-                    contentId,
-                    "file",
-                    byteSize(filePart.url),
-                    db,
-                    0,
-                    null,
-                    0,
-                    null,
-                    () => ({
-                        tokenCount: estimateTextTagTokenCount(filePart.url),
-                        inputTokenCount: null,
-                        reasoningTokenCount: null,
-                    }),
-                );
+                const tagId =
+                    existingTagId ??
+                    tagger.assignTag(
+                        sessionId,
+                        contentId,
+                        "file",
+                        byteSize(filePart.url),
+                        db,
+                        0,
+                        null,
+                        0,
+                        null,
+                        () => ({
+                            tokenCount: estimateTextTagTokenCount(filePart.url),
+                            inputTokenCount: null,
+                            reasoningTokenCount: null,
+                        }),
+                    );
                 accAssignTag += performance.now() - _tAssignFile;
                 if (existingTagId === undefined) {
                     const sourceContent = buildFileSourceContent(message.parts);

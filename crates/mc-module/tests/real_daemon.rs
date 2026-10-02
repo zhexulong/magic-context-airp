@@ -49,6 +49,20 @@ impl Drop for LiveDaemon {
     }
 }
 
+/// Owns the test's temp root. The daemon and every module process share the data home
+/// under it, so cleanup cannot belong to any one of them: bind this first so it drops
+/// last, after all of those processes have exited. A failing test keeps the root, since
+/// the seeded store and the daemon's log are what a failed run needs for diagnosis.
+struct TempRoot(PathBuf);
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 struct ModuleProcess {
     child: Child,
 }
@@ -66,6 +80,86 @@ impl Drop for ModuleProcess {
     }
 }
 
+/// Uses a generated fixture and throwaway daemon/store; never connects to a live installation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "set MC_SYNC_PROBE_FIXTURE to the scratch plugin page"]
+async fn cereb_full_sync_through_real_daemon() {
+    std::env::remove_var(subc_protocol::SUBC_MODULE_ID_ENV);
+    std::env::remove_var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+    std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
+    let fixture =
+        fs::read(std::env::var("MC_SYNC_PROBE_FIXTURE").expect("fixture required")).unwrap();
+    let workspace = workspace_root();
+    let subconscious = subconscious_root(&workspace);
+    let daemon_bin = ensure_binary(
+        &subconscious,
+        subconscious.join("target/debug/ck-subc"),
+        &["build", "-p", "subc-core", "--bins"],
+    );
+    let module_bin = ensure_binary(
+        &workspace,
+        workspace.join("target/debug/ck-mc"),
+        &["build", "-p", "mc-module"],
+    );
+    let temp_root = TempRoot(unique_temp_dir("mc-full-sync-probe"));
+    let runtime = temp_root.0.join("runtime");
+    let config = temp_root.0.join("config");
+    let data = temp_root.0.join("data");
+    let projects = temp_root.0.join("projects");
+    for dir in [&runtime, &data, &projects] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    PROJECT_BASE
+        .set(fs::canonicalize(projects).unwrap())
+        .unwrap();
+    write_empty_config(&config);
+    let daemon = spawn_daemon(&daemon_bin, &runtime, &config, &data);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let _module =
+        spawn_module_with_differential(&module_bin, &daemon.connection_file, &data, false);
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    wait_for_module_registration(&consumer, START_TIMEOUT).await;
+    for pass in 0..3 {
+        let mut page: Value = serde_json::from_slice(&fixture).unwrap();
+        page["transform_page_id"] = json!(format!("daemon-probe-{pass}"));
+        let encode_start = std::time::Instant::now();
+        let bytes = serde_json::to_vec(&page).unwrap();
+        let encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
+        let start = std::time::Instant::now();
+        let response = consumer
+            .call(
+                RouteTarget::ToolProvider {
+                    module_id: MODULE_ID.to_string(),
+                },
+                identity_for("ses"),
+                bytes,
+                fast_call_options(),
+            )
+            .await
+            .unwrap();
+        let round_trip_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let parse_start = std::time::Instant::now();
+        let decoded: Value = serde_json::from_slice(&response).unwrap();
+        let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(decoded["status"], "ok");
+        println!("daemon-probe pass={pass} encode_ms={encode_ms:.3} round_trip_ms={round_trip_ms:.3} response_parse_ms={parse_ms:.3} response_bytes={} timings={}", response.len(), decoded["timings"]);
+    }
+    let logs = data.join("cortexkit/magic-context/logs");
+    if let Ok(entries) = fs::read_dir(logs) {
+        for entry in entries.flatten() {
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                for line in text.lines().filter(|line| {
+                    line.contains("mc-pass-timing") || line.contains("mc-transform-page-timing")
+                }) {
+                    println!("scratch-module-log {line}");
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mc_transform_spine_through_real_daemon() {
     // Clear any inherited supervision environment variables so this test opens the
@@ -73,6 +167,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // identity.
     std::env::remove_var(subc_protocol::SUBC_MODULE_ID_ENV);
     std::env::remove_var(subc_protocol::SUBC_LAUNCH_NONCE_ENV);
+    std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
     let subconscious = subconscious_root(&workspace);
@@ -89,10 +184,21 @@ async fn mc_transform_spine_through_real_daemon() {
         &["build", "-p", "mc-module"],
     );
 
-    let temp = unique_temp_dir("mc-module-real-daemon");
+    // Declared before the daemon and modules so it drops after them.
+    let temp_root = TempRoot(unique_temp_dir("mc-module-real-daemon"));
+    let temp = temp_root.0.clone();
     let runtime_dir = temp.join("runtime");
     let config_dir = temp.join("config");
     let data_home = temp.join("data"); // store lands here (dev_descriptor → XDG_DATA_HOME)
+
+    // Project roots live under the temp root so they are removed with it.
+    let projects = temp.join("projects");
+    fs::create_dir_all(&projects).unwrap();
+    // Canonicalize so the seeded project_path matches the binding's project_root after
+    // any path resolution in the daemon/on_bind (e.g. macOS /var → /private/var).
+    PROJECT_BASE
+        .set(fs::canonicalize(&projects).unwrap_or(projects))
+        .expect("one real-daemon test per process sets the project base once");
     fs::create_dir_all(&runtime_dir).unwrap();
     fs::create_dir_all(&data_home).unwrap();
     write_empty_config(&config_dir);
@@ -105,7 +211,7 @@ async fn mc_transform_spine_through_real_daemon() {
     // reads it. No test-only wire surface.
     seed_store(&data_home);
 
-    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    let daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir, &data_home);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
 
     let mut module = spawn_module(&module_bin, &daemon.connection_file, &data_home);
@@ -321,6 +427,11 @@ async fn mc_transform_spine_through_real_daemon() {
     drop(module);
     tokio::time::sleep(Duration::from_millis(200)).await; // OS releases the single-writer lease
     let _module2 = spawn_module(&module_bin, &daemon.connection_file, &data_home);
+    // This module is started by hand, not supervised by the daemon, so between the
+    // kill and the new registration the daemon has no module of this id and answers
+    // `unknown_module`, which is terminal for route.open. Wait for the restarted
+    // module to register, exactly as for the first spawn.
+    wait_for_module_registration(&consumer, START_TIMEOUT).await;
 
     // replay the spine at the frozen baseline (boundary "m10" present) → pure defer, no write,
     // m0 reproduces byte-identical across the restart (the lineage baseline is durable).
@@ -459,10 +570,20 @@ async fn call_raw(consumer: &SubcConsumer, session: &str, body: Value) -> Value 
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> LiveDaemon {
+fn spawn_daemon(
+    daemon_bin: &Path,
+    runtime_dir: &Path,
+    config_dir: &Path,
+    data_home: &Path,
+) -> LiveDaemon {
     let child = Command::new(daemon_bin)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("XDG_CONFIG_HOME", config_dir)
+        // The daemon derives `cortexkit/run` (including `logs/`) from the data home, not
+        // the runtime dir. Without this, a test daemon's log sink resolves to the host's
+        // real `~/.local/share/cortexkit/run/logs/subc.log` and interleaves test boots
+        // with production ones. Sharing the module's data home mirrors production layout.
+        .env("XDG_DATA_HOME", data_home)
         .env("SUBC_PORT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -478,13 +599,28 @@ fn spawn_daemon(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) -> Liv
 }
 
 fn spawn_module(module_bin: &Path, connection_file: &Path, data_home: &Path) -> ModuleProcess {
+    spawn_module_with_differential(module_bin, connection_file, data_home, true)
+}
+
+fn spawn_module_with_differential(
+    module_bin: &Path,
+    connection_file: &Path,
+    data_home: &Path,
+    differential: bool,
+) -> ModuleProcess {
     let mut child = Command::new(module_bin)
         .arg("--subc")
         .arg(connection_file)
         .env(subc_protocol::SUBC_MODULE_ID_ENV, MODULE_ID)
         .env("XDG_DATA_HOME", data_home)
-        .env("MC_NATIVE_ATTACHMENT_DIFFERENTIAL", "1")
-        .env("MC_PREFIX_PROJECTION_DIFFERENTIAL", "1")
+        .env(
+            "MC_NATIVE_ATTACHMENT_DIFFERENTIAL",
+            if differential { "1" } else { "0" },
+        )
+        .env(
+            "MC_PREFIX_PROJECTION_DIFFERENTIAL",
+            if differential { "1" } else { "0" },
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -547,18 +683,17 @@ fn fast_call_options() -> CallOptions {
     }
 }
 
+/// Base directory for project roots, set by the test under its `TempRoot` so the roots
+/// are removed with it.
+static PROJECT_BASE: OnceLock<PathBuf> = OnceLock::new();
+
 /// A DETERMINISTIC project_root per session, shared by `identity_for` (the route binding)
 /// and `seed_store` (the memory's project_path) so the module resolves the SAME project a
-/// seeded memory was written under. A per-process base keeps runs isolated.
+/// seeded memory was written under.
 fn project_root_for(session: &str) -> String {
-    static BASE: OnceLock<PathBuf> = OnceLock::new();
-    let base = BASE.get_or_init(|| {
-        let d = unique_temp_dir("mc-module-projects");
-        fs::create_dir_all(&d).unwrap();
-        // Canonicalize so the seeded project_path matches the binding's project_root after
-        // any path resolution in the daemon/on_bind (e.g. macOS /var → /private/var).
-        fs::canonicalize(&d).unwrap_or(d)
-    });
+    let base = PROJECT_BASE
+        .get()
+        .expect("the test sets PROJECT_BASE before resolving a project root");
     let p = base.join(session);
     fs::create_dir_all(&p).unwrap();
     p.to_string_lossy().to_string()
@@ -572,10 +707,12 @@ fn identity_for(session: &str) -> BindIdentity {
     let reg = REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut map = reg.lock().unwrap();
     map.entry(session.to_string())
-        .or_insert_with(|| BindIdentity {
-            project_root: PathBuf::from(project_root_for(session)),
-            harness: "mc-module-test".to_string(),
-            session: session.to_string(),
+        .or_insert_with(|| {
+            BindIdentity::new(
+                PathBuf::from(project_root_for(session)),
+                "mc-module-test",
+                session,
+            )
         })
         .clone()
 }

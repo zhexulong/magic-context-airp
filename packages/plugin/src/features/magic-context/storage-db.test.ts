@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import {
     type chmodSync,
@@ -15,7 +15,11 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
+import {
+    __resetRpcIdentityTestHooks,
+    __setRpcIdentityTestHooks,
+    inspectWindowsProcessesSync,
+} from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -39,6 +43,7 @@ import {
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
     getSchemaFenceRejection,
+    initializeDatabase,
     inspectRpcServerDiscovery,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
@@ -302,15 +307,31 @@ describe("explicit shared storage resolution", () => {
         const override = makeTempDir("storage-db-explicit-");
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "";
         process.env.NODE_ENV = "development";
+        process.env.XDG_DATA_HOME = override;
         process.env.MAGIC_CONTEXT_STORAGE_DIR = join(override, "shared");
         __setRpcDiscoveryFsForTests({
             readdirSync: (_path, options) => (options?.withFileTypes ? [] : []),
         });
+        const processListProbeCalls: string[] = [];
         __setRpcIdentityTestHooks({
-            processListExecFileSync: (() => "") as typeof execFileSync,
+            processListExecFileSync: ((file: unknown, args?: readonly unknown[]) => {
+                processListProbeCalls.push([String(file), ...(args ?? []).map(String)].join(" "));
+                return "";
+            }) as typeof execFileSync,
         });
-        const db = openDatabase();
+
+        const db = openDatabase({ busyTimeoutMs: 0 });
+
         expect(db).not.toBeNull();
+        expect(openDatabase({ busyTimeoutMs: 0 })).toBe(db);
+        expect(processListProbeCalls).toHaveLength(3);
+        expect(processListProbeCalls[0]).toBe("ps -axo pid=,command=");
+        expect(processListProbeCalls.slice(1)).toHaveLength(2);
+        expect(
+            processListProbeCalls.slice(1).every((call) => /^ps -o ppid= -p \d+$/.test(call)),
+        ).toBe(true);
+        const timeout = db!.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+        expect(timeout.timeout).toBe(0);
         const dbPath = join(override, "shared", "context.db");
         expect(existsSync(dbPath)).toBe(true);
         expect(statSync(join(override, "shared")).mode & 0o777).toBe(0o700);
@@ -528,8 +549,10 @@ describe("storage-db", () => {
                     return "seed";
                 });
                 const placeholders = insertedColumns.map(() => "?").join(", ");
+                // A seeded tag may already have created this row through the version trigger.
+                const insertVerb = table === "session_meta" ? "INSERT OR IGNORE" : "INSERT";
                 db.prepare(
-                    `INSERT INTO ${table} (${insertedColumns.map((column) => column.name).join(", ")}) VALUES (${placeholders})`,
+                    `${insertVerb} INTO ${table} (${insertedColumns.map((column) => column.name).join(", ")}) VALUES (${placeholders})`,
                 ).run(...values);
                 expect(
                     db
@@ -1195,6 +1218,58 @@ describe("storage-db", () => {
             );
         });
 
+        it("#when an existing session_meta predates tags_version #then the schema bootstrap heals it before any migration runs", () => {
+            const dataHome = useTempDataHome("storage-db-legacy-tags-version-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(join(dataHome, "cortexkit", "magic-context"), {
+                recursive: true,
+            });
+            const legacyDb = new Database(dbPath);
+            legacyDb.run(`
+        CREATE TABLE session_meta (
+          session_id TEXT PRIMARY KEY,
+          last_response_time INTEGER,
+          cache_ttl TEXT,
+          counter INTEGER DEFAULT 0,
+          last_nudge_tokens INTEGER DEFAULT 0,
+          last_nudge_band TEXT DEFAULT '',
+          last_transform_error TEXT DEFAULT '',
+          is_subagent INTEGER DEFAULT 0,
+          last_context_percentage REAL DEFAULT 0,
+          last_input_tokens INTEGER DEFAULT 0,
+          observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_alert_sent INTEGER NOT NULL DEFAULT 0,
+          times_execute_threshold_reached INTEGER DEFAULT 0,
+          cleared_reasoning_through_tag INTEGER DEFAULT 0,
+          harness TEXT NOT NULL DEFAULT 'opencode'
+        );
+      `);
+            closeQuietly(legacyDb);
+
+            // Only the schema bootstrap, no migration runner: the tag triggers are
+            // created here and the migration that adds tags_version runs much later,
+            // so this is the window where a legacy database carries a trigger whose
+            // body names a column that does not exist. SQLite resolves a trigger body
+            // when the trigger fires AND whenever it reparses the whole schema, which
+            // every ALTER TABLE ... RENAME does — so an uncompilable trigger here also
+            // broke the embedding-table rebuild in the middle of the migration chain,
+            // leaving memory_embeddings dropped and unrecoverable.
+            const db = new Database(dbPath);
+            try {
+                initializeDatabase(db);
+                db.prepare(
+                    "INSERT INTO tags (session_id, message_id, type, tag_number) VALUES (?, ?, ?, ?)",
+                ).run("legacy-tags-version", "msg-1", "message", 1);
+                expect(
+                    db
+                        .prepare("SELECT tags_version FROM session_meta WHERE session_id = ?")
+                        .get("legacy-tags-version"),
+                ).toEqual({ tags_version: 1 });
+            } finally {
+                closeQuietly(db);
+            }
+        });
+
         it("#when an existing memory_embeddings table lacks model_id #then openDatabase adds the missing column", () => {
             const dataHome = useTempDataHome("storage-db-migrate-embedding-model-");
             const dbPath = resolveDbPath(dataHome);
@@ -1322,4 +1397,88 @@ describe("storage-db", () => {
             }
         });
     });
+});
+
+it("checks 500 dead RPC PIDs with one Windows snapshot and prunes only dead records", () => {
+    const storage = makeTempDir("mc-rpc-snapshot-");
+    const rpc = join(storage, "rpc", "project");
+    mkdirSync(rpc, { recursive: true });
+    for (let pid = 100000; pid < 100500; pid++) {
+        writeFileSync(
+            join(rpc, `port-${pid}.json`),
+            JSON.stringify({ pid, port: 43123, started_at: 0 }),
+        );
+    }
+    const live = 100501;
+    const liveFile = join(rpc, `port-${live}.json`);
+    writeFileSync(liveFile, JSON.stringify({ pid: live, port: 43123, started_at: 0 }));
+    let calls = 0;
+    __setRpcIdentityTestHooks({
+        platform: "win32",
+        processListExecFileSync: (() => {
+            calls++;
+            return JSON.stringify([
+                {
+                    ProcessId: live,
+                    ParentProcessId: 0,
+                    Name: "opencode.exe",
+                    CommandLine: "opencode serve",
+                    CreationDate: null,
+                },
+            ]);
+        }) as typeof execFileSync,
+    });
+    const result = inspectRpcServerDiscovery(storage, inspectWindowsProcessesSync());
+    expect(calls).toBe(1);
+    expect(result.staleFiles).toHaveLength(500);
+    expect(existsSync(join(rpc, "port-100000.json"))).toBe(false);
+    expect(existsSync(liveFile)).toBe(true);
+    expect(result.serverPids).toEqual([live]);
+});
+
+it("RPC holder inspection reports slow progress and refuses after its deadline", () => {
+    const storage = makeTempDir("mc-rpc-deadline-");
+    const rpc = join(storage, "rpc", "project");
+    mkdirSync(rpc, { recursive: true });
+    writeFileSync(
+        join(rpc, "port-100000.json"),
+        JSON.stringify({ pid: 100000, port: 43123, started_at: 0 }),
+    );
+    const processes = {
+        pi: { state: "known" as const, processIds: [] },
+        liveness: () => "inconclusive" as const,
+        evidence: () => ({ startTime: null, commandLine: null }),
+    };
+    const cliOptions = (onProgress: (checked: number, total: number) => void) => ({
+        deadlineMs: 15_000,
+        onProgress,
+    });
+    const progress: string[] = [];
+    let ticks = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => (++ticks <= 2 ? 0 : 4000));
+    try {
+        expect(
+            inspectRpcServerDiscovery(
+                storage,
+                processes,
+                cliOptions((checked, total) => progress.push(`${checked}/${total}`)),
+            ).state,
+        ).toBe("inconclusive");
+        expect(progress).toEqual(["0/1"]);
+        ticks = 0;
+        clock.mockImplementation(() => (++ticks <= 2 ? 0 : 16000));
+        expect(() =>
+            inspectRpcServerDiscovery(
+                storage,
+                processes,
+                cliOptions(() => {}),
+            ),
+        ).toThrow("timed out after 15 seconds");
+        expect(existsSync(join(rpc, "port-100000.json"))).toBe(true);
+        // Plugin hosts pass no options: a slow scan neither reports nor gives up.
+        ticks = 0;
+        expect(inspectRpcServerDiscovery(storage, processes).state).toBe("inconclusive");
+    } finally {
+        clock.mockRestore();
+    }
 });

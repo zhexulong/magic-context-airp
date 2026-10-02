@@ -8,6 +8,8 @@ import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
+import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
@@ -20,7 +22,11 @@ import {
     createFailClosedController,
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentityForSession,
+    setHomeProjectPermission,
+} from "./features/magic-context/memory/project-identity";
+import { backfillSessionActivity } from "./features/magic-context/session-activity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
@@ -37,8 +43,12 @@ import {
     COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./hooks/magic-context/compartment-prompt";
+import { recordToolParameters } from "./hooks/magic-context/dropped-input-guard";
 import { createLiveSessionState } from "./hooks/magic-context/live-session-state";
-import { SubcModuleTransport } from "./hooks/magic-context/module-transport";
+import {
+    getDefaultSubcConnectionFile,
+    SubcModuleTransport,
+} from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import {
@@ -57,6 +67,7 @@ import { createEventHandler } from "./plugin/event";
 import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
 import { isDisposedInstanceDirectory } from "./plugin/instance-disposal";
 import { createMessagesTransformHandler } from "./plugin/messages-transform";
+import { disableNativeAutoCompaction } from "./plugin/native-compaction-guard";
 import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
 import { createToolRegistry } from "./plugin/tool-registry";
 import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
@@ -68,6 +79,7 @@ import {
 } from "./shared/conflict-detector";
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
+import { setHarness } from "./shared/harness";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -87,6 +99,7 @@ import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 import { reloadWindowOverlay } from "./shared/window-geometry";
+import { CTX_MEMORY_LIST_TOOL_NAME } from "./tools/ctx-memory";
 import { setup } from "./v2/server";
 
 const BOOT_SERVER_DEADLINE_MS = 15_000;
@@ -107,6 +120,13 @@ const server: Plugin = async (ctx) => {
     // otherwise recreates the reporter's "no Magic Context lines" symptom.
     emitBootEnteringBreadcrumb(process.pid, ctx.directory, log, flushLogger);
 
+    // Lock the harness before the first database write. "opencode" is already
+    // the default, so this is a fence, not a change: if anything in this process
+    // has locked a different value first (the v2 setup lane running on a v1
+    // host), this throws at boot instead of letting the seat tag every
+    // session-scoped row under the wrong harness.
+    setHarness("opencode");
+
     const configStartedAt = performance.now();
     beginBootQuietPeriod();
     // Move config from the legacy per-harness locations to the shared CortexKit
@@ -119,6 +139,12 @@ const server: Plugin = async (ctx) => {
     });
     const loadedPluginConfig = loadPluginConfigDetailed(ctx.directory);
     const pluginConfig = loadedPluginConfig.config;
+    setHomeProjectPermission(pluginConfig.allow_home_project);
+    const liveConfigReader = pluginConfigReader(ctx.directory, pluginConfig);
+    const dreamerCap = createDreamerOutputCapSampler(
+        pluginConfig,
+        () => liveConfigReader.poll().effective,
+    );
     reloadWindowOverlay(pluginConfig.models?.window_overlay_path);
     const promptSurfaceRuntime = createPromptSurfaceRuntime({
         harness: "opencode",
@@ -278,13 +304,18 @@ const server: Plugin = async (ctx) => {
     const liveSessionState = createLiveSessionState();
     const rustModeModuleTransport =
         pluginConfig.transform_mode === "rust"
-            ? new SubcModuleTransport(pluginConfig.subc?.connection_file)
+            ? new SubcModuleTransport(
+                  pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+              )
             : undefined;
     const rustModeModuleClient: RustModeModuleClient | undefined = rustModeModuleTransport;
     // A durable Rust-deletion retry can outlive a config flip back to TypeScript,
     // so cleanup keeps a lazy transport even when new transforms no longer use Rust.
     const sessionCleanupModuleClient = pluginConfig.enabled
-        ? (rustModeModuleTransport ?? new SubcModuleTransport(pluginConfig.subc?.connection_file))
+        ? (rustModeModuleTransport ??
+          new SubcModuleTransport(
+              pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+          ))
         : undefined;
 
     const hooksPhase = await runBootPhaseWithinBudget(
@@ -294,6 +325,7 @@ const server: Plugin = async (ctx) => {
             createSessionHooksAsync({
                 ctx,
                 pluginConfig,
+                liveConfigReader,
                 liveSessionState,
                 rustModeModuleClient,
                 promptSurfaceRuntime,
@@ -368,6 +400,7 @@ const server: Plugin = async (ctx) => {
             const reopened = await createSessionHooksAsync({
                 ctx,
                 pluginConfig,
+                liveConfigReader,
                 liveSessionState,
                 rustModeModuleClient,
                 promptSurfaceRuntime,
@@ -390,6 +423,7 @@ const server: Plugin = async (ctx) => {
         rustToolBackends: magicContextRuntime.rustToolBackends,
         promptSurfaceRuntime,
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
+        includeDreamerOnlyTools: true,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
@@ -422,34 +456,49 @@ const server: Plugin = async (ctx) => {
                 const ocDb = openOpenCodeDb();
                 if (!ocDb) return;
                 try {
-                    await runSessionProjectBackfill(db, (afterSessionId, limit) => {
-                        const rows = (
-                            afterSessionId === null
-                                ? ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
+                    await runSessionProjectBackfill(
+                        db,
+                        (afterSessionId, limit) => {
+                            const rows = (
+                                afterSessionId === null
+                                    ? ocDb
+                                          .prepare(
+                                              `SELECT id, COALESCE(directory, '') AS directory
                                        FROM session
                                        ORDER BY id ASC
                                        LIMIT ?`,
-                                      )
-                                      .all(limit)
-                                : ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
+                                          )
+                                          .all(limit)
+                                    : ocDb
+                                          .prepare(
+                                              `SELECT id, COALESCE(directory, '') AS directory
                                        FROM session
                                        WHERE id > ?
                                        ORDER BY id ASC
                                        LIMIT ?`,
-                                      )
-                                      .all(afterSessionId, limit)
-                        ) as Array<{
-                            id: string;
-                            directory: string;
-                        }>;
-                        return rows.map((session) => ({
-                            sessionId: session.id,
-                            directory: session.directory,
-                        }));
+                                          )
+                                          .all(afterSessionId, limit)
+                            ) as Array<{
+                                id: string;
+                                directory: string;
+                            }>;
+                            return rows.map((session) => ({
+                                sessionId: session.id,
+                                directory: session.directory,
+                            }));
+                        },
+                        {
+                            leaseKey: "opencode:session-projects-creation-v2",
+                            allowHomeProject: pluginConfig.allow_home_project,
+                        },
+                    );
+                    await backfillSessionActivity(db, "opencode", (sessionId) => {
+                        const row = ocDb
+                            .prepare(
+                                "SELECT MAX(time_created) AS time FROM message WHERE session_id = ?",
+                            )
+                            .get(sessionId) as { time: number | null } | undefined;
+                        return row?.time ?? undefined;
                     });
                 } finally {
                     closeQuietly(ocDb);
@@ -493,16 +542,38 @@ const server: Plugin = async (ctx) => {
                 harness: "opencode" as const,
                 client: ctx.client,
                 dreamerConfig: dreamerRunnable ? pluginConfig.dreamer : undefined,
+                sampleDreamRun: () => {
+                    const fresh = liveConfigReader.poll().effective;
+                    const dreaming = dreamerRunConfig(pluginConfig, fresh);
+                    const historian = historianRunConfig(pluginConfig, fresh);
+                    return {
+                        dreamerConfig: dreamerRunnable ? dreaming.dreamer : undefined,
+                        mural: dreaming.mural,
+                        historianChildSweep: {
+                            timeoutMs: historian.historian_timeout_ms,
+                            fallbackModelCount: resolveHistorianModel(historian, "opencode")
+                                .fallbacks.length,
+                            keepSubagents: pluginConfig.keep_subagents === true,
+                        },
+                        gitCommitIndexing: dreaming.memory.git_commit_indexing,
+                    };
+                },
                 language: pluginConfig.language,
                 transformMode: pluginConfig.transform_mode,
                 embeddingConfig: pluginConfig.embedding,
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
-                historianChildSweep: {
-                    timeoutMs: pluginConfig.historian_timeout_ms,
-                    fallbackModelCount: resolveHistorianModel(pluginConfig, "opencode").fallbacks
-                        .length,
-                    keepSubagents: pluginConfig.keep_subagents === true,
+                get historianChildSweep() {
+                    const historian = historianRunConfig(
+                        pluginConfig,
+                        liveConfigReader.poll().effective,
+                    );
+                    return {
+                        timeoutMs: historian.historian_timeout_ms,
+                        fallbackModelCount: resolveHistorianModel(historian, "opencode").fallbacks
+                            .length,
+                        keepSubagents: pluginConfig.keep_subagents === true,
+                    };
                 },
                 mural: pluginConfig.mural,
                 retinaHandoff: pluginConfig.smart_notes.retina_handoff,
@@ -763,6 +834,10 @@ const server: Plugin = async (ctx) => {
         event: createEventHandler({
             magicContext: {
                 event: async (input) => {
+                    if (input.event.type === "session.deleted") {
+                        const properties = input.event.properties as { info?: { id?: string } };
+                        if (properties.info?.id) dreamerCap.delete(properties.info.id);
+                    }
                     await magicContextRuntime.magicContext?.event?.(input);
                 },
             },
@@ -809,6 +884,9 @@ const server: Plugin = async (ctx) => {
                 );
             },
         }),
+        "chat.params": async (input, output) => {
+            dreamerCap.apply(input, output);
+        },
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,
@@ -820,6 +898,18 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
+            onStorageBusyRefusal: async (sessionId, message) => {
+                const { sendStatusNotification } = await import(
+                    "./hooks/magic-context/send-session-notification"
+                );
+                const { abortSessionFailClosed } = await import(
+                    "./hooks/magic-context/transform-postprocess-phase"
+                );
+                await sendStatusNotification(ctx.client, sessionId, message, {
+                    toastDurationMs: 15000,
+                });
+                await abortSessionFailClosed(ctx.client, sessionId);
+            },
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
@@ -838,7 +928,9 @@ const server: Plugin = async (ctx) => {
             // Update tool-def measurement latch before delegating to magic-context
             // hooks. `registry.tools()` is invoked right after chat.message inside
             // OpenCode's prompt flow (see session/prompt.ts), so by the time
-            // `tool.definition` fires we'll have the correct {provider, model, agent}.
+            // `tool.definition` fires we'll have the correct provider and model.
+            // The host can omit `agent` for its default route; still measure the
+            // observed tools under the default key rather than losing the envelope.
             const typed = input as {
                 model?: { providerID?: string; modelID?: string };
                 agent?: string;
@@ -846,9 +938,10 @@ const server: Plugin = async (ctx) => {
             const provId = typed.model?.providerID;
             const modId = typed.model?.modelID;
             const agent = typed.agent;
-            if (provId && modId && agent) {
-                lastChatContext = { providerID: provId, modelID: modId, agentName: agent };
-            }
+            lastChatContext =
+                provId && modId
+                    ? { providerID: provId, modelID: modId, agentName: agent || "default" }
+                    : null;
             await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
         },
         "tool.definition": async (input, output) => {
@@ -857,10 +950,14 @@ const server: Plugin = async (ctx) => {
             // flight that reuses a historian/dreamer agent whose
             // chat.message preceded plugin init), skip — the measurement will
             // land correctly on the next flight.
-            if (!lastChatContext) return;
             const typedInput = input as { toolID?: string };
             const typedOutput = output as { description?: unknown; parameters?: unknown };
             if (!typedInput.toolID) return;
+            // The execute hook sees only the tool name, so keep the parameter
+            // names for the dropped-input refusal to list. This needs no chat
+            // context, so it runs before the measurement's early return.
+            recordToolParameters(typedInput.toolID, typedOutput.parameters);
+            if (!lastChatContext) return;
             recordToolDefinition(
                 lastChatContext.providerID,
                 lastChatContext.modelID,
@@ -889,6 +986,15 @@ const server: Plugin = async (ctx) => {
                 if (pluginConfig.enabled !== true) {
                     return;
                 }
+                // In compaction-off mode native compaction is the user's chosen
+                // window manager, so it is left alone.
+                if (isCompactionEnabled(pluginConfig)) {
+                    disableNativeAutoCompaction(config);
+                }
+                config.permission = {
+                    ...(config.permission ?? {}),
+                    [CTX_MEMORY_LIST_TOOL_NAME]: "deny",
+                } as typeof config.permission;
                 // See buildHiddenAgentConfig (agents/hidden-agent-registrations.ts)
                 // for permission precedence and hard `steps`/`maxSteps` cap semantics.
                 const commandConfig = {
