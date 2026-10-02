@@ -833,17 +833,8 @@ setHarness(PI_HARNESS_KIND);
 
 export function resolveHistorianFromConfig(
 	config: MagicContextConfig,
-	optionsOrHarness?:
-		| { embeddedModelRegistry?: ModelRegistry; forbidExternalPiCli?: boolean }
-		| PiHarnessKind,
-	harnessArg: PiHarnessKind = PI_HARNESS_KIND,
+	harness: PiHarnessKind = PI_HARNESS_KIND,
 ): PiHistorianOptions | undefined {
-	const harness =
-		typeof optionsOrHarness === "string" ? optionsOrHarness : harnessArg;
-	const options =
-		typeof optionsOrHarness === "object" && optionsOrHarness !== null
-			? optionsOrHarness
-			: undefined;
 	// Defensive: schema declares `historian` required with default {}, but the
 	// runtime config can come from a malformed JSONC merge that drops the
 	// field. Fall back to undefined-safe access so plugin load never crashes.
@@ -864,11 +855,12 @@ export function resolveHistorianFromConfig(
 
 	const fallbackModels = resolved.fallbacks;
 
-	const embedded = options?.embeddedModelRegistry;
-	const embeddedRunner = options?.forbidExternalPiCli
+	// GameBuddy embedded runtime: never spawn an external `pi` CLI; the
+	// ModelRegistry is bound after session construction via
+	// `bindHistorianRunner` at the call site.
+	const embeddedRunner = embeddedRuntime
 		? new EmbeddedPiHistorianRunner()
 		: undefined;
-	if (embeddedRunner && embedded) embeddedRunner.bindModelRegistry(embedded);
 	return {
 		runner: embeddedRunner ?? new PiSubagentRunner(),
 		model,
@@ -1327,9 +1319,11 @@ async function startPiMagicContextRuntime(
 		historian: hist,
 		bindHistorianRunner: embeddedRuntime
 			? (ctx) => {
-					const registry = ctx.modelRegistry;
-					embeddedModelRegistry = registry;
-					if (hist?.runner instanceof EmbeddedPiHistorianRunner) {
+					// Prefer the live session registry; fall back to the value the
+					// embedding Host injected through the runtime binding seam
+					// (both are the same SDK registry in production).
+					const registry = ctx.modelRegistry ?? embeddedModelRegistry;
+					if (registry !== undefined && hist?.runner instanceof EmbeddedPiHistorianRunner) {
 						hist.runner.bindModelRegistry(registry);
 					}
 				}
@@ -1371,10 +1365,11 @@ async function startPiMagicContextRuntime(
 			hasDeprecatedProtectedTags?: boolean;
 		},
 	): ResolvedPiProjectDeps {
-		const hist = resolveHistorianFromConfig(cfg, {
-			forbidExternalPiCli: embeddedRuntime,
-			embeddedModelRegistry,
-		});
+		// Shape-identical to upstream v0.44.4: `modelRegistry` is intentionally
+		// omitted here because an embedded runtime's registry only exists after
+		// session construction. The runner binds it in `bindHistorianRunner`
+		// below, which the embedding Host drives post-construction.
+		const hist = resolveHistorianFromConfig(cfg, PI_HARNESS_KIND);
 		if (hist) {
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
