@@ -3,9 +3,11 @@ import {
 	emitProbeFoldCommittedMarker,
 	emitProbeM0DigestMarker,
 	emitProbeM0MemoryIdsMarker,
+	emitProbeM0ChaptersMarker,
 	PROBE_FOLD_COMMITTED_PREFIX,
 	PROBE_M0_DIGEST_PREFIX,
 	PROBE_M0_MEMORY_IDS_PREFIX,
+	PROBE_M0_CHAPTERS_PREFIX,
 } from "./probe-materialization-marker";
 
 /**
@@ -104,18 +106,48 @@ test("m0 memory-ids marker reports the assembled id set, never content", () => {
 	expect(empty).toBe(`${PROBE_M0_MEMORY_IDS_PREFIX} rev_10 -\n`);
 });
 
-test("m0 memory-ids marker ignores malformed input and stays bounded", () => {
-	for (const badRevision of [undefined, null, "", "has space", 123, "r".repeat(129)]) {
-		expect(captureStderr(() => emitProbeM0MemoryIdsMarker(badRevision, [1]))).toBe("");
-	}
-	// Not an array (including a Set, which a caller might pass by mistake) is a
-	// no-op rather than a throw: a diagnostic must never break materialization.
-	for (const badIds of [undefined, null, "1,2,3", 42, new Set([1, 2])]) {
-		expect(captureStderr(() => emitProbeM0MemoryIdsMarker("rev_11", badIds))).toBe("");
-	}
-	// Non-integer / negative / unsafe ids are dropped instead of poisoning the line.
-	const filtered = captureStderr(() =>
-		emitProbeM0MemoryIdsMarker("rev_12", [1, -1, 2.5, Number.NaN, Number.MAX_VALUE, "3", 4]),
-	);
-	expect(filtered).toBe(`${PROBE_M0_MEMORY_IDS_PREFIX} rev_12 1,4\n`);
-});
+	test("m0 memory-ids marker ignores malformed input and stays bounded", () => {
+		for (const badRevision of [undefined, null, "", "has space", 123, "r".repeat(129)]) {
+			expect(captureStderr(() => emitProbeM0MemoryIdsMarker(badRevision, [1]))).toBe("");
+		}
+		// Not an array (including a Set, which a caller might pass by mistake) is a
+		// no-op rather than a throw: a diagnostic must never break materialization.
+		for (const badIds of [undefined, null, "1,2,3", 42, new Set([1, 2])]) {
+			expect(captureStderr(() => emitProbeM0MemoryIdsMarker("rev_11", badIds))).toBe("");
+		}
+		// Non-integer / negative / unsafe ids are dropped instead of poisoning the line.
+		const filtered = captureStderr(() =>
+			emitProbeM0MemoryIdsMarker("rev_12", [1, -1, 2.5, Number.NaN, Number.MAX_VALUE, "3", 4]),
+		);
+		expect(filtered).toBe(`${PROBE_M0_MEMORY_IDS_PREFIX} rev_12 1,4\n`);
+	});
+
+	test("m0 chapters marker reports count + block digest, never chapter text", () => {
+		const digest = "a".repeat(64);
+		const ok = captureStderr(() =>
+			emitProbeM0ChaptersMarker("rev_13", 2, digest),
+		);
+		expect(ok).toBe(`${PROBE_M0_CHAPTERS_PREFIX} rev_13 2 ${digest}\n`);
+
+		// Zero chapters is a real answer (no rollup yet), with a dash digest.
+		const zero = captureStderr(() =>
+			emitProbeM0ChaptersMarker("rev_14", 0, "-"),
+		);
+		expect(zero).toBe(`${PROBE_M0_CHAPTERS_PREFIX} rev_14 0 -\n`);
+
+		// Never carries chapter text: a non-hex digest becomes a dash, ids never leak.
+		const notHex = captureStderr(() =>
+			emitProbeM0ChaptersMarker("rev_15", 2, "not a hash but maybe chapter text"),
+		);
+		expect(notHex).toBe(`${PROBE_M0_CHAPTERS_PREFIX} rev_15 2 -\n`);
+	});
+
+	test("m0 chapters marker ignores malformed input and stays bounded", () => {
+		for (const badRevision of [undefined, null, "", "has space", 123, "r".repeat(129)]) {
+			expect(captureStderr(() => emitProbeM0ChaptersMarker(badRevision, 1, "a".repeat(64)))).toBe("");
+		}
+		// Bad count (negative / non-integer / missing) is a no-op.
+		for (const badCount of [undefined, null, -1, 1.5, "2", Number.NaN]) {
+			expect(captureStderr(() => emitProbeM0ChaptersMarker("rev_16", badCount, "a".repeat(64)))).toBe("");
+		}
+	});

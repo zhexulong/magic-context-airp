@@ -27,9 +27,10 @@
 
 import { createHash } from "node:crypto";
 import {
-	emitProbeFoldCommittedMarker,
-	emitProbeM0DigestMarker,
-	emitProbeM0MemoryIdsMarker,
+		emitProbeFoldCommittedMarker,
+		emitProbeM0DigestMarker,
+		emitProbeM0MemoryIdsMarker,
+		emitProbeM0ChaptersMarker,
 } from "./probe-materialization-marker";
 import {
 	factCategoriesForDomain,
@@ -3225,6 +3226,19 @@ export function injectM0M1Pi(
 		emitProbeM0MemoryIdsMarker(
 			materializationRevision(markers),
 			parseMemoryBlockIds(readCachedPiM0M1Row(db, state.sessionId)?.memory_block_ids ?? null),
+		);
+		// Chapter rollup (AIRP fork v1): count + block digest of the CHAPTERS
+		// lines actually present in the provider-bound m[0]. Count lets the
+		// harness verify chapters reach m[0] after a fold; digest lets it verify
+		// the chapter block is byte-identical across unrelated passes (prefix
+		// stability) and that a new chapter only appends. Never chapter text.
+		const chapterLines = m0.split("\n").filter((line) => line.startsWith("## CHAPTERS:"));
+		emitProbeM0ChaptersMarker(
+			materializationRevision(markers),
+			chapterLines.length,
+			chapterLines.length > 0
+				? m0DigestHex(Buffer.from(chapterLines.join("\n"), "utf8"))
+				: "-",
 		);
 	}
 	const insertionIndex = prependM0M1Messages(piMessages, m0, m1, muralWire);

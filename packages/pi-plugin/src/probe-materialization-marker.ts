@@ -25,6 +25,17 @@ export const PROBE_M0_DIGEST_PREFIX = "[probe:m0_digest]";
  * its own assembled set, and the caller compares that against whatever it seeded.
  */
 export const PROBE_M0_MEMORY_IDS_PREFIX = "[probe:m0_memory_ids]";
+/**
+ * Which narrative chapters are in the m[0] the provider is about to see.
+ *
+ * Same Class B contract as the memory-ids marker, for the chapter rollup
+ * (AIRP fork): the harness learns HOW MANY sealed chapters rendered and a
+ * digest of the rendered chapter block, so it can verify (a) chapters reach
+ * m[0] after a fold, and (b) the chapter block stays byte-identical across
+ * unrelated passes (prefix-cache stability). Count and digest only — never
+ * chapter text.
+ */
+export const PROBE_M0_CHAPTERS_PREFIX = "[probe:m0_chapters]";
 const OPAQUE_REVISION = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 /** Hard cap on the id list, so the marker line stays bounded regardless of render. */
@@ -71,20 +82,36 @@ export function emitProbeM0DigestMarker(digestHex: unknown, revision: unknown): 
  * render cannot produce an unbounded stderr line.
  */
 export function emitProbeM0MemoryIdsMarker(
-	revision: unknown,
-	renderedMemoryIds: unknown,
-): void {
-	if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
-	if (!Array.isArray(renderedMemoryIds)) return;
-	const ids: number[] = [];
-	for (const value of renderedMemoryIds) {
-		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) continue;
-		ids.push(value);
-		if (ids.length >= MAX_RENDERED_MEMORY_IDS) break;
+		revision: unknown,
+		renderedMemoryIds: unknown,
+	): void {
+		if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
+		if (!Array.isArray(renderedMemoryIds)) return;
+		const ids: number[] = [];
+		for (const value of renderedMemoryIds) {
+			if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) continue;
+			ids.push(value);
+			if (ids.length >= MAX_RENDERED_MEMORY_IDS) break;
+		}
+		// A sorted, de-duplicated list makes the marker deterministic for a given set,
+		// so a harness can compare two passes without depending on render order.
+		const unique = [...new Set(ids)].sort((left, right) => left - right);
+		const list = unique.length > 0 ? unique.join(",") : "-";
+		writeStderr(`${PROBE_M0_MEMORY_IDS_PREFIX} ${revision} ${list}`);
 	}
-	// A sorted, de-duplicated list makes the marker deterministic for a given set,
-	// so a harness can compare two passes without depending on render order.
-	const unique = [...new Set(ids)].sort((left, right) => left - right);
-	const list = unique.length > 0 ? unique.join(",") : "-";
-	writeStderr(`${PROBE_M0_MEMORY_IDS_PREFIX} ${revision} ${list}`);
-}
+
+	/** Chapter rollup marker: count + block digest, emitted at the same materialization
+	 * boundary as the memory-ids marker. Never carries chapter text. */
+export function emitProbeM0ChaptersMarker(
+		revision: unknown,
+		chapterCount: unknown,
+		chaptersBlockDigest: unknown,
+	): void {
+		if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
+		if (typeof chapterCount !== "number" || !Number.isSafeInteger(chapterCount) || chapterCount < 0) return;
+		const digest =
+			typeof chaptersBlockDigest === "string" && SHA256_HEX.test(chaptersBlockDigest)
+				? chaptersBlockDigest
+				: "-";
+		writeStderr(`${PROBE_M0_CHAPTERS_PREFIX} ${revision} ${chapterCount} ${digest}`);
+	}
