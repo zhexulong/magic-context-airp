@@ -147,6 +147,10 @@ import {
     stripClearedReasoning,
 } from "./strip-content";
 import { injectTemporalMarkers } from "./temporal-awareness";
+import {
+    hasRuntimeEnvironmentFactsProvider,
+    injectRuntimeEnvironmentFacts,
+} from "./runtime-environment-facts";
 import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
 import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
@@ -2177,6 +2181,25 @@ export function createTransform(deps: TransformDeps) {
                 sessionLog(sessionId, `temporal: injected ${injected} gap markers`);
             }
             logTransformTiming(sessionId, "injectTemporalMarkers", tTemporal);
+        }
+
+        // Non-durable runtime environment facts (GameBuddy companion surfaces):
+        // the host registers a provider at boot time and this pass injects its
+        // CURRENT snapshot (game hour/season/weather) as a bounded idempotent
+        // block. Same timing as the temporal markers above — every pass,
+        // including defer/cache-safe ones — and already idempotent by its own
+        // marker; the block replaces itself on each pass so the model always
+        // sees fresh state. Runs even when experimentalTemporalAwareness is
+        // off: a host that registered a provider explicitly asked for it.
+        // Unlike markers, the value changes between passes by design; the
+        // idempotency guarantee is that one pass never stacks two blocks.
+        if (hasRuntimeEnvironmentFactsProvider() && !compactionOff) {
+            const tEnv = performance.now();
+            const envInjected = injectRuntimeEnvironmentFacts(messages);
+            if (envInjected > 0) {
+                sessionLog(sessionId, `environment: injected current facts block`);
+            }
+            logTransformTiming(sessionId, "injectRuntimeEnvironmentFacts", tEnv);
         }
 
         let taggingSucceeded = false;

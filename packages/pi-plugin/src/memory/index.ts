@@ -30,3 +30,15 @@ export {
 	getDeclaredProjectIdentity,
 	setDeclaredProjectIdentity,
 } from "@magic-context/core/shared/harness";
+
+// Non-durable runtime environment facts (game hour/season/weather snapshot).
+// The host registers a provider at boot time; the transform pass injects its
+// current value as an idempotent block, so the companion model sees live world
+// state without any memory write. Re-exported from the plugin package (clock
+// and environment facts live next to temporal awareness in the same transform).
+export {
+	hasRuntimeEnvironmentFactsProvider,
+	injectRuntimeEnvironmentFacts,
+	renderRuntimeEnvironmentBlock,
+	setRuntimeEnvironmentFacts,
+} from "@magic-context/core/hooks/magic-context/runtime-environment-facts";
