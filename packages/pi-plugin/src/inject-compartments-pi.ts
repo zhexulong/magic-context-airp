@@ -104,6 +104,12 @@ import {
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
+import {
+	getChapters,
+	renderChaptersBlock,
+	estimateChaptersTokens,
+	DEFAULT_CHAPTER_BUDGET_TOKENS,
+} from "@magic-context/core/features/magic-context/chapter-storage";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 import {
@@ -463,6 +469,12 @@ export interface PiM0M1State {
 	volatileContext?: Readonly<GameBuddyStableContextMaterialization>;
 	/** Keeps memory/docs injection while suppressing compartment history rendering and trimming. */
 	compactionOff?: boolean;
+	/** Base compartments per chapter (default 28, configurable). Pure quantity
+	 *  chunking — no calendar semantics, no Stardew coupling in the fork. */
+	chapterCompartmentN?: number;
+	/** Total chapter block budget in tokens (default 4K). Warning threshold
+	 *  only: chapters are sealed and immutable, never truncated. */
+	chapterBudgetTokens?: number;
 }
 
 const EMPTY_PI_PROJECT_DOCS: PiProjectDocsRender = {
@@ -1433,7 +1445,10 @@ export function renderM0Pi(
 	//   <project-memory> — sibling
 	// The <session-history> wrapper contains ONLY the decayed compartments — it
 	// does NOT envelope project-docs / user-profile / project-memory. Sections
-	// joined by "\n\n".
+	// joined by "\n\n". CHAPTERS (fork v1) is the sole intentional Pi-side
+	// divergence: sealed chapter lines render at the head of the history block.
+	// OpenCode harness never has chapter rows (sealing is wired only into the Pi
+	// historian publish path), so byte parity for chapter-less sessions holds.
 	const sections: string[] = [];
 	if (projectDocs.length > 0) sections.push(projectDocs);
 	// Baseline user-profile MUST be trimmed to budget, matching OpenCode renderM0.
@@ -1453,10 +1468,35 @@ export function renderM0Pi(
 	);
 	if (userProfile.length > 0) sections.push(userProfile);
 	if (state.stableContext) sections.push(state.stableContext.renderedBlock);
+	// Chapter rollup (GameBuddy AIRP fork v1): immutable narrative-level
+	// summaries render at the HEAD of <session-history>, before decayed
+	// compartments, in chronological order. Sealed once at HARD fold and never
+	// rewritten, so the chapter block is byte-identical between folds and sits
+	// on the stable prefix of the provider cache. Chapters never decay and
+	// never consume compartment budget; over-budget tightening
+	// (decayPressureMultiplier) is absorbed entirely by base compartments.
+	const chapters = state.compactionOff
+		? []
+		: getChapters(db, state.sessionId);
+	const chaptersBlock = renderChaptersBlock(chapters);
+	if (chapters.length > 0) {
+		const estimated = estimateChaptersTokens(chapters);
+		if (
+			estimated > (state.chapterBudgetTokens ?? DEFAULT_CHAPTER_BUDGET_TOKENS)
+		) {
+			logSession(
+				state.sessionId,
+				`chapter rollup: ${chapters.length} chapter(s) ≈ ${Math.round(estimated)} tokens over budget (${state.chapterBudgetTokens ?? DEFAULT_CHAPTER_BUDGET_TOKENS}); no truncation — chapters are sealed and immutable, next chapter granularity (N) should increase`,
+			);
+		}
+	}
 	if (!state.compactionOff) {
+		const historyInner = [chaptersBlock, decayed]
+			.filter((block) => block.length > 0)
+			.join("\n\n");
 		sections.push(
-			decayed.length > 0
-				? `<session-history>\n${decayed}\n</session-history>`
+			historyInner.length > 0
+				? `<session-history>\n${historyInner}\n</session-history>`
 				: "<session-history></session-history>",
 		);
 	}

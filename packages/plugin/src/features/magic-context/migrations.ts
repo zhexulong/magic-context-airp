@@ -3156,6 +3156,40 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 92,
+        description: "narrative chapter rollup (immutable compartment-range summaries)",
+        up(db: Database): void {
+            // Chapters are sealed once inside the HARD fold transaction and are
+            // NEVER rewritten or deleted (v1; `revision` reserved for the v2
+            // Dreamer polish pass, which runs before sealing). They render at
+            // the head of the history block, chronological order, so the
+            // prefix cache sees a stable byte prefix across folds. Scoped by
+            // session_id exactly like compartments (UNIQUE(session_id,
+            // sequence)); project_path is stored for future cross-session
+            // aggregation but never drives v1 lookup.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS chapters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    project_path TEXT NOT NULL,
+                    span_start_sequence INTEGER NOT NULL,
+                    span_end_sequence INTEGER NOT NULL,
+                    start_date TEXT NOT NULL DEFAULT '',
+                    end_date TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source_compartment_ids TEXT NOT NULL DEFAULT '[]',
+                    importance INTEGER NOT NULL DEFAULT 50,
+                    sealed_at INTEGER NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chapters_session
+                    ON chapters (session_id, span_start_sequence);
+            `);
+        },
+    },
 ];
 
 /**

@@ -110,7 +110,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 91;
+export const LATEST_SUPPORTED_VERSION = 92;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema

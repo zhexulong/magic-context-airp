@@ -153,6 +153,9 @@ import {
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
 import { isPiSystemEntry } from "./system-entry-pi";
+import {
+	sealChaptersForCompartments,
+} from "@magic-context/core/features/magic-context/chapter-storage";
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
@@ -1459,9 +1462,37 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// Resolve durable ids for the just-appended compartments (last N rows by
 				// sequence — appendCompartments inserts at the tail). Used for events
 				// anchoring + post-commit embeddings.
-				persistedIds = getCompartments(db, sessionId)
-					.slice(-newCompartments.length)
-					.map((c) => c.id);
+				const appendedCompartments = getCompartments(db, sessionId).slice(
+					-newCompartments.length,
+				);
+				persistedIds = appendedCompartments.map((c) => c.id);
+				// Chapter rollup (GameBuddy AIRP fork v1): seals immutable narrative
+				// summaries over the newly appended range, INSIDE this transaction, so
+				// a crash cannot leave compartments without their chapters. Idempotent:
+				// only the interval after the last sealed chapter is considered.
+				try {
+					const sealed = sealChaptersForCompartments(
+						db,
+						sessionId,
+						appendedCompartments,
+						projectPath,
+					);
+					if (sealed > 0) {
+						sessionLog(
+							sessionId,
+							`chapter rollup: sealed ${sealed} chapter(s) over sequences ${appendedCompartments[0]?.sequence ?? 0}-${appendedCompartments[appendedCompartments.length - 1]?.sequence ?? 0}`,
+					);
+				}
+			} catch (error) {
+				// A rollup failure must never fail historian publication: chapters
+				// are a rendering enhancement, and the publish transaction already
+				// clears failure state. Log and continue — the next fold re-derives
+				// the same interval (idempotent).
+				sessionLog(
+					sessionId,
+					`chapter rollup failed (non-fatal): ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 				// v2 faithful fact lifecycle (E6 parity): facts are no longer a
 				// REPLACE-the-whole-list store. The historian emits only THIS
 				// chunk's facts (deduped against <project-memory> in the prompt);

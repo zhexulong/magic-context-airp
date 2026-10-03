@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { sealChaptersForCompartments } from "@magic-context/core/features/magic-context/chapter-storage";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -3418,4 +3419,131 @@ it("Pi shrinking budget refolds an oversized baseline once with empty m1", () =>
 	} finally {
 		closeQuietly(db);
 	}
+});
+
+describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
+	const sessionId = "pi-chapters";
+
+	function piCompartment(
+		sequence: number,
+		title: string,
+		importance = 50,
+		createdAt = Date.now() - (100 - sequence) * 60_000,
+	) {
+		return {
+			sequence,
+			startMessage: sequence,
+			endMessage: sequence,
+			startMessageId: `m${sequence}`,
+			endMessageId: `m${sequence}`,
+			title,
+			content: title,
+			p1: title,
+			p2: title,
+			p3: title,
+			p4: title,
+			importance,
+			episodeType: null,
+			legacy: 0,
+			createdAt,
+			rebaseStatus: "ok" as const,
+		};
+	}
+
+	function stateFor(dir: string) {
+		return {
+			sessionId,
+			projectIdentity: "pi-chapters",
+			projectDirectory: dir,
+			chapterCompartmentN: 28,
+		};
+	}
+
+	it("renders sealed chapters at the HEAD of <session-history>, chronological, append-only bytes", () => {
+		const db = createTestDb();
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-chapters-"));
+		try {
+			const state = stateFor(dir);
+			// First fold: 28 compartments → 1 chapter.
+			const firstFold = Array.from({ length: 28 }, (_, i) =>
+				piCompartment(i + 1, `First fold ${i + 1}`, 40 + i),
+			);
+			appendCompartments(db, sessionId, firstFold);
+			const persisted = getCompartments(db, sessionId);
+			expect(
+				sealChaptersForCompartments(db, sessionId, persisted, "pi-chapters"),
+			).toBe(1);
+
+			const m0First = renderM0Pi(state, db, "");
+			expect(m0First).toContain("## CHAPTERS:");
+			expect(m0First).toMatch(/<session-history>\n## CHAPTERS:/);
+			const chapterIndex = m0First.indexOf("## CHAPTERS:");
+			expect(chapterIndex).toBeGreaterThan(-1);
+			expect(m0First.indexOf("<session-history>")).toBeLessThan(chapterIndex);
+
+			// Second fold: 20 more compartments → partial chapter 2.
+			const secondFold = Array.from({ length: 20 }, (_, i) =>
+				piCompartment(29 + i, `Second fold ${i + 1}`, 50),
+			);
+			appendCompartments(db, sessionId, secondFold);
+			const persisted2 = getCompartments(db, sessionId).slice(-20);
+			expect(
+				sealChaptersForCompartments(db, sessionId, persisted2, "pi-chapters"),
+			).toBe(1);
+
+			const m0Second = renderM0Pi(state, db, "");
+			// Chapter 1's bytes are a stable prefix of the chapter block
+			// (append-only — the provider prefix cache survives). Extract just the
+			// chapter lines: the chapter block is the leading "## CHAPTERS:" run
+			// inside <session-history>, split from base compartments by \n\n.
+			const ch1Line = m0First
+				.slice(m0First.indexOf("## CHAPTERS:"), m0First.indexOf("</session-history>"))
+				.split("\n\n")[0];
+			const chapters2 = m0Second.slice(
+				m0Second.indexOf("## CHAPTERS:"),
+				m0Second.indexOf("</session-history>"),
+			);
+			const chapterLines2 = chapters2
+				.split("\n\n")
+				.filter((line) => line.startsWith("## CHAPTERS:"));
+			expect(ch1Line.length).toBeGreaterThan(0);
+			// First chapter line is byte-identical across folds.
+			expect(chapterLines2[0]).toBe(ch1Line);
+			// Second chapter line appended after it.
+			expect(chapterLines2).toHaveLength(2);
+			expect(chapterLines2[1]).toContain("Second fold 4");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
+
+	it("chapter block never decays or truncates under budget pressure", () => {
+		const db = createTestDb();
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-chapters-budget-"));
+		try {
+			const state = {
+				...stateFor(dir),
+				historyBudgetTokens: 100, // absurdly tight
+			};
+			const compartments = Array.from({ length: 56 }, (_, i) =>
+				piCompartment(i + 1, `Sealed ${i + 1}`, 50, 100_000_000),
+			);
+			appendCompartments(db, sessionId, compartments);
+			sealChaptersForCompartments(
+				db,
+				sessionId,
+				getCompartments(db, sessionId),
+				"pi-chapters",
+			);
+			const m0 = renderM0Pi(state, db, "", 3); // max tightening
+			// Both sealed chapters render; base compartments may be gone entirely.
+			expect((m0.match(/## CHAPTERS:/g) ?? []).length).toBe(2);
+			expect(m0).toContain("Sealed 1");
+			expect(m0).toContain("Sealed 56");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
 });

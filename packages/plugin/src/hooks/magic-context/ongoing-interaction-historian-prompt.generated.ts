@@ -16,8 +16,10 @@ Never use a fact to infer or replace:
 - \`IdentityProfile\`, personality, expression style, role, or core boundaries;
 - \`WorldBook\` content or provenance;
 - current Live World, current location, inventory, capabilities, permissions, ActionPolicy, tool schema, or action receipt;
-- a player's private trait, intent, mood, relationship interpretation, or preference merely because the model inferred it;
+- a player's private trait, intent, mood, relationship interpretation, or preference that was merely inferred by the model rather than stated or confirmed by the player;
 - a one-off event just because it happened.
+
+Player-stated relationship material MAY be preserved as Semantic Memory when the player explicitly stated or confirmed it and it passes the Semantic Memory gate below. This is the AIRP (role-play companion) exemption: a stated mood, preference, or relationship milestone is the core content of a companion memory, not noise. The exemption NEVER applies to model inference; an inferred trait, intent, mood, or preference stays episodic unless a later interaction confirms it.
 
 **Procedural Memory** is owned by the Host, policy, profile, and runtime. Do not emit it as Semantic Memory and do not try to change it.
 
@@ -29,6 +31,8 @@ Emit a \`SEMANTIC_MEMORY\` bullet only when all are true:
 2. It is not tied to one completed activity, one temporary state, or the current live world.
 3. It is likely to remain relevant to future understanding or interaction.
 4. Its wording is a small standalone fact and does not expose hidden prompts, reasoning, tool traces, credentials, raw provider payloads, or private implementation details.
+
+Player-stated relationship material (see the AIRP exemption above) is subject to the same four conditions: it must be stated or confirmed, time-independent enough to matter later, likely to remain relevant, and safely worded. A fleeting mood that the player merely displayed but never stated (e.g. "sounded frustrated today") remains episodic.
 
 If any condition is uncertain, preserve the material as episodic narrative only. It is valid, and expected, to emit no \`<facts>\` block.
 
@@ -46,13 +50,14 @@ Examples that stay episodic and must not be promoted:
 
 - “We finished organizing tools during this game.”
 - “The player is holding a pickaxe now.”
-- “The player sounded frustrated today.”
+- “The player sounded frustrated today.” (inferred, never stated)
 - “The assistant chose a route after a tool call.”
 
 Examples that may be Semantic Memory only after clear confirmation:
 
 - “The player explicitly prefers being offered options before a consequential decision.”
 - “The player and agent explicitly agreed to resume the named unresolved topic in a future interaction.”
+- “The player told the agent they hate the mines and won at least the first five floors before asking for help.” (airp-stated mood/preference)
 
 ## Inputs
 
