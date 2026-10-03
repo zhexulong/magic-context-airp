@@ -8,7 +8,7 @@ export type GameBuddyAuthoredSourceKind =
 export type GameBuddyChatContextScope = Readonly<{
 	continuityId: string;
 	sessionId: string;
-	surface: "tavern";
+	surface: "tavern" | "game";
 	threadId: string;
 	profile: Readonly<{
 		profileId: string;
