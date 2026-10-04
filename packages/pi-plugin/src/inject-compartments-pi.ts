@@ -31,6 +31,7 @@ import {
 		emitProbeM0DigestMarker,
 		emitProbeM0MemoryIdsMarker,
 		emitProbeM0ChaptersMarker,
+		emitProbeM0SourcesMarker,
 } from "./probe-materialization-marker";
 import {
 	factCategoriesForDomain,
@@ -3239,6 +3240,16 @@ export function injectM0M1Pi(
 			chapterLines.length > 0
 				? m0DigestHex(Buffer.from(chapterLines.join("\n"), "utf8"))
 				: "-",
+		);
+		// WHICH authored background rode those bytes. The digest proves m[0] is
+		// stable and the memory-id marker proves which memories were assembled;
+		// neither can say whether the companion's reviewed always-on world book was
+		// compiled into the Tier 2 baseline at all. Emitted at the same converged
+		// boundary, from the materialization the render actually used.
+		emitProbeM0SourcesMarker(
+			materializationRevision(markers),
+			state.stableContext?.sources.map((source) => source.kind) ?? [],
+			state.volatileContext?.sources.map((source) => source.kind) ?? [],
 		);
 	}
 	const insertionIndex = prependM0M1Messages(piMessages, m0, m1, muralWire);

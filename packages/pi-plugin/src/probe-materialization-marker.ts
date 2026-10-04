@@ -36,6 +36,19 @@ export const PROBE_M0_MEMORY_IDS_PREFIX = "[probe:m0_memory_ids]";
  * chapter text.
  */
 export const PROBE_M0_CHAPTERS_PREFIX = "[probe:m0_chapters]";
+/**
+ * WHICH authored sources are in the m[0] the provider is about to see.
+ *
+ * Same Class B contract as the sibling markers, for the always-on background
+ * seam: the harness learns which KINDS of reviewed context Magic Context
+ * compiled into the Tier 2 baseline (for example `lorebook_constant`), so "the
+ * card's always-on world book reached m[0]" is verifiable from the Chat surface
+ * without launching the game. Kinds only - never source text, never source ids,
+ * never counts of anything but the rendered set.
+ */
+export const PROBE_M0_SOURCES_PREFIX = "[probe:m0_sources]";
+const MAX_SOURCE_KINDS = 16;
+const SOURCE_KIND = /^[a-z][a-z0-9_]{0,63}$/;
 const OPAQUE_REVISION = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 /** Hard cap on the id list, so the marker line stays bounded regardless of render. */
@@ -98,6 +111,31 @@ export function emitProbeM0MemoryIdsMarker(
 		const unique = [...new Set(ids)].sort((left, right) => left - right);
 		const list = unique.length > 0 ? unique.join(",") : "-";
 		writeStderr(`${PROBE_M0_MEMORY_IDS_PREFIX} ${revision} ${list}`);
+	}
+
+	/** Authored-source marker: which kinds of stable/volatile context rendered into
+	 * this pass's m[0]. Never carries source content or identifiers. */
+export function emitProbeM0SourcesMarker(
+		revision: unknown,
+		stableKinds: unknown,
+		volatileKinds: unknown,
+	): void {
+		if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
+		// A sorted, de-duplicated list makes the marker deterministic for a given set,
+		// so a harness can compare two passes without depending on render order.
+		const list = (value: unknown): string => {
+			if (!Array.isArray(value)) return "-";
+			const kinds: string[] = [];
+			for (const kind of value) {
+				if (typeof kind !== "string" || !SOURCE_KIND.test(kind)) continue;
+				if (!kinds.includes(kind)) kinds.push(kind);
+				if (kinds.length >= MAX_SOURCE_KINDS) break;
+			}
+			return kinds.length > 0 ? kinds.sort().join(",") : "-";
+		};
+		writeStderr(
+			`${PROBE_M0_SOURCES_PREFIX} ${revision} stable=${list(stableKinds)} volatile=${list(volatileKinds)}`,
+		);
 	}
 
 	/** Chapter rollup marker: count + block digest, emitted at the same materialization
