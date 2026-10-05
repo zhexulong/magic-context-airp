@@ -3249,7 +3249,7 @@ export function injectM0M1Pi(
 		emitProbeM0SourcesMarker(
 			materializationRevision(markers),
 			state.stableContext?.sources.map((source) => source.kind) ?? [],
-			state.volatileContext?.sources.map((source) => source.kind) ?? [],
+			state.volatileContext?.volatileSources.map((source) => source.kind) ?? [],
 		);
 	}
 	const insertionIndex = prependM0M1Messages(piMessages, m0, m1, muralWire);
