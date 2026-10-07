@@ -3451,20 +3451,19 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 	}
 
 	function stateFor(dir: string) {
-		return {
-			sessionId,
-			projectIdentity: "pi-chapters",
-			projectDirectory: dir,
-			chapterCompartmentN: 28,
-		};
-	}
+	return {
+		sessionId,
+		projectIdentity: "pi-chapters",
+		projectDirectory: dir,
+	};
+}
 
 	it("renders sealed chapters at the HEAD of <session-history>, chronological, append-only bytes", () => {
 		const db = createTestDb();
 		const dir = mkdtempSync(join(tmpdir(), "mc-pi-chapters-"));
 		try {
 			const state = stateFor(dir);
-			// First fold: 28 compartments → 1 chapter.
+			// First fold: one fold is one chapter (the fold's own range, whatever its size).
 			const firstFold = Array.from({ length: 28 }, (_, i) =>
 				piCompartment(i + 1, `First fold ${i + 1}`, 40 + i),
 			);
@@ -3481,7 +3480,7 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 			expect(chapterIndex).toBeGreaterThan(-1);
 			expect(m0First.indexOf("<session-history>")).toBeLessThan(chapterIndex);
 
-			// Second fold: 20 more compartments → partial chapter 2.
+			// Second fold: 20 more compartments → chapter 2.
 			const secondFold = Array.from({ length: 20 }, (_, i) =>
 				piCompartment(29 + i, `Second fold ${i + 1}`, 50),
 			);
@@ -3537,8 +3536,9 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 				"pi-chapters",
 			);
 			const m0 = renderM0Pi(state, db, "", 3); // max tightening
-			// Both sealed chapters render; base compartments may be gone entirely.
-			expect((m0.match(/## CHAPTERS:/g) ?? []).length).toBe(2);
+			// The sealed chapter(s) render even under absurd pressure; base compartments may be
+			// gone entirely. One chapter here, because one fold is one chapter.
+			expect((m0.match(/## CHAPTERS:/g) ?? []).length).toBe(1);
 			expect(m0).toContain("Sealed 1");
 			expect(m0).toContain("Sealed 56");
 		} finally {

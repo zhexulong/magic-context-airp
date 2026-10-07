@@ -97,23 +97,33 @@ describe("migration v92 creates the chapters table", () => {
 });
 
 describe("sealChaptersForCompartments", () => {
-    test("seals one chapter per N compartments with default N=28", () => {
-        const compartments = Array.from({ length: 56 }, (_, i) =>
+    test("seals one chapter per fold, covering exactly what that fold appended", () => {
+        // Two compartments is a whole fold here. The chapter boundary follows the FOLD (the
+        // campaign phase edge), not an invented compartment count, so this is one chapter.
+        const compartments = Array.from({ length: 2 }, (_, i) =>
             compartment(i + 1, `Title ${i + 1}`, 50),
         );
-        const sealed = sealChaptersForCompartments(
-            db,
-            "session-01",
-            compartments,
-            "/test",
-        );
-        expect(sealed).toBe(2);
+        expect(sealChaptersForCompartments(db, "session-01", compartments, "/test")).toBe(1);
         const chapters = chaptersList();
-        expect(chapters).toHaveLength(2);
+        expect(chapters).toHaveLength(1);
         expect(chapters[0].spanStartSequence).toBe(1);
-        expect(chapters[0].spanEndSequence).toBe(28);
-        expect(chapters[1].spanStartSequence).toBe(29);
-        expect(chapters[1].spanEndSequence).toBe(56);
+        expect(chapters[0].spanEndSequence).toBe(2);
+    });
+
+    test("a fold larger than the cap is split, and the last chapter ends on the fold's end", () => {
+        // One fold of 5 with a cap of 2: 2 + 2 + 1. The remainder becomes the last chapter
+        // rather than staying open, so the interval is closed exactly at the fold boundary and
+        // no compartment is ever covered twice.
+        const compartments = Array.from({ length: 5 }, (_, i) =>
+            compartment(i + 1, `Title ${i + 1}`, 50),
+        );
+        expect(sealChaptersForCompartments(db, "session-01", compartments, "/test", 2)).toBe(3);
+        const chapters = chaptersList();
+        expect(chapters.map((c) => [c.spanStartSequence, c.spanEndSequence])).toEqual([
+            [1, 2],
+            [3, 4],
+            [5, 5],
+        ]);
     });
 
     test("idempotent: replaying the same fold never duplicates chapters", () => {
@@ -126,19 +136,20 @@ describe("sealChaptersForCompartments", () => {
         expect(chaptersList()).toHaveLength(1);
     });
 
-    test("a partial tail below N is sealed too (seal-once, no re-derivation)", () => {
+    test("a later fold becomes its own chapter, never folded into the previous one", () => {
         const first = Array.from({ length: 28 }, (_, i) =>
             compartment(i + 1, `A${i + 1}`),
         );
         sealChaptersForCompartments(db, "session-01", first, "/test");
-        // Second fold appends 5 more — under N=28, but all 5 must be sealed as
-        // a partial chapter so the interval never re-derives.
+        // A second fold of 5 is a second chapter. It must NOT extend the sealed first chapter:
+        // a sealed chapter's bytes are fixed, so extending it would rewrite the m[0] prefix.
         const second = Array.from({ length: 5 }, (_, i) =>
             compartment(29 + i, `B${i + 1}`),
         );
         expect(sealChaptersForCompartments(db, "session-01", second, "/test")).toBe(1);
         const chapters = chaptersList();
         expect(chapters).toHaveLength(2);
+        expect(chapters[0].spanEndSequence).toBe(28);
         expect(chapters[1].spanStartSequence).toBe(29);
         expect(chapters[1].spanEndSequence).toBe(33);
     });

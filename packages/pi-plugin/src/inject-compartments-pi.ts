@@ -471,9 +471,6 @@ export interface PiM0M1State {
 	volatileContext?: Readonly<GameBuddyStableContextMaterialization>;
 	/** Keeps memory/docs injection while suppressing compartment history rendering and trimming. */
 	compactionOff?: boolean;
-	/** Base compartments per chapter (default 28, configurable). Pure quantity
-	 *  chunking — no calendar semantics, no Stardew coupling in the fork. */
-	chapterCompartmentN?: number;
 	/** Total chapter block budget in tokens (default 4K). Warning threshold
 	 *  only: chapters are sealed and immutable, never truncated. */
 	chapterBudgetTokens?: number;

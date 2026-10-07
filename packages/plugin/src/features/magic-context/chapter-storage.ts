@@ -6,6 +6,19 @@
 // as empty strings and far-past experience vanishes from the prompt entirely
 // (the "goldfish memory" failure).
 //
+// Why this is a layer ABOVE the native decay curve rather than a rival to it:
+// the curve already renders a budget bounded history (its own docs call
+// `history_budget_percentage` "a budget for history that remains in the prompt"
+// and say the oldest low-priority compartments "can be omitted"). What it
+// cannot do is keep a trace of what it omitted, because the boundary moves with
+// age, importance and pressure. Measured on this very module (age in
+// compartments, at the pressure floor of 0.1): importance 20 -> 270, 50 -> 621,
+// 80 -> 1426. For a game save at roughly 30 compartments per in-game day that is
+// 9 / 21 / 48 in-game days of history still present, after which the earliest
+// days are gone from m[0] no matter how large the window is. Chapters are the
+// constant-budget answer to that: sealed once, then never rewritten, so they
+// cost a stable number of tokens per chapter instead of a growing share.
+//
 // v1 invariants (see design/architecture/airp-memory-evolution-architecture.md):
 //   - A chapter is sealed once, inside the SAME transaction that appends the
 //     compartments it summarizes (HARD fold), and is NEVER rewritten or
@@ -21,12 +34,31 @@
 //     (last_sealed.span_end_sequence, max(sequence)], NOT an "archived"
 //     state: the compartments table has no archived column, P5 is a render-
 //     time artifact of the decay curve.
+//   - The interval is closed at a HARD fold and by DEFAULT covers exactly the
+//     compartments that fold appended (one chapter per fold, see
+//     chaptersPerSeal). No invented compartment count drives this: the fold is
+//     the campaign phase boundary, and its compartments are equal by
+//     construction, so importance cannot bias which ones get the fast half-life.
 import { formatDate } from "../../hooks/magic-context/temporal-awareness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import type { Compartment } from "./compartment-storage";
 
-/** Default number of base compartments per chapter (configurable). */
-export const DEFAULT_CHAPTER_COMPARTMENT_N = 28;
+/**
+ * Upper bound on how many base compartments one chapter may summarize.
+ *
+ * Not a target and not a partition size. The default seals one chapter per HARD
+ * fold (the whole appended interval), which is what the campaign's own phase
+ * boundaries produce, and which keeps a chapter's compartments equal in age so
+ * importance cannot bias which of them gets the fast half-life. This ceiling
+ * exists only so a single unusually long fold cannot seal a chapter that
+ * swallows many phases; when it divides, the call still closes the interval at
+ * the fold's end (the last chapter covers the remainder), so every sealed
+ * chapter boundary stays on a phase edge.
+ */
+export const MAX_CHAPTER_COMPARTMENTS = 4096;
+
+/** Default cap on sealed chapter size; see MAX_CHAPTER_COMPARTMENTS. */
+export const DEFAULT_CHAPTER_COMPARTMENT_CAP = MAX_CHAPTER_COMPARTMENTS;
 
 /** Default total chapter budget in tokens; only a warning threshold, never a truncation trigger. */
 export const DEFAULT_CHAPTER_BUDGET_TOKENS = 4096;
@@ -161,29 +193,34 @@ function getInsertChapterStatement(db: Database): PreparedStatement {
  * @param compartments the compartments appended by this fold, chronological.
  * @param projectPath project identity for cross-session aggregation (v2); v1
  *   scopes strictly by session_id but stores the path for future use.
- * @param chapterCompartmentN base compartments per chapter (default 28).
+ * @param chapterCompartmentCap upper bound on compartments per chapter; see
+ *   MAX_CHAPTER_COMPARTMENTS. Only a pathological fold reaches it.
  */
 export function sealChaptersForCompartments(
     db: Database,
     sessionId: string,
     compartments: readonly Compartment[],
     projectPath: string,
-    chapterCompartmentN: number = DEFAULT_CHAPTER_COMPARTMENT_N,
+    chapterCompartmentCap: number = DEFAULT_CHAPTER_COMPARTMENT_CAP,
 ): number {
     if (compartments.length === 0) return 0;
+    const cap = Number.isFinite(chapterCompartmentCap) && chapterCompartmentCap >= 1 ? Math.floor(chapterCompartmentCap) : DEFAULT_CHAPTER_COMPARTMENT_CAP;
     const lastSealed = getLastSealedChapterSpanEnd(db, sessionId);
     // Only the interval (lastSealed, max sequence] is new.
     const candidateMax = compartments[compartments.length - 1]?.sequence ?? 0;
     if (candidateMax <= lastSealed) return 0;
 
-    // Reserve the whole interval even if not enough for a full chapter, so a
-    // later fold never re-derives a partial prefix (seal-once semantics).
     const all = compartments.filter((c) => c.sequence > lastSealed);
     const chapters: Chapter[] = [];
-    for (let start = 0; start < all.length; start += chapterCompartmentN) {
-        const slice = all.slice(start, start + chapterCompartmentN);
-        if (slice.length === 0) continue;
-        chapters.push(buildChapter(sessionId, projectPath, slice));
+    // Walk to the LAST full cap boundary, then close on the remainder, so the
+    // sealed ranges always end exactly at this fold's end (a phase edge) and
+    // every compartment is covered exactly once.
+    const fullEnd = Math.floor(all.length / cap) * cap;
+    for (let start = 0; start < fullEnd; start += cap) {
+        chapters.push(buildChapter(sessionId, projectPath, all.slice(start, start + cap)));
+    }
+    if (fullEnd < all.length) {
+        chapters.push(buildChapter(sessionId, projectPath, all.slice(fullEnd)));
     }
     const stmt = getInsertChapterStatement(db);
     for (const chapter of chapters) {
