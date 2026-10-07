@@ -167,6 +167,57 @@ describe("authored context private bridge", () => {
 		await capability.clear();
 	});
 
+	it("installs a matched volatile ref that is not the catalog's first entry", async () => {
+		// The caller selects volatile refs by keyword match, so the installed subset is generally not
+		// a prefix of the catalog array. An index-wise comparison rejected it and the turn failed;
+		// the contract only requires that every installed ref is backed by this materialization.
+		const first = "The moon festival is tonight.";
+		const second = "The lantern market opens at dusk.";
+		const entry = (sourceId: string, content: string, totalOrderKey: string, keys: readonly string[]) => ({
+			sourceId,
+			kind: "lorebook_entry" as const,
+			revision: "1",
+			content,
+			canonicalHash: createHash("sha256").update(content).digest("hex"),
+			budgetTokens: 7,
+			totalOrderKey,
+			provenance: "fixture",
+			selectionKeys: keys,
+		});
+		const body = {
+			version: "gamebuddy-authored-context-catalog/v2" as const,
+			scope,
+			stableSources: [source],
+			volatileSources: [
+				entry("first", first, "0001", ["moon festival"]),
+				entry("second", second, "0002", ["lantern"]),
+			],
+		};
+		const capability = publishGameBuddyAuthoredStableCatalog(scope, {
+			...body,
+			canonicalHash: createHash("sha256").update(canonical(body)).digest("hex"),
+		});
+		const plan = capability.prepare("preflight_volatile");
+		// The SECOND entry only, as the caller's keyword selection would produce.
+		const selected = plan.volatileSourceCandidates[1];
+		if (selected === undefined) throw new Error("fixture_missing_candidate");
+		const { selectionKeys: _selectionKeys, content: _content, budgetTokens: _budgetTokens, ...ref } = selected;
+		expect(() =>
+			capability.assertInstall("turn_volatile", plan.sourceRefs, [ref]),
+		).not.toThrow();
+		const materialized = __gamebuddyReadAuthoredVolatileMaterialization(scope.sessionId);
+		expect(materialized?.volatileSources.map((item) => item.sourceId)).toEqual([
+			"second",
+		]);
+		// A ref this materialization does not back is still refused.
+		expect(() =>
+			capability.assertInstall("turn_other", plan.sourceRefs, [
+				{ ...ref, revision: "2" },
+			]),
+		).toThrow("gamebuddy_authored_context_plan_mismatch");
+		await capability.clear();
+	});
+
 	it("returns reference-only plans and rejects mismatched refs", async () => {
 		const capability = publishGameBuddyAuthoredStableCatalog(scope, catalog());
 		const plan = capability.prepare("preflight_01");

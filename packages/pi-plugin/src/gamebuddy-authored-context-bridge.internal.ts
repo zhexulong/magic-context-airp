@@ -108,8 +108,16 @@ function mintCapability(
 					(r, i) => JSON.stringify(r) !== JSON.stringify(expected[i]),
 				) ||
 				volatileRefs.length > expectedVolatile.length ||
+				// MEMBERSHIP, not index: the plan's volatile refs are selected by the caller for this turn
+				// (keyword matches), which is a subset in an order of its own choosing - not a prefix of
+				// this catalog array. Comparing by index rejected every plan whose matched entry was not
+				// the first volatile source, so any player message containing a trigger word failed its
+				// turn with an opaque 503.
 				volatileRefs.some(
-					(r, i) => JSON.stringify(r) !== JSON.stringify(expectedVolatile[i]),
+					(r) =>
+						!expectedVolatile.some(
+							(e) => JSON.stringify(e) === JSON.stringify(r),
+						),
 				)
 			)
 				throw new Error("gamebuddy_authored_context_plan_mismatch");
