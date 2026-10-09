@@ -51,11 +51,20 @@ export type GameBuddyPlayerMemoryReadInput = Readonly<{
 }>;
 
 export type GameBuddyPlayerMemoryReadView = Readonly<{
-	stateToken: string;
-	content: string;
-	category: "semantic" | "interaction";
-	status: "active" | "permanent" | "archived";
-	sourceRefs?: readonly string[];
+  stateToken: string;
+  content: string;
+  category: "semantic" | "interaction";
+  status: "active" | "permanent" | "archived";
+  /**
+   * Who wrote the row, in the store's own vocabulary (`historian` | `agent` | `dreamer` | `user`).
+   *
+   * The management surface has always allowed a player to edit and archive ANY row, but it could not
+   * say which rows the player wrote themselves and which the companion's own machinery produced - so
+   * the two were indistinguishable exactly where a player decides what to trust. The value is carried
+   * verbatim: the store owns the vocabulary, and the display wording belongs to the surface.
+   */
+  sourceType: string;
+  sourceRefs?: readonly string[];
 }>;
 
 export type GameBuddyPlayerMemoryReadProjection = Readonly<{
@@ -147,16 +156,17 @@ function view(
 		memory.category !== "INTERACTION_EPISODE"
 	)
 		return undefined;
-	return Object.freeze({
-		stateToken,
-		content: memory.content,
-		category:
-			memory.category === "SEMANTIC_MEMORY" ? "semantic" : "interaction",
-		status: memory.status,
-		...(sourceRefs(memory) === undefined
-			? {}
-			: { sourceRefs: sourceRefs(memory) }),
-	});
+  return Object.freeze({
+    stateToken,
+    content: memory.content,
+    category:
+      memory.category === "SEMANTIC_MEMORY" ? "semantic" : "interaction",
+    status: memory.status,
+    sourceType: memory.sourceType,
+    ...(sourceRefs(memory) === undefined
+      ? {}
+      : { sourceRefs: sourceRefs(memory) }),
+  });
 }
 
 /** Bound read-only projection. It deliberately exposes no Memory mutation method. */
