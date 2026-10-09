@@ -286,6 +286,7 @@ import {
 	isPiLiveUsageRawBranchEstimate,
 	resolvePiPressureSnapshotWithEstimateGuard,
 } from "./pi-pressure";
+import { hostOutlivesBackgroundRuns } from "./pi-background-run-lifetime";
 import { assertPiRawFallbackFits, PiStorageBusyError } from "./pi-raw-fallback";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
@@ -4841,9 +4842,11 @@ function maybeFireHistorian(args: {
 			return;
 		}
 
-		// Headless Pi exits after agent_end without dispatching session_shutdown.
-		// Leave the eligible history in the store for the next interactive pass.
-		if (!ctx.hasUI) return;
+		// A host that ends the process without dispatching session_shutdown (a headless one-shot Pi) must
+// not spawn a fire-and-forget historian: the run would be killed mid-flight and its lease never
+// released. That is a question about lifetime, not about the interface, so ask it directly - an
+// embedded host declares that it outlives background runs even though it has no UI.
+if (!hostOutlivesBackgroundRuns(ctx.hasUI)) return;
 		triggered = true;
 		sessionLog(
 			sessionId,
