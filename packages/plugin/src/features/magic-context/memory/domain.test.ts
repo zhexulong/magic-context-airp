@@ -21,13 +21,18 @@ const interactionOutput = `<output>
 describe("ongoing-interaction memory domain", () => {
     test("uses a dedicated historian prompt that keeps completed activity episodic", () => {
         const prompt = historianSystemPromptForDomain("ongoing-interaction");
-        expect(prompt).toContain("Episodic Memory");
-        expect(prompt).toContain("Semantic Memory gate");
-        expect(prompt).toContain("We finished organizing tools during this game.");
-        expect(prompt).toContain("must not be promoted");
-        expect(prompt).toContain("IdentityProfile");
-        expect(prompt).toContain("Live World");
-        expect(historianSystemPromptForDomain("coding-project")).not.toBe(prompt);
+    expect(prompt).toContain("Episodic Memory");
+    expect(prompt).toContain("Semantic Memory gate");
+    expect(prompt).toContain("We finished organizing our tools that afternoon.");
+    expect(prompt).toContain("must not be promoted");
+    expect(prompt).toContain("IdentityProfile");
+    expect(prompt).toContain("Live World");
+    // The companion's voice is part of this domain's contract, not a stylistic detail: the
+    // compartments are read back into the companion's own context, where the player is "you".
+    expect(prompt).toContain("## Voice");
+    expect(prompt).toContain('"I" for the companion, "you" for the player');
+    expect(prompt).toContain('never "the player", "the user", "the assistant", "the agent"');
+    expect(historianSystemPromptForDomain("coding-project")).not.toBe(prompt);
     });
 
     test("accepts only the ongoing-interaction fact taxonomy", () => {
