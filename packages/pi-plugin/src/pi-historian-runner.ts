@@ -660,8 +660,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			if (existingValidationError) {
 				sessionLog(
 					sessionId,
-					`historian failure: source=existing-validation reason="${existingValidationError}"`,
-				);
+						`historian failure: source=existing-validation reason="${existingValidationError}"`,
+					);
+					// The row must name the reason the run failed: this path already knows it (the line above),
+					// and leaving it out produced `historian_runs` rows of status 'failed' with a NULL reason,
+					// which are indistinguishable from an unattributed crash.
+					telemetry.status = "failed";
+					telemetry.failureReason = `existing-validation: ${existingValidationError}`;
 				{
 					const failCount = incrementHistorianFailure(
 						db,
@@ -687,12 +692,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					? createDefaultBoundarySnapshotForTests(sessionId)
 					: null);
 			if (!boundarySnapshot) {
-				sessionLog(
-					sessionId,
-					"historian no-op: missing protected-tail boundary snapshot from Pi trigger decision",
-				);
-				return;
-			}
+			sessionLog(
+				sessionId,
+				"historian no-op: missing protected-tail boundary snapshot from Pi trigger decision",
+			);
+			// A no-op, not a failure - and the row has to say which, or the pacing of the historian is
+			// read as a broken historian.
+			telemetry.status = "noop";
+			telemetry.failureReason = "missing protected-tail boundary snapshot";
+			return;
+		}
 			let validation =
 				boundarySnapshot.rawRangeFingerprint.length > 0
 					? validateBoundarySnapshot({
@@ -736,6 +745,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					sessionId,
 					`historian no-op: stale protected-tail snapshot (${validation.detail ?? validation.reason ?? "unknown"})`,
 				);
+				telemetry.status = "noop";
+				telemetry.failureReason = `stale protected-tail snapshot: ${validation.detail ?? validation.reason ?? "unknown"}`;
 				return;
 			}
 			const protectedTailStart = boundarySnapshot.protectedTailStart;
@@ -755,9 +766,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					recordHighPressureNoEligibleHead(db, boundarySnapshot);
 				}
 				// Tail exhausted — clear the emergency catch-up latch (see OpenCode).
-				clearEmergencyDrainLatch(db, sessionId);
-				return;
-			}
+			clearEmergencyDrainLatch(db, sessionId);
+			telemetry.status = "noop";
+			telemetry.failureReason = "no eligible head above the protected tail";
+			return;
+		}
 
 			const perRunCap = selectPerRunCap(boundarySnapshot);
 			const usable = Math.max(
@@ -1200,12 +1213,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					retainDrainReservationForRetryThrottle = false;
 					rollbackDrainReservation();
 					sessionLog(
-						sessionId,
-						`historian producer admission refused: ${errorMsg}`,
-					);
-					return;
+				sessionId,
+				`historian producer admission refused: ${errorMsg}`,
+			);
+			// The run failed for a known reason, so the row must carry it: this path logs the reason and
+			// then left the telemetry at its default, which recorded `failed` with a NULL reason and made
+			// the embedded historian's real failure undiagnosable (measured 2026-10-08).
+			telemetry.status = "failed";
+			telemetry.failureReason = `producer admission refused: ${errorMsg}`;
+			return;
 				}
 				sessionLog(sessionId, `historian failure: ${errorMsg}`);
+			telemetry.status = "failed";
+			telemetry.failureReason = errorMsg;
 				{
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));
@@ -1320,7 +1340,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				sessionLog(
 					sessionId,
 					`historian failure: source=no-progress newCompartmentCount=${newCompartments.length} lastNewEnd=${lastNewEnd} priorEnd=${offset - 1}`,
-				);
+		);
+		telemetry.status = "failed";
+		telemetry.failureReason = `no progress: ${errorMsg}`;
 				{
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));
@@ -1434,11 +1456,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// holder check and writes on one fresh write-locked snapshot.
 			if (!compartmentLeaseHolderId) {
 				sessionLog(
-					sessionId,
-					"historian publish skipped: missing compartment lease holder",
-				);
-				rollbackDrainReservation();
-				return;
+				sessionId,
+				"historian publish skipped: missing compartment lease holder",
+			);
+			rollbackDrainReservation();
+			telemetry.status = "noop";
+			telemetry.failureReason = "publish skipped: missing compartment lease holder";
+			return;
 			}
 			const compartmentTagKeys = await getRawSessionTagKeysThrough(
 				sessionId,
@@ -1452,11 +1476,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				if (!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)) {
 					db.exec("ROLLBACK");
 					sessionLog(
-						sessionId,
-						"historian publish skipped: compartment lease no longer held",
-					);
-					rollbackDrainReservation();
-					return;
+					sessionId,
+					"historian publish skipped: compartment lease no longer held",
+				);
+				rollbackDrainReservation();
+				telemetry.status = "noop";
+				telemetry.failureReason = "publish skipped: compartment lease no longer held";
+				return;
 				}
 				appendCompartments(db, sessionId, newCompartments);
 				// Resolve durable ids for the just-appended compartments (last N rows by
@@ -1810,8 +1836,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				harness: resolvePiHarnessKind(),
 				subagentInvocationId: invocationId,
 				runKind: telemetry.runKind ?? "incremental",
-				status: telemetry.status ?? "failed",
-				failureReason: telemetry.failureReason ?? null,
+					status: telemetry.status ?? "failed",
+					// Safety net. The default telemetry is `status: "failed"` with no reason, so any exit that
+					// does not fill in `failureReason` writes a failed row that cannot be diagnosed - which is
+					// exactly what happened on the embedded host (2 of 62 rows, reason NULL). Every exit that
+					// knows its reason now records it; this line covers the ones added later.
+					failureReason:
+						telemetry.failureReason ??
+						((telemetry.status ?? "failed") === "failed"
+							? "unattributed failure (this exit path does not record a reason)"
+							: null),
 				chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
 				chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
 				unprocessedFrom: telemetry.unprocessedFrom ?? null,
