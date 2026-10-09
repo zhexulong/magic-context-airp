@@ -1070,17 +1070,42 @@ export function resolveDreamerFromConfig(
  * All driven by the user's `magic-context.jsonc` (Pi convention paths).
  */
 const embeddedRuntime = process.env.GAMEBUDDY_EMBEDDED_RUNTIME === "1";
-let embeddedModelRegistry: ModelRegistry | undefined;
+// One process, one registry: see `pi-embedded-model-registry.ts` for why this cannot be module state
+// (jiti evaluates an extension repeatedly with `moduleCache: false`, and the runner is rebuilt per
+// pass, so a module local would be written by one evaluation and ignored by the one that runs).
+import {
+	readEmbeddedModelRegistry,
+	writeEmbeddedModelRegistry,
+} from "./pi-embedded-model-registry";
 
 export type EmbeddedHistorianRuntimeBinding = Readonly<{
 	bind: (registry: ModelRegistry) => boolean;
 }>;
 
-/** Process-private production seam used by the embedding Host after session construction. */
-export function getEmbeddedHistorianRuntimeBinding():
-	| EmbeddedHistorianRuntimeBinding
-	| undefined {
-	return activeEmbeddedHistorianRuntimeBinding;
+/**
+ * Process-private production seam used by the embedding Host after session construction.
+ *
+ * The binding is ALSO published on `globalThis` under a `Symbol.for` key, because an exported
+ * function can never be reached from outside: Pi loads extensions through jiti
+ * (`loadExtensionModule` -> `jiti.import(path, { moduleCache: false })`), so the extension's module
+ * instance lives in jiti's registry, and a Host that imports the same file gets a SECOND, unused
+ * instance whose `embeddedModelRegistry` nothing reads. That is why this seam had no callers - it was
+ * unreachable by construction. The global slot is the same cross-registry channel this package
+ * already uses for its child-init context marker.
+ */
+const EMBEDDED_HISTORIAN_BINDING_SLOT = Symbol.for(
+	"magic-context.pi.embedded-historian-binding",
+);
+
+type EmbeddedHistorianBindingGlobal = typeof globalThis & {
+	[EMBEDDED_HISTORIAN_BINDING_SLOT]?: EmbeddedHistorianRuntimeBinding;
+};
+
+export function getEmbeddedHistorianRuntimeBinding(): EmbeddedHistorianRuntimeBinding | undefined {
+	return (
+		(globalThis as EmbeddedHistorianBindingGlobal)[EMBEDDED_HISTORIAN_BINDING_SLOT] ??
+		activeEmbeddedHistorianRuntimeBinding
+	);
 }
 
 const activeEmbeddedHistorianRuntimeBinding:
@@ -1088,11 +1113,16 @@ const activeEmbeddedHistorianRuntimeBinding:
 	| undefined = embeddedRuntime
 	? Object.freeze({
 			bind(registry: ModelRegistry): boolean {
-				embeddedModelRegistry = registry;
+				writeEmbeddedModelRegistry(registry);
 				return true;
 			},
 		})
 	: undefined;
+
+if (activeEmbeddedHistorianRuntimeBinding !== undefined) {
+	(globalThis as EmbeddedHistorianBindingGlobal)[EMBEDDED_HISTORIAN_BINDING_SLOT] =
+		activeEmbeddedHistorianRuntimeBinding;
+}
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	if (process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV] === "1") {
@@ -1498,7 +1528,7 @@ async function startPiMagicContextRuntime(
 					// Prefer the live session registry; fall back to the value the
 					// embedding Host injected through the runtime binding seam
 					// (both are the same SDK registry in production).
-					const registry = ctx.modelRegistry ?? embeddedModelRegistry;
+					const registry = ctx.modelRegistry ?? readEmbeddedModelRegistry();
 					if (registry !== undefined && hist?.runner instanceof EmbeddedPiHistorianRunner) {
 						hist.runner.bindModelRegistry(registry);
 					}

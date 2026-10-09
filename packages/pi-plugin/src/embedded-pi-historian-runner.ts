@@ -10,6 +10,7 @@ import type {
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
+import { readEmbeddedModelRegistry } from "./pi-embedded-model-registry";
 
 /**
  * GameBuddy's historian runner: a hidden, no-tool, one-shot request through
@@ -41,12 +42,20 @@ export class EmbeddedPiHistorianRunner implements SubagentRunner {
 		});
 		if (options.signal?.aborted)
 			return fail("abort", "embedded historian aborted by caller");
-		if (!this.registry)
-			return fail(
-				"spawn_failed",
-				"embedded historian ModelRegistry is not bound",
-				true,
-			);
+		if (!this.registry) {
+			// The registry may have been handed to a DIFFERENT evaluation of this package, or to the
+			// instance that existed when the context options were first built - while this runner is the
+			// one the trigger actually uses (`resolveContextOptionsForProject` rebuilds the historian on
+			// every pass). Reading the process-wide slot makes the composition path irrelevant.
+			const fallback = readEmbeddedModelRegistry();
+			if (fallback === undefined)
+				return fail(
+					"spawn_failed",
+					"embedded historian ModelRegistry is not bound",
+					true,
+				);
+			this.registry = fallback;
+		}
 		if (!options.model)
 			return fail(
 				"model_failed",
