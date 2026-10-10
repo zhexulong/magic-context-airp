@@ -177,26 +177,26 @@ export interface RetrospectivePromptEvent {
     createdAt: number;
 }
 
-export const RETROSPECTIVE_SYSTEM_PROMPT = `You are a retrospective learning agent for Magic Context.
+export const RETROSPECTIVE_SYSTEM_PROMPT = `You are a retrospective learning agent for Magic Context, keeping the companion's side of a long-running relationship with the player.
 
-You learn only from recurring user-friction moments where the user had to correct, re-explain, or recover from the assistant's repeated behavior. You receive a pre-rendered friction window from the host and may use ctx_search to look for corroborating prior patterns.
+You learn only from recurring moments where the player had to correct you, re-explain something, or recover from your reply. You receive a pre-rendered friction window from the host and may use ctx_search to look for corroborating prior patterns. The player is "you"; your own recollection is "I".
 
 Rules:
-1. Pattern, not one-off: extract only recurring behavior that is likely to happen again. Zero learnings is fine.
-2. Distill, do not transcribe: never quote the user, never include dates, and never preserve session-local anger.
-3. Root cause + correction: the learning must tell a future agent what to do differently.
+1. Pattern, not one-off: extract only recurring behaviour that is likely to happen again. Zero learnings is fine.
+2. Distill, do not transcribe: never quote the player, never include dates, and never preserve the heat of a bad exchange.
+3. Root cause + correction: the learning must tell your future self what to do differently.
 4. Privacy by host-apply: do not call memory-writing tools. Emit only the XML schema requested by the prompt.`;
 
 /** Tiny system prompt for the cheap LLM gate (turn 1): it reads only U: lines
  *  and answers "n" or "y: <ordinals>". Kept minimal so the gate is cheap. */
 export const FRICTION_GATE_SYSTEM_PROMPT =
-    "You are a conservative friction detector for a coding agent. You read recent user message lines and decide whether the user was correcting, re-explaining to, or frustrated with the assistant. Output exactly one line and nothing else.";
+    "You are a conservative friction detector for a companion. You read recent player message lines and decide whether the player was correcting you, re-explaining something to you, or frustrated with your reply. Output exactly one line and nothing else.";
 
 export function buildFrictionGatePrompt(args: { userLines: string[] }): string {
-    return `Decide whether these user lines show the user correcting, re-explaining to, or expressing frustration at the ASSISTANT's behavior — a moment a future assistant should learn from.
+    return `Decide whether these player lines show the player correcting you, re-explaining something to you, or expressing frustration at your reply — a moment the companion should learn from.
 
-Fire (y) when the user: corrects a mistake the assistant made, repeats an instruction the assistant didn't follow, tells the assistant to stop or revert an unwanted action, or shows frustration at repeated assistant behavior.
-Do NOT fire (n) for: a normal request or question; the user changing their own mind or fixing their own earlier message ("actually, use X instead — my mistake"); reporting a bug/error/test failure to investigate; a calm one-off "do X instead". The words "no", "not", "error", "fail", "wrong" inside an otherwise-normal sentence are not friction.
+Fire (y) when the player: corrects a mistake you made, repeats something you didn't follow, tells you to stop or revert an unwanted action, or shows frustration at repeated behaviour of yours.
+Do NOT fire (n) for: a normal request or question; the player changing their own mind or fixing their own earlier message ("actually, use X instead — my mistake"); reporting a bug/error/test failure to investigate; a calm one-off "do X instead". The words "no", "not", "error", "fail", "wrong" inside an otherwise-normal sentence are not friction.
 
 Return exactly one line: "n", or "y: <line numbers>". Be conservative.
 
@@ -234,11 +234,11 @@ ${renderRetrospectiveEvents(args.events)}
 
 ### Extraction rules
 - Extract only durable, recurring learnings. A single annoyed/corrective message is noise.
-- Write actionable present-tense corrections for future agents.
-- Do NOT quote the user, include dates, or preserve anger/frustration wording.
+- Write actionable present-tense notes for your future self.
+- Do NOT quote the player, include dates, or preserve anger/frustration wording.
 - Write in plain prose with NO quotation marks at all — not around the user's words, and not around illustrative trigger words. Describe trigger conditions directly (write: when the user asks you to investigate or diagnose without requesting a fix — not: when the user says "investigate"). A learning containing any quotation marks is rejected.
 - Use route="memory" for project-specific agent behavior/rules, with category one of PROJECT_RULES, ARCHITECTURE, CONSTRAINTS, CONFIG_VALUES, NAMING.
-- Use route="observation" only for recurring user workflow/preferences that belong in the global user profile.
+- Use route="observation" only for recurring player preferences that belong in the profile.
 - Zero learnings is acceptable and should be represented by an empty learnings block.
 
 Return only XML in this exact shape:
