@@ -30,8 +30,10 @@ describe("ongoing-interaction memory domain", () => {
     // The companion's voice is part of this domain's contract, not a stylistic detail: the
     // compartments are read back into the companion's own context, where the player is "you".
     expect(prompt).toContain("## Voice");
-    expect(prompt).toContain('"I" for the companion, "you" for the player');
-    expect(prompt).toContain('never "the player", "the user", "the assistant", "the agent"');
+    expect(prompt).toContain('write "I" for the companion and "you" for the player');
+    // The voice must never read as licence to drop the ordinals the contract requires.
+    expect(prompt).toContain("The ordinals are still REQUIRED");
+    expect(prompt).toContain('No role labels ("the player", "the user", "the assistant", "the agent")');
     expect(historianSystemPromptForDomain("coding-project")).not.toBe(prompt);
     });
 
