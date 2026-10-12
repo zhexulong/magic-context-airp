@@ -2556,6 +2556,103 @@ describe("createDreamTaskExecutor — retrospective", () => {
 
         expect(getUserMemoryCandidates(db)).toEqual([]);
     });
+
+    test("module-managed project writes its learnings through the authority and leaves the TS store alone", async () => {
+        db = freshDb();
+        const project = "/repo/retro-module";
+        ensureContextStoreUuid(db);
+        installAuthorityManagedMarker(db, project, "store");
+        const provider = {
+            listProjectSessions: mock(() => [{ sessionId: "s1" }]),
+            readUserMessagesSince: mock(() => ({
+                messages: [
+                    {
+                        sessionId: "s1",
+                        ordinal: 1,
+                        role: "user" as const,
+                        text: "Please stop assuming CLI commands work without checking the actual output.",
+                        ts: 200,
+                    },
+                    {
+                        sessionId: "s1",
+                        ordinal: 2,
+                        role: "user" as const,
+                        text: "Please stop assuming CLI commands work without checking actual output.",
+                        ts: 220,
+                    },
+                ],
+                truncated: false,
+            })),
+            readUserMessagesBefore: mock(() => []),
+        };
+        let lastSystem = "";
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "retro-module-child" } })),
+                prompt: mock(async (args: { body?: { system?: string } }) => {
+                    lastSystem = args.body?.system ?? "";
+                    return {};
+                }),
+                messages: mock(async () => ({
+                    data: assistantMessages(
+                        lastSystem.includes("friction detector")
+                            ? "y: 2"
+                            : `<learnings>
+  <learning route="memory" category="PROJECT_RULES">Verify provider-executed tool availability on wire before describing it as supported.</learning>
+</learnings>`,
+                    ),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const moduleCalls: Array<{ method?: string; body?: unknown }> = [];
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            retrospectiveRawProvider: provider,
+            userMemoryCollectionEnabled: false,
+            moduleClient: {
+                authorityStatus: async () => ({ authority: { state: "MODULE", generation: 3 } }),
+                call: async (call: { method?: string; body?: unknown }) => {
+                    moduleCalls.push(call);
+                    return { result: { ok: true } };
+                },
+                mirrorPull: async () => ({ result: {} }),
+            } as never,
+        });
+
+        const result = await executor(
+            {
+                task: "retrospective",
+                schedule: "0 5 * * *",
+                timeoutMinutes: 20,
+                retrospectiveRecencyDays: 100_000,
+            },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-retro-module",
+                leaseKey: leaseKeyFor("retrospective", project),
+            },
+        );
+
+        expect(result.status).toBe("completed");
+        const writes = moduleCalls.filter((call) => call.method === "ctx_memory");
+        expect(writes).toHaveLength(1);
+        expect(
+            (writes[0]?.body as { arguments?: Record<string, unknown> } | undefined)?.arguments,
+        ).toMatchObject({
+            action: "write",
+            memory_project: project,
+            category: "PROJECT_RULES",
+            content:
+                "Verify provider-executed tool availability on wire before describing it as supported.",
+        });
+        // The module owns this project's rows, so the TypeScript store stays empty.
+        expect(getMemoriesByProject(db, project)).toEqual([]);
+    });
 });
 
 test("createDreamTaskExecutor surfaces host-refused verify counts", async () => {
