@@ -38,13 +38,14 @@ function isPromotableCategory(
     category: string,
     domain: MemoryDomain = "coding-project",
 ): category is MemoryCategory {
-    // INTERACTION_EPISODE is a durable category only in the explicit ongoing
-    // interaction domain. Keep the coding-project allowlist unchanged rather
-    // than widening the global promotion set.
-    if (category === "SEMANTIC_MEMORY" || category === "INTERACTION_EPISODE") {
-        return domain === "ongoing-interaction";
-    }
-    return PROMOTABLE_CATEGORIES.some((promotableCategory) => promotableCategory === category);
+    // The two domains have disjoint durable taxonomies, and the gate must be no wider than the taxonomy a
+    // domain actually has. Both directions matter: a coding category promoted into a companion continuity
+    // would be permanent contamination no later parser can undo, and `PROMOTABLE_CATEGORIES` still lists
+    // SEMANTIC_MEMORY for the legacy shape, so the ongoing categories have to be excluded explicitly on the
+    // coding side too rather than falling through to that list.
+    const ongoingOnly = category === "SEMANTIC_MEMORY" || category === "INTERACTION_EPISODE";
+    if (domain === "ongoing-interaction") return ongoingOnly;
+    return !ongoingOnly && PROMOTABLE_CATEGORIES.some((promotableCategory) => promotableCategory === category);
 }
 
 function resolveExpiresAt(category: MemoryCategory): number | null {

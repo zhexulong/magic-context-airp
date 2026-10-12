@@ -409,6 +409,30 @@ describe("promotion", () => {
                 getMemoriesByProject(db, "/repo/project").map((memory) => memory.category),
             ).toEqual(["PROJECT_RULES"]);
         });
+
+        it("rejects coding categories in ongoing-interaction, so the gate is no wider than the taxonomy", () => {
+            db = makeMemoryDatabase();
+            // The historian's fact parser restricts first, but this gate must not be correct only by accident:
+            // a coding category promoted into a companion continuity would be permanent contamination.
+            const result = promoteSessionFactsDurable(
+                db,
+                "ses-1",
+                "/repo/project",
+                [
+                    { category: "ARCHITECTURE_DECISIONS", content: "Use SQLite for cross-session memory" },
+                    { category: "NAMING", content: "Name the extractor extractFacts" },
+                    {
+                        category: "SEMANTIC_MEMORY",
+                        content: "The player explicitly confirmed a durable preference.",
+                    },
+                ],
+                "ongoing-interaction",
+            );
+            expect(result.factsPromoted).toBe(1);
+            expect(getMemoriesByProject(db, "/repo/project").map((memory) => memory.category)).toEqual([
+                "SEMANTIC_MEMORY",
+            ]);
+        });
     });
 
     describe("#given source exclusion", () => {
