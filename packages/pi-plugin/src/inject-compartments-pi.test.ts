@@ -3546,4 +3546,82 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("reads chapters by continuity, not by session: a new session under the same continuity sees the history, another continuity never does", () => {
+		const db = createTestDb();
+		const dir = mkdtempSync(join(tmpdir(), "mc-pi-chapters-scope-"));
+		// The chapter-only lines of a rendered m[0] (compartment headings never
+		// start with this prefix), so a marker cannot pass on decayed bytes.
+		const chapterLines = (m0: string) =>
+			m0.split("\n").filter((line) => line.startsWith("## CHAPTERS:"));
+		try {
+			// Continuity A, session 1: one fold, one sealed chapter.
+			const continuityASessionOne = {
+				...stateFor(dir),
+				sessionId: "pi-continuityA-s1",
+			};
+			appendCompartments(
+				db,
+				continuityASessionOne.sessionId,
+				Array.from({ length: 12 }, (_, i) =>
+					piCompartment(i + 1, `A1 fold ${i + 1}`, 50),
+				),
+			);
+			sealChaptersForCompartments(
+				db,
+				continuityASessionOne.sessionId,
+				getCompartments(db, continuityASessionOne.sessionId),
+				continuityASessionOne.projectIdentity,
+			);
+
+			// Continuity A, session 2: a fresh Pi session under the SAME continuity.
+			const continuityASessionTwo = {
+				...stateFor(dir),
+				sessionId: "pi-continuityA-s2",
+			};
+			const m0NewSession = renderM0Pi(continuityASessionTwo, db, "");
+			expect(
+				chapterLines(m0NewSession).some((line) => line.includes("A1 fold")),
+			).toBe(true);
+
+			// Continuity B: its own chapter exists but must never leak into A.
+			const continuityBSession = {
+				...stateFor(dir),
+				sessionId: "pi-continuityB-s1",
+				projectIdentity: "pi-chapters-other",
+			};
+			appendCompartments(
+				db,
+				continuityBSession.sessionId,
+				Array.from({ length: 12 }, (_, i) =>
+					piCompartment(i + 1, `B fold ${i + 1}`, 50),
+				),
+			);
+			sealChaptersForCompartments(
+				db,
+				continuityBSession.sessionId,
+				getCompartments(db, continuityBSession.sessionId),
+				continuityBSession.projectIdentity,
+			);
+
+			const m0ContinuityA = renderM0Pi(continuityASessionOne, db, "");
+			expect(
+				chapterLines(m0ContinuityA).some((line) => line.includes("A1 fold")),
+			).toBe(true);
+			expect(
+				chapterLines(m0ContinuityA).some((line) => line.includes("B fold")),
+			).toBe(false);
+
+			const m0ContinuityB = renderM0Pi(continuityBSession, db, "");
+			expect(
+				chapterLines(m0ContinuityB).some((line) => line.includes("B fold")),
+			).toBe(true);
+			expect(
+				chapterLines(m0ContinuityB).some((line) => line.includes("A1 fold")),
+			).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			closeQuietly(db);
+		}
+	});
 });

@@ -107,7 +107,7 @@ import {
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import {
-	getChapters,
+	getChaptersForProject,
 	renderChaptersBlock,
 	estimateChaptersTokens,
 	DEFAULT_CHAPTER_BUDGET_TOKENS,
@@ -1474,9 +1474,15 @@ export function renderM0Pi(
 	// on the stable prefix of the provider cache. Chapters never decay and
 	// never consume compartment budget; over-budget tightening
 	// (decayPressureMultiplier) is absorbed entirely by base compartments.
+	// scoped by the CONTINUITY (state.projectIdentity), not by this Pi session:
+	// the player panel and the player CRUD read chapters through
+	// getChaptersForProject on the continuity's project path, and a Pi session
+	// only partitions one run's own compartments. Session scoping here would
+	// reset the companion's long history whenever a new Pi session started under
+	// the same continuity.
 	const chapters = state.compactionOff
 		? []
-		: getChapters(db, state.sessionId);
+		: getChaptersForProject(db, state.projectIdentity);
 	const chaptersBlock = renderChaptersBlock(chapters);
 	if (chapters.length > 0) {
 		const estimated = estimateChaptersTokens(chapters);

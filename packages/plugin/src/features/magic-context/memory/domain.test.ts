@@ -34,6 +34,14 @@ describe("ongoing-interaction memory domain", () => {
     // The voice must never read as licence to drop the ordinals the contract requires.
     expect(prompt).toContain("The ordinals are still REQUIRED");
     expect(prompt).toContain('No role labels ("the player", "the user", "the assistant", "the agent")');
+    // The Voice rule is not compartment-only: the durable entry bodies render on the player's
+    // Memory panel, so they must read in the same voice and drop the same role labels.
+    expect(prompt).toContain(
+        "The `<SEMANTIC_MEMORY>` and `<INTERACTION_EPISODE>` entry bodies",
+    );
+    expect(prompt).toContain(
+        'they follow the same rule: first person for the companion ("I"), second person for the player ("you"), and no role labels in those entry bodies',
+    );
     expect(historianSystemPromptForDomain("coding-project")).not.toBe(prompt);
     });
 
