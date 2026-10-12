@@ -3190,6 +3190,24 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 93,
+        description: "player edits and removal for narrative chapters",
+        up(db: Database): void {
+            // A chapter stops being write-once the moment the player can see it: the product's own rule for
+            // Memory is that a player may correct or remove what the system wrote, and a chapter is the same
+            // kind of thing (Magic Context produced it; the player reads it on the same panel).
+            //
+            // Removal is a TOMBSTONE, never a DELETE: the row keeps covering its span, so the next fold
+            // cannot re-derive the interval and resurrect what the player removed, and the exclusion stays
+            // auditable. `status` also lets rendering skip a removed chapter while the read projection still
+            // reports it as removed instead of silently vanishing.
+            db.exec(`
+                ALTER TABLE chapters ADD COLUMN status TEXT NOT NULL DEFAULT 'sealed';
+                ALTER TABLE chapters ADD COLUMN edited_at INTEGER;
+            `);
+        },
+    },
 ];
 
 /**

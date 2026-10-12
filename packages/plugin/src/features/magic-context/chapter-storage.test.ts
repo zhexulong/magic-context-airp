@@ -18,10 +18,13 @@ import { initializeDatabase } from "./storage-db";
 import { runMigrations } from "./migrations";
 import {
     buildChapter,
+    deleteChapter,
     getChapters,
     getLastSealedChapterSpanEnd,
     renderChaptersBlock,
+    estimateChaptersTokens,
     sealChaptersForCompartments,
+    updateChapterContent,
     type Chapter,
 } from "./chapter-storage";
 import type { Compartment } from "./compartment-storage";
@@ -275,5 +278,69 @@ describe("renderChaptersBlock", () => {
         // not baked into the body ("Beta; Alpha" has no heading/span text).
         expect(rendered).toContain("Alpha ("); // heading title + span
         expect(chapter.content).toBe("Beta; Alpha"); // body is highlight-only
+    });
+});
+describe("player edits and removal (v93)", () => {
+    /** Seal one chapter so the CRUD tests act on a row the fold really wrote. */
+    function sealOne(): Chapter {
+        sealChaptersForCompartments(db, "session-01", [compartment(1, "first")], "/p");
+        const [chapter] = getChapters(db, "session-01");
+        if (chapter === undefined) throw new Error("fixture sealed no chapter");
+        return chapter;
+    }
+
+    test("a sealed chapter arrives with an untouched status", () => {
+        const chapter = sealOne();
+        expect(chapter.status).toBe("sealed");
+        expect(chapter.editedAt).toBeNull();
+    });
+
+    test("the player's text replaces the body and is recorded as the player's", () => {
+        const chapter = sealOne();
+        expect(updateChapterContent(db, { sessionId: "session-01", chapterId: chapter.id, content: "what I remember", now: 111 })).toBe(true);
+
+        const [updated] = getChapters(db, "session-01");
+        expect(updated?.content).toBe("what I remember");
+        expect(updated?.status).toBe("edited");
+        expect(updated?.editedAt).toBe(111);
+        // The fold's own record of what was covered does not move.
+        expect(updated?.spanStartSequence).toBe(chapter.spanStartSequence);
+        expect(updated?.spanEndSequence).toBe(chapter.spanEndSequence);
+        expect(updated?.revision).toBe(chapter.revision + 1);
+    });
+
+    test("removal is a tombstone: the row and its span survive, and it stops rendering", () => {
+        const chapter = sealOne();
+        const before = renderChaptersBlock(getChapters(db, "session-01"));
+        expect(before).toContain("## CHAPTERS:");
+
+        expect(deleteChapter(db, { sessionId: "session-01", chapterId: chapter.id, now: 222 })).toBe(true);
+
+        const after = getChapters(db, "session-01");
+        expect(after).toHaveLength(1);
+        expect(after[0]?.status).toBe("deleted");
+        expect(after[0]?.content).toBe(chapter.content);
+        // Rendering drops it, and the span stays covered so a later fold cannot re-derive it.
+        expect(renderChaptersBlock(after)).toBe("");
+        expect(getLastSealedChapterSpanEnd(db, "session-01")).toBe(chapter.spanEndSequence);
+        expect(sealChaptersForCompartments(db, "session-01", [compartment(1, "first")], "/p")).toBe(0);
+    });
+
+    test("a second removal changes nothing, and another session cannot touch the row", () => {
+        const chapter = sealOne();
+        expect(deleteChapter(db, { sessionId: "other-session", chapterId: chapter.id, now: 1 })).toBe(false);
+        expect(updateChapterContent(db, { sessionId: "other-session", chapterId: chapter.id, content: "x", now: 1 })).toBe(false);
+        expect(deleteChapter(db, { sessionId: "session-01", chapterId: chapter.id, now: 2 })).toBe(true);
+        expect(deleteChapter(db, { sessionId: "session-01", chapterId: chapter.id, now: 3 })).toBe(false);
+        expect(getChapters(db, "session-01")[0]?.editedAt).toBe(2);
+    });
+
+    test("the estimate counts what renders, not what the player removed", () => {
+        sealChaptersForCompartments(db, "session-01", [compartment(1, "first"), compartment(2, "second")], "/p", 1);
+        const all = getChapters(db, "session-01");
+        expect(all).toHaveLength(2);
+        const full = estimateChaptersTokens(all);
+        expect(deleteChapter(db, { sessionId: "session-01", chapterId: all[1]!.id, now: 5 })).toBe(true);
+        expect(estimateChaptersTokens(getChapters(db, "session-01"))).toBeLessThan(full);
     });
 });

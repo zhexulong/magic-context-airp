@@ -63,6 +63,12 @@ export const DEFAULT_CHAPTER_COMPARTMENT_CAP = MAX_CHAPTER_COMPARTMENTS;
 /** Default total chapter budget in tokens; only a warning threshold, never a truncation trigger. */
 export const DEFAULT_CHAPTER_BUDGET_TOKENS = 4096;
 
+/**
+ * A chapter's lifecycle as the player sees it: sealed by the fold, corrected by the player, or removed.
+ * Removed rows are kept (tombstoned) so the span stays covered and the removal is auditable.
+ */
+export type ChapterStatus = "sealed" | "edited" | "deleted";
+
 export interface Chapter {
     id: number;
     sessionId: string;
@@ -72,7 +78,12 @@ export interface Chapter {
     startDate: string;
     endDate: string;
     title: string;
-    /** Sealed, immutable v1 body; v2 Dreamer polish rewrites this pre-seal only. */
+    /**
+     * The body: sealed by the fold, then the PLAYER's to correct. The product's Memory rule is that a
+     * player may fix what the system wrote, and a chapter is the same kind of thing - Magic Context
+     * produced it and the player reads it on the same panel. "Immutable" described the fold's own
+     * discipline (a later pass never rewrites a sealed chapter), not a claim about the player.
+     */
     content: string;
     sourceCompartmentIds: number[];
     /** Generation-time sort input only; not a runtime decay signal. */
@@ -80,6 +91,9 @@ export interface Chapter {
     sealedAt: number;
     revision: number;
     createdAt: number;
+    status: ChapterStatus;
+    /** When the player last edited or removed it; null means the fold's own text is untouched. */
+    editedAt: number | null;
 }
 
 interface ChapterRow {
@@ -97,6 +111,8 @@ interface ChapterRow {
     sealed_at: number;
     revision: number;
     created_at: number;
+    status: string;
+    edited_at: number | null;
 }
 
 function isChapterRow(value: unknown): value is ChapterRow {
@@ -114,7 +130,9 @@ function isChapterRow(value: unknown): value is ChapterRow {
         typeof row.content === "string" &&
         typeof row.source_compartment_ids === "string" &&
         typeof row.sealed_at === "number" &&
-        typeof row.created_at === "number"
+        typeof row.created_at === "number" &&
+        (row.status === "sealed" || row.status === "edited" || row.status === "deleted") &&
+        (row.edited_at === null || typeof row.edited_at === "number")
     );
 }
 
@@ -145,6 +163,8 @@ function toChapter(row: ChapterRow): Chapter {
         sealedAt: row.sealed_at,
         revision: row.revision,
         createdAt: row.created_at,
+        status: row.status as ChapterStatus,
+        editedAt: row.edited_at,
     };
 }
 
@@ -294,19 +314,25 @@ export function buildChapter(
         sealedAt,
         revision: 0,
         createdAt: sealedAt,
+        // A chapter is born sealed and unedited; the player may correct or remove it afterwards.
+        status: "sealed",
+        editedAt: null,
     };
 }
 
 /**
  * Render the chapters block for a session: chronological, append-only, one
  * `## CHAPTERS:` line per chapter, styled like the decay-render headings so
- * the m[0] history block stays internally consistent. Empty when there are
- * no chapters. A chapter's body is sealed and immutable; the block is the
- * same bytes on every pass between folds.
+ * the m[0] history block stays internally consistent. Empty when there are no
+ * chapters to show.
+ *
+ * A removed chapter is not rendered, but its row remains and still covers its span, so a later fold has
+ * nothing new to summarize there and the removal cannot be undone by one.
  */
 export function renderChaptersBlock(chapters: readonly Chapter[]): string {
-    if (chapters.length === 0) return "";
-    return chapters
+    const visible = chapters.filter((chapter) => chapter.status !== "deleted");
+    if (visible.length === 0) return "";
+    return visible
         .map((chapter) => {
             const span =
                 chapter.startDate === chapter.endDate
@@ -334,6 +360,54 @@ function guardChapterBody(value: string): string {
 /** Total rendered chapters token estimate (cheap heuristic; warning only). */
 export function estimateChaptersTokens(chapters: readonly Chapter[]): number {
     return (
-        chapters.reduce((sum, c) => sum + c.content.length + c.title.length, 0) / 4
+        chapters
+            .filter((chapter) => chapter.status !== "deleted")
+            .reduce((sum, c) => sum + c.content.length + c.title.length, 0) / 4
     );
+}
+
+/**
+ * Replace a chapter's body with the player's own words.
+ *
+ * Nothing else moves: the span, the title and the fold's own record stay as the fold wrote them, and
+ * `status`/`edited_at` record that the text is now the player's. Scoped by session, so a caller cannot
+ * edit across sessions; returns false when no such chapter belongs to this session.
+ */
+export function updateChapterContent(
+    db: Database,
+    args: Readonly<{
+        sessionId: string;
+        chapterId: number;
+        content: string;
+        now: number;
+    }>,
+): boolean {
+    const result = db
+        .prepare(
+            `UPDATE chapters
+                SET content = ?, status = 'edited', edited_at = ?, revision = revision + 1
+              WHERE id = ? AND session_id = ?`,
+        )
+        .run(args.content, args.now, args.chapterId, args.sessionId);
+    return result.changes > 0;
+}
+
+/**
+ * Remove a chapter from the companion's history, as a tombstone.
+ *
+ * The row keeps its span - so a later fold cannot re-derive the interval and bring the chapter back - and
+ * its body, so the removal stays auditable; rendering skips it from then on.
+ */
+export function deleteChapter(
+    db: Database,
+    args: Readonly<{ sessionId: string; chapterId: number; now: number }>,
+): boolean {
+    const result = db
+        .prepare(
+            `UPDATE chapters
+                SET status = 'deleted', edited_at = ?, revision = revision + 1
+              WHERE id = ? AND session_id = ? AND status != 'deleted'`,
+        )
+        .run(args.now, args.chapterId, args.sessionId);
+    return result.changes > 0;
 }
