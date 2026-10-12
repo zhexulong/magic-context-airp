@@ -51,6 +51,12 @@ export const DREAMER_DOCS_ALLOWED_TOOLS = [
 // calls NO tools (zero), so it gets the empty allow-list, locked.
 export const DREAMER_REVIEWER_AGENT = "dreamer-reviewer";
 
+// Pure XML reflector for the reflect task: it reads the durable memory the host
+// renders and returns the higher-level lines the host applies through the same
+// learning pipeline the retrospective uses. Zero tools, locked — reflection must
+// never be able to write memory itself.
+export const DREAMER_REFLECT_AGENT = "dreamer-reflect";
+
 /** Curate receives its category snapshot from the host and edits memories via
  *  ctx_memory. It does not read code; the verify task checks memory accuracy.
  *  Keep the `dreamer` id because memory-tool authorization matches that id. */

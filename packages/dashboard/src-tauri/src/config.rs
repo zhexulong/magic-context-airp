@@ -30,7 +30,7 @@ pub fn resolve_project_config_path(project_path: &str) -> PathBuf {
 /// frontend DreamerTasksField list). The dashboard renders this fixed set so
 /// every project shows the same tasks regardless of its (possibly stale) per-
 /// project scheduler snapshot in task_schedule_state.
-pub const CANONICAL_DREAM_TASKS: [&str; 12] = [
+pub const CANONICAL_DREAM_TASKS: [&str; 13] = [
     "map-memories",
     "verify",
     "verify-broad",
@@ -38,6 +38,7 @@ pub const CANONICAL_DREAM_TASKS: [&str; 12] = [
     "compress-cues",
     "classify-memories",
     "retrospective",
+    "reflect",
     "maintain-docs",
     "evaluate-smart-notes",
     "review-user-memories",
@@ -57,6 +58,9 @@ pub fn default_task_schedule(task: &str) -> &'static str {
         "compress-cues" => "0 4 * * *",
         "classify-memories" => "0 6 * * *",
         "retrospective" => "0 5 * * *",
+        // Reflection writes new durable memory rows, so it stays opt-in until a
+        // paired outcome run justifies scheduling it by default.
+        "reflect" => "",
         "maintain-docs" => "",
         "evaluate-smart-notes" => "0 3 * * *",
         "review-user-memories" => "0 3 * * *",

@@ -7,6 +7,7 @@ describe("dreamer task registry", () => {
     test("classify-memories is canonical, memory-domain, and ordered after curate", () => {
         expect(isCanonicalDreamTask("classify-memories")).toBe(true);
         expect(isCanonicalDreamTask("retrospective")).toBe(true);
+        expect(isCanonicalDreamTask("reflect")).toBe(true);
         expect(MEMORY_DOMAIN_TASKS).toEqual([
             "map-memories",
             "verify",
@@ -15,6 +16,7 @@ describe("dreamer task registry", () => {
             "compress-cues",
             "classify-memories",
             "retrospective",
+            "reflect",
             "promote-primers",
             "refresh-primers",
         ]);

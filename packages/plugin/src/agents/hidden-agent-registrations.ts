@@ -151,6 +151,20 @@ export function buildHiddenAgentRegistrations(args: {
             lockPermissions: true,
         },
         {
+            id: "dreamer-reflect",
+            mode: "primary",
+            hidden: true,
+            description: HIDDEN_AGENT_DESCRIPTION,
+            prompt: args.dreamerPrompt,
+            // reflect: the host renders the durable memory it already keeps, the
+            // model answers with XML lines, and the host applies them. Like the
+            // reviewer, it needs NO tool — zero, locked.
+            allowedTools: [],
+            maxSteps: 4,
+            overrides: args.dreamerOverrides,
+            lockPermissions: true,
+        },
+        {
             id: "dreamer-retrospective",
             mode: "primary",
             hidden: true,

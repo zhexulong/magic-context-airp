@@ -137,9 +137,8 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `memory` | object | — | Cross-session memory configuration |
-| `memory.enabled` | boolean | `true` | Enable cross-session memory (default: true) |
-| `memory.domain` | `"coding-project"` \\| `"ongoing-interaction"` | `"coding-project"` | Memory interpretation domain. coding-project preserves upstream defaults; ongoing-interaction uses Episodic/Semantic boundaries. |
 | `memory.enabled` | boolean | `true` | Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding. |
+| `memory.domain` | `"coding-project"` \| `"ongoing-interaction"` | `"coding-project"` | Memory interpretation domain. coding-project preserves upstream defaults; ongoing-interaction uses Episodic/Semantic boundaries. |
 | `memory.injection_budget_tokens` | number (500–20000) | `4000` | Token budget for memory injection on session start (min: 500, max: 20000, default: 4000) |
 | `memory.auto_promote` **Live** | boolean | `true` | Automatically promote eligible session facts into memory (default: true) |
 | `memory.retrieval_count_promotion_threshold` | number (1–) | `3` | retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3) |
@@ -221,6 +220,8 @@ Off-hours maintenance through Dreamer.
 | `dreamer.tasks.retrospective.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.retrospective.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.retrospective.recency_days` **Live** | integer (1–3650) | `30` | retrospective: collect source messages from only the most recent N days |
+| `dreamer.tasks.reflect.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.reflect.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.maintain-docs.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.maintain-docs.token_budget` | integer (–9007199254740991) | — | Maximum cumulative prompt tokens (input + cache read + cache write) for one tool-loop child. Defaults vary by task. |
 | `dreamer.tasks.maintain-docs.max_tokens` | integer (–9007199254740991) | `12000` | Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md |

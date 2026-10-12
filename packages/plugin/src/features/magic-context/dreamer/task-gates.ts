@@ -124,6 +124,26 @@ export function countProjectSessionsSince(
     return row?.cnt ?? 0;
 }
 
+/** Live active/permanent memories created or changed after `since` — the
+ *  reflection window. A never-run task (`since` 0) sees the whole live pool. */
+export function countMemoriesChangedSince(
+    db: Database,
+    projectPath: string,
+    since: number,
+): number {
+    const row = db
+        .prepare<[string, number, number], { cnt: number }>(
+            `SELECT COUNT(*) AS cnt
+               FROM memories
+              WHERE project_path = ?
+                AND status IN ('active','permanent')
+                AND (expires_at IS NULL OR expires_at > ?)
+                AND updated_at > ?`,
+        )
+        .get(projectPath, Date.now(), since);
+    return row?.cnt ?? 0;
+}
+
 function countMappedMemories(db: Database, projectPath: string): number {
     const row = db
         .prepare<[string, number], { cnt: number }>(
@@ -303,6 +323,16 @@ export function getDreamTaskBacklog(
             const pending = countProjectSessionsSince(db, projectPath, watermark ?? null);
             return { pending, total: pending };
         }
+        case "reflect": {
+            const lastRunAt =
+                options.lastRunAt !== undefined
+                    ? options.lastRunAt
+                    : getTaskScheduleState(db, projectPath, task)?.lastRunAt;
+            return {
+                pending: countMemoriesChangedSince(db, projectPath, lastRunAt ?? 0),
+                total: countLiveMemories(db, projectPath),
+            };
+        }
         case "maintain-docs": {
             const total = countCompartmentsSince(db, projectPath, 0);
             const lastRunAt =
@@ -398,6 +428,12 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // raw provider does the precise typed-user-message scan and bails
             // before any child session if empty. Never-run → "sessions exist".
             return countProjectSessionsSince(db, project, ctx.retrospectiveWatermarkMs ?? null) > 0;
+
+        case "reflect":
+            // Cheap pre-gate: the reflection reads the project's durable memory
+            // stream, so it only needs the memory lease once a row has arrived or
+            // changed since the last reflection. Never-run → "any live memory".
+            return countMemoriesChangedSince(db, project, lastRunAt ?? 0) > 0;
 
         case "maintain-docs":
             // New compartments since the last maintain-docs run. Never-run → any exist.

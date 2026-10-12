@@ -44,6 +44,7 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `dreamer.tasks.map-memories.schedule`
 - `dreamer.tasks.promote-primers.promotion_threshold`
 - `dreamer.tasks.promote-primers.schedule`
+- `dreamer.tasks.reflect.schedule`
 - `dreamer.tasks.refresh-primers.schedule`
 - `dreamer.tasks.retrospective.recency_days`
 - `dreamer.tasks.retrospective.schedule`

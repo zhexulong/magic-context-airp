@@ -1,6 +1,7 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { type AuthorityModuleClient, getContextStoreUuid } from "../context-authority";
+import type { MemoryCategory } from "../memory/types";
 import type { ClassifyModuleClient } from "./classify";
 
 const loggedNotOwnerProjects = new Set<string>();
@@ -86,6 +87,50 @@ export async function resolveDreamerModuleRoute(args: {
         moduleAuthorityGeneration: generation,
         moduleCommandId: args.commandId,
     };
+}
+
+/**
+ * Apply memory learnings through the Rust module authority. A module-managed
+ * project must NOT also write these rows with the TypeScript store: the module's
+ * durable state is the fence, so a second writer would race it. One command id
+ * per learning lets the module de-duplicate a batch the host retries.
+ */
+export async function writeMemoryLearningsThroughModule(args: {
+    moduleRoute: DreamerModuleRoute;
+    projectIdentity: string;
+    learnings: readonly { category: MemoryCategory; content: string }[];
+}): Promise<number> {
+    let written = 0;
+    for (const learning of args.learnings) {
+        try {
+            const response = await args.moduleRoute.moduleClient.call({
+                sessionId: args.moduleRoute.moduleSessionId,
+                projectRoot: args.moduleRoute.moduleProjectRoot,
+                method: "ctx_memory",
+                body: {
+                    name: "ctx_memory",
+                    arguments: {
+                        action: "write",
+                        memory_project: args.projectIdentity,
+                        category: learning.category,
+                        content: learning.content,
+                        command_id: `${args.moduleRoute.moduleCommandId}:${written}`,
+                    },
+                },
+            });
+            const body = ((response as { result?: unknown })?.result ?? response) as {
+                ok?: unknown;
+                error?: unknown;
+            };
+            if (body?.ok === false || body?.error) {
+                throw new Error("module rejected the memory learning");
+            }
+            written += 1;
+        } catch (error) {
+            throw new DreamerModuleFailureError("ctx_memory learning write", error);
+        }
+    }
+    return written;
 }
 
 export interface ModuleMemoryIdentity {

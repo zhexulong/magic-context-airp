@@ -37,6 +37,7 @@
     "src/features/magic-context/memory/domain.ts",
     "src/hooks/magic-context/historian-prompt.generated.ts",
     "src/hooks/magic-context/ongoing-interaction-historian-prompt.generated.ts",
+    "src/hooks/magic-context/reflect-prompt.generated.ts",
     "README.md"
   ],
   "scripts": {

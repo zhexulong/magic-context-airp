@@ -9,6 +9,7 @@ import {
     DREAMER_MEMORY_MAPPER_AGENT,
     DREAMER_MEMORY_MAPPER_ALLOWED_TOOLS,
     DREAMER_PRIMER_INVESTIGATOR_AGENT,
+    DREAMER_REFLECT_AGENT,
     DREAMER_RETROSPECTIVE_AGENT,
     DREAMER_REVIEWER_AGENT,
 } from "./agents/dreamer";
@@ -74,6 +75,7 @@ describe("hidden-agent registration drift guard", () => {
                 DREAMER_PRIMER_INVESTIGATOR_AGENT,
                 DREAMER_MEMORY_MAPPER_AGENT,
                 DREAMER_CLASSIFIER_AGENT,
+                DREAMER_REFLECT_AGENT,
                 SMART_NOTE_COMPILER_AGENT,
                 HISTORIAN_AGENT,
                 HISTORIAN_EDITOR_AGENT,
@@ -259,7 +261,7 @@ describe("hidden-agent registration drift guard", () => {
     });
 
     test("every hidden agent has an internal-only task-routing description", () => {
-        expect(regs).toHaveLength(11);
+        expect(regs).toHaveLength(12);
         for (const registration of regs) {
             expect(registration.mode, registration.id).toBe("primary");
             expect(registration.hidden, registration.id).toBe(true);
@@ -297,6 +299,12 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(DREAMER_REVIEWER_AGENT)?.allowedTools).toEqual([]);
         expect(byId(DREAMER_REVIEWER_AGENT)?.lockPermissions).toBe(true);
         expect(byId(DREAMER_REVIEWER_AGENT)?.maxSteps).toBe(4);
+    });
+
+    test("dreamer-reflect is a zero-tool locked reflector", () => {
+        expect(byId(DREAMER_REFLECT_AGENT)?.allowedTools).toEqual([]);
+        expect(byId(DREAMER_REFLECT_AGENT)?.lockPermissions).toBe(true);
+        expect(byId(DREAMER_REFLECT_AGENT)?.maxSteps).toBe(4);
     });
 
     test("memory mapper inline allow-list matches canonical (read-only, no write/ctx_memory/ctx_search)", () => {
@@ -350,6 +358,7 @@ describe("hidden-agent registration drift guard", () => {
             DREAMER_PRIMER_INVESTIGATOR_AGENT,
             DREAMER_MEMORY_MAPPER_AGENT,
             DREAMER_CLASSIFIER_AGENT,
+            DREAMER_REFLECT_AGENT,
             SMART_NOTE_COMPILER_AGENT,
         ]);
         for (const reg of regs) {
@@ -466,6 +475,7 @@ describe("hidden-agent registration drift guard", () => {
                 DREAMER_PRIMER_INVESTIGATOR_AGENT,
                 DREAMER_MEMORY_MAPPER_AGENT,
                 DREAMER_CLASSIFIER_AGENT,
+                DREAMER_REFLECT_AGENT,
                 SMART_NOTE_COMPILER_AGENT,
                 HISTORIAN_AGENT,
                 HISTORIAN_EDITOR_AGENT,

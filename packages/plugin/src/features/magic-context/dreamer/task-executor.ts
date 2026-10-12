@@ -79,8 +79,10 @@ import {
     type DreamerModuleRoute,
     logDreamerNotOwnerOnce,
     resolveDreamerModuleRoute,
+    writeMemoryLearningsThroughModule,
 } from "./module-apply";
 import { promotePrimers } from "./promote-primers";
+import { runReflectTask } from "./reflect";
 import { refreshPrimers } from "./refresh-primers";
 import {
     applyRetrospectiveLearnings,
@@ -486,7 +488,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             config.task === "classify-memories" ||
             config.task === "verify" ||
             config.task === "verify-broad" ||
-            config.task === "retrospective"
+            config.task === "retrospective" ||
+            config.task === "reflect"
         ) {
             try {
                 moduleRoute = await resolveDreamerModuleRoute({
@@ -513,6 +516,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     "verify",
                     "verify-broad",
                     "retrospective",
+                    "reflect",
                 ] as DreamTaskName[]
             ).includes(config.task)
         ) {
@@ -1037,6 +1041,28 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                               }
                             : undefined,
                 };
+            }
+
+            if (config.task === "reflect") {
+                const memoryBefore = getMemoryCountsByStatus(db, projectIdentity);
+                await runReflectTask({
+                    db,
+                    projectIdentity,
+                    ...requireDreamTransport(deps),
+                    parentSessionId: parent,
+                    sessionDirectory: deps.sessionDirectory,
+                    holderId,
+                    leaseKey,
+                    deadline,
+                    leaseAcquisition,
+                    memoryDomain: deps.memoryDomain ?? "coding-project",
+                    moduleRoute,
+                    model: config.model,
+                    fallbackModels: config.fallbackModels,
+                    language: config.language ?? deps.language,
+                });
+                recordRun("completed", null, { memoryChanges: computeMemoryDelta(memoryBefore) });
+                return { status: "completed" };
             }
 
             // Agentic tasks: verify / curate / maintain-docs.
@@ -1599,34 +1625,15 @@ async function runRetrospectiveTask(
                 return true;
             });
             hostLearnings = learnings.filter((learning) => learning.route !== "memory");
-            for (const learning of moduleLearnings) {
-                try {
-                    const response = await helpers.moduleRoute.moduleClient.call({
-                        sessionId: helpers.moduleRoute.moduleSessionId,
-                        projectRoot: helpers.moduleRoute.moduleProjectRoot,
-                        method: "ctx_memory",
-                        body: {
-                            name: "ctx_memory",
-                            arguments: {
-                                action: "write",
-                                memory_project: projectIdentity,
-                                category: learning.category,
-                                content: learning.content,
-                                command_id: `${helpers.moduleRoute.moduleCommandId}:${moduleMemoryWritten}`,
-                            },
-                        },
-                    });
-                    const body = ((response as { result?: unknown })?.result ?? response) as {
-                        ok?: unknown;
-                        error?: unknown;
-                    };
-                    if (body?.ok === false || body?.error)
-                        throw new Error("module rejected retrospective memory");
-                    moduleMemoryWritten += 1;
-                } catch (error) {
-                    throw new DreamerModuleFailureError("ctx_memory retrospective write", error);
-                }
-            }
+            moduleMemoryWritten = await writeMemoryLearningsThroughModule({
+                moduleRoute: helpers.moduleRoute,
+                projectIdentity,
+                learnings: moduleLearnings.flatMap((learning) =>
+                    learning.category
+                        ? [{ category: learning.category, content: learning.content }]
+                        : [],
+                ),
+            });
             // Invalid memory learnings remain rejected, but never reach a TypeScript memory insert.
         }
         // Apply learnings AND record the processed-window key in ONE transaction

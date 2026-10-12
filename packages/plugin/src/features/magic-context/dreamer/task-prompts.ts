@@ -1,5 +1,9 @@
 import type { DreamingTask } from "../../../config/schema/magic-context";
+import { REFLECT_SYSTEM_PROMPT } from "../../../hooks/magic-context/reflect-prompt.generated";
+import { factCategoriesForDomain, type MemoryDomain } from "../memory/domain";
 import type { CurateMemoryCategory } from "./curate-category-rotation";
+
+export { REFLECT_SYSTEM_PROMPT };
 
 /** Memory shape the curate prompt renders (verify now has its own runner/prompt). */
 export interface CuratePromptMemory {
@@ -246,6 +250,49 @@ Return only XML in this exact shape:
   <learning route="memory" category="PROJECT_RULES">one durable actionable correction</learning>
   <learning route="observation">one recurring user preference</learning>
 </learnings>`;
+}
+
+// ── Reflect ─────────────────────────────────────────────────────────
+
+export interface ReflectPromptMemory {
+    category: string;
+    content: string;
+}
+
+/**
+ * Render the reflection task message: the durable memory the host has already
+ * kept, plus the category vocabulary of the ACTIVE domain. That vocabulary comes
+ * from `factCategoriesForDomain` — the same source the historian's fact parser
+ * and promotion path use — so the prompt can never offer a category the parser
+ * (or the store) would refuse.
+ */
+export function buildReflectPrompt(args: {
+    projectIdentity: string;
+    memoryDomain: MemoryDomain;
+    memories: readonly ReflectPromptMemory[];
+}): string {
+    const categories = factCategoriesForDomain(args.memoryDomain);
+    const memoryList =
+        args.memories.length > 0
+            ? args.memories.map((memory) => `- [${memory.category}] ${memory.content}`).join("\n")
+            : "(nothing kept yet)";
+    return `## Task: Reflection
+
+**Project:** ${args.projectIdentity}
+
+### What you already keep
+${memoryList}
+
+### Categories you may use
+${categories.join(", ")}
+
+Read the material above as your own memory of this relationship and write only the higher-level durable lines it supports: what you have come to understand about the two of you, what you keep having to remember, and what is still unresolved. Do not restate what you were given, do not describe a completed activity, and do not describe the current world.
+
+Return only:
+<learnings>
+  <learning route="memory" category="${categories[0] ?? ""}">one durable line, in your own voice</learning>
+</learnings>
+An empty <learnings></learnings> block is a valid answer.`;
 }
 
 // ── Maintain Docs ──────────────────────────────────────────────────────────

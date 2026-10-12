@@ -20,6 +20,7 @@ export const CANONICAL_DREAM_TASKS = [
     "compress-cues",
     "classify-memories",
     "retrospective",
+    "reflect",
     "maintain-docs",
     "evaluate-smart-notes",
     "review-user-memories",
@@ -99,6 +100,11 @@ export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, DreamTaskCapability>
         transport: "tool-loop",
         toolLoopPurpose: "needs search tools to investigate the friction it finds in past sessions",
     },
+    // The reflection reads the project's own durable memory stream, which the host
+    // renders for it, and answers in one completion. The host applies the result
+    // through the same learning pipeline the retrospective uses, so it must never
+    // need the agent to call a memory tool.
+    reflect: { requiresTools: false, transport: "single-shot" },
     "maintain-docs": {
         requiresTools: true,
         transport: "tool-loop",
@@ -265,6 +271,7 @@ export const MEMORY_DOMAIN_TASKS: readonly DreamTaskName[] = [
     "compress-cues",
     "classify-memories",
     "retrospective",
+    "reflect",
     "promote-primers",
     "refresh-primers",
 ];

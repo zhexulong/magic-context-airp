@@ -80,6 +80,13 @@ export const TASKS: TaskMeta[] = [
     defaultSchedule: "0 5 * * *",
   },
   {
+    name: "reflect",
+    label: "Reflect",
+    description:
+      "Reflects on the memories she already keeps and writes the higher-level ones",
+    defaultSchedule: "",
+  },
+  {
     name: "maintain-docs",
     label: "Maintain docs",
     description: "Keep ARCHITECTURE.md / STRUCTURE.md in sync",

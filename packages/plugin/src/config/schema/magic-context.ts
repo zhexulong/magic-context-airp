@@ -553,6 +553,10 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
     "compress-cues": "0 4 * * *",
     "classify-memories": "0 6 * * *",
     retrospective: "0 5 * * *",
+    // reflect writes new durable Memory rows from the project's own memory stream.
+    // Its quality gate is a paired outcome run (see the historian prompt rubric's V2
+    // section), so it stays OFF until an operator schedules it deliberately.
+    reflect: "",
     "maintain-docs": "",
     "evaluate-smart-notes": "0 3 * * *",
     "review-user-memories": "0 3 * * *",
@@ -593,6 +597,9 @@ export const DreamTasksSchema = z
         ),
         retrospective: RetrospectiveTaskConfigSchema.default(() =>
             RetrospectiveTaskConfigSchema.parse(defaultTaskConfig("retrospective")),
+        ),
+        reflect: DreamTaskBaseConfigSchema.default(() =>
+            DreamTaskBaseConfigSchema.parse(defaultTaskConfig("reflect")),
         ),
         "maintain-docs": DreamTaskBaseConfigSchema.extend({
             max_tokens: z
@@ -1603,6 +1610,7 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "dreamer.tasks.classify-memories.schedule",
     "dreamer.tasks.retrospective.schedule",
     "dreamer.tasks.retrospective.recency_days",
+    "dreamer.tasks.reflect.schedule",
     "dreamer.tasks.maintain-docs.schedule",
     "dreamer.tasks.evaluate-smart-notes.schedule",
     "dreamer.tasks.review-user-memories.schedule",
