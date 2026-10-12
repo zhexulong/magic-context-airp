@@ -9,6 +9,7 @@ export {
 	assertMemoryProfileMatch,
 	createGameBuddyPlayerMemoryReadProjection,
 	type GameBuddyPlayerMemoryReadProjection,
+	type GameBuddyPlayerChapterView,
 	type GameBuddyPlayerMemoryReadView,
 	resolveGameBuddyMemoryProjectPath,
 	validateMemoryProfileBinding,

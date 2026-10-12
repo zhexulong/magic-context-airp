@@ -6,6 +6,10 @@ import {
 import { getDeclaredProjectIdentity } from "@magic-context/core/shared/harness";
 import { resolveProjectIdentityOrFallback } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
+import {
+	getChaptersForProject,
+	type ChapterStatus,
+} from "@magic-context/core/features/magic-context/chapter-storage";
 
 /**
  * The vendor store is project-scoped.  A GameBuddy continuity gets a stable,
@@ -67,7 +71,30 @@ export type GameBuddyPlayerMemoryReadView = Readonly<{
   sourceRefs?: readonly string[];
 }>;
 
+/**
+ * One narrative chapter as the player reads it: the stretch of time it covers, what the fold wrote (or
+ * what the player replaced it with), and whether the player has touched it.
+ *
+ * `status` is carried verbatim from the store: `sealed` is the fold's own text, `edited` is the
+ * player's, and `deleted` is a tombstone the panel still shows, so a removal stays visible and auditable
+ * instead of silently vanishing.
+ */
+export type GameBuddyPlayerChapterView = Readonly<{
+	chapterId: number;
+	title: string;
+	spanStartSequence: number;
+	spanEndSequence: number;
+	startDate: string;
+	endDate: string;
+	content: string;
+	status: ChapterStatus;
+	editedAt: number | null;
+}>;
+
 export type GameBuddyPlayerMemoryReadProjection = Readonly<{
+	listChapters(
+		input: GameBuddyPlayerMemoryReadInput,
+	): Promise<readonly GameBuddyPlayerChapterView[]>;
 	listMemories(
 		input: GameBuddyPlayerMemoryReadInput,
 	): Promise<readonly GameBuddyPlayerMemoryReadView[]>;
@@ -186,6 +213,29 @@ export function createGameBuddyPlayerMemoryReadProjection(
 		return new MemoryCommandFacade(db);
 	};
 	return Object.freeze({
+async listChapters(input) {
+	assertMemoryProfileMatch(args, input);
+	const db = await openDatabaseAsync(
+		join(args.runtimeCwd, "data", "cortexkit", "magic-context", "context.db"),
+	);
+	if (!db) throw new Error("gamebuddy_memory_storage_unavailable");
+	// Continuity-scoped, like every other panel read: the runtime root and its memory partition are
+	// shared, and a Pi session only partitions one run's own compartments.
+	return getChaptersForProject(db, projectPath).map((chapter) =>
+		Object.freeze({
+			chapterId: chapter.id,
+			title: chapter.title,
+			spanStartSequence: chapter.spanStartSequence,
+			spanEndSequence: chapter.spanEndSequence,
+			startDate: chapter.startDate,
+			endDate: chapter.endDate,
+			content: chapter.content,
+			status: chapter.status,
+			editedAt: chapter.editedAt,
+		}),
+	);
+},
+
 		async listMemories(input) {
 			assertMemoryProfileMatch(args, input);
 			return (await open()).list(projectPath).flatMap((entry) => {

@@ -366,17 +366,32 @@ export function estimateChaptersTokens(chapters: readonly Chapter[]): number {
     );
 }
 
+/** Every chapter recorded for a continuity (project path), chronological. */
+export function getChaptersForProject(db: Database, projectPath: string): Chapter[] {
+    return db
+        .prepare(
+            "SELECT * FROM chapters WHERE project_path = ? ORDER BY span_start_sequence ASC, id ASC",
+        )
+        .all(projectPath)
+        .filter(isChapterRow)
+        .map(toChapter);
+}
+
 /**
  * Replace a chapter's body with the player's own words.
  *
  * Nothing else moves: the span, the title and the fold's own record stay as the fold wrote them, and
- * `status`/`edited_at` record that the text is now the player's. Scoped by session, so a caller cannot
- * edit across sessions; returns false when no such chapter belongs to this session.
+ * `status`/`edited_at` record that the text is now the player's.
+ *
+ * Scoped by the CONTINUITY's project path rather than by a Pi session: the panel is a continuity surface
+ * (the runtime root and its memory partition are shared), and a Pi session only partitions one run's
+ * compartments. Returns false when no such chapter belongs to this continuity, so a caller cannot reach
+ * another continuity's history.
  */
 export function updateChapterContent(
     db: Database,
     args: Readonly<{
-        sessionId: string;
+        projectPath: string;
         chapterId: number;
         content: string;
         now: number;
@@ -386,9 +401,9 @@ export function updateChapterContent(
         .prepare(
             `UPDATE chapters
                 SET content = ?, status = 'edited', edited_at = ?, revision = revision + 1
-              WHERE id = ? AND session_id = ?`,
+              WHERE id = ? AND project_path = ?`,
         )
-        .run(args.content, args.now, args.chapterId, args.sessionId);
+        .run(args.content, args.now, args.chapterId, args.projectPath);
     return result.changes > 0;
 }
 
@@ -400,14 +415,14 @@ export function updateChapterContent(
  */
 export function deleteChapter(
     db: Database,
-    args: Readonly<{ sessionId: string; chapterId: number; now: number }>,
+    args: Readonly<{ projectPath: string; chapterId: number; now: number }>,
 ): boolean {
     const result = db
         .prepare(
             `UPDATE chapters
                 SET status = 'deleted', edited_at = ?, revision = revision + 1
-              WHERE id = ? AND session_id = ? AND status != 'deleted'`,
+              WHERE id = ? AND project_path = ? AND status != 'deleted'`,
         )
-        .run(args.now, args.chapterId, args.sessionId);
+        .run(args.now, args.chapterId, args.projectPath);
     return result.changes > 0;
 }

@@ -20,6 +20,7 @@ import {
     buildChapter,
     deleteChapter,
     getChapters,
+    getChaptersForProject,
     getLastSealedChapterSpanEnd,
     renderChaptersBlock,
     estimateChaptersTokens,
@@ -289,6 +290,14 @@ describe("player edits and removal (v93)", () => {
         return chapter;
     }
 
+    test("the panel's read is continuity-scoped, not session-scoped", () => {
+        sealChaptersForCompartments(db, "session-01", [compartment(1, "first")], "/p");
+        sealChaptersForCompartments(db, "session-02", [compartment(2, "second")], "/p");
+        sealChaptersForCompartments(db, "session-03", [compartment(3, "elsewhere")], "/other");
+        expect(getChaptersForProject(db, "/p").map((chapter) => chapter.sessionId)).toEqual(["session-01", "session-02"]);
+        expect(getChaptersForProject(db, "/other")).toHaveLength(1);
+    });
+
     test("a sealed chapter arrives with an untouched status", () => {
         const chapter = sealOne();
         expect(chapter.status).toBe("sealed");
@@ -297,7 +306,7 @@ describe("player edits and removal (v93)", () => {
 
     test("the player's text replaces the body and is recorded as the player's", () => {
         const chapter = sealOne();
-        expect(updateChapterContent(db, { sessionId: "session-01", chapterId: chapter.id, content: "what I remember", now: 111 })).toBe(true);
+        expect(updateChapterContent(db, { projectPath: "/p", chapterId: chapter.id, content: "what I remember", now: 111 })).toBe(true);
 
         const [updated] = getChapters(db, "session-01");
         expect(updated?.content).toBe("what I remember");
@@ -314,7 +323,7 @@ describe("player edits and removal (v93)", () => {
         const before = renderChaptersBlock(getChapters(db, "session-01"));
         expect(before).toContain("## CHAPTERS:");
 
-        expect(deleteChapter(db, { sessionId: "session-01", chapterId: chapter.id, now: 222 })).toBe(true);
+        expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 222 })).toBe(true);
 
         const after = getChapters(db, "session-01");
         expect(after).toHaveLength(1);
@@ -328,10 +337,10 @@ describe("player edits and removal (v93)", () => {
 
     test("a second removal changes nothing, and another session cannot touch the row", () => {
         const chapter = sealOne();
-        expect(deleteChapter(db, { sessionId: "other-session", chapterId: chapter.id, now: 1 })).toBe(false);
-        expect(updateChapterContent(db, { sessionId: "other-session", chapterId: chapter.id, content: "x", now: 1 })).toBe(false);
-        expect(deleteChapter(db, { sessionId: "session-01", chapterId: chapter.id, now: 2 })).toBe(true);
-        expect(deleteChapter(db, { sessionId: "session-01", chapterId: chapter.id, now: 3 })).toBe(false);
+        expect(deleteChapter(db, { projectPath: "/other", chapterId: chapter.id, now: 1 })).toBe(false);
+        expect(updateChapterContent(db, { projectPath: "/other", chapterId: chapter.id, content: "x", now: 1 })).toBe(false);
+        expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 2 })).toBe(true);
+        expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 3 })).toBe(false);
         expect(getChapters(db, "session-01")[0]?.editedAt).toBe(2);
     });
 
@@ -340,7 +349,7 @@ describe("player edits and removal (v93)", () => {
         const all = getChapters(db, "session-01");
         expect(all).toHaveLength(2);
         const full = estimateChaptersTokens(all);
-        expect(deleteChapter(db, { sessionId: "session-01", chapterId: all[1]!.id, now: 5 })).toBe(true);
+        expect(deleteChapter(db, { projectPath: "/p", chapterId: all[1]!.id, now: 5 })).toBe(true);
         expect(estimateChaptersTokens(getChapters(db, "session-01"))).toBeLessThan(full);
     });
 });

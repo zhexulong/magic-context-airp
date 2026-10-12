@@ -9,11 +9,16 @@ import {
 	createGameBuddyPlayerMemoryReadProjection,
 	type GameBuddyPlayerMemoryProfileBinding,
 	type GameBuddyPlayerMemoryReadInput,
+	GameBuddyPlayerChapterView,
 	type GameBuddyPlayerMemoryReadProjection,
 	type GameBuddyPlayerMemoryReadView,
 	resolveGameBuddyMemoryProjectPath,
 	validateMemoryProfileBinding,
 } from "./gamebuddy-player-memory-read-projection";
+import {
+	deleteChapter,
+	updateChapterContent,
+} from "@magic-context/core/features/magic-context/chapter-storage";
 
 export type {
 	GameBuddyPlayerMemoryProfileBinding,
@@ -28,6 +33,21 @@ export type {
 export type GameBuddyPlayerMemoryCrudFacade =
 	GameBuddyPlayerMemoryReadProjection &
 		Readonly<{
+			/**
+			 * Replace a chapter's body with the player's own words. Nothing else moves: the span, the title and
+			 * the fold's own record stay as the fold wrote them.
+			 */
+			updateChapter(
+				input: GameBuddyPlayerMemoryReadInput &
+					Readonly<{ chapterId: number; content: string }>,
+			): Promise<GameBuddyPlayerChapterView>;
+			/**
+			 * Remove a chapter from the companion's history as a TOMBSTONE: the row keeps its span, so a later
+			 * fold cannot re-derive the interval and bring it back, and the body stays for audit.
+			 */
+			deleteChapter(
+				input: GameBuddyPlayerMemoryReadInput & Readonly<{ chapterId: number }>,
+			): Promise<GameBuddyPlayerChapterView>;
 			create(
 				input: GameBuddyPlayerMemoryReadInput & Readonly<{ content: string }>,
 			): Promise<GameBuddyPlayerMemoryReadView>;
@@ -53,6 +73,12 @@ export function createGameBuddyPlayerMemoryCrudFacade(
 		args.continuityId,
 	);
 	const read = createGameBuddyPlayerMemoryReadProjection(args);
+	// The chapter mutations belong to the storage layer, so this facade opens the database itself
+	// rather than going through the Memory command facade.
+	const openChapterDb = async () =>
+		await openDatabaseAsync(
+			join(args.runtimeCwd, "data", "cortexkit", "magic-context", "context.db"),
+		);
 	const open = async (): Promise<MemoryCommandFacade> => {
 		const db = await openDatabaseAsync(
 			join(args.runtimeCwd, "data", "cortexkit", "magic-context", "context.db"),
@@ -67,6 +93,44 @@ export function createGameBuddyPlayerMemoryCrudFacade(
 
 	return Object.freeze({
 		...read,
+		async updateChapter(input) {
+			assertMemoryProfileMatch(args, input);
+			const db = await openChapterDb();
+			if (!db) throw new Error("gamebuddy_memory_storage_unavailable");
+			if (
+				!updateChapterContent(db, {
+					projectPath,
+					chapterId: input.chapterId,
+					content: input.content,
+					now: Date.now(),
+				})
+			)
+				throw new Error("gamebuddy_chapter_not_found");
+			const updated = (await read.listChapters(input)).find(
+				(chapter) => chapter.chapterId === input.chapterId,
+			);
+			if (updated === undefined) throw new Error("gamebuddy_chapter_not_found");
+			return updated;
+		},
+		async deleteChapter(input) {
+			assertMemoryProfileMatch(args, input);
+			const db = await openChapterDb();
+			if (!db) throw new Error("gamebuddy_memory_storage_unavailable");
+			if (
+				!deleteChapter(db, {
+					projectPath,
+					chapterId: input.chapterId,
+					now: Date.now(),
+				})
+			)
+				throw new Error("gamebuddy_chapter_not_found");
+			const removed = (await read.listChapters(input)).find(
+				(chapter) => chapter.chapterId === input.chapterId,
+			);
+			if (removed === undefined || removed.status !== "deleted")
+				throw new Error("gamebuddy_chapter_delete_readback_failed");
+			return removed;
+		},
 		async create(input) {
 			assertMemoryProfileMatch(args, input);
 			const result = (await open()).create({
