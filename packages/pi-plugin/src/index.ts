@@ -1710,6 +1710,7 @@ async function startPiMagicContextRuntime(
 			// useless on Pi.
 			embeddingConfig: current.config.embedding,
 			memoryEnabled: current.config.memory.enabled,
+			memoryDomain: current.config.memory.domain,
 			retinaHandoff: current.config.smart_notes.retina_handoff,
 			mural: current.config.mural,
 			language: current.config.language,

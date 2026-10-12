@@ -44,6 +44,7 @@ import {
     releaseGitSweepLease,
     renewGitSweepLease,
 } from "../features/magic-context/git-commits";
+import type { MemoryDomain } from "../features/magic-context/memory/domain";
 import {
     embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
@@ -109,6 +110,8 @@ interface ProjectRegistration {
         max_commits: number;
     };
     memoryEnabled?: boolean;
+    /** Active memory domain (config `memory.domain`); see DreamTaskExecutorDeps.memoryDomain. */
+    memoryDomain?: MemoryDomain;
     memoryInjectionBudgetTokens?: number;
     historianChildSweep?: {
         timeoutMs: number;
@@ -633,6 +636,7 @@ async function sweepProject(
             // closed-book, defeating the open-book primer redesign.
             primerRawProviderFactory: reg.primerRawProviderFactory,
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
+            memoryDomain: reg.memoryDomain,
             ensureProjectRegistered: reg.ensureRegistered,
             language: reg.language,
             mural: reg.mural,

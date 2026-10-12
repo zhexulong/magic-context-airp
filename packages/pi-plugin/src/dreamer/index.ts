@@ -17,6 +17,7 @@ import {
 	runManualDream,
 } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
 import { DreamTokenBudgetExceeded } from "@magic-context/core/features/magic-context/dreamer/token-budget";
+import type { MemoryDomain } from "@magic-context/core/features/magic-context/memory/domain";
 import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
@@ -60,6 +61,12 @@ export interface PiDreamerOptions {
 	 * previously made dreamer's memory tasks a no-op.
 	 */
 	memoryEnabled: boolean;
+	/**
+	 * The active memory domain (config `memory.domain`). The dreamer's learning
+	 * tasks write Memory rows, so their category vocabulary must be the same
+	 * domain taxonomy the historian's promotion path uses.
+	 */
+	memoryDomain?: MemoryDomain;
 	retinaHandoff?: boolean;
 	mural?: { enabled: boolean; model?: string };
 	language?: string;
@@ -308,6 +315,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		language: opts.language,
 		gitCommitIndexing: opts.gitCommitIndexing,
 		memoryEnabled: opts.memoryEnabled,
+		memoryDomain: opts.memoryDomain,
 		embeddingConfig: opts.embeddingConfig,
 		retinaHandoff: opts.retinaHandoff,
 		mural: opts.mural,
@@ -397,6 +405,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				}),
 				primerRawProviderFactory: createPiPrimerRawProviderFactory(),
 				userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreamerConfig),
+				memoryDomain: manualOpts.memoryDomain,
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				language: manualOpts.language,
 				retinaHandoff: manualOpts.retinaHandoff,

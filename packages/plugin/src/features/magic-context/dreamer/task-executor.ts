@@ -43,6 +43,7 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
+import type { MemoryDomain } from "../memory/domain";
 import { runCompressCues } from "../mural/compress-cues";
 import { detectOverflow } from "../overflow-detection";
 import { recordChildInvocation } from "../subagent-token-capture";
@@ -146,6 +147,14 @@ export interface DreamTaskExecutorDeps {
         | ((db: Database, projectIdentity: string) => RetrospectiveRawProvider | null);
     /** Host-side privacy gate for route="observation" learnings. */
     userMemoryCollectionEnabled?: boolean;
+    /**
+     * The active memory domain of this runtime (config `memory.domain`). It is the
+     * interpretation context for the historian AND for the learning tasks that
+     * write Memory rows, so a lesson's category is judged by the same domain-aware
+     * gate that decides promotion. Surfaces that do not wire it are coding
+     * projects, which is the config default.
+     */
+    memoryDomain?: MemoryDomain;
     /** Ensure the project embedding provider is registered before primer clustering embeds candidates. */
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void> | void;
     /**
@@ -1569,7 +1578,10 @@ async function runRetrospectiveTask(
 
         const sourceSessionId =
             flagged[0]?.sessionId ?? userMessages[0]?.sessionId ?? "retrospective";
-        const learnings = parseRetrospectiveLearnings(deepenRun.validated);
+        const learnings = parseRetrospectiveLearnings(
+            deepenRun.validated,
+            helpers.deps.memoryDomain ?? "coding-project",
+        );
         let moduleMemoryWritten = 0;
         const moduleRejected: Array<{ content: string; reason: string }> = [];
         let hostLearnings = learnings;

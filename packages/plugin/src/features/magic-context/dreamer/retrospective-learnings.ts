@@ -1,5 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
-import { V2_MEMORY_CATEGORIES } from "../memory/constants";
+import { factCategoriesForDomain, type MemoryDomain } from "../memory/domain";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { getMemoryByHash, insertMemory } from "../memory/storage-memory";
 import type { MemoryCategory } from "../memory/types";
@@ -31,12 +31,24 @@ export interface RetrospectiveApplyResult {
 const LEARNINGS_BLOCK_REGEX = /<learnings\b[^>]*>(.*?)<\/learnings>/is;
 const LEARNING_REGEX = /<learning\b([^>]*)>(.*?)<\/learning>/gis;
 const ATTR_REGEX = /([a-zA-Z_:-]+)\s*=\s*"([^"]*)"/g;
-const VALID_MEMORY_CATEGORIES: ReadonlySet<string> = new Set(V2_MEMORY_CATEGORIES);
 const RAW_QUOTE_REGEX = /["“”][^"“”]{4,}["“”]|'[^']{4,}'/;
 const DATE_REGEX =
     /\b(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}\/\d{1,2}\/20\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+20\d{2})\b/i;
 
-export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLearning[] {
+/**
+ * A `route="memory"` learning is accepted only for a category the ACTIVE memory
+ * domain already owns. The accepted set is read from `factCategoriesForDomain`,
+ * the single definition of each domain's durable taxonomy that the historian's
+ * fact parser validates against and that the promotion/admission gates act on
+ * (`SEMANTIC_MEMORY` + `INTERACTION_EPISODE` for ongoing-interaction,
+ * `PROJECT_RULES`…`NAMING` for coding-project). Reading it here instead of
+ * hardcoding a list is what lets an ongoing-interaction lesson land at all while
+ * still refusing a category the active domain cannot hold.
+ */
+export function parseRetrospectiveLearnings(
+    text: string,
+    memoryDomain: MemoryDomain,
+): ParsedRetrospectiveLearning[] {
     const block = text.match(LEARNINGS_BLOCK_REGEX)?.[1];
     if (!block) return [];
 
@@ -52,7 +64,7 @@ export function parseRetrospectiveLearnings(text: string): ParsedRetrospectiveLe
 
         if (route === "memory") {
             const category = attrs.category;
-            if (!VALID_MEMORY_CATEGORIES.has(category as MemoryCategory)) continue;
+            if (!factCategoriesForDomain(memoryDomain).includes(category)) continue;
             learnings.push({ route, category: category as MemoryCategory, content });
         } else {
             learnings.push({ route, content });

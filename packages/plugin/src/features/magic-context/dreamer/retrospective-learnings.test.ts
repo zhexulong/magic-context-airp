@@ -36,7 +36,7 @@ describe("parseRetrospectiveLearnings", () => {
             <learning route="memory" category="NOT_A_CATEGORY">dropped</learning>
             <learning route="bogus">dropped</learning>
         </learnings>`;
-        const learnings = parseRetrospectiveLearnings(xml);
+        const learnings = parseRetrospectiveLearnings(xml, "coding-project");
         expect(learnings.length).toBe(2);
         expect(learnings[0]).toEqual({
             route: "memory",
@@ -47,7 +47,25 @@ describe("parseRetrospectiveLearnings", () => {
     });
 
     test("returns [] when there is no <learnings> block", () => {
-        expect(parseRetrospectiveLearnings("no xml here")).toEqual([]);
+        expect(parseRetrospectiveLearnings("no xml here", "coding-project")).toEqual([]);
+    });
+
+    test("accepts the active domain's durable taxonomy and refuses the other domain's", () => {
+        const xml = `<learnings>
+            <learning route="memory" category="SEMANTIC_MEMORY">You told me you want to be offered options before a decision that matters.</learning>
+            <learning route="memory" category="INTERACTION_EPISODE">We agreed to come back to the unopened cellar rooms another day.</learning>
+            <learning route="memory" category="PROJECT_RULES">Verify a tool is callable before claiming support.</learning>
+        </learnings>`;
+        const categories = (domain: "coding-project" | "ongoing-interaction") =>
+            parseRetrospectiveLearnings(xml, domain).map((learning) => learning.category);
+
+        // The companion runtime's domain keeps its own two durable categories and
+        // refuses a coding category; the coding domain is the mirror image.
+        expect(categories("ongoing-interaction")).toEqual([
+            "SEMANTIC_MEMORY",
+            "INTERACTION_EPISODE",
+        ]);
+        expect(categories("coding-project")).toEqual(["PROJECT_RULES"]);
     });
 });
 
@@ -112,10 +130,13 @@ describe("hasHighSourceOverlap", () => {
 describe("applyRetrospectiveLearnings", () => {
     test("writes memory learnings, gates observations on userMemoryCollectionEnabled", () => {
         db = freshDb();
-        const learnings = parseRetrospectiveLearnings(`<learnings>
+        const learnings = parseRetrospectiveLearnings(
+            `<learnings>
             <learning route="memory" category="CONSTRAINTS">External rate limits apply when calling the provider in bulk.</learning>
             <learning route="observation">Wants tradeoffs discussed before structural changes.</learning>
-        </learnings>`);
+        </learnings>`,
+            "coding-project",
+        );
 
         // Gate OFF → observation dropped.
         const off = applyRetrospectiveLearnings({
@@ -134,9 +155,12 @@ describe("applyRetrospectiveLearnings", () => {
 
     test("gate ON inserts observation candidates", () => {
         db = freshDb();
-        const learnings = parseRetrospectiveLearnings(`<learnings>
+        const learnings = parseRetrospectiveLearnings(
+            `<learnings>
             <learning route="observation">Prefers the smallest effective fix first.</learning>
-        </learnings>`);
+        </learnings>`,
+            "coding-project",
+        );
         const on = applyRetrospectiveLearnings({
             db,
             projectIdentity: PROJECT,
@@ -155,7 +179,7 @@ describe("applyRetrospectiveLearnings", () => {
             db,
             projectIdentity: PROJECT,
             sourceSessionId: "ses-1",
-            learnings: parseRetrospectiveLearnings(xml),
+            learnings: parseRetrospectiveLearnings(xml, "coding-project"),
             userMemoryCollectionEnabled: false,
         });
         expect(first.memoryWritten).toBe(1);
@@ -164,7 +188,7 @@ describe("applyRetrospectiveLearnings", () => {
             db,
             projectIdentity: PROJECT,
             sourceSessionId: "ses-2",
-            learnings: parseRetrospectiveLearnings(xml),
+            learnings: parseRetrospectiveLearnings(xml, "coding-project"),
             userMemoryCollectionEnabled: false,
         });
         expect(second.memoryWritten).toBe(0);
@@ -173,9 +197,12 @@ describe("applyRetrospectiveLearnings", () => {
 
     test("rejects a near-transcription learning via sourceUserTexts", () => {
         db = freshDb();
-        const learnings = parseRetrospectiveLearnings(`<learnings>
+        const learnings = parseRetrospectiveLearnings(
+            `<learnings>
             <learning route="memory" category="PROJECT_RULES">Stop reinventing the search tool that was purpose built for this.</learning>
-        </learnings>`);
+        </learnings>`,
+            "coding-project",
+        );
         const applied = applyRetrospectiveLearnings({
             db,
             projectIdentity: PROJECT,

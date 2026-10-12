@@ -180,7 +180,7 @@ export default {
 									db,
 									projectIdentity: root,
 									sourceSessionId: command.parent,
-									learnings: parseRetrospectiveLearnings(completion.text ?? ""),
+									learnings: parseRetrospectiveLearnings(completion.text ?? "", "coding-project"),
 									userMemoryCollectionEnabled: false,
 								})
 							: undefined;
