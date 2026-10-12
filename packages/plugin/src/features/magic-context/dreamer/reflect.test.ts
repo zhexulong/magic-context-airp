@@ -158,6 +158,10 @@ describe("createDreamTaskExecutor — reflect", () => {
         expect(written.map((memory) => memory.content)).toEqual([
             "We agreed to leave the unopened cellar rooms for another day.",
         ]);
+        // The row is an ordinary, player-owned Memory entry that names the task it
+        // came from — never a parallel store.
+        expect(written[0]?.metadataJson).toBe(JSON.stringify({ source: "reflect" }));
+        expect(written[0]?.sourceType).toBe("dreamer");
     });
 
     test("refuses a coding category in the companion runtime's domain", async () => {

@@ -152,6 +152,8 @@ export function applyRetrospectiveLearnings(args: {
     userMemoryCollectionEnabled: boolean;
     /** The raw source user lines, for the near-transcription reject check. */
     sourceUserTexts?: readonly string[];
+    /** Provenance tag stored on the written rows; names the task that asked for them. */
+    source?: string;
 }): RetrospectiveApplyResult {
     const result: RetrospectiveApplyResult = {
         memoryWritten: 0,
@@ -195,7 +197,7 @@ export function applyRetrospectiveLearnings(args: {
                 content: learning.content,
                 sourceSessionId: args.sourceSessionId,
                 sourceType: "dreamer",
-                metadataJson: JSON.stringify({ source: "retrospective" }),
+                metadataJson: JSON.stringify({ source: args.source ?? "retrospective" }),
             });
             result.memoryWritten += 1;
             continue;

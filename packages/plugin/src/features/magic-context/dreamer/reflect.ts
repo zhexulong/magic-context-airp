@@ -294,6 +294,7 @@ export async function runReflectTask(args: ReflectTaskArgs): Promise<ReflectTask
                         // Reflection writes Memory; a user-profile observation is not
                         // this task's output and parseReflectLearnings already dropped it.
                         userMemoryCollectionEnabled: false,
+                        source: "reflect",
                     }),
             );
             result.memoryWritten = applied.memoryWritten;
