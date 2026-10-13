@@ -1,13 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
+import { supersededMemory } from "../../features/magic-context/memory/storage-memory";
 import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-index";
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
+import { MAX_UNIFIED_SEARCH_LIMIT } from "../../features/magic-context/search";
+import { getOrCreateSessionMeta, queueMemoryMutation } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import {
+    injectM0M1,
+    materializeM0,
+    renderMemoryBlockV2,
+} from "../../hooks/magic-context/inject-compartments";
+import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { createCtxSearchTools } from "./tools";
 
 const toolContext = (sessionID = "ses-search", directory?: string) =>
@@ -149,6 +162,71 @@ describe("createCtxSearchTools", () => {
         );
     });
 
+    it("hides a forced m[1] memory using the persisted visible manifest", async () => {
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-search-m1-"));
+        try {
+            const projectPath = "git:search-m1";
+            const sessionId = "ses-search-m1";
+            const original = insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE",
+                content: "original memory ".repeat(40),
+                importance: 100,
+            });
+            const replacement = insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE",
+                content: "M1SearchToken replacement ".repeat(40),
+                importance: 1,
+            });
+            const options = {
+                db,
+                sessionId,
+                projectPath,
+                projectDirectory: dir,
+                injectDocs: false,
+                memoryInjectionBudgetTokens: estimateTokens(renderMemoryBlockV2([original])) + 2,
+            };
+            materializeM0({ ...options, state: getOrCreateSessionMeta(db, sessionId) });
+            supersededMemory(db, original.id, replacement.id);
+            queueMemoryMutation(db, {
+                projectPath,
+                mutationType: "superseded",
+                targetMemoryId: original.id,
+                supersededById: replacement.id,
+            });
+            const refreshed = injectM0M1({
+                ...options,
+                state: getOrCreateSessionMeta(db, sessionId),
+                isCacheBustingPass: true,
+            });
+            expect(refreshed.m1Text).toContain(`#${replacement.id}: M1SearchToken`);
+            const hidden = insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE",
+                content: "M1SearchToken hidden memory",
+            });
+            const tools = createCtxSearchTools({
+                db,
+                resolveProjectPath: () => projectPath,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await tools.ctx_search.execute(
+                { query: "M1SearchToken", sources: ["memory"] },
+                toolContext(sessionId),
+            );
+            expect(result).toContain(`id=${hidden.id}`);
+            expect(result).not.toContain(`id=${replacement.id} `);
+            expect(result).toContain(
+                `Memories: 1 additional match suppressed because it is already visible in your project-memory block (ids ${replacement.id}).`,
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     it("explains when matching raw messages are still in the live tail", async () => {
         indexMessagesAfterOrdinal(
             db,
@@ -244,6 +322,36 @@ describe("createCtxSearchTools", () => {
         expect(clean).toContain("first result");
         expect(clean).toContain("second result");
         expect(clean).toContain("third result");
+    });
+
+    // A model-supplied limit is the only bound on the result size, so an
+    // unbounded one (limit: 1e6) could dump the archive into a single tool
+    // result. The cap matches the Rust module's ctx_search.
+    it("caps a huge limit at the maximum result count", async () => {
+        const isolated = createTestDb();
+        try {
+            for (let index = 0; index < 40; index += 1) {
+                insertMemory(isolated, {
+                    projectPath: "/repo/project",
+                    category: "ARCHITECTURE",
+                    content: `Needle bravo entry number ${index} result.`,
+                });
+            }
+            const isolatedTools = createCtxSearchTools({
+                db: isolated,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await isolatedTools.ctx_search.execute(
+                { query: "Needle bravo", sources: ["memory"], limit: 1_000_000 },
+                toolContext(),
+            );
+            expect(result).toContain(`Found ${MAX_UNIFIED_SEARCH_LIMIT} results`);
+        } finally {
+            closeQuietly(isolated);
+        }
     });
 
     it("formats message results with inline ranges and one trailing expand hint", async () => {

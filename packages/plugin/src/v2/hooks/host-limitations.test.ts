@@ -48,20 +48,7 @@ describe("v2 transform-mode resolution", () => {
         expect(client).toBeDefined();
         // Every method the RPC status handlers and the transform reach for must be
         // present; a missing one reads as "Rust module status unavailable" at runtime.
-        for (const method of [
-            "call",
-            "stateSyncCapabilities",
-            "deleteSession",
-            "closeSession",
-            "authorityStatus",
-            "authorityPrepare",
-            "authoritySeed",
-            "authorityDrain",
-            "mirrorPull",
-            "mirrorMemory",
-            "memoryIdentityAck",
-            "getCompartmentsAfter",
-        ]) {
+        for (const method of ["call", "stateSyncCapabilities", "deleteSession", "closeSession"]) {
             expect(typeof (client as unknown as Record<string, unknown>)[method]).toBe("function");
         }
     });
@@ -82,7 +69,7 @@ describe("v2 transform-mode resolution", () => {
     });
 
     it("shows a declared limitation as a status warning", () => {
-        declareHostLimitation("hidden_cleanup_unbound");
+        declareHostLimitation("historian_unavailable");
         const detail = {
             inputTokens: 0,
             contextLimit: 0,
@@ -93,7 +80,7 @@ describe("v2 transform-mode resolution", () => {
             executeThreshold: 65,
             hostLimitations: activeHostLimitations(),
         } as unknown as StatusDetail;
-        expect(statusSummaryFromDetail(detail).warnings).toEqual(["hidden_cleanup_unbound"]);
+        expect(statusSummaryFromDetail(detail).warnings).toEqual(["historian_unavailable"]);
     });
 });
 

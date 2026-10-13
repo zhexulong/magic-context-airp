@@ -1,6 +1,4 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
-
-import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import { describeUnresolvedProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { getLastIndexedOrdinal } from "../../features/magic-context/message-index";
 import {
@@ -27,17 +25,19 @@ import {
     getNoteByIdInScope,
     SESSION_NOTE_CONDITION_ERROR,
 } from "../../features/magic-context/storage-notes";
-import { storeAheadOfBinaryFailure } from "../../hooks/magic-context/store-ahead-refusal";
-import type { RustNoteToolRequest, RustToolBackends } from "../../plugin/rust-tool-backends";
 import {
-    isRustAuthorityDrainingError,
-    toolCallIdFromContext,
-} from "../../plugin/rust-tool-backends";
-import { sessionLog } from "../../shared/logger";
+    projectNeedsSingleStoreMigration,
+    renderSingleStoreMigrationRequiredRefusal,
+} from "../../hooks/magic-context/single-store-refusal";
+import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
-import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import { CTX_NOTE_DESCRIPTION } from "./constants";
+import {
+    CTX_NOTE_DESCRIPTION,
+    NOTES_FILTER_DESCRIPTION,
+    SMART_NOTES_DISABLED_REPLY,
+    withoutSmartNoteText,
+} from "./constants";
 import {
     EMPTY_READ_REPLY,
     formatWriteReply,
@@ -52,6 +52,7 @@ export { CTX_NOTE_LIGHT_DESCRIPTION } from "../light-descriptions";
 export interface CtxNoteToolDeps {
     db: Database;
     dreamerEnabled?: boolean;
+    smartNotesEnabled?: boolean;
     /**
      * Resolve the project identity for the session's directory at call time.
      * See CtxMemoryToolDeps.resolveProjectPath for why this is a function.
@@ -149,52 +150,6 @@ function writeTray(
     return { activeCount: active.length, oldestTouchedAt: oldest };
 }
 
-function noteAuthorityRefusal(_args: CtxNoteArgs, action: RustNoteToolRequest["action"]): string {
-    const isMutation = action === "write" || action === "update" || action === "dismiss";
-    return renderCapabilityRefusal(isMutation ? "note_change" : "note_access");
-}
-
-function moduleNoteText(
-    response: unknown,
-    args: CtxNoteArgs,
-    action: RustNoteToolRequest["action"],
-): string | null {
-    let value = response;
-    if (value !== null && typeof value === "object" && "result" in value) {
-        value = (value as { result?: unknown }).result;
-    }
-    if (isRustAuthorityDrainingError(value)) {
-        return noteAuthorityRefusal(args, action);
-    }
-    if (typeof value === "string") return value;
-    if (value !== null && typeof value === "object") {
-        const record = value as Record<string, unknown>;
-        if (record.ok === false || record.error || typeof record.message === "string") {
-            const error = record.error;
-            const message =
-                typeof error === "string"
-                    ? error
-                    : error !== null && typeof error === "object" && "message" in error
-                      ? String((error as { message?: unknown }).message)
-                      : typeof record.message === "string"
-                        ? record.message
-                        : "module rejected ctx_note";
-            return `Error: ${message}`;
-        }
-        const content = record.content;
-        if (Array.isArray(content)) {
-            const text = content.find(
-                (item): item is { text: string } =>
-                    item !== null &&
-                    typeof item === "object" &&
-                    typeof (item as { text?: unknown }).text === "string",
-            )?.text;
-            if (text) return text;
-        }
-    }
-    return null;
-}
-
 const ctxNoteArgsShape = {
     action: tool.schema
         .enum(["write", "read", "dismiss", "update"])
@@ -218,7 +173,7 @@ const ctxNoteArgsShape = {
         .enum(["all", "active", "pending", "ready", "dismissed"])
         .optional()
         .describe(
-            "Read filter: active (default: active + ready), all, pending (unsurfaced smart notes), ready, dismissed.",
+            "Read filter: all, active, pending (unsurfaced smart notes), ready, dismissed. Omitted, it shows active session notes plus every current smart note (pending included); active shows only notes whose stored status is active.",
         ),
     limit: tool.schema.number().optional().describe("Rows per read (default 25)."),
     offset: tool.schema.number().optional().describe("Skip this many newest rows (default 0)."),
@@ -228,7 +183,7 @@ const ctxNoteArgsShape = {
         .max(50)
         .optional()
         .describe(
-            "Note ids: one for update, 1–50 for dismiss, any number for read (returns full bodies). Ignored by write.",
+            "Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write.",
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
@@ -279,9 +234,19 @@ function parseNoteIds(action: string, value: unknown): number[] | string {
 }
 
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
+    const { surface_condition: _condition, ...plainArgs } = ctxNoteArgsShape;
     return tool({
-        description: CTX_NOTE_DESCRIPTION,
-        args: ctxNoteArgsShape,
+        description:
+            deps.smartNotesEnabled === false
+                ? withoutSmartNoteText(CTX_NOTE_DESCRIPTION)
+                : CTX_NOTE_DESCRIPTION,
+        args:
+            deps.smartNotesEnabled === false
+                ? {
+                      ...plainArgs,
+                      filter: ctxNoteArgsShape.filter.describe(NOTES_FILTER_DESCRIPTION),
+                  }
+                : ctxNoteArgsShape,
         async execute(rawArgs: CtxNoteArgs, toolContext) {
             const parsedArgs = ctxNoteArgsSchema.safeParse(rawArgs);
             let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxNoteArgs;
@@ -297,6 +262,9 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 offset: "number",
                 note_ids: { type: "array", items: "number", maxItems: 50 },
             });
+            if (deps.smartNotesEnabled === false && args.surface_condition !== undefined) {
+                return SMART_NOTES_DISABLED_REPLY;
+            }
             const sessionId = toolContext.sessionID;
             // Infer write only on NON-EMPTY content. GPT-family models fill every
             // optional param (content:"" for a read), so a bare `typeof === "string"`
@@ -313,7 +281,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 action === "write" &&
                 Boolean(args.surface_condition?.trim()) &&
                 (await wakePlaneStatus()) === "present";
-            const surfaceCondition = wakePlaneActive ? undefined : args.surface_condition?.trim();
+            const _surfaceCondition = wakePlaneActive ? undefined : args.surface_condition?.trim();
 
             // Resolve the session's actual project from `toolContext.directory`
             // each call. OpenCode's top-level `ctx.directory` (the launch dir)
@@ -321,88 +289,8 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // runs `opencode -s <id>` from outside the project.
             const projectIdentity = deps.resolveProjectPath?.(toolContext.directory);
 
-            const marker = projectIdentity
-                ? getAuthorityManagedMarker(deps.db, projectIdentity)
-                : null;
-            let notesAuthority: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
-            if (projectIdentity && deps.rustToolBackends?.authorityState) {
-                try {
-                    notesAuthority = await deps.rustToolBackends.authorityState({
-                        projectPath: projectIdentity,
-                        projectRoot: toolContext.directory,
-                        sessionId,
-                        domain: "notes",
-                    });
-                } catch (error) {
-                    const storeAhead = storeAheadOfBinaryFailure(error);
-                    if (storeAhead) {
-                        sessionLog(sessionId, "ctx_note store-ahead refusal", error);
-                        return storeAhead.message;
-                    }
-                    if (marker) {
-                        sessionLog(sessionId, "ctx_note capability refusal", error);
-                        return noteAuthorityRefusal(args, action);
-                    }
-                }
-            }
-            if (notesAuthority === "MODULE") {
-                const rustNote = deps.rustToolBackends?.note;
-                if (!rustNote || !projectIdentity) {
-                    return noteAuthorityRefusal(args, action);
-                }
-                let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
-                if ((action === "write" || action === "update") && surfaceCondition) {
-                    if (
-                        deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
-                    ) {
-                        return renderCapabilityRefusal("smart_note_condition");
-                    }
-                    compilation = await compileSurfaceCondition(surfaceCondition, {
-                        projectPath: toolContext.directory,
-                    });
-                }
-                const commandId = toolCallIdFromContext(toolContext);
-                const request: RustNoteToolRequest = {
-                    ...(commandId ? { commandId } : {}),
-                    sessionId,
-                    projectRoot: toolContext.directory,
-                    projectPath: projectIdentity,
-                    memoryProject: projectIdentity,
-                    action,
-                    content: args.content,
-                    surfaceCondition,
-                    ...(compilation ? conditionCompileStorageFields(compilation) : {}),
-                    filter: args.filter,
-                    limit: args.limit,
-                    offset: args.offset,
-                    noteIds: Array.isArray(noteIds) ? noteIds : undefined,
-                };
-                try {
-                    const text = moduleNoteText(await rustNote(request), args, action);
-                    if (text === null) {
-                        return noteAuthorityRefusal(args, action);
-                    }
-                    if (text.startsWith("Error:")) return text;
-                    if (wakePlaneActive) {
-                        return `${text}\nwake plane active — create a scheduled wake instead; stored as a plain note.`;
-                    }
-                    if (compilation) return text + conditionCompileReplySuffix(compilation);
-                    return text;
-                } catch (error) {
-                    const storeAhead = storeAheadOfBinaryFailure(error);
-                    if (storeAhead) {
-                        sessionLog(sessionId, "ctx_note store-ahead refusal", error);
-                        return storeAhead.message;
-                    }
-                    if (isRustAuthorityDrainingError(error)) {
-                        return noteAuthorityRefusal(args, action);
-                    }
-                    sessionLog(sessionId, "ctx_note capability refusal", error);
-                    return noteAuthorityRefusal(args, action);
-                }
-            }
-            if (marker || notesAuthority === "PREPARING" || notesAuthority === "DRAINING") {
-                return noteAuthorityRefusal(args, action);
+            if (projectIdentity && projectNeedsSingleStoreMigration(deps.db, projectIdentity)) {
+                return renderSingleStoreMigrationRequiredRefusal();
             }
 
             if (action === "write") {

@@ -1,7 +1,9 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
+    getDroppedTagsByNumbers,
+    getNewestToolTagNumbers,
     getPendingOps,
-    getTagsBySession,
+    getTagsByNumbers,
     removePendingOp,
     updateTagDropMode,
     updateTagStatus,
@@ -201,21 +203,47 @@ export function foldBustsServedPrefix(
  * The legacy marker was only ever written inside the newest-call window or for
  * a call that could not be removed, so every legacy tag is re-decided as an
  * in-window drop. Tags not on this pass's wire stay as they are.
+ *
+ * `keepFullDrop` lets a host exempt `full` tags whose removal it has already
+ * recorded. Pi records the first structural removal of each arc; such a call
+ * was removed, not served as a marker, and it may only look unremovable on this
+ * pass (a model that needs tool pairs beside its reasoning). Converting it
+ * would keep the call on every later pass, including ones that can remove it.
  */
 export function convertLegacyToolSkeletons(
     db: ContextDatabase,
     sessionId: string,
     targets: ReadonlyMap<number, TagTarget>,
+    options: { keepFullDrop?: (callId: string | null) => boolean } = {},
 ): Map<number, ConvertedToolDropMode> {
-    const rows = db
-        .prepare(
-            `SELECT tag_number AS tagNumber, drop_mode AS dropMode
+    const prepared = prepareLegacyToolSkeletonConversions(db, sessionId, targets, options);
+    prepared.persist(db);
+    return prepared.converted;
+}
+
+/** Traverse the wire before writer admission; commit only if the tag rows still match. */
+export function prepareLegacyToolSkeletonConversions(
+    db: ContextDatabase,
+    sessionId: string,
+    targets: ReadonlyMap<number, TagTarget>,
+    options: { keepFullDrop?: (callId: string | null) => boolean } = {},
+) {
+    const readRows = (connection: ContextDatabase) =>
+        connection
+            .prepare(
+                `SELECT tag_number AS tagNumber, drop_mode AS dropMode, message_id AS callId
                FROM tags
               WHERE session_id = ? AND type = 'tool' AND status = 'dropped'
                 AND drop_mode IN ('truncated', 'full')
               ORDER BY tag_number`,
-        )
-        .all(sessionId) as Array<{ tagNumber: number; dropMode: string }>;
+            )
+            .all(sessionId) as Array<{
+            tagNumber: number;
+            dropMode: string;
+            callId: string | null;
+        }>;
+    const rows = readRows(db);
+    const identity = JSON.stringify(rows);
     const converted = new Map<number, ConvertedToolDropMode>();
     for (const row of rows) {
         const target = targets.get(row.tagNumber);
@@ -226,16 +254,24 @@ export function convertLegacyToolSkeletons(
             target.wouldStrandConversationEnd?.() === true;
         let mode: ConvertedToolDropMode;
         if (row.dropMode === "full") {
+            if (options.keepFullDrop?.(row.callId) === true) continue;
             // Removable full drops already serve real-or-absent bytes.
             if (target.cannotRemove?.() !== true) continue;
             mode = "skeleton_real";
         } else {
             mode = hasSmallToolInput(target) || cannotRemove ? "skeleton_real" : "full";
         }
-        updateTagDropMode(db, sessionId, row.tagNumber, mode);
         converted.set(row.tagNumber, mode);
     }
-    return converted;
+    return {
+        converted,
+        isCurrent: (connection: ContextDatabase) =>
+            JSON.stringify(readRows(connection)) === identity,
+        persist: (connection: ContextDatabase) => {
+            for (const [tagNumber, mode] of converted)
+                updateTagDropMode(connection, sessionId, tagNumber, mode);
+        },
+    };
 }
 
 /** Render conversions from convertLegacyToolSkeletons on this pass's wire. */
@@ -302,11 +338,22 @@ export function applyPendingOperations(
         db.transaction(() => {
             admitted = true;
             startedAt = performance.now();
-            const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
+            // Load only the rows this batch reads: the operations' own tags. A
+            // full getTagsBySession load (every tag the session ever had, about
+            // 100k rows on a long session) ran here while this transaction held
+            // the writer lock and cost over a second per call.
+            const tags =
+                preloadedTags ??
+                getTagsByNumbers(db, sessionId, [
+                    ...new Set([
+                        ...pendingOps.map((op) => op.tagId),
+                        ...syntheticPendingOps.map((op) => op.tagId),
+                    ]),
+                ]);
             const tagById = new Map(tags.map((tag) => [tag.tagNumber, tag] as const));
             const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status] as const));
             const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type] as const));
-            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
             const opsToApply: Array<{ op: PendingOp; synthetic: boolean }> = [
                 ...pendingOps.map((op) => ({ op, synthetic: false })),
                 ...syntheticPendingOps.map((op) => ({ op, synthetic: true })),
@@ -326,13 +373,17 @@ export function applyPendingOperations(
 
             // Newest-K tool calls at THIS moment — the skeleton window. Computed
             // once per apply pass over all tool tags (any status: the window
-            // reflects conversation recency, not droppability).
+            // reflects conversation recency, not droppability). Preloaded tags
+            // carry the window rows (getTagsForPendingOperations); otherwise an
+            // index walk reads just those K tag numbers.
             const skeletonWindow = new Set(
-                tags
-                    .filter((tag) => tag.type === "tool")
-                    .map((tag) => tag.tagNumber)
-                    .sort((left, right) => right - left)
-                    .slice(0, RECENT_TOOL_SKELETON_WINDOW),
+                preloadedTags
+                    ? tags
+                          .filter((tag) => tag.type === "tool")
+                          .map((tag) => tag.tagNumber)
+                          .sort((left, right) => right - left)
+                          .slice(0, RECENT_TOOL_SKELETON_WINDOW)
+                    : getNewestToolTagNumbers(db, sessionId, RECENT_TOOL_SKELETON_WINDOW),
             );
 
             for (const { op: pendingOp, synthetic } of opsToApply) {
@@ -350,6 +401,10 @@ export function applyPendingOperations(
                 }
 
                 const target = targets.get(pendingOp.tagId);
+                if (target?.thinkingDropProtected) {
+                    reject("active_thinking");
+                    continue;
+                }
                 const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
 
                 if (synthetic) {
@@ -498,7 +553,9 @@ export function applyFlushedStatuses(
     preloadedTags?: TagEntry[],
 ): boolean {
     let didMutateMessage = false;
-    const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+    // Rows without a target in the visible output cannot change that output.
+    // Restrict fallback callers, including Pi, to dropped tags in the target map.
+    const tags = preloadedTags ?? getDroppedTagsByNumbers(db, sessionId, [...targets.keys()]);
 
     for (const tag of tags) {
         if (tag.status === "dropped") {

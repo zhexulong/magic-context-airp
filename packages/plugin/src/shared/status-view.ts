@@ -17,14 +17,25 @@ import type { DreamerTickFailure } from "../features/magic-context/dreamer/tick-
 import { formatCacheTtlDisplay } from "./cache-ttl-display";
 import { type ConfigParseFailure, formatConfigParseStatusLine } from "./config-diagnostics";
 import { formatThresholdPercent } from "./format-threshold";
+import { primaryQuotaDiagnostic } from "./quota-diagnostic";
 import type { TailHygieneStatus } from "./rpc-types";
+import {
+    type StatusCheck,
+    type StatusUnavailableReason,
+    type StatusVersions,
+    statusVersionNotice,
+} from "./status-view-check";
 import { formatTailHygiene } from "./tail-hygiene-status";
 import {
     renderUserFacingFailure,
     type UserFacingFailureKey,
     userFacingFailureCode,
 } from "./user-facing-codes";
-import { formatWindowDerivationLine, type WindowGeometryResult } from "./window-geometry";
+import {
+    formatWindowDerivationLine,
+    formatWindowSource,
+    type WindowGeometryResult,
+} from "./window-geometry";
 
 /** Theme-independent colour role; each host maps these onto its own palette. */
 export type StatusTone = "accent" | "text" | "muted" | "warning" | "error";
@@ -140,12 +151,14 @@ export interface StatusViewSource {
      * backlog that silently never falls.
      */
     readonly dreamerUnsupportedTasks?: readonly string[];
+    readonly dreamerSkipped?: readonly string[];
     /**
      * Set when the last background maintenance pass stopped before finishing.
      * Shown so "the dreamer has nothing to do" and "the dreamer never got to
      * its work" are not the same blank space in this view.
      */
     readonly dreamerTickFailure?: DreamerTickFailure | null;
+    readonly dreamerFailures?: readonly { task: string; error: string }[];
     readonly memoryCount: number;
     readonly sessionNoteCount?: number;
     readonly readySmartNoteCount?: number;
@@ -159,8 +172,30 @@ export interface StatusViewSource {
     readonly compactionEnabled?: boolean;
     /** Failure codes to print under the sections, already selected by the host. */
     readonly warnings?: readonly UserFacingFailureKey[];
+    /**
+     * Set when this server migrated the shared store at startup while other
+     * OpenCode servers (these PIDs, from their RPC discovery records) could not
+     * be checked; if one was an older build still running, it now reads a
+     * store newer than it supports.
+     */
+    readonly unconfirmedMigrationHolders?: {
+        readonly pids: readonly number[];
+        readonly fromVersion: number;
+        readonly toVersion: number;
+    };
     readonly hiddenVariantWarnings?: readonly string[];
 }
+
+declare const checkedStatusViewSource: unique symbol;
+
+/**
+ * A `StatusViewSource` that has passed `checkStatusViewSource`. The brand exists
+ * only in the type system: `buildStatusView` accepts nothing else, so a payload
+ * cannot reach the view model without going through the check.
+ */
+export type CheckedStatusViewSource = StatusViewSource & {
+    readonly [checkedStatusViewSource]: true;
+};
 
 export interface StatusViewOptions {
     /** Plugin version shown next to the title. */
@@ -475,11 +510,17 @@ function historyRows(source: StatusViewSource, now: number): StatusRow[] {
     return rows;
 }
 
-/** One row naming every Dreamer task this host cannot run, or nothing when it runs them all. */
+/** Availability rows for unsupported tasks and explicitly disabled/unavailable runs. */
 function dreamerUnsupportedRows(source: StatusViewSource): StatusRow[] {
     const unsupported = source.dreamerUnsupportedTasks ?? [];
-    if (unsupported.length === 0) return [];
+    const skipped: StatusRow[] = (source.dreamerSkipped ?? []).map((value) => ({
+        label: "Dreamer skipped",
+        value,
+        tone: "muted",
+    }));
+    if (unsupported.length === 0) return skipped;
     return [
+        ...skipped,
         {
             label: "Dreamer unavailable",
             value: `${unsupported.join(", ")} (${userFacingFailureCode("dream_task_needs_tool_loop")})`,
@@ -490,9 +531,18 @@ function dreamerUnsupportedRows(source: StatusViewSource): StatusRow[] {
 
 /** One row naming the stage that stopped the last maintenance pass, if one did. */
 function dreamerTickFailureRows(source: StatusViewSource, now: number): StatusRow[] {
+    const quotas = [
+        ...new Set(
+            (source.dreamerFailures ?? []).flatMap((failure) => {
+                const quota = primaryQuotaDiagnostic(failure.error);
+                return quota ? [quota] : [];
+            }),
+        ),
+    ].map((value): StatusRow => ({ label: "Dreamer quota", value, tone: "warning" }));
     const failure = source.dreamerTickFailure;
-    if (!failure) return [];
+    if (!failure) return quotas;
     return [
+        ...quotas,
         {
             label: "Dreamer blocked",
             value: `${failure.stage} failed ${formatRelativeTime(failure.at, now)} (${userFacingFailureCode(
@@ -610,6 +660,16 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
                     tone: "muted",
                 },
                 { label: "Subagent", value: source.isSubagent ? "yes" : "no", tone: "muted" },
+                {
+                    label: "Denominator",
+                    value: `${Math.round(source.contextLimit)} tokens`,
+                    tone: "muted",
+                },
+                {
+                    label: "Window source",
+                    value: formatWindowSource(source.windowGeometry),
+                    tone: "muted",
+                },
             ],
         },
         { title: "Cache TTL", labelWidth: 14, rows: cacheRows(source, now) },
@@ -627,7 +687,16 @@ function statusSections(source: StatusViewSource, now: number): StatusSection[] 
 }
 
 function warningBlock(source: StatusViewSource): StatusWarning[] {
+    const holders = source.unconfirmedMigrationHolders;
     return [
+        ...(holders && holders.pids.length > 0
+            ? [
+                  {
+                      text: `Magic Context upgraded its database from v${holders.fromVersion} to v${holders.toVersion} while OpenCode PID ${holders.pids.join(", ")} could not be checked. If an older OpenCode is still open, quit all OpenCode processes and start again.`,
+                      tone: "error" as const,
+                  },
+              ]
+            : []),
         ...(source.hiddenVariantWarnings ?? []).map((text) => ({ text, tone: "warning" as const })),
         ...(source.configReloadFailure
             ? [
@@ -651,8 +720,11 @@ function warningBlock(source: StatusViewSource): StatusWarning[] {
     ];
 }
 
-/** Builds the full status view from one snapshot. */
-export function buildStatusView(source: StatusViewSource, options: StatusViewOptions): StatusView {
+/** Builds the full status view from one checked snapshot. */
+export function buildStatusView(
+    source: CheckedStatusViewSource,
+    options: StatusViewOptions,
+): StatusView {
     const now = options.now ?? Date.now();
     const off = !compactionEnabled(source);
     const tone = off ? "accent" : pressureTone(source.usagePercentage);
@@ -697,6 +769,131 @@ export function buildStatusView(source: StatusViewSource, options: StatusViewOpt
         warnings: warningBlock(source),
         footer: "Esc to close",
     };
+}
+
+/** Short name for the reason, shown on the headline and in the reason row. */
+function unavailableLabel(reason: StatusUnavailableReason): string {
+    if (reason.kind === "rpc_error") return "server did not answer";
+    if (reason.kind === "not_tracked") {
+        return reason.cause === "home_directory" ? "home directory" : "memory paused";
+    }
+    if (reason.kind === "malformed") return "incomplete status data";
+    return "view error";
+}
+
+/** Full-width sentences explaining the reason and what to do about it. */
+function unavailableExplanation(
+    reason: StatusUnavailableReason,
+    versionNotice: string | null,
+): string[] {
+    const persists = "If this persists after a restart, report it with magic-context.log attached.";
+    if (reason.kind === "rpc_error") {
+        return [
+            `The Magic Context server did not return status: ${reason.message}`,
+            renderUserFacingFailure("status_unavailable", "plain"),
+        ];
+    }
+    if (reason.kind === "not_tracked" && reason.cause === "home_directory") {
+        return [
+            "This is your home directory, so Magic Context keeps no project history or memory here.",
+            "Set allow_home_project in magic-context.jsonc to opt in.",
+        ];
+    }
+    if (reason.kind === "not_tracked") {
+        return [
+            "Magic Context could not work out a project identity for this directory, so its memory features are paused.",
+            'magic-context.log names the cause (search for "memory features paused"), for example a git command that failed.',
+        ];
+    }
+    if (reason.kind === "malformed") {
+        return [
+            `The status reply is missing, or has unexpected values for: ${reason.fields.join(", ")}.`,
+            versionNotice ? "The version difference above is the likely cause." : persists,
+        ];
+    }
+    return [`The status view could not be drawn: ${reason.message}`, persists];
+}
+
+/**
+ * The view drawn instead of the status when there is no usable snapshot. It has
+ * the same shape as a full view (headline, sections, warnings, footer), so a
+ * host draws it with the same code and cannot crash on a missing part.
+ */
+export function buildUnavailableStatusView(
+    reason: StatusUnavailableReason,
+    versions: StatusVersions | null,
+    options: StatusViewOptions,
+): StatusView {
+    const label = unavailableLabel(reason);
+    const versionNotice = statusVersionNotice(versions);
+    const rows: StatusRow[] = [{ label: "Reason", value: label, tone: "warning" }];
+    if (versions) {
+        rows.push(
+            { label: "Server", value: versions.server ?? "not reported", tone: "muted" },
+            { label: "UI", value: versions.ui, tone: "muted" },
+        );
+    }
+    return {
+        title: "⚡ Magic Context Status",
+        version: `v${options.version}`,
+        headline: {
+            left: { text: "Status unavailable", tone: "error" },
+            right: { text: label, tone: "muted" },
+        },
+        windowLine: null,
+        bar: [],
+        breakdown: [],
+        hygiene: null,
+        sections: [{ title: "Status unavailable", labelWidth: 8, rows }],
+        warnings: [
+            ...(versionNotice ? [{ text: versionNotice, tone: "error" as const }] : []),
+            ...unavailableExplanation(reason, versionNotice).map((text) => ({
+                text,
+                tone: "warning" as const,
+            })),
+        ],
+        footer: "Esc to close",
+    };
+}
+
+/**
+ * The view for one checked status result: the full status, or the
+ * "status unavailable" view naming why there is none. A version difference
+ * between the server and this UI is named in both. This never throws, so a
+ * host can call it inside a render without guarding it.
+ */
+export function buildStatusViewFor(
+    check: StatusCheck<unknown>,
+    options: StatusViewOptions,
+): StatusView {
+    if (check.state === "unavailable") {
+        return buildUnavailableStatusView(check.reason, check.versions, options);
+    }
+    try {
+        const view = buildStatusView(check.source, options);
+        const versionNotice = statusVersionNotice(check.versions);
+        const notices: StatusWarning[] = [
+            ...(versionNotice ? [{ text: versionNotice, tone: "warning" as const }] : []),
+            ...(check.ignoredFields.length > 0
+                ? [
+                      {
+                          text: `Ignored status fields with an unexpected shape: ${check.ignoredFields.join(", ")}`,
+                          tone: "warning" as const,
+                      },
+                  ]
+                : []),
+        ];
+        return notices.length > 0 ? { ...view, warnings: [...notices, ...view.warnings] } : view;
+    } catch (error) {
+        return buildUnavailableStatusView(
+            {
+                kind: "view_error",
+                message: error instanceof Error ? error.message : String(error),
+            },
+            check.versions,
+            options,
+        );
+    }
 }
 
 /** Pads one row to its section's label column; values print flush right. */

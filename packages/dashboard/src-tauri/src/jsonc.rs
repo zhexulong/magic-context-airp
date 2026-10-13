@@ -8,6 +8,28 @@
 
 use std::path::Path;
 
+pub fn read_smart_notes_enabled(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)).ok())
+        .and_then(|value| {
+            value
+                .pointer("/smart_notes/enabled")
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+/// Freeze smart-note task visibility until dashboard restart, matching the hosts' startup-only tool definitions.
+pub fn startup_smart_notes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        read_smart_notes_enabled(&crate::config::resolve_user_config_path(
+            &crate::config::config_home(),
+        ))
+    })
+}
+
 /// Strip JSONC line/block comments AND trailing commas, respecting string
 /// literals, so the result parses as plain JSON.
 ///
@@ -66,13 +88,12 @@ pub fn strip_jsonc(input: &str) -> String {
             i += 2;
             continue;
         }
-        // Trailing comma (outside strings only): a `,` whose next non-whitespace
-        // char is `}` or `]`. Skip emitting it.
+        // Trailing comma (outside strings only): a `,` whose next char, past any
+        // whitespace and comments, is `}` or `]`. Skip emitting it. Comments
+        // must be skipped here too: `"a": 1, // note` before `}` is a trailing
+        // comma, and keeping it makes the whole file unparseable.
         if c == ',' {
-            let mut k = i + 1;
-            while k < chars.len() && chars[k].is_whitespace() {
-                k += 1;
-            }
+            let k = skip_whitespace_and_comments(&chars, i + 1);
             if k < chars.len() && (chars[k] == '}' || chars[k] == ']') {
                 i += 1;
                 continue;
@@ -82,6 +103,32 @@ pub fn strip_jsonc(input: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Index of the first char at or after `start` that is neither whitespace nor
+/// part of a `//` or `/* */` comment. Only called outside string literals.
+fn skip_whitespace_and_comments(chars: &[char], start: usize) -> usize {
+    let mut k = start;
+    loop {
+        while k < chars.len() && chars[k].is_whitespace() {
+            k += 1;
+        }
+        if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '/' {
+            while k < chars.len() && chars[k] != '\n' {
+                k += 1;
+            }
+            continue;
+        }
+        if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+            k += 2;
+            while k + 1 < chars.len() && !(chars[k] == '*' && chars[k + 1] == '/') {
+                k += 1;
+            }
+            k = (k + 2).min(chars.len());
+            continue;
+        }
+        return k;
+    }
 }
 
 /// True when the config file at `path` exists AND declares a non-empty `dreamer`
@@ -133,6 +180,16 @@ pub fn read_dreamer_task_schedules(path: &Path) -> std::collections::HashMap<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smart_notes_visibility_defaults_on_and_reads_user_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic-context.jsonc");
+        assert!(super::read_smart_notes_enabled(&path));
+        std::fs::write(&path, "{\"smart_notes\": {\"enabled\": false}} // disabled").unwrap();
+        assert!(!super::read_smart_notes_enabled(&path));
+        std::fs::write(&path, "{\"smart_notes\": {\"enabled\": true}}").unwrap();
+        assert!(super::read_smart_notes_enabled(&path));
+    }
     use super::*;
 
     #[test]
@@ -155,6 +212,18 @@ mod tests {
         let input = "{\n  // line\n  \"a\": 1, /* block */\n  \"b\": [1, 2,],\n}";
         let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(input)).unwrap();
         assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn strips_a_trailing_comma_followed_by_a_comment() {
+        let input = "{\n  \"dreamer\": {\n    \"tasks\": { \"verify\": { \"schedule\": \"0 3 * * *\" }, // last\n    },\n  }, /* block */\n  \"b\": [1, 2, /* two */ ],\n}";
+        let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(input))
+            .unwrap_or_else(|e| panic!("stripped JSONC must parse: {e}"));
+        assert_eq!(
+            parsed["dreamer"]["tasks"]["verify"]["schedule"],
+            "0 3 * * *"
+        );
         assert_eq!(parsed["b"], serde_json::json!([1, 2]));
     }
 

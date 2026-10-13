@@ -23,6 +23,13 @@ export interface PerfPassInput {
 
 interface SyntheticOptions {
 	messages: number;
+	/**
+	 * Start the branch with a persisted system message entry, as Pi 0.87 does.
+	 * The entry is not counted in `messages`.
+	 */
+	systemEntry?: boolean;
+	/** Times each tool result repeats its "result line " filler text (default 12-16). */
+	toolResultRepeat?: number;
 }
 
 export function loadFixture(path: string): PerfFixture {
@@ -64,13 +71,36 @@ export function generateSyntheticFixture(
 			parentId,
 			timestamp: new Date(timestamp).toISOString(),
 			message,
-		} as SessionEntry);
+		} as unknown as SessionEntry);
 		parentId = id;
 		timestamp += 1_000;
 		sequence += 1;
 	};
 
-	while (sequence < options.messages) {
+	if (options.systemEntry) {
+		entries.push({
+			type: "message",
+			id: "synthetic-system-entry",
+			parentId,
+			timestamp: new Date(timestamp).toISOString(),
+			message: {
+				role: "system",
+				content: "You are a synthetic coding agent.",
+				toolsAdded: [
+					{
+						name: "read",
+						description: "Read a file",
+						parameters: { type: "object", properties: {} },
+					},
+				],
+				timestamp,
+			},
+		} as unknown as SessionEntry);
+		parentId = "synthetic-system-entry";
+		timestamp += 1_000;
+	}
+	const messageLimit = options.messages;
+	while (sequence < messageLimit) {
 		const turn = Math.floor(sequence / 6);
 		append({
 			role: "user",
@@ -126,7 +156,7 @@ export function generateSyntheticFixture(
 			content: [
 				{
 					type: "text",
-					text: `Tool output ${turn}: ${"result line ".repeat(12 + (turn % 5))}`,
+					text: `Tool output ${turn}: ${"result line ".repeat((options.toolResultRepeat ?? 12) + (turn % 5))}`,
 				},
 			],
 			details: { truncated: false },

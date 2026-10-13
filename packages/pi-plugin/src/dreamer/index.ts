@@ -16,7 +16,10 @@ import {
 	type ManualRunResult,
 	runManualDream,
 } from "@magic-context/core/features/magic-context/dreamer/task-scheduler";
-import { DreamTokenBudgetExceeded } from "@magic-context/core/features/magic-context/dreamer/token-budget";
+import {
+	DreamTokenBudgetExceeded,
+	type DreamTokenBudgetState,
+} from "@magic-context/core/features/magic-context/dreamer/token-budget";
 import type { MemoryDomain } from "@magic-context/core/features/magic-context/memory/domain";
 import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -26,6 +29,7 @@ import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
 import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
 import { HiddenAgentStepLimit } from "@magic-context/core/v2/hooks/hidden-child";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
+import { isPiModelRegistered } from "../model-chain-health";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
 import { PiRetrospectiveRawProvider } from "./retrospective-raw-provider-pi";
@@ -41,7 +45,7 @@ export interface PiDreamerOptions {
 	modelRegistry?: { find(provider: string, modelId: string): unknown };
 	sampleDreamRun?: () => {
 		dreamerConfig?: DreamerConfig;
-		mural?: { enabled: boolean; model?: string };
+		mural?: { enabled: boolean };
 		gitCommitIndexing?: PiDreamerOptions["gitCommitIndexing"];
 	};
 	/** Active Pi-compatible host used to select per-harness model configuration. */
@@ -68,7 +72,8 @@ export interface PiDreamerOptions {
 	 */
 	memoryDomain?: MemoryDomain;
 	retinaHandoff?: boolean;
-	mural?: { enabled: boolean; model?: string };
+	smartNotesEnabled?: boolean;
+	mural?: { enabled: boolean };
 	language?: string;
 	gitCommitIndexing: {
 		enabled: boolean;
@@ -157,16 +162,20 @@ export function validatePiDreamerModels(
 			if (harness === "omp" && model.startsWith("@")) return true;
 			let available = resolved.get(model);
 			if (available === undefined) {
-				const separator = model.indexOf("/");
-				available =
-					separator > 0 &&
-					Boolean(
-						registry.find(
-							model.slice(0, separator),
-							model.slice(separator + 1),
-						),
-					);
-				resolved.set(model, available);
+				available = isPiModelRegistered(model, registry, harness);
+				// Positives only. OMP hydrates discovery-backed providers such as
+				// `litellm` from a fire-and-forget boot refresh that the startup
+				// path never awaits (config/model-registry.ts
+				// `#refreshRuntimeDiscoveries`, main.ts `refreshInBackground`), and
+				// extension `registerProvider` calls are themselves queued until
+				// after extension loading -- so a miss during registration usually
+				// means "not yet", not "absent". Remembering the miss pinned the
+				// historian off for the whole process even after the model became
+				// visible; OMP's own consumers re-check after awaiting instead
+				// (session/agent-session.ts `#retryInactiveAdvisorAfterModelDiscovery`).
+				// A genuinely absent model costs one extra `find()` per re-resolution,
+				// which happens per transform pass.
+				if (available) resolved.set(model, available);
 			}
 			if (available) return true;
 			if (!warnedUnknownModels.has(model)) {
@@ -318,6 +327,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		memoryDomain: opts.memoryDomain,
 		embeddingConfig: opts.embeddingConfig,
 		retinaHandoff: opts.retinaHandoff,
+		smartNotesEnabled: opts.smartNotesEnabled,
 		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
 		// Pi retrospectives read JSONL messages and context.db activity, not
@@ -384,7 +394,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 							dreamerConfig,
 							manualOpts.harness,
 							manualOpts.language,
-							mural?.model,
+							manualOpts.smartNotesEnabled,
 						),
 						manualOpts.modelRegistry,
 						manualOpts.harness,
@@ -393,7 +403,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 						dreamerConfig,
 						manualOpts.harness,
 						manualOpts.language,
-						mural?.model,
+						manualOpts.smartNotesEnabled,
 					),
 			executor: createDreamTaskExecutor({
 				client: manualClient as never,
@@ -409,6 +419,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				language: manualOpts.language,
 				retinaHandoff: manualOpts.retinaHandoff,
+				smartNotesEnabled: manualOpts.smartNotesEnabled,
 				mural,
 			}),
 			task,
@@ -530,12 +541,16 @@ function createPiDreamerClient(
 	readTokenBudget: (
 		task: string,
 	) => { spent: number; finalizeFired: boolean } | undefined;
+	readChildTokenBudget: (
+		sessionId: string,
+	) => DreamTokenBudgetState | undefined;
 } {
 	const runner = piSubagentRunnerFactory();
 	const budgetStates = new Map<
 		string,
 		{ spent: number; finalizeFired: boolean }
 	>();
+	const childBudgetStates = new Map<string, DreamTokenBudgetState>();
 	const assertRegistrationOwnerActive = (): void => {
 		if (!isRegistrationOwnerActive()) {
 			throw new Error(
@@ -622,8 +637,9 @@ function createPiDreamerClient(
 			try {
 				const result = await runPromise;
 				const budget = result.meta?.tokenBudget as
-					| { spent?: number; finalizeFired?: boolean }
+					| DreamTokenBudgetState
 					| undefined;
+				if (budget) childBudgetStates.set(sessionId, budget);
 				const budgetTask = accountingTaskFromTitle(dreamSession.title);
 				if (budgetTask && budget && typeof budget.spent === "number") {
 					const prior = budgetStates.get(budgetTask);
@@ -694,18 +710,27 @@ function createPiDreamerClient(
 		},
 		delete: async (args: SessionDeleteArgs) => {
 			sessionsById.delete(args.path.id);
+			childBudgetStates.delete(args.path.id);
 			return {};
 		},
 	};
 
 	return {
+		// Pi runs background tasks in --no-session subprocesses, so they never
+		// appear in the user's session list and need no parent to hide them.
+		backgroundSessionsAreHidden: true,
 		session,
 		readTokenBudget: (task: string) => budgetStates.get(task),
+		readChildTokenBudget: (sessionId: string) =>
+			childBudgetStates.get(sessionId),
 		resetDreamTokenBudget: (task: string) => budgetStates.delete(task),
 	} as unknown as DreamTimerClient & {
 		readTokenBudget: (
 			task: string,
 		) => { spent: number; finalizeFired: boolean } | undefined;
+		readChildTokenBudget: (
+			sessionId: string,
+		) => DreamTokenBudgetState | undefined;
 		resetDreamTokenBudget: (task: string) => void;
 	};
 }

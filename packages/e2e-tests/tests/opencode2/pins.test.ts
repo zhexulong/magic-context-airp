@@ -39,6 +39,28 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// `allow_home_project` setting at startup, so every project-identity caller
 			// honours it (86a598a3a5, "honor home project permission across identity
 			// callers"); also v1.
+			// It was re-minted again when the v1 entry's comment on the historian
+			// override fields began calling disallowed_tools a legacy no-op
+			// (878b65a3e3, "make historian agents tool-free across OpenCode and
+			// Pi"); a comment-only v1 change.
+			// It was re-minted again when the v1 `config` hook began denying
+			// ctx_memory and ctx_note to task child sessions through OpenCode 1's
+			// primary_tools list (528f693e84, "hide memory and note tools from
+			// OpenCode subagents"); OpenCode 2 filters them per request instead.
+			// Re-minted for the v95 merge (4ec6c1fc4a): ebd7052c03 changed the v1
+			// opener to openCurrentDatabase, so host paths cannot synchronously run
+			// migrations after async boot. This deliberate v1 safety change is not
+			// v2 loader leakage; the worker applies pending migrations off-thread.
+			// Re-minted when the v1 entry began checking the agent's checkout claim
+			// before Magic Context's first write for a session (62c040ad76, "gate every
+			// pre-turn Magic Context write on the checkout claim"); OpenCode 2 wires the
+			// same check through its own adapter, so this is a v1 change, not v2 leakage.
+			// Re-minted when that checkout-claim check was removed again: the claim is
+			// now checked only at session registration, reconnect and move, outside
+			// Magic Context's per-turn path. Also a v1 change, not v2 leakage.
+			// Re-minted when the v1 entry began passing the startup-only
+			// `smart_notes.enabled` switch to the dreamer runtime (7965fc9bf0, "add
+			// startup-only smart notes capability switch"); also a v1 change.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
@@ -48,4 +70,23 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			expected,
 		);
 	}
+});
+
+
+test("native session API release pins agree across CI, Docker and packages", () => {
+    const root = resolve(import.meta.dir, "../../../..");
+    const read = (path: string) => readFileSync(resolve(root, path), "utf8");
+    const plugin = JSON.parse(read("packages/plugin/package.json")).devDependencies;
+    const e2e = JSON.parse(read("packages/e2e-tests/package.json")).devDependencies;
+    for (const name of ["@opencode/cli", "@opencode/plugin", "@opencode/ai", "@opencode/client"]) {
+        expect(plugin[name], name).toBe("2.0.22");
+    }
+    for (const name of ["@opencode/ai", "@opencode/client"]) expect(e2e[name], name).toBe("2.0.22");
+    const ci = read(".github/workflows/ci.yml");
+    expect(ci).toContain("if (version !== 'opencode v2.0.22')");
+    expect(ci).not.toContain("OpenCode 2.0.15");
+    const docker = read("tests/docker/opencode2/Dockerfile");
+    for (const name of ["@opencode/cli", "@opencode/cli-linux-x64", "@opencode/client"]) {
+        expect(docker).toContain(`${name}@2.0.22`);
+    }
 });

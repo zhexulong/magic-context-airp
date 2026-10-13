@@ -1,9 +1,16 @@
 import {
+    type FrozenReasoningPart,
     MERGED_REASONING_PARTS_PREFIX,
     readFrozenMergedReasoningParts,
 } from "../../features/magic-context/merged-reasoning-decisions";
 import { isRecord } from "../../shared/record-type-guard";
-import { isSentinel, makeSentinel, makeWholeMessageSentinel } from "./sentinel";
+import {
+    isSentinel,
+    makeSentinel,
+    makeWholeMessageSentinel,
+    modelAcceptsEmptyContent,
+    neutralizeWholeMessage,
+} from "./sentinel";
 import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 
@@ -51,12 +58,15 @@ function isSystemInjectedText(text: string): boolean {
  * length so proxy providers that hash message-array structure see a stable
  * prefix. For Anthropic/Bedrock, the provider's upstream filter drops
  * empty-content messages on the wire anyway — same effective behavior, no
- * mid-pipeline array mutation.
+ * mid-pipeline array mutation. An OpenCode 2 `system` row on canonical
+ * Anthropic is left with no parts instead and omitted when the payload goes
+ * back to the host (see `wholeMessageNeutralizationRemoves`).
  */
 export function stripSystemInjectedMessages(
     messages: MessageLike[],
     protectedTailStart: number,
     providerID?: string,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
 ): { stripped: number; sentineledIds: string[] } {
     let stripped = 0;
     const sentineledIds: string[] = [];
@@ -109,8 +119,8 @@ export function stripSystemInjectedMessages(
         }
 
         if (hasContentPart && allContentIsSystemInjection) {
-            msg.parts.length = 0;
-            msg.parts.push(makeWholeMessageSentinel(providerID));
+            onFirstApplication?.(msg, 0);
+            neutralizeWholeMessage(msg, providerID);
             stripped++;
             if (typeof msg.info.id === "string") sentineledIds.push(msg.info.id);
         }
@@ -163,13 +173,15 @@ const METADATA_PART_TYPES = new Set([
  * length so proxy providers that hash message-array structure see a stable
  * prefix. For Anthropic/Bedrock, OpenCode's upstream filter drops empty
  * content messages on the wire — same effective behavior, no mid-pipeline
- * array mutation.
+ * array mutation. An OpenCode 2 `system` row on canonical Anthropic is left
+ * with no parts instead (see `wholeMessageNeutralizationRemoves`).
  *
  * Returns both count and sentineled IDs so callers can persist-and-replay.
  */
 export function stripDroppedPlaceholderMessages(
     messages: MessageLike[],
     providerID?: string,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
 ): {
     stripped: number;
     sentineledIds: string[];
@@ -227,8 +239,8 @@ export function stripDroppedPlaceholderMessages(
         }
 
         if (hasContentPart && !hasNonDroppedContent) {
-            msg.parts.length = 0;
-            msg.parts.push(makeWholeMessageSentinel(providerID));
+            onFirstApplication?.(msg, 0);
+            neutralizeWholeMessage(msg, providerID);
             stripped++;
             if (typeof msg.info.id === "string") sentineledIds.push(msg.info.id);
         }
@@ -259,6 +271,9 @@ export function replayClearedReasoning(
         if (!parts) continue;
 
         for (const tp of parts) {
+            // A drop may already have rewritten this part to an empty text
+            // sentinel; it is no longer reasoning and must stay empty.
+            if (tp.type === "text") continue;
             if (tp.thinking !== undefined && tp.thinking !== "[cleared]") {
                 tp.thinking = "[cleared]";
                 cleared++;
@@ -308,12 +323,9 @@ export function clearOldReasoning(
     messages: MessageLike[],
     reasoningByMessage: Map<MessageLike, ThinkingLikePart[]>,
     messageTagNumbers: Map<MessageLike, number>,
-    clearReasoningAge: number,
+    cutoff: number,
 ): number {
-    const maxTag = findMaxTag(messageTagNumbers);
-    if (maxTag === 0) return 0;
-
-    const ageCutoff = maxTag - clearReasoningAge;
+    const ageCutoff = cutoff;
     let cleared = 0;
 
     for (const message of messages) {
@@ -324,6 +336,9 @@ export function clearOldReasoning(
         if (!parts) continue;
 
         for (const tp of parts) {
+            // A drop may already have rewritten this part to an empty text
+            // sentinel; it is no longer reasoning and must stay empty.
+            if (tp.type === "text") continue;
             if (tp.thinking !== undefined && tp.thinking !== "[cleared]") {
                 tp.thinking = "[cleared]";
                 cleared++;
@@ -336,14 +351,6 @@ export function clearOldReasoning(
     }
 
     return cleared;
-}
-
-function findMaxTag(messageTagNumbers: Map<MessageLike, number>): number {
-    let max = 0;
-    for (const tag of messageTagNumbers.values()) {
-        if (tag > max) max = tag;
-    }
-    return max;
 }
 
 const CLEARED_REASONING_TYPES = new Set(["thinking", "reasoning"]);
@@ -394,12 +401,9 @@ const INLINE_THINKING_PATTERN = /<(?:thinking|think)>[\s\S]*?<\/(?:thinking|thin
 export function stripInlineThinking(
     messages: MessageLike[],
     messageTagNumbers: Map<MessageLike, number>,
-    clearReasoningAge: number,
+    cutoff: number,
 ): number {
-    const maxTag = findMaxTag(messageTagNumbers);
-    if (maxTag === 0) return 0;
-
-    const ageCutoff = maxTag - clearReasoningAge;
+    const ageCutoff = cutoff;
     let stripped = 0;
 
     for (const message of messages) {
@@ -492,6 +496,7 @@ function planMergedAssistantReasoningStrip(
     messages: MessageLike[],
     mutationExemptMessage?: MessageLike,
     frozenMessageIds?: ReadonlySet<string>,
+    protectedMessages?: ReadonlySet<MessageLike>,
 ): MergedReasoningStripPlan[] {
     const plan: MergedReasoningStripPlan[] = [];
     let prevRole: string | undefined;
@@ -509,7 +514,11 @@ function planMergedAssistantReasoningStrip(
         const firstInRun = prevRole !== "assistant";
         if (firstInRun) keptReasoningInRun = false;
 
-        if (message === mutationExemptMessage || frozenMessageIds?.has(message.info.id ?? "")) {
+        if (
+            protectedMessages?.has(message) ||
+            message === mutationExemptMessage ||
+            frozenMessageIds?.has(message.info.id ?? "")
+        ) {
             prevRole = role;
             continue;
         }
@@ -782,7 +791,7 @@ export function applyFrozenTrailingBlankDecisions(
 export function findMergedReasoningStripCandidateIds(
     messages: MessageLike[],
     providerID?: string,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: { mutationExemptMessage?: MessageLike; protectedMessages?: ReadonlySet<MessageLike> },
 ): string[] {
     if (providerID !== "anthropic") return [];
 
@@ -846,18 +855,28 @@ export function stripReasoningFromAssistantIds(
     messages: MessageLike[],
     providerID: string | undefined,
     messageIds: ReadonlySet<string>,
+    protectedMessages?: ReadonlySet<MessageLike>,
 ): number {
-    if (providerID !== "anthropic" || messageIds.size === 0) return 0;
+    if (messageIds.size === 0) return 0;
+    const emptySentinels = modelAcceptsEmptyContent(providerID);
     let stripped = 0;
     for (const message of messages) {
+        if (protectedMessages?.has(message)) continue;
         const id = message.info.id;
         if (typeof id !== "string" || !messageIds.has(id)) continue;
         for (let index = 0; index < message.parts.length; index += 1) {
             const part = message.parts[index];
             if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
-            message.parts[index] = makeSentinel(part);
+            if (emptySentinels) {
+                message.parts[index] = makeSentinel(part);
+            } else {
+                // Cloud and custom adapters may forward empty blocks instead of filtering them.
+                message.parts.splice(index, 1);
+                index -= 1;
+            }
             stripped += 1;
         }
+        if (message.parts.length === 0) message.parts.push(makeWholeMessageSentinel(providerID));
     }
     return stripped;
 }
@@ -870,7 +889,7 @@ export function findMergedReasoningStripDecisions(
     messages: MessageLike[],
     providerID: string | undefined,
     frozenIds: ReadonlySet<string>,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: { mutationExemptMessage?: MessageLike; protectedMessages?: ReadonlySet<MessageLike> },
 ): string[] {
     if (providerID !== "anthropic") return [];
     const frozenParts = readFrozenMergedReasoningParts(frozenIds);
@@ -879,6 +898,7 @@ export function findMergedReasoningStripDecisions(
         messages,
         options?.mutationExemptMessage,
         new Set(frozenParts.keys()),
+        options?.protectedMessages,
     )) {
         const id = entry.message.info.id;
         if (typeof id !== "string" || id.length === 0 || frozenParts.has(id)) continue;
@@ -897,6 +917,16 @@ export function stripReasoningFromMergedAssistants(
     options?: {
         mutationExemptMessage?: MessageLike;
         frozenMessageIds?: ReadonlySet<string>;
+        /**
+         * `readFrozenMergedReasoningParts(frozenMessageIds)` and its key set,
+         * when the caller already decoded them. A caller that strips one message
+         * at a time passes these so each call does not decode every frozen
+         * decision again. They must describe the same `frozenMessageIds`.
+         */
+        frozenParts?: ReadonlyMap<string, readonly FrozenReasoningPart[]>;
+        frozenPartMessageIds?: ReadonlySet<string>;
+        protectedMessages?: ReadonlySet<MessageLike>;
+        restoreMessages?: ReadonlySet<MessageLike>;
     },
 ): number {
     // Anthropic-only workaround for @ai-sdk/anthropic's groupIntoBlocks
@@ -908,14 +938,15 @@ export function stripReasoningFromMergedAssistants(
     if (providerID !== "anthropic") return 0;
 
     let stripped = 0;
-    const frozenParts = readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
+    const frozenParts =
+        options?.frozenParts ??
+        readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
     // Replay the exact persisted selection without reconsidering adjacency.
     // Dropping empty preceding assistants can make a stripped thinking part
     // look eligible to keep on the next request. Only legacy bare ids still
     // use that layout-dependent rule, preserving their pre-deployment bytes.
     for (const message of messages) {
-        if (message === options?.mutationExemptMessage || message.info.role !== "assistant")
-            continue;
+        if (message.info.role !== "assistant" || options?.restoreMessages?.has(message)) continue;
         const parts = frozenParts.get(message.info.id ?? "");
         if (!parts) continue;
         for (let index = 0; index < message.parts.length; index += 1) {
@@ -927,10 +958,15 @@ export function stripReasoningFromMergedAssistants(
             stripped++;
         }
     }
+    // Bare legacy ids lack exact part evidence. Replay the established layout
+    // rule rather than first-stripping a previously kept sibling on a defer.
+    // Active-turn protection applies to first selection, not frozen replay.
+    // An anchored recovery may explicitly retain the rejected turn's originals.
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,
-        new Set(frozenParts.keys()),
+        options?.frozenPartMessageIds ?? new Set(frozenParts.keys()),
+        options?.frozenMessageIds ? options.restoreMessages : options?.protectedMessages,
     )) {
         if (options?.frozenMessageIds) {
             const id = entry.message.info.id;
@@ -983,6 +1019,8 @@ export function stripProcessedImages(
         detect: boolean;
         watermark: number;
         messageTagNumbers: Map<MessageLike, number>;
+        /** Reports only first strips, never restoring an already frozen image. */
+        onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     },
 ): StripProcessedImagesResult {
     const { detect, watermark, messageTagNumbers } = options;
@@ -1026,6 +1064,7 @@ export function stripProcessedImages(
                 part.url.startsWith("data:") &&
                 part.url.length > 200
             ) {
+                if (isNewDetection) options.onFirstApplication?.(msg, j);
                 msg.parts[j] = makeSentinel(part);
                 stripped++;
                 touchedThisMsg = true;

@@ -1,20 +1,26 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { v2NonNarrativeStoredGapRanges } from "./compartment-runner-incremental";
 import { validateHistorianOutput } from "./compartment-runner-validation";
 import {
+    cleanUserText,
     getProtectedTailStartOrdinal,
+    getRawSessionMessageCount,
     getRawSessionMessageIdsThrough,
+    hasRawMessageProvider,
     primeTailRawMessageCache,
     readRawSessionMessageRange,
     readRawSessionMessages,
     readSessionChunk,
+    setBoundedRawMessageProvider,
+    setRawMessageProvider,
     withRawMessageProvider,
     withRawSessionMessageCache,
 } from "./read-session-chunk";
@@ -37,7 +43,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -179,6 +185,135 @@ function appendOpenCodeMessage(
         closeQuietly(db);
     }
 }
+
+describe("raw message provider lifecycle", () => {
+    const provider = { readMessages: () => [], getMessageCount: () => 7 };
+
+    it("keeps the outer provider after nested synchronous return and throw", () => {
+        const sessionId = "provider-nested-sync";
+        const cleanup = setRawMessageProvider(sessionId, provider);
+        try {
+            expect(withRawMessageProvider(sessionId, provider, () => 42)).toBe(42);
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+            expect(() =>
+                withRawMessageProvider(sessionId, provider, () => {
+                    throw new Error("nested failure");
+                }),
+            ).toThrow("nested failure");
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+        } finally {
+            cleanup();
+        }
+        expect(hasRawMessageProvider(sessionId)).toBe(false);
+    });
+
+    it("keeps the outer provider after nested async settlement and rejection", async () => {
+        const sessionId = "provider-nested-async";
+        await withRawMessageProvider(sessionId, provider, async () => {
+            await withRawMessageProvider(sessionId, provider, async () => {
+                await Promise.resolve();
+                expect(getRawSessionMessageCount(sessionId)).toBe(7);
+            });
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+            await expect(
+                withRawMessageProvider(sessionId, provider, async () => {
+                    await Promise.resolve();
+                    throw new Error("nested rejection");
+                }),
+            ).rejects.toThrow("nested rejection");
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+        });
+        expect(hasRawMessageProvider(sessionId)).toBe(false);
+    });
+
+    it("keeps a shared registration until every scope cleans up, exactly once", () => {
+        const sessionId = "provider-shared-cleanup";
+        const outerCleanup = setRawMessageProvider(sessionId, provider);
+        const innerCleanup = setRawMessageProvider(sessionId, provider);
+        try {
+            outerCleanup();
+            outerCleanup();
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+        } finally {
+            innerCleanup();
+            outerCleanup();
+        }
+        expect(hasRawMessageProvider(sessionId)).toBe(false);
+    });
+
+    it.each([
+        "old-first",
+        "new-first",
+    ])("never overwrites or restores a replaced provider (%s cleanup)", (order) => {
+        const sessionId = `provider-replaced-${order}`;
+        const oldCleanup = setRawMessageProvider(sessionId, provider);
+        const newCleanup = setRawMessageProvider(sessionId, {
+            readMessages: () => [],
+            getMessageCount: () => 11,
+        });
+        try {
+            if (order === "old-first") {
+                oldCleanup();
+                expect(getRawSessionMessageCount(sessionId)).toBe(11);
+                newCleanup();
+            } else {
+                newCleanup();
+                expect(hasRawMessageProvider(sessionId)).toBe(false);
+                oldCleanup();
+            }
+            expect(hasRawMessageProvider(sessionId)).toBe(false);
+        } finally {
+            newCleanup();
+            oldCleanup();
+        }
+    });
+
+    it("does not let an old scope remove a later registration of the same object", () => {
+        const sessionId = "provider-reregistered";
+        const oldCleanup = setRawMessageProvider(sessionId, provider);
+        const replacementCleanup = setRawMessageProvider(sessionId, { readMessages: () => [] });
+        const latestCleanup = setRawMessageProvider(sessionId, provider);
+        try {
+            oldCleanup();
+            replacementCleanup();
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+        } finally {
+            latestCleanup();
+            replacementCleanup();
+            oldCleanup();
+        }
+        expect(hasRawMessageProvider(sessionId)).toBe(false);
+    });
+
+    it("shares one registration when the same bounded provider is registered twice", () => {
+        const sessionId = "bounded-provider-shared";
+        const { readMessages: _full, ...bounded } = provider;
+        const outerCleanup = setBoundedRawMessageProvider(sessionId, bounded);
+        const innerCleanup = setBoundedRawMessageProvider(sessionId, bounded);
+        try {
+            innerCleanup();
+            expect(getRawSessionMessageCount(sessionId)).toBe(7);
+        } finally {
+            innerCleanup();
+            outerCleanup();
+        }
+        expect(hasRawMessageProvider(sessionId)).toBe(false);
+    });
+
+    it("owns registrations separately for each session", () => {
+        const firstCleanup = setRawMessageProvider("provider-session-one", provider);
+        const secondCleanup = setRawMessageProvider("provider-session-two", provider);
+        try {
+            firstCleanup();
+            expect(hasRawMessageProvider("provider-session-one")).toBe(false);
+            expect(getRawSessionMessageCount("provider-session-two")).toBe(7);
+        } finally {
+            secondCleanup();
+            firstCleanup();
+        }
+        expect(hasRawMessageProvider("provider-session-two")).toBe(false);
+    });
+});
 
 describe("readSessionChunk", () => {
     it("reads raw OpenCode messages with stable ordinals and ids", () => {
@@ -640,5 +775,44 @@ describe("readSessionChunk", () => {
             expect(chunk.text).not.toContain("second content");
             expect(chunk.hasMore).toBe(true);
         });
+    });
+});
+
+/** Byte-exact shape OpenCode 1.17.8 and older gave a user message sent mid-run. */
+function steeringWrapped(userText: string): string {
+    return `<system-reminder>\nThe user sent the following message:\n${userText}\n\nPlease address this message and continue with your tasks.\n</system-reminder>`;
+}
+
+describe("the historian chunk reader keeps OpenCode's mid-run steering wrapper", () => {
+    // Same cases as the Rust historian chunk reader's test of clean_user_text.
+    it("keeps the wrapper verbatim and strips only reminders around it", () => {
+        const wrapped = steeringWrapped("use staging");
+        expect(cleanUserText(wrapped)).toBe(wrapped);
+        const nested = steeringWrapped("quote <system-reminder>x</system-reminder> then go");
+        expect(cleanUserText(nested)).toBe(nested);
+        const mixed = `${wrapped}\n\n<system-reminder>\nPlan mode is active.\n</system-reminder>`;
+        expect(cleanUserText(mixed)).toBe(wrapped);
+        expect(cleanUserText("<system-reminder>internal</system-reminder>")).toBe("");
+        expect(cleanUserText("<!-- OMO_INTERNAL_INITIATOR -->hello")).toBe("hello");
+    });
+
+    it("reads a steering-wrapped user message as the user's words, not noise", () => {
+        useTempDataHome("read-session-steering-");
+        createOpenCodeDbWithMessages("ses-steering", [
+            {
+                id: "m-1",
+                role: "user",
+                part: {
+                    type: "text",
+                    text: steeringWrapped("Stop and use the staging database instead."),
+                },
+            },
+            { id: "m-2", role: "assistant", part: { type: "text", text: "switching" } },
+        ]);
+
+        const chunk = readSessionChunk("ses-steering", 10_000, 1);
+
+        expect(chunk.text).toContain("[1] U:");
+        expect(chunk.text).toContain("Stop and use the staging database instead.");
     });
 });

@@ -53,13 +53,14 @@ function request(
     timestampMs: number,
     verdict: AnalyzedCacheRequest["verdict"] = "BUST",
     divergenceClass = "unaccounted_rewrite",
+    rewrittenTokens = verdict === "BUST" ? 123 : undefined,
 ): AnalyzedCacheRequest {
     return {
         session: "ses_sentinel",
         at: new Date(timestampMs).toISOString(),
         timestampMs,
         verdict,
-        rewrittenTokens: verdict === "BUST" ? 123 : undefined,
+        rewrittenTokens,
         divergenceClass:
             verdict === "BUST" || divergenceClass === "usage_missing"
                 ? (divergenceClass as never)
@@ -492,6 +493,75 @@ describe("cache-bust windows and ids", () => {
         ]);
     });
 
+    test("does not alert on a zero-rewrite tail shrink but still alerts on a 1,000-token tail rewrite", async () => {
+        const directory = temporaryDirectory("cache-bust-tail-shrink-alerts-");
+        const zeroState = join(directory, "zero-state.json");
+        const zeroLogs: string[] = [];
+        const zeroStdout: string[] = [];
+        const zeroCalls: CacheBustEvent[] = [];
+        const zero = await runSentinelOnce(
+            { ...options(zeroState), send: true },
+            {
+                now: () => 2_000,
+                listActiveSessions: () => [{ ...activeSession, activityMs: 2_000 }],
+                analyzeSession: async () => ({
+                    requests: [request(1_800, "BUST", "tail_shrink_no_rewrite", 0)],
+                    highWaterMarkMs: 1_800,
+                    directory: "/tmp/tail-shrink",
+                }),
+                transport: {
+                    async record(event) {
+                        zeroCalls.push(event);
+                        return { disposition: "delivered", committed_order: 1 };
+                    },
+                },
+                stdout: (line) => zeroStdout.push(line),
+                stderr: (line) => zeroLogs.push(line),
+            },
+        );
+
+        expect(zeroCalls).toEqual([]);
+        expect(zeroStdout).toEqual([]);
+        expect(zero).toMatchObject({ accountedWindows: 1, unaccountedWindows: 0 });
+        expect(zeroLogs.map((line) => JSON.parse(line))).toContainEqual(
+            expect.objectContaining({
+                kind: "cache_bust_sentinel_observation",
+                session_id: "ses_sentinel",
+                divergence_class: "tail_shrink_no_rewrite",
+                rewritten_tokens: 0,
+            }),
+        );
+
+        const rewriteState = join(directory, "rewrite-state.json");
+        const rewriteCalls: CacheBustEvent[] = [];
+        const rewrite = await runSentinelOnce(
+            { ...options(rewriteState), send: true },
+            {
+                now: () => 2_000,
+                listActiveSessions: () => [{ ...activeSession, activityMs: 2_000 }],
+                analyzeSession: async () => ({
+                    requests: [request(1_800, "BUST", "unaccounted_tail_rewrite", 1_000)],
+                    highWaterMarkMs: 1_800,
+                    directory: "/tmp/tail-rewrite",
+                }),
+                transport: {
+                    async record(event) {
+                        rewriteCalls.push(event);
+                        return { disposition: "delivered", committed_order: 2 };
+                    },
+                },
+                stdout: () => {},
+                stderr: () => {},
+            },
+        );
+
+        expect(rewriteCalls).toHaveLength(1);
+        expect(rewriteCalls[0]?.payload).toMatchObject({
+            divergence_class: "unaccounted_tail_rewrite",
+            rewritten_tokens: 1_000,
+        });
+        expect(rewrite).toMatchObject({ unaccountedWindows: 1, accepted: 1 });
+    });
     test("does not emit a wake for a provider full miss", async () => {
         const directory = temporaryDirectory("cache-bust-provider-full-miss-");
         const events: string[] = [];
@@ -631,6 +701,77 @@ describe("MC decision store joins", () => {
             droppedCount: 2,
         });
     });
+
+    // The pass-trace half of store migration 63, exactly as ck-mc runs it.
+    const migration63PassTrace = readFileSync(
+        join(
+            import.meta.dir,
+            "../../../crates/mc-store/src/migrations/store_063_pass_trace_ring.sql",
+        ),
+        "utf8",
+    );
+
+    test("reads rust scheduler history from migration 63 ring rows", () => {
+        const directory = temporaryDirectory("cache-bust-sentinel-ring-");
+        const storePath = join(directory, "store.db");
+        const store = new Database(storePath);
+        store.exec(`
+            CREATE TABLE mc_pass_trace (
+                session_id TEXT PRIMARY KEY,
+                scheduler_history TEXT NOT NULL DEFAULT '[]',
+                scheduler_interesting_history TEXT NOT NULL DEFAULT '[]'
+            );
+        `);
+        store.query("INSERT INTO mc_pass_trace VALUES (?, ?, ?)").run(
+            "ses_sentinel",
+            JSON.stringify([
+                {
+                    timestamp_ms: 20_200,
+                    request_observed_at_ms: 20_100,
+                    scheduler_decision: "Execute",
+                    canonical_decision: "execute",
+                    applied_drop_count: 2,
+                },
+            ]),
+            "[]",
+        );
+        store.exec(migration63PassTrace);
+        const columns = (
+            store.query("PRAGMA table_info(mc_pass_trace)").all() as Array<{ name: string }>
+        ).map((row) => row.name);
+        expect(columns).not.toContain("scheduler_history");
+        store.close(false);
+
+        const loaded = loadSessionDecisions(activeSession, {
+            ...options(join(directory, "state.json")),
+            databasePath: join(directory, "context.db"),
+            rustStorePath: storePath,
+        });
+
+        expect(nearestCacheBustDecision(loaded, 20_100)).toMatchObject({
+            canonicalDecision: "execute",
+            droppedCount: 2,
+        });
+    });
+
+    test("reports an error, not zero rows, for a trace row with no readable history", () => {
+        const directory = temporaryDirectory("cache-bust-sentinel-no-history-");
+        const storePath = join(directory, "store.db");
+        const store = new Database(storePath);
+        store.exec(`
+            CREATE TABLE mc_pass_trace (session_id TEXT PRIMARY KEY, receive_count INTEGER);
+            INSERT INTO mc_pass_trace VALUES ('ses_sentinel', 3);
+        `);
+        store.close(false);
+
+        expect(() =>
+            loadSessionDecisions(activeSession, {
+                ...options(join(directory, "state.json")),
+                databasePath: join(directory, "context.db"),
+                rustStorePath: storePath,
+            }),
+        ).toThrow(CacheBustSentinelInputError);
+    });
 });
 
 describe("agent.deliver contract", () => {
@@ -694,6 +835,7 @@ describe("agent.deliver contract", () => {
                 from_session_id: "health-sentinel-mc" as const,
                 from_harness: "magic-context" as const,
                 content,
+                one_way: true as const,
             },
             urgency: "high" as const,
         };
@@ -730,6 +872,7 @@ describe("agent.deliver contract", () => {
             "from_session_id",
             "from_harness",
             "content",
+            "one_way",
         ]);
         expect(await transport.record(event)).toEqual({
             result: { disposition: "delivered", committed_order: 41 },

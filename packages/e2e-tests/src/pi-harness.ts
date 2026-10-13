@@ -33,6 +33,7 @@ export interface PiTestHarnessOptions {
   modelContextLimit?: number;
   mockDefault?: MockResponse;
   extensionsBeforeMagicContext?: string[];
+  extensionsAfterMagicContext?: string[];
   /** Share the cortexkit DB with another harness. */
   sharedDataDir?: string;
   /** Optional working directory override before the persistent Pi process starts. */
@@ -239,6 +240,8 @@ export class PiTestHarness implements PiHostHarness {
       magicContextConfig: options.magicContextConfig,
       piSettingsExtra: options.piSettingsExtra,
       modelContextLimit: options.modelContextLimit,
+      extensionsBeforeMagicContext: options.extensionsBeforeMagicContext,
+      extensionsAfterMagicContext: options.extensionsAfterMagicContext,
     });
 
     try {

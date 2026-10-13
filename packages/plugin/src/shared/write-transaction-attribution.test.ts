@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 const repoRoot = resolve(import.meta.dir, "../../../../");
 const beginImmediate = /\b(?:[A-Za-z_$][\w$]*\.)?exec\("BEGIN IMMEDIATE"\)/g;
@@ -32,10 +33,7 @@ const fencedSources: Array<{ path: string; sites: string[]; reporterCalls?: stri
             "storage_meta_wrapup_release",
         ],
     },
-    {
-        path: "packages/plugin/src/features/magic-context/context-authority.ts",
-        sites: ["authority_marker_capture", "authority_capture_check"],
-    },
+
     {
         path: "packages/plugin/src/features/magic-context/compartment-storage.ts",
         sites: ["compartment_state_replace", "recomp_staging_promote"],
@@ -53,7 +51,7 @@ const fencedSources: Array<{ path: string; sites: string[]; reporterCalls?: stri
         // directly), so it reports through the injected reporter instead.
         path: "packages/plugin/src/shared/sqlite.ts",
         sites: ["async_acquisition_dynamic_site", "privileged_writer"],
-        reporterCalls: ["console.warn(", "reportSlowPrivilegedWrite?.("],
+        reporterCalls: ["reportSqliteDiagnostic(", "reportSlowPrivilegedWrite?.("],
     },
     {
         path: "packages/plugin/src/features/magic-context/git-commits/sweep-coordinator.ts",
@@ -89,11 +87,15 @@ const fencedSources: Array<{ path: string; sites: string[]; reporterCalls?: stri
     },
     {
         path: "packages/pi-plugin/src/context-handler.ts",
-        sites: ["pi_compaction_queue"],
+        sites: ["pi_fallback_adoption"],
     },
 ];
 
 const nonBeginCoveredSites: Array<{ path: string; site: string }> = [
+    {
+        path: "packages/plugin/src/hooks/magic-context/lkg-persist.ts",
+        site: "lkg_stale_gc",
+    },
     {
         path: "packages/plugin/src/hooks/magic-context/compartment-runner-incremental.ts",
         site: "historian-publish",
@@ -147,7 +149,7 @@ const newlyCoveredSites = [
     "pi_materialize_cache",
     "pi_soft_refresh_cache",
     "pi_historian_publish",
-    "pi_compaction_queue",
+    "pi_fallback_adoption",
     "note_nudge_trigger",
     "user_memory_candidate_insert",
 ] as const;
@@ -180,7 +182,9 @@ function assertCoveredBeginImmediate(
 
 describe("write transaction attribution fences", () => {
     beforeAll(async () => {
-        scenarioRoot = mkdtempSync(join(tmpdir(), "magic-context-write-attribution-"));
+        scenarioRoot = createTestTempDirFromPath(
+            join(tmpdir(), "magic-context-write-attribution-"),
+        );
         scenarioLogPath = join(scenarioRoot, "transactions.log");
         const scenario = `
             const timing = await import(${JSON.stringify(new URL("./write-transaction-timing.ts", import.meta.url).href)});

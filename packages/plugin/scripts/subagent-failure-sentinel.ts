@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { SubcClient } from "@cortexkit/subc-client";
-
+import { loadPluginConfig } from "../src/config";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../src/shared/storage-permissions";
 import { parseAgentDeliverReply } from "./cache-bust-sentinel";
 
 const HOUR = 3_600_000;
@@ -51,7 +55,10 @@ export type FailureSentinelOptions = {
 export function normalizeError(error: string | null): string {
     return (error ?? "(no error)")
         .replace(/(?:[a-zA-Z]:)?(?:\/[\w.~-]+){2,}/g, "<path>")
-        .replace(/\b(?:[a-f0-9]{8}-){4}[a-f0-9]{12}\b/gi, "<id>")
+        .replace(/\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b/gi, "<id>")
+        // Recorded errors are cut at a fixed length, which can split a UUID;
+        // the surviving prefix (8 hex digits plus partial groups) is still an id.
+        .replace(/\b[a-f0-9]{8}(?:-[a-f0-9]{1,12})+/gi, "<id>")
         .replace(/\b(?:0x[a-f0-9]+|[a-f0-9]{16,}|(?:session|task|run|agent|invocation|request|trace|job|msg|wi|ct)_[a-z0-9_-]+)\b/gi, "<id>")
         .replace(/\b\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|minutes?|mins?|hours?|hrs?)\b/gi, "<duration>")
         .replace(/\b\d+(?:\.\d+)?\b/g, "<number>")
@@ -76,10 +83,7 @@ function loadState(path: string, now: number): State {
 }
 
 function saveState(path: string, state: State): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function key(alert: Alert): string {
@@ -140,7 +144,9 @@ async function deliver(options: FailureSentinelOptions, content: string, id: str
         const reply = await client.call("prefrontal-core", "agent.deliver", {
             agent_id: AGENT_ID, delivery_id: id,
             body: { kind: "peer_message", from_agent: "mc-subagent-failure-sentinel",
-                from_session_id: "health-sentinel-mc", from_harness: "magic-context", content },
+                from_session_id: "health-sentinel-mc", from_harness: "magic-context", content,
+                // A script sends this, so replies cannot reach it.
+                one_way: true },
             urgency: "high",
         }, { identity: { project_root: process.cwd(), harness: "magic-context", session: "health-sentinel-mc" },
             consumerIdentity: null, timeoutMs: 15_000 });
@@ -217,6 +223,9 @@ function parseArgs(args: string[]): FailureSentinelOptions & { once: boolean; in
 
 if (import.meta.main) {
     try {
+        setStoragePrivatePermissionEnforcement(
+            loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+        );
         const options = parseArgs(process.argv.slice(2));
         do {
             await runFailureSentinel(options);

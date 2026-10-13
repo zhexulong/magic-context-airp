@@ -63,7 +63,85 @@ pub struct PiCompactionEntry {
 }
 
 type MetaCache = HashMap<PathBuf, (SystemTime, Arc<PiSessionMeta>)>;
-type DetailCache = HashMap<PathBuf, (SystemTime, Arc<PiSessionDetail>)>;
+
+/// Parsed session details kept between the dashboard's polls.
+///
+/// A detail includes every message of its parent chain, so an entry is fresh
+/// only while every file in that chain still has the modification time and
+/// length it had when parsed. Entries are bounded; past the limit the oldest
+/// insertion is dropped.
+#[derive(Default)]
+struct DetailCache {
+    entries: HashMap<PathBuf, CachedDetail>,
+    inserted: u64,
+}
+
+struct CachedDetail {
+    /// (file, stamp) for the session file and each ancestor it includes.
+    chain: Vec<(PathBuf, FileStamp)>,
+    detail: Arc<PiSessionDetail>,
+    inserted: u64,
+}
+
+#[derive(Default)]
+struct EntryTimeCache {
+    entries: HashMap<PathBuf, CachedEntryTimes>,
+    clock: u64,
+}
+
+struct CachedEntryTimes {
+    stamp: FileStamp,
+    /// `None` records a requested ID that was absent, avoiding another scan.
+    requested: HashMap<String, Option<i64>>,
+    last_used: u64,
+}
+
+/// A shared detail with the (file, stamp) pairs it was built from.
+type DetailWithChain = (Arc<PiSessionDetail>, Vec<(PathBuf, FileStamp)>);
+
+/// Details of sessions recently viewed. Each can hold tens of thousands of
+/// messages with their raw JSON, so only a handful are kept.
+const MAX_CACHED_DETAILS: usize = 16;
+const MAX_CACHED_ENTRY_TIME_FILES: usize = 8;
+const MAX_CACHED_ENTRY_TIME_IDS_PER_FILE: usize = 8_192;
+
+impl DetailCache {
+    fn fresh(&self, path: &Path) -> Option<DetailWithChain> {
+        let cached = self.entries.get(path)?;
+        cached
+            .chain
+            .iter()
+            .all(|(file, stamp)| file_stamp(file).as_ref() == Some(stamp))
+            .then(|| (Arc::clone(&cached.detail), cached.chain.clone()))
+    }
+
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        chain: Vec<(PathBuf, FileStamp)>,
+        detail: Arc<PiSessionDetail>,
+    ) {
+        if !self.entries.contains_key(&path) && self.entries.len() >= MAX_CACHED_DETAILS {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.inserted)
+                .map(|(path, _)| path.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.inserted += 1;
+        self.entries.insert(
+            path,
+            CachedDetail {
+                chain,
+                detail,
+                inserted: self.inserted,
+            },
+        );
+    }
+}
 
 #[derive(Clone)]
 struct OmpEnvironment {
@@ -81,6 +159,7 @@ struct OmpEnvironment {
 
 static META_CACHE: OnceLock<RwLock<MetaCache>> = OnceLock::new();
 static DETAIL_CACHE: OnceLock<RwLock<DetailCache>> = OnceLock::new();
+static ENTRY_TIME_CACHE: OnceLock<RwLock<EntryTimeCache>> = OnceLock::new();
 static TEST_ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
@@ -94,7 +173,11 @@ fn meta_cache() -> &'static RwLock<MetaCache> {
 }
 
 fn detail_cache() -> &'static RwLock<DetailCache> {
-    DETAIL_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+    DETAIL_CACHE.get_or_init(|| RwLock::new(DetailCache::default()))
+}
+
+fn entry_time_cache() -> &'static RwLock<EntryTimeCache> {
+    ENTRY_TIME_CACHE.get_or_init(|| RwLock::new(EntryTimeCache::default()))
 }
 
 fn test_root() -> &'static RwLock<Option<PathBuf>> {
@@ -538,21 +621,154 @@ pub fn read_pi_session_meta(path: &Path) -> Option<PiSessionMeta> {
     Some((*meta).clone())
 }
 
-pub fn read_pi_session_detail(path: &Path) -> Option<PiSessionDetail> {
-    let mtime = file_mtime(path)?;
-    if let Ok(cache) = detail_cache().read() {
-        if let Some((cached_mtime, cached)) = cache.get(path) {
-            if *cached_mtime == mtime {
-                return Some((**cached).clone());
+/// The session's messages, including its parent chain's. Shared rather than
+/// cloned: the dashboard polls this every second while a session is open, and
+/// a deep copy of a long session costs as much as re-reading it.
+pub fn read_pi_session_detail(path: &Path) -> Option<Arc<PiSessionDetail>> {
+    read_pi_session_detail_cached(detail_cache(), path, &mut HashSet::new())
+        .map(|(detail, _)| detail)
+}
+
+/// Resolve only the compartment boundary IDs for this file. Keeping requested
+/// IDs rather than every transcript ID bounds memory even for very long logs.
+pub fn read_pi_entry_times(path: &Path, message_ids: &[String]) -> HashMap<String, i64> {
+    let wanted: HashSet<String> = message_ids
+        .iter()
+        .filter(|id| !id.starts_with("pi-msg-"))
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let Some(stamp) = file_stamp(path) else {
+        return HashMap::new();
+    };
+
+    let mut unresolved = wanted.clone();
+    let mut resolved = HashMap::new();
+    if let Ok(mut cache) = entry_time_cache().write() {
+        cache.clock = cache.clock.wrapping_add(1);
+        let used = cache.clock;
+        if let Some(cached) = cache.entries.get_mut(path) {
+            if cached.stamp == stamp {
+                cached.last_used = used;
+                for id in &wanted {
+                    if let Some(timestamp) = cached.requested.get(id) {
+                        if let Some(timestamp) = timestamp {
+                            resolved.insert(id.clone(), *timestamp);
+                        }
+                        unresolved.remove(id);
+                    }
+                }
             }
         }
     }
-
-    let detail = Arc::new(read_pi_session_detail_uncached(path, &mut HashSet::new())?);
-    if let Ok(mut cache) = detail_cache().write() {
-        cache.insert(path.to_path_buf(), (mtime, Arc::clone(&detail)));
+    if unresolved.is_empty() {
+        return resolved;
     }
-    Some((*detail).clone())
+
+    let newly_resolved = read_requested_entry_times(path, &unresolved);
+    for (id, timestamp) in &newly_resolved {
+        resolved.insert(id.clone(), *timestamp);
+    }
+
+    // An unusually compartment-heavy session can exceed this cap. It is still
+    // fully resolved for this request, but not retained between page opens.
+    if wanted.len() > MAX_CACHED_ENTRY_TIME_IDS_PER_FILE {
+        return resolved;
+    }
+
+    if let Ok(mut cache) = entry_time_cache().write() {
+        let existing_ids = cache
+            .entries
+            .get(path)
+            .filter(|cached| cached.stamp == stamp)
+            .map_or(0, |cached| cached.requested.len());
+        if existing_ids + unresolved.len() > MAX_CACHED_ENTRY_TIME_IDS_PER_FILE {
+            return resolved;
+        }
+        cache.clock = cache.clock.wrapping_add(1);
+        let used = cache.clock;
+        if !cache
+            .entries
+            .get(path)
+            .is_some_and(|cached| cached.stamp == stamp)
+        {
+            if cache.entries.len() >= MAX_CACHED_ENTRY_TIME_FILES {
+                if let Some(oldest) = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_used)
+                    .map(|(path, _)| path.clone())
+                {
+                    cache.entries.remove(&oldest);
+                }
+            }
+            cache.entries.insert(
+                path.to_path_buf(),
+                CachedEntryTimes {
+                    stamp,
+                    requested: HashMap::new(),
+                    last_used: used,
+                },
+            );
+        }
+        if let Some(cached) = cache.entries.get_mut(path) {
+            cached.last_used = used;
+            for id in unresolved {
+                cached
+                    .requested
+                    .insert(id.clone(), newly_resolved.get(&id).copied());
+            }
+        }
+    }
+    resolved
+}
+
+fn read_requested_entry_times(path: &Path, wanted: &HashSet<String>) -> HashMap<String, i64> {
+    let Ok(file) = File::open(path) else {
+        return HashMap::new();
+    };
+    entry_times_from_reader(BufReader::new(file), wanted)
+}
+
+fn entry_times_from_reader<R: BufRead>(
+    reader: R,
+    wanted: &HashSet<String>,
+) -> HashMap<String, i64> {
+    let mut times = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Some(entry) = parse_json_line(&line) else {
+            continue;
+        };
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !wanted.contains(id) || id.starts_with("pi-msg-") {
+            continue;
+        }
+        if let Some(timestamp) = parse_ts_ms(entry.get("timestamp")) {
+            times.insert(id.to_string(), timestamp);
+        }
+    }
+    times
+}
+
+fn read_pi_session_detail_cached(
+    cache: &RwLock<DetailCache>,
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Option<DetailWithChain> {
+    if let Some(hit) = cache.read().ok().and_then(|cache| cache.fresh(path)) {
+        return Some(hit);
+    }
+
+    let (detail, chain) = read_pi_session_detail_uncached(cache, path, visited)?;
+    let detail = Arc::new(detail);
+    if let Ok(mut cache) = cache.write() {
+        cache.insert(path.to_path_buf(), chain.clone(), Arc::clone(&detail));
+    }
+    Some((detail, chain))
 }
 
 pub fn find_pi_session_path(session_id: &str) -> Option<PathBuf> {
@@ -667,15 +883,22 @@ fn read_pi_session_meta_uncached(path: &Path, mtime: SystemTime) -> Option<PiSes
     })
 }
 
+/// Parses one session file, taking its parent chain from the cache so an
+/// unchanged parent is not re-read each time the child grows. Returns the
+/// detail with the stamps of every file it was built from.
 fn read_pi_session_detail_uncached(
+    cache: &RwLock<DetailCache>,
     path: &Path,
     visited: &mut HashSet<PathBuf>,
-) -> Option<PiSessionDetail> {
+) -> Option<(PiSessionDetail, Vec<(PathBuf, FileStamp)>)> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canonical) {
         return None;
     }
 
+    // Stamp before reading: an append that lands mid-parse then leaves the
+    // entry looking stale, so the next poll parses again instead of missing it.
+    let mut chain = vec![(path.to_path_buf(), file_stamp(path)?)];
     let meta = read_pi_session_meta(path)?;
     let mut messages = Vec::new();
     let mut compaction_entries = Vec::new();
@@ -689,12 +912,17 @@ fn read_pi_session_detail_uncached(
                 .unwrap_or_else(|| Path::new(""))
                 .join(parent_path)
         };
-        if let Some(parent_detail) = read_pi_session_detail_uncached(&parent_path, visited) {
-            messages.extend(parent_detail.messages);
-            compaction_entries.extend(parent_detail.compaction_entries);
+        if let Some((parent_detail, parent_chain)) =
+            read_pi_session_detail_cached(cache, &parent_path, visited)
+        {
+            messages.extend(parent_detail.messages.iter().cloned());
+            compaction_entries.extend(parent_detail.compaction_entries.iter().cloned());
+            chain.extend(parent_chain);
         }
     }
 
+    #[cfg(test)]
+    DETAIL_FILE_PARSES.with(|count| count.set(count.get() + 1));
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     for (idx, line) in reader.lines().map_while(Result::ok).enumerate() {
@@ -751,11 +979,14 @@ fn read_pi_session_detail_uncached(
         }
     }
 
-    Some(PiSessionDetail {
-        meta,
-        messages,
-        compaction_entries,
-    })
+    Some((
+        PiSessionDetail {
+            meta,
+            messages,
+            compaction_entries,
+        },
+        chain,
+    ))
 }
 
 fn pi_message_from_entry(entry: Value) -> Option<PiMessage> {
@@ -900,6 +1131,22 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
+/// Modification time plus length. The length catches an append that lands
+/// within the file system's timestamp granularity.
+type FileStamp = (SystemTime, u64);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Session files parsed for details on this thread, so tests can tell a
+    /// cache hit from a re-read.
+    static DETAIL_FILE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn system_time_ms(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -971,7 +1218,7 @@ pub fn clear_caches_for_tests() {
         cache.clear();
     }
     if let Ok(mut cache) = detail_cache().write() {
-        cache.clear();
+        cache.entries.clear();
     }
     if let Ok(mut root) = test_root().write() {
         *root = None;
@@ -997,6 +1244,28 @@ mod tests {
         let path = session_dir.join("2026-01-01_test.jsonl");
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn jsonl_time_map_resolves_ids_and_ignores_missing_and_fallback_ids() {
+        let wanted = [
+            "message-1".to_string(),
+            "absent-message".to_string(),
+            "pi-msg-42".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let fixture = concat!(
+            "{\"type\":\"message\",\"id\":\"message-1\",\"timestamp\":1700000000123}\n",
+            "{\"type\":\"message\",\"timestamp\":1700000000456}\n",
+            "{\"type\":\"message\",\"id\":\"pi-msg-42\",\"timestamp\":1700000000789}\n"
+        );
+
+        let times = entry_times_from_reader(std::io::Cursor::new(fixture), &wanted);
+
+        assert_eq!(times.get("message-1"), Some(&1_700_000_000_123));
+        assert!(!times.contains_key("absent-message"));
+        assert!(!times.contains_key("pi-msg-42"));
     }
 
     #[test]
@@ -1062,6 +1331,9 @@ mod tests {
         };
         {
             let _guard = set_test_omp_environment(environment.clone());
+            let pi_session_root = home.path().join("isolated-pi-sessions");
+            fs::create_dir_all(&pi_session_root).unwrap();
+            set_test_root_for_tests(pi_session_root);
             assert!(scan_omp_session_dir().is_empty());
             assert!(scan_pi_compatible_session_dir()
                 .iter()
@@ -1183,6 +1455,98 @@ mod tests {
             resolve_omp_profile(Some("".into()), Some("work".into())),
             None
         );
+    }
+
+    fn detail_parses() -> usize {
+        DETAIL_FILE_PARSES.with(|count| count.get())
+    }
+
+    fn append_line(path: &Path, line: &str) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn message_line(id: &str) -> String {
+        format!(
+            r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{{"role":"user","content":"{id}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn detail_reads_reuse_an_unchanged_parent_and_notice_a_changed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent.jsonl");
+        fs::write(
+            &parent,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"session","id":"p","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj"}"#,
+                message_line("p1")
+            ),
+        )
+        .unwrap();
+        let child = dir.path().join("child.jsonl");
+        fs::write(
+            &child,
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"session","id":"c","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj","parentSession":"parent.jsonl"}"#,
+                message_line("c1")
+            ),
+        )
+        .unwrap();
+        let cache = RwLock::new(DetailCache::default());
+        let read = || {
+            let before = detail_parses();
+            let (detail, _) =
+                read_pi_session_detail_cached(&cache, &child, &mut HashSet::new()).unwrap();
+            let ids: Vec<String> = detail.messages.iter().map(|m| m.entry_id.clone()).collect();
+            (detail, ids, detail_parses() - before)
+        };
+
+        let (first, ids, parses) = read();
+        assert_eq!((ids, parses), (vec!["p1".to_string(), "c1".to_string()], 2));
+
+        // Nothing changed: the same shared detail, no file read.
+        let (second, _, parses) = read();
+        assert_eq!(parses, 0);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // The live child grows: only the child is read again.
+        append_line(&child, &message_line("c2"));
+        let (_, ids, parses) = read();
+        assert_eq!(parses, 1);
+        assert_eq!(ids, ["p1", "c1", "c2"]);
+
+        // The parent changes under an unchanged child: the child's detail
+        // includes the parent's messages, so it must not be served stale.
+        append_line(&parent, &message_line("p2"));
+        let (_, ids, parses) = read();
+        assert_eq!(parses, 2);
+        assert_eq!(ids, ["p1", "p2", "c1", "c2"]);
+    }
+
+    #[test]
+    fn the_detail_cache_keeps_a_bounded_number_of_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = RwLock::new(DetailCache::default());
+        let mut last = PathBuf::new();
+        for i in 0..MAX_CACHED_DETAILS + 4 {
+            last = dir.path().join(format!("s{i}.jsonl"));
+            fs::write(
+                &last,
+                format!(
+                    r#"{{"type":"session","id":"s{i}","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/proj"}}"#
+                ),
+            )
+            .unwrap();
+            read_pi_session_detail_cached(&cache, &last, &mut HashSet::new()).unwrap();
+        }
+        let cache = cache.read().unwrap();
+        assert_eq!(cache.entries.len(), MAX_CACHED_DETAILS);
+        assert!(cache.fresh(&last).is_some(), "the newest session was evicted");
+        assert!(cache.fresh(&dir.path().join("s0.jsonl")).is_none());
     }
 
     #[test]

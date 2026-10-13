@@ -5,6 +5,7 @@ import { promptSyncWithValidatedOutputRetry } from "./model-suggestion-retry";
 import {
     createPromptAsyncTransport,
     promptAsyncAndWaitForIdle,
+    recordPromptSessionError,
     supportsPromptAsync,
 } from "./prompt-async-transport";
 
@@ -190,6 +191,96 @@ describe("promptAsyncAndWaitForIdle", () => {
 });
 
 describe("dreamer budget on an async child", () => {
+    test("forwards Pi's finalized per-child budget before manifest application", async () => {
+        let ready = false;
+        const states: unknown[] = [];
+        const client = {
+            session: {
+                prompt: async () => {
+                    ready = true;
+                },
+            },
+            readChildTokenBudget: (id: string) => {
+                expect(id).toBe("ses-child");
+                expect(ready).toBe(true);
+                return { spent: 58, finalizeFired: true };
+            },
+        };
+        const transport = createPromptAsyncTransport(client as never, "ses-child", {
+            onBudgetUpdate: (state) => states.push(state),
+        });
+        expect(transport).toBeDefined();
+        await transport?.(request());
+        expect(states).toEqual([{ spent: 58, finalizeFired: true, sessionId: "ses-child" }]);
+    });
+    test("finalizes a zero-usage OpenCode mapper at 58 steps, before the hard ceiling", async () => {
+        const messages: unknown[] = [];
+        let sends = 0;
+        let aborted = false;
+        const states: unknown[] = [];
+        const client = {
+            session: {
+                messages: async () => ({ data: [...messages] }),
+                promptAsync: async (req: { body: { parts: unknown[] } }) => {
+                    sends++;
+                    if (sends === 2)
+                        expect(JSON.stringify(req.body.parts)).toContain("no more tool calls");
+                    messages.push({
+                        info: { id: `u${sends}`, role: "user" },
+                        parts: req.body.parts,
+                    });
+                },
+                abort: async () => {
+                    aborted = true;
+                },
+                status: async () => {
+                    if (sends === 1 && messages.length === 1) {
+                        for (let step = 1; step <= 58; step++)
+                            messages.push({
+                                info: {
+                                    id: `a${step}`,
+                                    role: "assistant",
+                                    finish: "tool-calls",
+                                    tokens: { input: 0 },
+                                    time: { completed: 1 },
+                                },
+                                parts: [{ type: "tool" }],
+                            });
+                    }
+                    if (sends === 2 && messages.length === 60)
+                        messages.push({
+                            info: {
+                                id: "final",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: 1 },
+                                time: { completed: 2 },
+                            },
+                            parts: [{ type: "text", text: "<verify/>" }],
+                        });
+                    return {
+                        data: sends === 1 && !aborted ? { "ses-child": { type: "busy" } } : {},
+                    };
+                },
+            },
+        };
+        await promptAsyncAndWaitForIdle(
+            client as never,
+            {
+                ...request(),
+                signal: AbortSignal.timeout(200),
+                body: { ...request().body, agent: "dreamer-memory-mapper" },
+            },
+            {
+                tokenBudget: 3_000_000,
+                pollIntervalMs: 1,
+                startGraceMs: 100,
+                onBudgetUpdate: (state) => states.push(state),
+            },
+        );
+        expect(sends).toBe(2);
+        expect(states).toContainEqual(expect.objectContaining({ finalizeFired: true, spent: 0 }));
+    });
     test("sums prompt usage across validation retries in the same child", async () => {
         const messages: unknown[] = [];
         const states: Array<{ spent: number }> = [];
@@ -281,80 +372,121 @@ describe("dreamer budget on an async child", () => {
         expect(host.promptAsync).toHaveBeenCalledTimes(1);
         expect(host.abort).not.toHaveBeenCalled();
     });
-    test("returns the final manifest after a soft nudge without changing the child agent", async () => {
-        const host = asyncHost({ plan: ["busy", "settle"] });
-        const messages: Array<{
-            info: {
-                id: string;
-                role: string;
-                tokens?: unknown;
-                time?: { completed: number };
-                finish?: string;
-            };
-            parts: unknown[];
-        }> = [];
-        let sends = 0;
-        const client = {
-            session: {
-                messages: async () => ({ data: [...messages] }),
-                promptAsync: mock(async (_req: unknown) => {
-                    sends++;
-                    messages.push({ info: { id: `u${sends}`, role: "user" }, parts: [] });
-                    return { data: undefined };
-                }),
-                abort: host.abort,
-                status: async () => {
-                    if (sends === 1 && !messages.some((m) => m.info.id === "a1")) {
-                        messages.push({
-                            info: {
-                                id: "a1",
-                                role: "assistant",
-                                tokens: { input: 81 },
-                                time: { completed: 1 },
-                                finish: "tool-calls",
-                            },
-                            parts: [],
-                        });
-                    }
-                    if (sends === 2 && !messages.some((m) => m.info.id === "a2")) {
-                        messages.push({
-                            info: {
-                                id: "a2",
-                                role: "assistant",
-                                tokens: { input: 1 },
-                                time: { completed: 2 },
-                                finish: "stop",
-                            },
-                            parts: [{ type: "text", text: "<mappings/>" }],
-                        });
-                    }
-                    return {
-                        data:
-                            sends === 1 && host.abort.mock.calls.length === 0
-                                ? { "ses-child": { type: "busy" } }
-                                : {},
-                    };
-                },
+    test("keeps a completed answer when a poll receives over-budget tool usage and completion together", async () => {
+        const host = asyncHost({ plan: ["settle"] });
+        const originalMessages = host.client.session.messages;
+        host.client.session.messages = mock(
+            async (...args: Parameters<typeof originalMessages>) => {
+                const response = await originalMessages(...args);
+                if (response.data.some((message) => message.info.role === "assistant")) {
+                    response.data.unshift({
+                        info: {
+                            id: "coarse-tool",
+                            role: "assistant",
+                            finish: "tool-calls",
+                            tokens: { input: 120 },
+                            time: { created: 1, completed: 2 },
+                        },
+                        parts: [],
+                    } as never);
+                }
+                return response;
             },
-        } as never;
-        const body = {
-            ...request(),
-            body: {
-                agent: "dreamer-memory-mapper",
-                system: "same system",
-                parts: [{ type: "text", text: "work" }],
-            },
-        };
-        await promptAsyncAndWaitForIdle(client, body, { pollIntervalMs: 1, tokenBudget: 100 });
-        const prompts = (client as { session: { promptAsync: ReturnType<typeof mock> } }).session
-            .promptAsync.mock.calls;
-        expect(prompts).toHaveLength(2);
-        expect((prompts[1]?.[0] as typeof body).body.agent).toBe(
-            (prompts[0]?.[0] as typeof body).body.agent,
         );
-        expect(messages.at(-1)?.parts).toEqual([{ type: "text", text: "<mappings/>" }]);
-        expect(host.abort).toHaveBeenCalledTimes(1);
+        await promptAsyncAndWaitForIdle(host.client as never, request(), {
+            pollIntervalMs: 1,
+            tokenBudget: 100,
+        });
+        expect(host.promptAsync).toHaveBeenCalledTimes(1);
+        expect(host.abort).not.toHaveBeenCalled();
     });
+
+    for (const finalUsage of [1, 25]) {
+        test(`returns the final manifest after a soft nudge with ${finalUsage} final tokens`, async () => {
+            const host = asyncHost({ plan: ["busy", "settle"] });
+            const messages: Array<{
+                info: {
+                    id: string;
+                    role: string;
+                    tokens?: unknown;
+                    time?: { completed: number };
+                    finish?: string;
+                };
+                parts: unknown[];
+            }> = [];
+            let sends = 0;
+            const client = {
+                session: {
+                    messages: async () => ({ data: [...messages] }),
+                    promptAsync: mock(async (_req: unknown) => {
+                        sends++;
+                        messages.push({ info: { id: `u${sends}`, role: "user" }, parts: [] });
+                        return { data: undefined };
+                    }),
+                    abort: async () => {
+                        recordPromptSessionError("ses-child", {
+                            name: "MessageAbortedError",
+                            data: { message: "Aborted" },
+                        });
+                        return host.abort();
+                    },
+                    status: async () => {
+                        if (sends === 1 && !messages.some((m) => m.info.id === "a1")) {
+                            messages.push({
+                                info: {
+                                    id: "a1",
+                                    role: "assistant",
+                                    tokens: { input: 81 },
+                                    time: { completed: 1 },
+                                    finish: "tool-calls",
+                                },
+                                parts: [],
+                            });
+                        }
+                        if (sends === 2 && !messages.some((m) => m.info.id === "a2")) {
+                            if (finalUsage === 25) {
+                                refuseBudgetedToolCall("ses-child");
+                                refuseBudgetedToolCall("ses-child");
+                            }
+                            messages.push({
+                                info: {
+                                    id: "a2",
+                                    role: "assistant",
+                                    tokens: { input: finalUsage },
+                                    time: { completed: 2 },
+                                    finish: "stop",
+                                },
+                                parts: [{ type: "text", text: "<mappings/>" }],
+                            });
+                        }
+                        return {
+                            data:
+                                sends === 1 && host.abort.mock.calls.length === 0
+                                    ? { "ses-child": { type: "busy" } }
+                                    : {},
+                        };
+                    },
+                },
+            } as never;
+            const body = {
+                ...request(),
+                body: {
+                    agent: "dreamer-memory-mapper",
+                    system: "same system",
+                    parts: [{ type: "text", text: "work" }],
+                },
+            };
+            await promptAsyncAndWaitForIdle(client, body, { pollIntervalMs: 1, tokenBudget: 100 });
+            const prompts = (client as { session: { promptAsync: ReturnType<typeof mock> } })
+                .session.promptAsync.mock.calls;
+            expect(prompts).toHaveLength(2);
+            expect((prompts[1]?.[0] as typeof body).body.agent).toBe(
+                (prompts[0]?.[0] as typeof body).body.agent,
+            );
+            expect(messages.at(-1)?.parts).toEqual([{ type: "text", text: "<mappings/>" }]);
+            expect(host.abort).toHaveBeenCalledTimes(1);
+        });
+    }
     test("finalizes once, refuses two tool calls, and keeps agent and tools unchanged", async () => {
         const messages: Array<{
             info: {
@@ -405,7 +537,7 @@ describe("dreamer budget on an async child", () => {
                                 role: "assistant",
                                 tokens: { input: 1, cache: { read: 1, write: 0 } },
                                 time: { completed: 2 },
-                                finish: "stop",
+                                finish: "tool-calls",
                             },
                             parts: [{ type: "text", text: "<manifest/>" }],
                         });
@@ -467,4 +599,49 @@ describe("prompt_async transport under the retry chain", () => {
         expect(host.prompt).not.toHaveBeenCalled();
         expect(host.abort).toHaveBeenCalledWith({ path: { id: "ses-child" } });
     });
+});
+
+test("an idle accepted user row is not a no-output completion after 30 seconds", async () => {
+    const host = asyncHost({ plan: ["idle-pending"] });
+    await expect(
+        promptAsyncAndWaitForIdle(host.client, request(), {
+            pollIntervalMs: 1,
+            startGraceMs: 20,
+        }),
+    ).rejects.toThrow("settled assistant");
+});
+
+test("an early child session error preserves DeepSeek's unsupported-model 400 without waiting for an assistant", async () => {
+    const host = asyncHost({ plan: ["idle-pending"] });
+    const message =
+        "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4-flash";
+    host.promptAsync.mockImplementation(async () => {
+        recordPromptSessionError("ses-child", {
+            name: "APIError",
+            data: { statusCode: 400, message },
+        });
+        recordPromptSessionError("ses-child", {
+            name: "UnknownError",
+            data: { message: "duplicate stack" },
+        });
+        return { data: undefined };
+    });
+    await expect(
+        promptAsyncAndWaitForIdle(host.client, request(), {
+            pollIntervalMs: 1,
+            startGraceMs: 60000,
+        }),
+    ).rejects.toThrow(`${message} (status=400)`);
+    expect(host.polls()).toBe(0);
+});
+
+test("session errors belonging to another child do not fail the run", async () => {
+    const host = asyncHost({ plan: ["settle"] });
+    const send = host.promptAsync.getMockImplementation()!;
+    host.promptAsync.mockImplementation(async (req) => {
+        recordPromptSessionError("other-child", "unrelated");
+        return send(req);
+    });
+    await promptAsyncAndWaitForIdle(host.client, request(), { pollIntervalMs: 1 });
+    expect(host.polls()).toBe(1);
 });

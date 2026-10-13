@@ -64,6 +64,15 @@
         "input": {}
     },
     {
+        "class": "accounted_tag_identity_repair",
+        "decision": {
+            "decision": "execute",
+            "canonicalDecision": "execute",
+            "materializeReason": "tag_identity_repair"
+        },
+        "input": {}
+    },
+    {
         "class": "accounted_ctx_reduce",
         "decision": { "decision": "defer", "droppedCount": 2 },
         "input": { "contentEvidence": "assistant tool name=ctx_reduce" }
@@ -106,6 +115,11 @@
         "class": "provider_short_read_identical_bytes",
         "decision": { "decision": "defer", "canonicalDecision": "defer" },
         "input": { "providerShortReadWithIdenticalPrefix": true }
+    },
+    {
+        "class": "tail_shrink_no_rewrite",
+        "decision": { "decision": "unknown" },
+        "input": { "tailShrink": true, "rewrittenTokens": 0 }
     },
     {
         "class": "self_inflicted_epoch",

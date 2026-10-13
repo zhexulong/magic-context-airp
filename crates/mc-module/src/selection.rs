@@ -32,12 +32,8 @@ use crate::transform::{utf16_len, utf16_prefix, ReductionDecision};
 
 // --- ported TS constants (exact; the differential golden is the arbiter) ---
 
-/// `todowrite`: keep the newest 1 (the live plan is the newest todo state).
-const TODOWRITE_KEEP: usize = 1;
 /// Distinct recent message owners retained as continuation context.
 const SUPERSESSION_RECENT_MESSAGE_WINDOW: usize = 20;
-/// Recent `ctx_reduce` arcs retained as visible housekeeping exemplars.
-const CTX_REDUCE_KEEP: usize = 3;
 /// Zero-value meta tools whose every occurrence is droppable.
 const ZERO_VALUE_META_TOOLS: &[&str] = &["bash_status", "bash_kill"];
 /// Coordination tools that should not be surfaced as ctx_reduce guidance. This
@@ -55,8 +51,20 @@ pub(crate) const RECLAIM_HINT_EXCLUDED_TOOLS: &[&str] = &[
 /// `ctx_note` actions that carry no lasting value (droppable when positively read).
 const CTX_NOTE_ZERO_VALUE_ACTIONS: &[&str] = &["read", "dismiss"];
 /// Mirrors the duplicate-safe tool list in the TypeScript twin:
-/// `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts`.
+/// `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts`. Hosts hand over bare tool
+/// names (OpenCode 1.18.30 stores `read`, `grep`, `glob`; Pi stores `read`, `grep`), so the bare
+/// names are what match; the `mcp_` forms cover MCP servers that expose the same tools under that
+/// prefix.
 const DEDUP_SAFE_TOOLS: &[&str] = &[
+    "grep",
+    "read",
+    "glob",
+    "ast_grep_search",
+    "lsp_diagnostics",
+    "lsp_symbols",
+    "lsp_find_references",
+    "lsp_goto_definition",
+    "lsp_prepare_rename",
     "mcp_grep",
     "mcp_read",
     "mcp_glob",
@@ -93,6 +101,12 @@ const TIER_RECENCY_RESERVE: f64 = 0.20;
 pub(crate) const AGE_RECLAIM_MIN_TOKENS: usize = 250;
 /// Minimum reclaim to justify an emergency cache bust (tokens).
 const EMERGENCY_REARM_MIN_TOKENS: f64 = 2000.0;
+/// The selected arcs must together reclaim at least this many tokens, or the pass is
+/// skipped unless another mutation already prices it. The gap check above only proves
+/// there is something to close. One live session spent an hour at 100% context dropping
+/// one fresh tool result per pass, 28 to 149 tokens each against a ~9,200-token gap.
+/// Mirrors the TS `EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS`.
+const EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS: f64 = EMERGENCY_REARM_MIN_TOKENS;
 /// Byte→token estimate for the emergency reclaim math (matches the TS nudge).
 const TOKENS_PER_BYTE: f64 = 0.25;
 /// T1 (keep longest): navigation/structure the agent re-uses.
@@ -244,6 +258,12 @@ pub struct SelectionContext {
     /// True when supersession can ride concrete work already scheduled for this pass.
     /// Unlike `pass_already_busting`, a held emergency latch alone does not set this.
     pub supersession_ride_available: bool,
+    /// True only when a rebuild that is independent of the emergency itself (a fold, an
+    /// m[1] or render-config change, a pending soft refresh) already rewrites the cached
+    /// prefix on this pass. The force-band edge and the 95% backstop are permissions to
+    /// rewrite, not rewrites that are already paid for, so they never set this. Only this
+    /// flag waives the emergency minimum achievable reclaim.
+    pub emergency_minimum_waived: bool,
     /// At the scheduler's >=95% backstop, the token window and tier reserve yield.
     pub emergency_window_yields: bool,
     /// Persisted token-window protection expressed as exact block ids.
@@ -270,12 +290,25 @@ pub enum PassClass {
     Defer,
 }
 
-/// Config knobs (frozen at bind, like the budget): the smart-drops gate and the
-/// keep/reserve/hint parameters. Defaults mirror the TS constants (smart_drops off).
-#[derive(Debug, Clone, Default)]
+/// Effective per-project keep counts, read for each automatic selection.
+#[derive(Debug, Clone)]
 pub struct SelectionConfig {
-    /// Gates the smart-drops selectors (control-plane + edit supersession).
+    /// Deprecated caller input, ignored. Supersession always rides a rebuilding pass.
     pub smart_drops: bool,
+    pub protected_tools: std::collections::BTreeMap<String, usize>,
+}
+
+pub(crate) fn default_protected_tools() -> std::collections::BTreeMap<String, usize> {
+    [("todowrite".to_string(), 1), ("ctx_reduce".to_string(), 3)].into()
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self {
+            smart_drops: false,
+            protected_tools: default_protected_tools(),
+        }
+    }
 }
 
 /// A tool ARC grouped from the flat blocks: the selection unit. Each selector picks
@@ -899,23 +932,38 @@ fn expand_arc(
 
 // --- the five selectors: each returns the ARC-IDs (or block-ids) it targets ---
 
-fn newest_ctx_reduce_arc_ids(arcs: &[&ToolArc]) -> HashSet<String> {
+fn protected_tool_arc_ids(arcs: &[ToolArc], config: &SelectionConfig) -> HashSet<String> {
+    let mut counts = default_protected_tools();
+    for (name, count) in &config.protected_tools {
+        counts.insert(normalize_tool_name(name), *count);
+    }
     let mut newest_first: Vec<&ToolArc> = arcs
         .iter()
-        .copied()
-        .filter(|arc| arc.name == "ctx_reduce")
+        .filter(|arc| !arc.reduced && !arc.result_ids.is_empty())
         .collect();
+    // Tag allocation follows result position, including the block index when
+    // parallel results share an owner ordinal. Lexical arc ids are not tag order.
     newest_first.sort_by(|left, right| {
         right
-            .ordinal
-            .cmp(&left.ordinal)
+            .dedup_result_ordinal
+            .cmp(&left.dedup_result_ordinal)
+            .then_with(|| {
+                right
+                    .dedup_result_block_index
+                    .cmp(&left.dedup_result_block_index)
+            })
             .then_with(|| right.arc_id.cmp(&left.arc_id))
     });
-    newest_first
-        .into_iter()
-        .take(CTX_REDUCE_KEEP)
-        .map(|arc| arc.arc_id.clone())
-        .collect()
+    let mut protected = HashSet::new();
+    for arc in newest_first {
+        if let Some(count) = counts.get_mut(&arc.name) {
+            if *count > 0 {
+                protected.insert(arc.arc_id.clone());
+                *count -= 1;
+            }
+        }
+    }
+    protected
 }
 
 /// Derive the continuation floor from the complete mutable tail. Blocks behind the
@@ -953,17 +1001,17 @@ fn recent_supersession_owner_message_ids(items: &[SelItem], arcs: &[ToolArc]) ->
         .collect()
 }
 
-/// 1.1 Control-plane supersession + 1.2 edit supersession (the smart_drops selectors).
-/// Newest-arc-first, per tool name: todowrite keep-1, ctx_reduce keep-K, zero-value
-/// meta drop-all, ctx_note drop-on-zero-value-action; edit/write older-per-file →
-/// edit_marker. Returns per-arc intents so the caller expands + shapes them. Active
-/// (non-reduced, client-executed) arcs only.
+/// For active tool-call/result groups, drop older todowrite/ctx_reduce results
+/// and zero-value metadata calls; drop ctx_note only for read/dismiss actions.
+/// Keep a short path-and-diff marker for older edit/write calls to the same file.
+/// Consider newest calls first and let the caller expand intents into block-level
+/// changes. Exclude calls already summarized or not executed by the client.
 fn select_supersession(
     arcs: &[&ToolArc],
     recent_message_ids: &HashSet<String>,
 ) -> HashMap<String, ArcIntent> {
     let mut intents: HashMap<String, ArcIntent> = HashMap::new();
-    // Newest-arc-first for keep-N and newest-per-file semantics.
+    // Newest calls determine which results and file edits remain current.
     let mut newest_first: Vec<&&ToolArc> = arcs.iter().collect();
     newest_first.sort_by(|a, b| {
         b.ordinal
@@ -971,13 +1019,11 @@ fn select_supersession(
             .then_with(|| b.arc_id.cmp(&a.arc_id))
     });
 
-    let mut todowrite_seen = 0usize;
-    let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
     let mut seen_file: HashSet<String> = HashSet::new();
 
     for arc in newest_first {
         let name = arc.name.as_str();
-        // Edit supersession first (1.2): older-per-file → edit_marker.
+        // Keep the newest edit to each file; mark older edits for that file.
         if is_edit_tool(name) {
             if let Some(fp) = read_input_str(&arc.input, FILE_PATH_KEYS) {
                 if seen_file.contains(&fp) {
@@ -996,28 +1042,25 @@ fn select_supersession(
             }
             // no resolvable filePath → skip (fail-safe); still fall through to name rules
         }
-        // Control-plane supersession (1.1).
-        let is_drop_target = if name == "todowrite" {
-            todowrite_seen += 1;
-            todowrite_seen > TODOWRITE_KEEP
-        } else if name == "ctx_reduce" {
-            !protected_ctx_reduce_arcs.contains(&arc.arc_id)
-        } else if ZERO_VALUE_META_TOOLS.contains(&name) {
-            true
-        } else if name == "ctx_note" {
-            read_input_str(&arc.input, &["action"])
-                .map(|a| CTX_NOTE_ZERO_VALUE_ACTIONS.contains(&a.as_str()))
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        // Older completed control and metadata results no longer carry current state.
+        let is_drop_target =
+            if name == "todowrite" || name == "ctx_reduce" || ZERO_VALUE_META_TOOLS.contains(&name)
+            {
+                true
+            } else if name == "ctx_note" {
+                read_input_str(&arc.input, &["action"])
+                    .map(|a| CTX_NOTE_ZERO_VALUE_ACTIONS.contains(&a.as_str()))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
         if is_drop_target
             && arc
                 .owner_message_id
                 .as_ref()
                 .is_some_and(|owner| !recent_message_ids.contains(owner))
         {
-            // A full drop supersedes an edit_marker for the same arc (drop wins).
+            // If another rule also selects this arc, remove it rather than marking it.
             intents.insert(arc.arc_id.clone(), ArcIntent { edit_marker: false });
         }
     }
@@ -1027,6 +1070,8 @@ fn select_supersession(
 /// Select older completed duplicate calls from safe tools. The owner is in both the lookup key
 /// and the fingerprint, so identical calls from distinct assistant messages stay distinct.
 /// Arguments use `serde_json` serialization; a serialization failure skips that candidate.
+/// Protected arcs join their group so a protected newest copy still anchors it, but are never
+/// selected themselves; leaving them out kept one unprotected copy beside the protected one.
 fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
     // Like the TS tag-side index, retain an owner-qualified lookup key separately
     // from the fingerprint bucket. The owner must also remain in the fingerprint value.
@@ -1035,11 +1080,6 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
         if !DEDUP_SAFE_TOOLS.contains(&arc.dedup_name.as_str())
             || arc.owner_message_id.is_none()
             || arc.result_ids.is_empty()
-            || arc
-                .call_inputs
-                .iter()
-                .any(|(id, _)| ctx.block_is_protected(id))
-            || arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
         {
             continue;
         }
@@ -1078,6 +1118,12 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
             group.pop();
             group
                 .into_iter()
+                .filter(|arc| {
+                    !arc.call_inputs
+                        .iter()
+                        .any(|(id, _)| ctx.block_is_protected(id))
+                        && !arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
+                })
                 .map(|arc| arc.arc_id.clone())
                 .collect::<Vec<_>>()
         })
@@ -1096,28 +1142,21 @@ fn two_pass_batch_can_apply(ctx: &SelectionContext) -> bool {
 
 /// 1.4 Age-based two-pass: tool arcs whose age (ToolCall ordinal) is at/under the
 /// last-execute watermark. Add-only (the watermark advances forward). Returns arc ids.
-fn select_two_pass(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
+fn select_two_pass(
+    arcs: &[&ToolArc],
+    ctx: &SelectionContext,
+    protected: &HashSet<String>,
+) -> HashSet<String> {
     if !two_pass_batch_can_apply(ctx) || ctx.last_execute_ordinal == 0 {
         return HashSet::new();
     }
-    let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
-    let newest_todowrite = arcs
-        .iter()
-        .filter(|arc| arc.name == "todowrite")
-        .max_by(|left, right| {
-            left.ordinal
-                .cmp(&right.ordinal)
-                .then_with(|| left.arc_id.cmp(&right.arc_id))
-        })
-        .map(|arc| arc.arc_id.as_str());
     arcs.iter()
+        .filter(|arc| !protected.contains(&arc.arc_id))
         .filter(|arc| arc.ordinal <= ctx.last_execute_ordinal)
         .filter(|arc| {
             arc.reclaim_tokens
                 .is_none_or(|tokens| tokens >= AGE_RECLAIM_MIN_TOKENS)
         })
-        .filter(|arc| Some(arc.arc_id.as_str()) != newest_todowrite)
-        .filter(|arc| !protected_ctx_reduce_arcs.contains(&arc.arc_id))
         .map(|arc| arc.arc_id.clone())
         .collect()
 }
@@ -1129,10 +1168,15 @@ fn select_agent_drops(
     ctx: &SelectionContext,
     live_ids: &HashSet<String>,
     frozen: &HashSet<String>,
+    protected_tools: &HashSet<String>,
     out: &mut Vec<ReductionDecision>,
 ) {
     for id in &ctx.agent_drop_ids {
-        if frozen.contains(id) || !live_ids.contains(id) || ctx.block_is_protected(id) {
+        if frozen.contains(id)
+            || !live_ids.contains(id)
+            || ctx.block_is_protected(id)
+            || protected_tools.contains(id)
+        {
             continue;
         }
         // Queued drops consume permission; neither pressure nor another command creates it.
@@ -1227,6 +1271,7 @@ fn active_floor_tokens(
 /// live tag class, while candidates remain active tool arcs. Returns the arc ids to full-drop.
 fn select_emergency(
     arcs: &[&ToolArc],
+    protected: &HashSet<String>,
     ctx: &SelectionContext,
     all_active_floor_tokens: f64,
     reclaim_by_arc: &HashMap<String, f64>,
@@ -1250,6 +1295,14 @@ fn select_emergency(
     // comparison on that rounded value; comparing the raw float can fire for a
     // sub-threshold fractional remainder at the boundary.
     let reclaim_tokens = (ctx.current_total_input_tokens - target).round();
+    let floor_above_ceiling = fixed_floor > ctx.ceiling_tokens;
+    if floor_above_ceiling {
+        tracing::info!(
+            "mc-module: emergency drop: fixed floor ~{:.0} already exceeds ceiling {:.0}; tool drops cannot reach the target",
+            fixed_floor,
+            ctx.ceiling_tokens
+        );
+    }
     if reclaim_tokens <= EMERGENCY_REARM_MIN_TOKENS {
         *assessment = Some(mc_store::EmergencyDropAssessment {
             fixed_floor_tokens: fixed_floor,
@@ -1258,6 +1311,8 @@ fn select_emergency(
             selected_reclaim_tokens: 0.0,
             candidate_tokens: 0.0,
             target_unreachable: reclaim_tokens > 0.0,
+            floor_above_ceiling,
+            skipped_below_minimum_reclaim: false,
         });
         return HashSet::new();
     }
@@ -1292,20 +1347,19 @@ fn select_emergency(
     // Protect ctx_reduce exemplars without changing the target math. The fixed floor
     // above already derives from every active floor tag, so removing candidates changes
     // neither the floor nor target (panel-verified emergency interaction).
-    let protected_ctx_reduce_arcs = newest_ctx_reduce_arc_ids(arcs);
 
     // Build candidates per tier (persisted protected identities + reserve excluded).
     let mut by_tier: HashMap<u8, Vec<&&ToolArc>> = HashMap::new();
     for arc in arcs {
+        if protected.contains(&arc.arc_id) {
+            continue;
+        }
         if arc
             .call_inputs
             .iter()
             .any(|(id, _)| ctx.block_is_protected(id))
             || arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
         {
-            continue;
-        }
-        if protected_ctx_reduce_arcs.contains(&arc.arc_id) {
             continue;
         }
         let tier = resolve_tool_tier(&arc.name);
@@ -1315,9 +1369,14 @@ fn select_emergency(
         by_tier.entry(tier).or_default().push(arc);
     }
 
-    let candidate_tokens = by_tier
-        .values()
-        .flatten()
+    // Summed in tier order: floating-point addition is not associative, so summing in
+    // the hash map's per-process iteration order could give a different last bit for the
+    // same candidates from one run to the next.
+    let mut candidate_tiers = by_tier.keys().copied().collect::<Vec<_>>();
+    candidate_tiers.sort_unstable();
+    let candidate_tokens = candidate_tiers
+        .iter()
+        .flat_map(|tier| by_tier[tier].iter())
         .map(|arc| {
             reclaim_by_arc
                 .get(&arc.arc_id)
@@ -1347,19 +1406,43 @@ fn select_emergency(
             }
         }
     }
+    // Price the selection before committing it. Skipping leaves the pressure episode
+    // armed, so the candidates can still ride a later rewrite.
+    let skipped_below_minimum_reclaim = !selected.is_empty()
+        && !ctx.emergency_minimum_waived
+        && reclaimed < EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS;
+    if skipped_below_minimum_reclaim {
+        tracing::info!(
+            "mc-module: emergency drop skipped: achievable reclaim ~{:.0} < {:.0} against gap {:.0} ({} arcs)",
+            reclaimed,
+            EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS,
+            reclaim_tokens,
+            selected.len()
+        );
+    }
     *assessment = Some(mc_store::EmergencyDropAssessment {
         fixed_floor_tokens: fixed_floor,
         target_tokens: target,
         required_reclaim_tokens: reclaim_tokens,
-        selected_reclaim_tokens: reclaimed,
+        selected_reclaim_tokens: if skipped_below_minimum_reclaim {
+            0.0
+        } else {
+            reclaimed
+        },
         candidate_tokens,
-        target_unreachable: reclaimed < reclaim_tokens,
+        target_unreachable: skipped_below_minimum_reclaim || reclaimed < reclaim_tokens,
+        floor_above_ceiling,
+        skipped_below_minimum_reclaim,
     });
+    if skipped_below_minimum_reclaim {
+        return HashSet::new();
+    }
     selected
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SelectionOutcome {
+    pub protected_tool_block_ids: HashSet<String>,
     pub decisions: Vec<ReductionDecision>,
     pub emergency_drop_assessment: Option<mc_store::EmergencyDropAssessment>,
     /// The pressure pass was already busting, or was in the force band, so the age
@@ -1486,8 +1569,23 @@ pub(crate) fn select_reductions_with_outcome(
     ctx: &SelectionContext,
     cfg: &SelectionConfig,
 ) -> SelectionOutcome {
+    let arcs = group_arcs(items, frozen_keys);
+    let protected_tools = protected_tool_arc_ids(&arcs, cfg);
+    let protected_tool_block_ids = arcs
+        .iter()
+        .filter(|arc| protected_tools.contains(&arc.arc_id))
+        .flat_map(|arc| {
+            arc.call_inputs
+                .iter()
+                .map(|(id, _)| id.clone())
+                .chain(arc.result_ids.iter().cloned())
+        })
+        .collect();
     if ctx.pass_class == PassClass::Defer {
-        return SelectionOutcome::default();
+        return SelectionOutcome {
+            protected_tool_block_ids,
+            ..SelectionOutcome::default()
+        };
     }
 
     let live_ids: HashSet<String> = items
@@ -1504,7 +1602,6 @@ pub(crate) fn select_reductions_with_outcome(
         })
         .map(|item| item.id.clone())
         .collect();
-    let arcs = group_arcs(items, frozen_keys);
     let supersession_recent_message_ids = recent_supersession_owner_message_ids(items, &arcs);
     let incomplete_arc_ids = arcs
         .iter()
@@ -1528,7 +1625,13 @@ pub(crate) fn select_reductions_with_outcome(
     };
     // Apply the same arc guards to queued drops as to automatic reductions.
     let mut agent_decisions = Vec::new();
-    select_agent_drops(ctx, &live_ids, frozen_keys, &mut agent_decisions);
+    select_agent_drops(
+        ctx,
+        &live_ids,
+        frozen_keys,
+        &protected_tool_block_ids,
+        &mut agent_decisions,
+    );
     agent_decisions.retain(|decision| arc_allows_reduction(&decision.target_id));
     let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let reasoning_adjacency_collapse_arcs = reasoning_adjacency_collapse_arc_ids(items);
@@ -1556,6 +1659,9 @@ pub(crate) fn select_reductions_with_outcome(
     // removed here must not also enter the two-pass age batch.
     let dedup_arc_ids = if reclaim_ride_available(ctx) {
         select_tool_dedup(&active_arcs, ctx)
+            .into_iter()
+            .filter(|id| !protected_tools.contains(id))
+            .collect()
     } else {
         HashSet::new()
     };
@@ -1564,7 +1670,7 @@ pub(crate) fn select_reductions_with_outcome(
         .copied()
         .filter(|arc| !dedup_arc_ids.contains(&arc.arc_id))
         .collect();
-    let two_pass_arc_ids = select_two_pass(&arcs_after_dedup, ctx);
+    let two_pass_arc_ids = select_two_pass(&arcs_after_dedup, ctx, &protected_tools);
     let mut eligible_supersession_arc_ids = None;
     let mut emergency_drop_assessment = None;
 
@@ -1585,6 +1691,7 @@ pub(crate) fn select_reductions_with_outcome(
             );
             let emergency_arc_ids = select_emergency(
                 &active_arcs,
+                &protected_tools,
                 ctx,
                 all_active_floor_tokens,
                 &reclaim_by_arc,
@@ -1612,14 +1719,15 @@ pub(crate) fn select_reductions_with_outcome(
             }
             // Supersession joins a priced batch, including the shared force-episode
             // opportunity. A held latch without independent work grants no new ride.
-            if cfg.smart_drops
-                && (ctx.pass_already_busting
-                    || !emergency_arc_ids.is_empty()
-                    || !two_pass_arc_ids.is_empty())
+            if ctx.pass_already_busting
+                || !emergency_arc_ids.is_empty()
+                || !two_pass_arc_ids.is_empty()
             {
                 // A superseded arc remains eligible while the ride gate is shut, so the count
                 // observed when it next opens summarizes everything accumulated between rides.
-                let intents = select_supersession(&active_arcs, &supersession_recent_message_ids);
+                let mut intents =
+                    select_supersession(&active_arcs, &supersession_recent_message_ids);
+                intents.retain(|id, _| !protected_tools.contains(id));
                 eligible_supersession_arc_ids =
                     Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
@@ -1647,9 +1755,11 @@ pub(crate) fn select_reductions_with_outcome(
             // Supersession is deferred work: ordinary execute-band pressure and a held
             // emergency latch cannot authorize a rewrite. Concrete scheduled work or an
             // admitted two-pass batch lets the whole pending set ride the same bust.
-            if cfg.smart_drops && reclaim_ride_available(ctx) {
+            if reclaim_ride_available(ctx) {
                 // Count the exact selector output before overlap precedence removes members.
-                let intents = select_supersession(&active_arcs, &supersession_recent_message_ids);
+                let mut intents =
+                    select_supersession(&active_arcs, &supersession_recent_message_ids);
+                intents.retain(|id, _| !protected_tools.contains(id));
                 eligible_supersession_arc_ids =
                     Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
@@ -1769,7 +1879,13 @@ pub(crate) fn select_reductions_with_outcome(
 
     // ctx_reduce agent drops stay block-granular, but pass-through carriers are absent
     // from live_ids so Media and Opaque can never become reduction targets.
-    select_agent_drops(ctx, &live_ids, frozen_keys, &mut out);
+    select_agent_drops(
+        ctx,
+        &live_ids,
+        frozen_keys,
+        &protected_tool_block_ids,
+        &mut out,
+    );
 
     // Agent-directed ids can name either half of a tool arc, so apply the same whole-message
     // guard after their block-granular decisions have been added.
@@ -1807,6 +1923,7 @@ pub(crate) fn select_reductions_with_outcome(
             .map(|(protected, applied)| protected.difference(applied).count())
     };
     SelectionOutcome {
+        protected_tool_block_ids,
         decisions,
         emergency_drop_assessment,
         two_pass_batch_can_apply,
@@ -1819,6 +1936,33 @@ pub(crate) fn select_reductions_with_outcome(
         ),
         applied_supersession_count: applied_supersession_arcs.as_ref().map(HashSet::len),
     }
+}
+
+/// Return blocks protected by the keep counts frozen when the reminder's tail
+/// baseline was last rebuilt. Config changes take effect after a rebuilding pass
+/// saves a new baseline.
+pub(crate) fn protected_blocks_for_policy(
+    items: &[SelItem],
+    frozen: &HashSet<String>,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> HashSet<String> {
+    let arcs = group_arcs(items, frozen);
+    let protected = protected_tool_arc_ids(
+        &arcs,
+        &SelectionConfig {
+            protected_tools: counts.clone(),
+            ..SelectionConfig::default()
+        },
+    );
+    arcs.iter()
+        .filter(|arc| protected.contains(&arc.arc_id))
+        .flat_map(|arc| {
+            arc.call_inputs
+                .iter()
+                .map(|(id, _)| id.clone())
+                .chain(arc.result_ids.iter().cloned())
+        })
+        .collect()
 }
 
 /// Collapse to one decision per target_id (drop beats edit_marker beats skeleton) and
@@ -2090,6 +2234,51 @@ mod tests {
             .any(|d| d.target_id == call_block_id("legacy")));
     }
 
+    /// The candidate total is the same on every run for the same candidates, whatever
+    /// order the per-tier map happens to iterate in.
+    #[test]
+    fn emergency_candidate_total_does_not_depend_on_map_iteration_order() {
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 142_021.0;
+        ctx.ceiling_tokens = 116_900.0;
+        ctx.emergency_window_yields = true;
+        let mut items = vec![text_with_id("text", 1, 240_000)];
+        let mut reclaim = HashMap::new();
+        // One arc per tier, with amounts whose sum depends on the order they are added in.
+        for (n, (name, tokens)) in [("read", 0.1), ("edit", 0.2), ("bash", 0.3)]
+            .into_iter()
+            .enumerate()
+        {
+            let mid = format!("tool-{n}");
+            items.push(tool_call(
+                &mid,
+                n as u64 + 2,
+                name,
+                serde_json::json!({}),
+                0,
+            ));
+            items.push(tool_result(&mid, n as u64 + 2, name, 8_000));
+            reclaim.insert(call_block_id(&mid), tokens);
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let totals = (0..64)
+            .map(|_| {
+                let mut assessment = None;
+                select_emergency(
+                    &arcs,
+                    &HashSet::new(),
+                    &ctx,
+                    80_000.0,
+                    &reclaim,
+                    &mut assessment,
+                );
+                assessment.unwrap().candidate_tokens.to_bits()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(totals.len(), 1, "{totals:?}");
+    }
+
     #[test]
     fn emergency_floor_walk_exhausts_candidates_or_reaches_target() {
         let mut ctx = base_ctx(PassClass::EmergencyForce);
@@ -2104,7 +2293,14 @@ mod tests {
         let arcs = group_arcs(&items, &HashSet::new());
         let arcs = arcs.iter().collect::<Vec<_>>();
         let mut assessment = None;
-        let selected = select_emergency(&arcs, &ctx, 80_000.0, &HashMap::new(), &mut assessment);
+        let selected = select_emergency(
+            &arcs,
+            &HashSet::new(),
+            &ctx,
+            80_000.0,
+            &HashMap::new(),
+            &mut assessment,
+        );
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 10);
         assert_eq!(report.fixed_floor_tokens, 62_021.0);
@@ -2114,7 +2310,14 @@ mod tests {
         assert!(report.target_unreachable);
         ctx.tag_window_protected_block_ids
             .extend((1..10).map(|n| result_block_id(&format!("tool-{n}"))));
-        let selected = select_emergency(&arcs, &ctx, 80_000.0, &HashMap::new(), &mut assessment);
+        let selected = select_emergency(
+            &arcs,
+            &HashSet::new(),
+            &ctx,
+            80_000.0,
+            &HashMap::new(),
+            &mut assessment,
+        );
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(report.candidate_tokens, 2_000.0);
@@ -2122,11 +2325,67 @@ mod tests {
         ctx.emergency_window_yields = true;
         ctx.current_total_input_tokens = 20_000.0;
         ctx.ceiling_tokens = 20_000.0;
-        let selected = select_emergency(&arcs, &ctx, 20_000.0, &HashMap::new(), &mut assessment);
+        let selected = select_emergency(
+            &arcs,
+            &HashSet::new(),
+            &ctx,
+            20_000.0,
+            &HashMap::new(),
+            &mut assessment,
+        );
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 7);
         assert_eq!(report.selected_reclaim_tokens, 14_000.0);
         assert!(!report.target_unreachable);
+    }
+
+    /// The live worker shape: the fixed floor (~326K) is already above the ceiling
+    /// (~251K) and the only candidate is a fresh result worth ~149 tokens. At the 95%
+    /// backstop production sets both `emergency_window_yields` and `pass_already_busting`;
+    /// neither waives the minimum, so the pass is skipped. Only an independent rebuild
+    /// (`emergency_minimum_waived`) lets the small selection ride. Mirrors the TS tests.
+    #[test]
+    fn emergency_skips_a_selection_below_the_minimum_achievable_reclaim() {
+        let items = vec![
+            text_with_id("conversation", 1, 36_204),
+            tool_call("fresh", 2, "bash", serde_json::json!({}), 0),
+            tool_result("fresh", 3, "bash", 596),
+        ];
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 335_200.0;
+        ctx.ceiling_tokens = 251_000.0;
+        ctx.emergency_window_yields = true;
+        ctx.pass_already_busting = true;
+        let mut assessment = None;
+        let selected = select_emergency(
+            &arcs,
+            &HashSet::new(),
+            &ctx,
+            9_200.0,
+            &HashMap::new(),
+            &mut assessment,
+        );
+        let report = assessment.as_ref().unwrap();
+        assert!(selected.is_empty());
+        assert!(report.skipped_below_minimum_reclaim);
+        assert!(report.floor_above_ceiling);
+        assert_eq!(report.selected_reclaim_tokens, 0.0);
+
+        ctx.emergency_minimum_waived = true;
+        let selected = select_emergency(
+            &arcs,
+            &HashSet::new(),
+            &ctx,
+            9_200.0,
+            &HashMap::new(),
+            &mut assessment,
+        );
+        let report = assessment.as_ref().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(!report.skipped_below_minimum_reclaim);
+        assert!(report.floor_above_ceiling);
     }
 
     #[test]
@@ -2373,6 +2632,7 @@ mod tests {
             first_applied_agent_drop_ids: HashSet::new(),
             pass_already_busting: false,
             supersession_ride_available: false,
+            emergency_minimum_waived: false,
             emergency_window_yields: false,
             tag_window_protected_block_ids: HashSet::new(),
             exempt_message_protected_block_ids: HashSet::new(),
@@ -2655,6 +2915,7 @@ mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
                 supersession_ride_available: case.smart_drops || case.ctx.pass_already_busting,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: golden_ordinal_threshold_to_row_identities(
                     &items,
@@ -2664,6 +2925,7 @@ mod tests {
             };
             let cfg = SelectionConfig {
                 smart_drops: case.smart_drops,
+                ..SelectionConfig::default()
             };
             let frozen: HashSet<String> = case.frozen.iter().cloned().collect();
             let out = select_reductions(&items, &frozen, &ctx, &cfg);
@@ -2846,7 +3108,10 @@ mod tests {
         for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 4 + n as u64, 1));
         }
-        let config = SelectionConfig { smart_drops: true };
+        let config = SelectionConfig {
+            smart_drops: true,
+            ..SelectionConfig::default()
+        };
         let mut protected = base_ctx(PassClass::Execute);
         protected.supersession_ride_available = true;
         protected
@@ -2957,7 +3222,10 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
 
         assert_eq!(out.len(), 4);
@@ -3097,7 +3365,10 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
 
         assert_eq!(out.len(), 4);
@@ -3126,7 +3397,10 @@ mod tests {
             ),
             tool_result("c1", 1, "edit", 100),
         ];
-        let cfg = SelectionConfig { smart_drops: true };
+        let cfg = SelectionConfig {
+            smart_drops: true,
+            ..SelectionConfig::default()
+        };
         let mut next_ordinal = 2;
 
         for pass in 1..=PASSES {
@@ -3196,7 +3470,10 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         assert_eq!(out.len(), 6, "all three superseded arcs must ride together");
         assert_eq!(
@@ -3235,7 +3512,10 @@ mod tests {
             items.push(text_with_id(&format!("tail-{n}#0"), 3 + n as u64, 1));
         }
 
-        let cfg = SelectionConfig { smart_drops: true };
+        let cfg = SelectionConfig {
+            smart_drops: true,
+            ..SelectionConfig::default()
+        };
         let previous =
             select_reductions(&items, &HashSet::new(), &base_ctx(PassClass::Execute), &cfg);
         assert!(previous.is_empty());
@@ -3268,7 +3548,10 @@ mod tests {
             ),
             tool_result("c1", 1, "edit", 100),
         ];
-        let cfg = SelectionConfig { smart_drops: true };
+        let cfg = SelectionConfig {
+            smart_drops: true,
+            ..SelectionConfig::default()
+        };
         let mut next_ordinal = 2;
         let mut self_caused_busts = 0;
 
@@ -3354,7 +3637,10 @@ mod tests {
             ),
             tool_result("c1", 1, "edit", 100),
         ];
-        let cfg = SelectionConfig { smart_drops: true };
+        let cfg = SelectionConfig {
+            smart_drops: true,
+            ..SelectionConfig::default()
+        };
         let mut previous_served = served_block_bytes(&items, &[]);
         let mut next_ordinal = 2;
         let mut applied_reclaims = 0;
@@ -3438,7 +3724,10 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         let admitted = decisions
             .iter()
@@ -3478,7 +3767,10 @@ mod tests {
         ctx.current_total_input_tokens = 190_000.0;
         ctx.ceiling_tokens = 130_000.0;
         ctx.tag_window_protected_block_ids = items.iter().map(|item| item.id.clone()).collect();
-        let cfg = SelectionConfig { smart_drops: false };
+        let cfg = SelectionConfig {
+            smart_drops: false,
+            ..SelectionConfig::default()
+        };
         assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
         ctx.emergency_window_yields = true;
         let decisions = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
@@ -3520,7 +3812,10 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         let admitted = decisions
             .iter()
@@ -4230,7 +4525,10 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         let c1_call = out
             .iter()
@@ -4299,7 +4597,10 @@ mod tests {
                 &items,
                 &HashSet::new(),
                 ctx,
-                &SelectionConfig { smart_drops: true },
+                &SelectionConfig {
+                    smart_drops: true,
+                    ..SelectionConfig::default()
+                },
             );
             out.iter()
                 .find(|d| d.target_id == call_block_id("c1") && d.kind == "edit_marker")
@@ -4322,6 +4623,7 @@ mod tests {
             has_prior_drop: true,
             pass_already_busting: true,
             supersession_ride_available: true,
+            emergency_minimum_waived: false,
             ..base_ctx(PassClass::Execute)
         };
 
@@ -4332,13 +4634,19 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx_a,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         let set_b = select_reductions(
             &items,
             &HashSet::new(),
             &ctx_b,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         assert!(
             !set_a.iter().any(|d| d.target_id == result_block_id("c9")),
@@ -4550,7 +4858,25 @@ mod tests {
 
     #[test]
     fn duplicate_non_safe_tools_never_deduplicate() {
-        let args = serde_json::json!({"path": "src/lib.rs"});
+        // `bash` can return different output for identical arguments, so it never dedups.
+        let args = serde_json::json!({"command": "date"});
+        let items = vec![
+            tool_call_with_ids("owner#0", "owner#0", 1, "bash", args.clone(), 50),
+            tool_result_with_ids("older-result#0", "owner#0", 2, "bash", 300),
+            tool_call_with_ids("owner#1", "owner#1", 1, "bash", args, 50),
+            tool_result_with_ids("newer-result#0", "owner#1", 3, "bash", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.supersession_ride_available = true;
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.is_empty(), "non-safe tools must stay live: {out:?}");
+    }
+
+    #[test]
+    fn duplicate_bare_host_read_names_deduplicate() {
+        // OpenCode and Pi both hand over the bare `read` name, never `mcp_read`.
+        let args = serde_json::json!({"filePath": "src/lib.rs"});
         let items = vec![
             tool_call_with_ids("owner#0", "owner#0", 1, "read", args.clone(), 50),
             tool_result_with_ids("older-result#0", "owner#0", 2, "read", 300),
@@ -4561,7 +4887,54 @@ mod tests {
         ctx.supersession_ride_available = true;
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
-        assert!(out.is_empty(), "non-safe tools must stay live: {out:?}");
+        assert_eq!(
+            out.iter()
+                .map(|decision| (decision.target_id.as_str(), decision.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("older-result#0", "drop"), ("owner#0", "drop")],
+            "the older bare-name duplicate must fully drop: {out:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_safe_tools_keep_one_copy_when_the_newest_is_protected() {
+        let args = serde_json::json!({"filePath": "src/lib.rs"});
+        let mut items = Vec::new();
+        for index in 0..3 {
+            let call = format!("owner#{index}");
+            let result = format!("result-{index}#0");
+            items.push(tool_call_with_ids(
+                &call,
+                &call,
+                1,
+                "read",
+                args.clone(),
+                50,
+            ));
+            items.push(tool_result_with_ids(
+                &result,
+                &call,
+                2 + index as u64,
+                "read",
+                300,
+            ));
+        }
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.supersession_ride_available = true;
+        ctx.tag_window_protected_block_ids =
+            HashSet::from(["owner#2".to_string(), "result-2#0".to_string()]);
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        let mut targets = out
+            .iter()
+            .map(|decision| decision.target_id.as_str())
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            vec!["owner#0", "owner#1", "result-0#0", "result-1#0"],
+            "both unprotected copies drop; only the protected newest stays: {out:?}"
+        );
     }
 
     #[test]
@@ -4604,6 +4977,26 @@ mod tests {
             "protected-owner#1".to_string(),
             "protected-new-result#0".to_string(),
         ]);
+        let out = select_reductions(
+            &protected_items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert_eq!(
+            out.iter()
+                .map(|decision| decision.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["protected-old-result#0", "protected-owner#0"],
+            "a protected newest duplicate anchors its group, so the unprotected older copy drops: {out:?}"
+        );
+
+        ctx.tag_window_protected_block_ids = HashSet::from([
+            "protected-owner#0".to_string(),
+            "protected-old-result#0".to_string(),
+            "protected-owner#1".to_string(),
+            "protected-new-result#0".to_string(),
+        ]);
         assert!(
             select_reductions(
                 &protected_items,
@@ -4612,7 +5005,7 @@ mod tests {
                 &SelectionConfig::default(),
             )
             .is_empty(),
-            "a protected newest duplicate must not let the older candidate deduplicate"
+            "a protected duplicate is never selected, even with a newer copy"
         );
 
         let open_items = vec![
@@ -4770,8 +5163,282 @@ mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: true },
+            &SelectionConfig {
+                smart_drops: true,
+                ..SelectionConfig::default()
+            },
         );
         assert!(out.is_empty(), "defer produces no reductions");
+    }
+
+    #[test]
+    fn protected_tools_default_todowrite_survives_emergency_95() {
+        let items = (1..=4)
+            .flat_map(|n| {
+                let id = format!("todo-{n}");
+                [
+                    tool_call(&id, n, "todowrite", serde_json::json!({}), 0),
+                    tool_result(&id, n, "todowrite", 4000),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.emergency_window_yields = true;
+        ctx.emergency_minimum_waived = true;
+        ctx.current_total_input_tokens = 4000.0;
+        ctx.ceiling_tokens = 1.0;
+        let decisions =
+            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(!decisions
+            .iter()
+            .any(|decision| decision.target_id.starts_with("todo-4#")));
+        assert!(decisions
+            .iter()
+            .any(|decision| decision.target_id.starts_with("todo-3#")));
+    }
+
+    fn check_protected_tools_shared_selection_golden(lane: &str) {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            lane: String,
+            protected_tools: std::collections::BTreeMap<String, usize>,
+            tools: Vec<String>,
+            expected: Vec<usize>,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/protected-tools.json")).unwrap();
+        for case in cases.into_iter().filter(|case| case.lane == lane) {
+            let mut items = Vec::new();
+            for (i, name) in case.tools.iter().enumerate() {
+                let call = format!("owner#{}", 2 * i);
+                let result = format!("owner#{}", 2 * i + 1);
+                items.push(tool_call_with_ids(
+                    &call,
+                    &call,
+                    i as u64 + 1,
+                    name,
+                    serde_json::json!({"filePath":"same"}),
+                    0,
+                ));
+                items.push(tool_result_with_ids(
+                    &result,
+                    &call,
+                    i as u64 + 1,
+                    name,
+                    4000,
+                ));
+            }
+            for n in 20..40 {
+                items.push(user_text(&format!("recent-{n}"), n));
+            }
+            let mut ctx = base_ctx(if case.lane == "emergency" {
+                PassClass::EmergencyForce
+            } else {
+                PassClass::Execute
+            });
+            ctx.last_execute_ordinal = if case.lane == "age" { 4 } else { 0 };
+            ctx.current_total_input_tokens = 4000.0;
+            ctx.ceiling_tokens = 1.0;
+            ctx.emergency_window_yields = true;
+            ctx.emergency_minimum_waived = true;
+            ctx.pass_already_busting = true;
+            ctx.supersession_ride_available = true;
+            let cfg = SelectionConfig {
+                smart_drops: false,
+                protected_tools: case.protected_tools,
+            };
+            let decisions = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+            let mut selected = decisions
+                .iter()
+                .filter_map(|decision| {
+                    let index = decision
+                        .target_id
+                        .strip_prefix("owner#")?
+                        .parse::<usize>()
+                        .ok()?;
+                    Some(index / 2 + 1)
+                })
+                .collect::<Vec<_>>();
+            selected.sort_unstable();
+            selected.dedup();
+            assert_eq!(selected, case.expected, "{}", case.label);
+        }
+    }
+
+    #[test]
+    fn protected_tools_emergency_golden() {
+        check_protected_tools_shared_selection_golden("emergency");
+    }
+    #[test]
+    fn protected_tools_age_golden() {
+        check_protected_tools_shared_selection_golden("age");
+    }
+    #[test]
+    fn protected_tools_supersession_golden() {
+        check_protected_tools_shared_selection_golden("supersession");
+    }
+    #[test]
+    fn protected_tools_edit_golden() {
+        check_protected_tools_shared_selection_golden("edit");
+    }
+    #[test]
+    fn protected_tools_duplicate_golden() {
+        check_protected_tools_shared_selection_golden("duplicate");
+    }
+
+    #[test]
+    fn protected_tools_rotation_and_legacy_false_only_ride_a_rebuild() {
+        let mut items = Vec::new();
+        for n in 1..=4 {
+            let id = format!("todo-{n}");
+            items.push(tool_call(&id, n, "todowrite", serde_json::json!({}), 0));
+            items.push(tool_result(&id, n, "todowrite", 4000));
+        }
+        for n in 20..40 {
+            items.push(user_text(&format!("recent-{n}"), n));
+        }
+        let mut ctx = base_ctx(PassClass::Defer);
+        let cfg = SelectionConfig::default(); // Legacy false has no effect.
+        assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
+        ctx.pass_class = PassClass::Execute;
+        ctx.pass_already_busting = false;
+        ctx.supersession_ride_available = false;
+        assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
+        ctx.pass_already_busting = true;
+        ctx.supersession_ride_available = true;
+        let decisions = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+        assert!(decisions
+            .iter()
+            .any(|decision| decision.target_id == "todo-3#1"));
+        assert!(!decisions
+            .iter()
+            .any(|decision| decision.target_id == "todo-4#1"));
+        let frozen = HashSet::from(["todo-4#1".to_string()]);
+        let decisions = select_reductions(&items, &frozen, &ctx, &cfg);
+        assert!(!decisions
+            .iter()
+            .any(|decision| decision.target_id == "todo-3#1"));
+        // Agent-requested drops use the same keep count and stay queued until
+        // a newer call displaces this result.
+        ctx.agent_drop_ids = vec!["todo-3#1".to_string()];
+        assert!(!select_reductions(&items, &frozen, &ctx, &cfg)
+            .iter()
+            .any(|decision| decision.target_id == "todo-3#1"));
+    }
+
+    #[test]
+    fn protected_tool_agent_drop_shared_hold_rotation_golden() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            tools: Vec<String>,
+            protected_tools: std::collections::BTreeMap<String, usize>,
+            drop: usize,
+            new_tool: String,
+            #[serde(default)]
+            historian: bool,
+            #[serde(default)]
+            agent_self_stamp: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
+                .unwrap();
+        for case in cases {
+            // The facade rejects an agent dropping its own ctx_reduce result. Drops queued
+            // by historian publication reach this planner and still obey the keep counts.
+            if case.agent_self_stamp {
+                continue;
+            }
+            let mut items = Vec::new();
+            for (i, name) in case.tools.iter().enumerate() {
+                let id = format!("hold-{}", i + 1);
+                items.push(tool_call(&id, i as u64 + 1, name, serde_json::json!({}), 0));
+                items.push(tool_result(&id, i as u64 + 1, name, 100));
+            }
+            let target = format!("hold-{}#1", case.drop);
+            let cfg = SelectionConfig {
+                protected_tools: case.protected_tools,
+                ..SelectionConfig::default()
+            };
+            let mut ctx = base_ctx(PassClass::Execute);
+            ctx.pass_already_busting = true;
+            ctx.emergency_window_yields = true;
+            ctx.agent_drop_ids = vec![target.clone()];
+            for _ in 0..2 {
+                let selected = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+                assert!(
+                    !selected.iter().any(|decision| decision.target_id == target),
+                    "{} remains held",
+                    case.label
+                );
+            }
+            if case.historian {
+                let covered_arc = format!("hold-{}#0", case.drop);
+                items.retain(|item| item.arc_id.as_deref() != Some(covered_arc.as_str()));
+                let after_trim =
+                    select_reductions_with_outcome(&items, &HashSet::new(), &ctx, &cfg);
+                assert!(!after_trim
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.target_id == target));
+                assert!(after_trim.protected_tool_block_ids.contains("hold-1#1"));
+                continue;
+            }
+            items.push(tool_call(
+                "arriving",
+                200,
+                &case.new_tool,
+                serde_json::json!({}),
+                0,
+            ));
+            items.push(tool_result("arriving", 200, &case.new_tool, 100));
+            ctx.pass_class = PassClass::Defer;
+            assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
+            ctx.pass_class = PassClass::Execute;
+            let selected = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+            assert!(
+                selected.iter().any(|decision| decision.target_id == target),
+                "{} applies after rotation",
+                case.label
+            );
+            let frozen = HashSet::from([target.clone()]);
+            assert!(
+                !select_reductions(&items, &frozen, &ctx, &cfg)
+                    .iter()
+                    .any(|decision| decision.target_id == target),
+                "{} never resurrects",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_historian_queued_drop_holds_until_fold_trim() {
+        let mut items = vec![
+            tool_call("older", 1, "custom", serde_json::json!({}), 0),
+            tool_result("older", 1, "custom", 100),
+            tool_call("covered", 2, "custom", serde_json::json!({}), 0),
+            tool_result("covered", 2, "custom", 100),
+        ];
+        let cfg = SelectionConfig {
+            protected_tools: [("custom".to_string(), 1)].into(),
+            ..SelectionConfig::default()
+        };
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.pass_already_busting = true;
+        // Agent and historian drops use the same durable queue and protection
+        // rules. A summarized result stops counting when a fold trims its source.
+        ctx.agent_drop_ids = vec!["covered#1".to_string()];
+        assert!(!select_reductions(&items, &HashSet::new(), &ctx, &cfg)
+            .iter()
+            .any(|decision| decision.target_id == "covered#1"));
+        items.retain(|item| !item.id.starts_with("covered#"));
+        let outcome = select_reductions_with_outcome(&items, &HashSet::new(), &ctx, &cfg);
+        assert!(outcome.protected_tool_block_ids.contains("older#1"));
+        assert!(!outcome
+            .decisions
+            .iter()
+            .any(|decision| decision.target_id == "covered#1"));
     }
 }

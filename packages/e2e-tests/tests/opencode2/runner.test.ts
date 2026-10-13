@@ -9,7 +9,7 @@ import {
 } from "../../../plugin/src/v2/store-reader";
 import { awaitPluginActivation } from "../../src/opencode2-runner/plugin-activation";
 import { assertWriteFenceUnchanged, snapshotWriteFence } from "../../src/opencode2-runner/write-fence";
-import { ROOT_KEYS, assertIsolation, assertLiveUnchanged, assertOpenPaths, handoff, isolation, snapshotLive, spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
+import { ROOT_KEYS, assertIsolation, assertLiveUnchanged, assertOpenPaths, handoff, isolation, snapshotLive, spawnOpencode2, waitForPluginActive, waitForPluginLog } from '../../src/opencode2-runner/spawn';
 
 test("hermetic_v2_runner environment refuses unsafe roots before boot", () => {
 	const fixture = isolation();
@@ -48,6 +48,36 @@ test("fd guard refuses operator paths and permits isolated database", () => {
 		assertOpenPaths(["/work/magic-context/packages/plugin/src/config/index.ts"], fixture.root),
 	).not.toThrow();
 	expect(() => assertOpenPaths(["/tmp/unexpected.txt"], fixture.root, [], ["/tmp/unexpected.txt"])).toThrow("forbidden");
+});
+test("Foundation HTTP-cache exception permits only the exact opted-in file and SQLite handles", () => {
+	const previous = process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+	const root = "/throwaway/fixture";
+	const cache = "/private/var/folders/ab/verified-user/C/opencode/Cache.db";
+	try {
+		delete process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+		expect(() => assertOpenPaths([cache], root)).toThrow("forbidden");
+		process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB = cache;
+		for (const suffix of ["", "-wal", "-shm"]) {
+			const path = `${cache}${suffix}`;
+			if (process.platform === "darwin") {
+				expect(() => assertOpenPaths([path], root, [], [path])).not.toThrow();
+			} else {
+				expect(() => assertOpenPaths([path], root)).toThrow("forbidden");
+			}
+		}
+		for (const path of [
+			`${cache}.other.db`, cache.replace("verified-user", "another-user"),
+			cache.replace("Cache.db", "opencode.db"),
+			join(homedir(), ".local/share/opencode/opencode.db"),
+			join(homedir(), ".local/share/cortexkit/magic-context/context.db"),
+			join(homedir(), ".config/opencode/settings.json"),
+		]) expect(() => assertOpenPaths([path], root)).toThrow("forbidden");
+		process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB = join(homedir(), ".local/share/opencode/Cache.db");
+		expect(() => assertOpenPaths([process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB], root)).toThrow("forbidden");
+	} finally {
+		if (previous === undefined) delete process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+		else process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB = previous;
+	}
 });
 test("live snapshot detects changed database and logs that the top-level HOME fence misses", () => {
 	const { root } = isolation();
@@ -216,9 +246,10 @@ test("v2_loads_via_exports_map and session_message_reader real host writes", asy
 			plugins.data.find((plugin) => plugin.id === "opencode-magic-context")
 				?.state.status,
 		).toBe("active");
-		expect(host.stdout() + host.stderr()).toContain(
-			"@cortexkit/opencode-magic-context v2 setup",
-		);
+		expect(
+			await waitForPluginLog(host.env, "@cortexkit/opencode-magic-context v2 setup"),
+		).toContain("@cortexkit/opencode-magic-context v2 setup");
+		expect(host.stdout() + host.stderr()).not.toContain("[magic-context]");
 		host.mock.setDefault({
 			text: "fixture reply",
 			usage: { input_tokens: 100, output_tokens: 10 },

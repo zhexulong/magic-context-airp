@@ -18,7 +18,9 @@
  * ever removed: other packages' slots and version-pinned Magic Context slots
  * are left alone. When the config entry follows another dist-tag (`@beta`,
  * `@next`), the slot checked and cleared is that tag's, compared against the
- * tag's current version.
+ * tag's current version. A slot the config never loads (the config loads Magic
+ * Context from a local checkout, or pins a version) is reported as one
+ * informational line and never cleared.
  *
  * The slot is never removed while an OpenCode process may be using it. A
  * running host keeps no file inside the slot open once the plugin is loaded
@@ -34,6 +36,7 @@ import { existsSync, rmSync } from "node:fs";
 import { compareSemverCore } from "@magic-context/core/hooks/auto-update-checker/semver";
 import { inspectWindowsProcessesSync } from "@magic-context/core/shared/rpc-utils";
 import {
+    describeUnusedOpenCodePluginCache,
     getOpenCodeV2PluginCacheSlot,
     isOpenCodePluginDistTag,
     readConfiguredOpenCodePluginSpec,
@@ -126,7 +129,9 @@ export interface OpenCodeV2CacheResult {
         | "cleared"
         | "in_use"
         | "in_use_unknown"
-        | "error";
+        | "error"
+        /** The config never makes OpenCode 2 load this slot; it is left alone. */
+        | "unused";
     slot: string;
     cached?: string;
     latest?: string;
@@ -140,6 +145,11 @@ export interface OpenCodeV2CacheResult {
      * holds that tag's current version.
      */
     distTag?: string;
+    /**
+     * Set on `not_found` when the config does not reference the slot either,
+     * so a missing install is expected rather than pending.
+     */
+    unused?: boolean;
 }
 
 /**
@@ -173,18 +183,29 @@ function prereleaseOf(version: string): string {
     return dash === -1 ? "" : withoutBuild.slice(dash + 1);
 }
 
+/**
+ * Semver precedence of two versions: negative when `a` is older, positive
+ * when newer, 0 when equal. Within one core version a prerelease ranks below
+ * the release (0.44.0-beta.1 < 0.44.0-beta.3 < 0.44.0). Null when either is
+ * not a semver version.
+ */
+export function compareSemverPrecedence(a: string, b: string): number | null {
+    const comparison = compareSemverCore(a, b);
+    if (comparison === null || comparison !== 0) return comparison;
+    return comparePrerelease(prereleaseOf(a), prereleaseOf(b));
+}
+
 /** True when the cached install is older than `latest` or unreadable. */
 function isStale(cached: string | undefined, latest: string): boolean {
     if (cached === undefined) return true;
     if (cached === latest) return false;
-    const comparison = compareSemverCore(cached, latest);
+    const comparison = compareSemverPrecedence(cached, latest);
     // Unparseable versions that differ are treated as stale; a newer cached
-    // build (for example a prerelease ahead of `latest`) is left alone.
+    // build (for example a prerelease ahead of `latest`) is left alone. Same
+    // core: prerelease order decides, which matters for a `@beta` or `@next`
+    // slot (0.44.0-beta.1 is older than 0.44.0-beta.3).
     if (comparison === null) return true;
-    if (comparison !== 0) return comparison < 0;
-    // Same core: prerelease order decides, which matters for a `@beta` or
-    // `@next` slot (0.44.0-beta.1 is older than 0.44.0-beta.3).
-    return comparePrerelease(prereleaseOf(cached), prereleaseOf(latest)) < 0;
+    return comparison < 0;
 }
 
 export interface OpenCodeV2SlotRemovalDeps {
@@ -257,12 +278,27 @@ export function checkOpenCodeV2PluginCache(
          * `latestVersion` must be that tag's current version.
          */
         distTag?: string;
+        /**
+         * Magic Context specs the config makes OpenCode 2 load (see
+         * `readReferencedOpenCodePluginSpecs`). A slot whose spec is not in the
+         * set is never loaded, so it is reported as unused and never cleared.
+         * Undefined when the config could not be read; the slot then counts.
+         */
+        referencedSpecs?: ReadonlySet<string>;
     },
     deps: OpenCodeV2SlotRemovalDeps & { slot?: string } = {},
 ): OpenCodeV2CacheResult {
     const distTag = options.distTag && options.distTag !== "latest" ? options.distTag : undefined;
     const slot = deps.slot ?? getOpenCodeV2PluginCacheSlot(undefined, distTag ?? "latest");
     const tagged = distTag ? { distTag } : {};
+    if (
+        options.referencedSpecs !== undefined &&
+        !options.referencedSpecs.has(distTag ?? "latest")
+    ) {
+        return existsSync(slot)
+            ? { action: "unused", slot, cached: readOpenCodeV2CachedPluginVersion(slot), ...tagged }
+            : { action: "not_found", slot, unused: true, ...tagged };
+    }
     if (!existsSync(slot)) return { action: "not_found", slot, ...tagged };
 
     const cached = readOpenCodeV2CachedPluginVersion(slot);
@@ -319,7 +355,11 @@ export interface OpenCodeV2CacheReporter {
 export function reportOpenCodeV2PluginCache(
     result: OpenCodeV2CacheResult,
     report: OpenCodeV2CacheReporter,
-    options: { reportMissing: boolean },
+    options: {
+        reportMissing: boolean;
+        /** The local path the config loads Magic Context from, for the unused-copy line. */
+        loadedFrom?: string;
+    },
 ): { fixed: boolean; issue: boolean } {
     const tag = result.distTag ?? "latest";
     const versions = `cached: ${result.cached ?? "unreadable"}${result.latest ? `, ${tag}: ${result.latest}` : ""}`;
@@ -327,7 +367,7 @@ export function reportOpenCodeV2PluginCache(
     const slotName = result.distTag ? ` @${result.distTag}` : "";
     switch (result.action) {
         case "not_found":
-            if (options.reportMissing) {
+            if (options.reportMissing && !result.unused) {
                 report.pass(
                     `OpenCode 2 plugin cache has no Magic Context${slotName} install yet (OpenCode installs it on next start)`,
                 );
@@ -375,6 +415,17 @@ export function reportOpenCodeV2PluginCache(
             );
             report.info(`  ${result.slot}`);
             return { fixed: true, issue: false };
+        case "unused":
+            report.info(
+                describeUnusedOpenCodePluginCache({
+                    host: "OpenCode 2",
+                    spec: tag,
+                    cached: result.cached,
+                    paths: [result.slot],
+                    loadedFrom: options.loadedFrom,
+                }),
+            );
+            return { fixed: false, issue: false };
         case "error":
             report.warn(`Could not clear the OpenCode 2 plugin cache: ${result.error}`);
             report.info(`  Manually delete: ${result.slot}`);

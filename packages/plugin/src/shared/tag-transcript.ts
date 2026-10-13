@@ -67,9 +67,11 @@ import {
 } from "../hooks/magic-context/tag-content-primitives";
 import type { TagTarget } from "../hooks/magic-context/tag-messages";
 import { toolInputStringBytes } from "../hooks/magic-context/tool-input-size";
+import { TEXT_TAG_IDENTITY_MARKER } from "./tag-owner-id";
 import type { Transcript, TranscriptMessage, TranscriptPart } from "./transcript";
 
-export const TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
+// Re-exported so existing importers keep one source for the marker.
+export { TEXT_TAG_IDENTITY_MARKER };
 
 export interface TagTranscriptOptions {
     /**
@@ -972,7 +974,14 @@ function applyTextPrefixAndTarget(args: TagTextPartArgs, tagId: number, text: st
     }
 
     const targetStart = args.timing ? performance.now() : 0;
-    args.targets.set(tagId, buildTextTarget(args.part, args.message));
+    args.targets.set(
+        tagId,
+        buildTextTarget(
+            args.part,
+            args.message,
+            args.skipPrefixInjection ? "" : prependTag(tagId, ""),
+        ),
+    );
     if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
@@ -1148,6 +1157,10 @@ function buildAggregateTarget(
     };
 
     return {
+        mutationParts: occurrences.map((occ) => ({
+            message: { info: occ.message.info, parts: [] },
+            part: occ.part,
+        })),
         measureReclaim(skeleton) {
             let beforeTools = 0;
             let afterTools = 0;
@@ -1307,8 +1320,11 @@ function buildAggregateTarget(
 function buildTextTarget(
     part: TranscriptPart,
     message: { info: { id?: string; role: string } },
+    textPrefix: string,
 ): TagTarget {
     return {
+        mutationParts: [{ message: { info: message.info, parts: [] }, part }],
+        textPrefix,
         setContent(content: string): boolean {
             return part.setText(content);
         },
@@ -1340,6 +1356,7 @@ function buildToolTarget(
     tagId: number,
 ): TagTarget {
     return {
+        mutationParts: [{ message: { info: message.info, parts: [] }, part }],
         setContent(content: string): boolean {
             return setToolContentOrText(part, content);
         },

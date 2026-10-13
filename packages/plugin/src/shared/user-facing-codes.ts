@@ -1,5 +1,6 @@
 import type { EmbeddingFailureClass } from "../features/magic-context/memory/embedding-failure";
 import type { PromptFailureClass } from "./model-suggestion-retry";
+import { sanitizeDiagnosticText } from "./redaction";
 
 export const USER_FACING_FAILURES = {
     historian_unavailable: {
@@ -7,16 +8,35 @@ export const USER_FACING_FAILURES = {
         sentence: "History compression could not finish this turn.",
         action: "It will retry automatically.",
     },
-    hidden_cleanup_unbound: {
-        code: "MC-H02",
-        sentence: "Some finished background sessions could not be removed from this host.",
-        action: "They are removed automatically the next time Magic Context runs inside a registered OpenCode service.",
-    },
     historian_saved_history_misaligned: {
         code: "MC-H03",
         sentence:
             "History compression is paused because this session's saved summaries no longer line up with its messages.",
         action: "Run /ctx-recomp to rebuild them.",
+    },
+    history_boundary_unresolved: {
+        code: "MC-H04",
+        sentence:
+            "This request was not sent: the message that marks where this session's history summary ends is missing from the OpenCode store, and without it the request is larger than the model's context window.",
+        action: "Run /ctx-recomp to rebuild the history summary.",
+    },
+    history_over_window_unmanaged: {
+        code: "MC-H06",
+        sentence:
+            "This request was not sent: this session's history is larger than the model's context window, and Magic Context does not have a summary of it yet to send in its place.",
+        action: "Send your message again once history compression has caught up, or switch to a model with a larger context window.",
+    },
+    frozen_history_over_window: {
+        code: "MC-H07",
+        sentence:
+            "This request was not sent: the conversation is larger than the context window the provider reported, and the compressed history Magic Context has ready does not fit either.",
+        action: "Run /ctx-flush to compress it now, then send your message again.",
+    },
+    historian_window_too_small: {
+        code: "MC-H05",
+        sentence:
+            "History compression is paused because the history model's context window is too small for its instructions.",
+        action: "Set historian.model in magic-context.jsonc to a model with a larger context window.",
     },
     recomp_unavailable: {
         code: "MC-R01",
@@ -32,6 +52,11 @@ export const USER_FACING_FAILURES = {
         code: "MC-D02",
         sentence: "Memory maintenance could not reach its model.",
         action: "Check the model connection, then run /ctx-dream again.",
+    },
+    dream_local_refusal: {
+        code: "MC-D12",
+        sentence: "Memory maintenance was refused before reaching the model.",
+        action: "Check the hidden-request diagnostic in the Magic Context log before retrying.",
     },
     dream_step_limit: {
         code: "MC-D10",
@@ -149,6 +174,12 @@ export const USER_FACING_FAILURES = {
         sentence: "The last context update did not finish.",
         action: "Send another message to retry.",
     },
+    transform_pass_degraded: {
+        code: "MC-S06",
+        sentence:
+            "This request was not sent: Magic Context could not finish preparing it, and without that preparation it could be far larger than the previous request.",
+        action: "Send your message again.",
+    },
     configuration_warning: {
         code: "MC-S03",
         sentence: "Some configuration settings could not be applied.",
@@ -208,6 +239,18 @@ export const USER_FACING_FAILURES = {
         code: "MC-C10",
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
+    },
+    context_db_missing: {
+        code: "MC-C15",
+        sentence: "Magic Context has no context.db.",
+        action: "Run `npx @cortexkit/magic-context doctor store init`, then restart ck-mc.",
+    },
+    // MC-C16 is retired: released builds showed it when a turn was refused because
+    // another machine held the session's agent. Do not reuse it for a new failure.
+    single_store_migration_required: {
+        code: "MC-C14",
+        sentence: "Magic Context's Rust mode needs a one-time migration of its store.",
+        action: "Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`.",
     },
     store_ahead_of_binary: {
         code: "MC-C13",
@@ -289,6 +332,7 @@ export function capabilityRefusalCode(capability: CapabilityRefusal): string {
 const DREAM_FAILURE_KEYS = {
     provider_timeout: "dream_provider_timeout",
     provider_error: "dream_provider_error",
+    local_refusal: "dream_local_refusal",
     step_limit: "dream_step_limit",
     token_budget: "dream_token_budget",
     empty_completion: "dream_empty_completion",
@@ -315,8 +359,12 @@ const EMBEDDING_FAILURE_KEYS = {
 export function renderDreamFailure(
     failureClass: PromptFailureClass,
     style: UserFacingTextStyle = "markdown",
+    refusalReason?: string | null,
 ): string {
-    return renderUserFacingFailure(DREAM_FAILURE_KEYS[failureClass], style);
+    const rendered = renderUserFacingFailure(DREAM_FAILURE_KEYS[failureClass], style);
+    return failureClass === "local_refusal" && refusalReason
+        ? `${rendered} Reason: ${sanitizeDiagnosticText(refusalReason).slice(0, 500)}`
+        : rendered;
 }
 
 export function dreamFailureCode(failureClass: PromptFailureClass): string {

@@ -1,16 +1,19 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
+import * as embeddingModule from "@magic-context/core/features/magic-context/memory/embedding";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
-import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage";
+import { autoSearchTestSnapshot } from "@magic-context/core/hooks/magic-context/auto-search-snapshot.fixture";
+import * as searchModule from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
+import { PiContextBudget, PiContextDeadlineError } from "./pi-context-budget";
 import {
 	assistantMessage,
 	createTestDb,
@@ -43,14 +46,131 @@ function memoryResult(
 }
 
 describe("runAutoSearchHintForPi", () => {
+	let snapshotSpy: ReturnType<
+		typeof spyOn<typeof embeddingModule, "getProjectEmbeddingSnapshot">
+	>;
+	beforeEach(() => {
+		snapshotSpy = spyOn(
+			embeddingModule,
+			"getProjectEmbeddingSnapshot",
+		).mockReturnValue(autoSearchTestSnapshot(baseOptions.projectPath));
+	});
 	afterEach(() => {
+		snapshotSpy.mockRestore();
 		clearAutoSearchForPiSession("ses-auto");
 		clearAutoSearchForPiSession("ses-auto-2");
 	});
 
+	it("coalesces concurrent Pi passes and replays into each caller's own array", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "searchAutoHint").mockResolvedValue([
+			memoryResult(),
+		]);
+		try {
+			const first = [userMessage("explain the historian cache wiring", 1)];
+			const second = [userMessage("explain the historian cache wiring", 1)];
+			const results = await Promise.all([
+				runAutoSearchHintForPi({
+					db,
+					sessionId: "ses-auto",
+					messages: first,
+					entryIds: ["same-user"],
+					decisions: [],
+					options: baseOptions,
+				}),
+				runAutoSearchHintForPi({
+					db,
+					sessionId: "ses-auto",
+					messages: second,
+					entryIds: ["same-user"],
+					decisions: [],
+					options: baseOptions,
+				}),
+			]);
+			expect(results[0]).toBe(first);
+			expect(results[1]).toBe(second);
+			expect(textOf(first[0])).toContain("<ctx-search-hint>");
+			expect(textOf(second[0])).toBe(textOf(first[0]));
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("does not publish a worker hint beyond the pass optional cutoff", async () => {
+		const db = createTestDb();
+		let now = 0;
+		const budget = new PiContextBudget(0, () => now);
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
+			async () => {
+				now = 21_001;
+				return [memoryResult()];
+			},
+		);
+		const messages = [userMessage("explain the historian cache wiring", 1)];
+		try {
+			await expect(
+				runAutoSearchHintForPi({
+					db,
+					sessionId: "ses-auto",
+					messages,
+					entryIds: ["cutoff-user"],
+					options: baseOptions,
+					passGuard: { assert: budget.assert, wait: budget.wait },
+				}),
+			).rejects.toBeInstanceOf(PiContextDeadlineError);
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
+			expect(getAutoSearchHintDecisions(db, "ses-auto")).toEqual([]);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("does not replay a coalesced hint into an expired joining pass", async () => {
+		const db = createTestDb();
+		let now = 0;
+		const budget = new PiContextBudget(0, () => now);
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
+			async () => {
+				now = 21_001;
+				return [memoryResult()];
+			},
+		);
+		const owner = [userMessage("explain the historian cache wiring", 1)];
+		const joined = [userMessage("explain the historian cache wiring", 1)];
+		try {
+			const first = runAutoSearchHintForPi({
+				db,
+				sessionId: "ses-auto",
+				messages: owner,
+				entryIds: ["joined-user"],
+				options: baseOptions,
+			});
+			const second = runAutoSearchHintForPi({
+				db,
+				sessionId: "ses-auto",
+				messages: joined,
+				entryIds: ["joined-user"],
+				options: baseOptions,
+				passGuard: { assert: budget.assert, wait: budget.wait },
+			});
+			await first;
+			await expect(second).rejects.toBeInstanceOf(PiContextDeadlineError);
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(textOf(owner[0])).toContain("<ctx-search-hint>");
+			expect(textOf(joined[0])).not.toContain("<ctx-search-hint>");
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
 	it("reuses the per-turn cached hint for the same user message id", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -84,7 +204,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("excludes Primers from transform-time auto-search hints", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [],
 		);
 		try {
@@ -107,7 +227,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("replays persisted hints but skips fresh decisions when strict entry ids fail", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -155,7 +275,7 @@ describe("runAutoSearchHintForPi", () => {
 		// now-removed message's id ("entry-OLD-WRONG"). The reference-keyed map
 		// must win and anchor the hint to the real id ("entry-REAL").
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -200,7 +320,7 @@ describe("runAutoSearchHintForPi", () => {
 		// anchor would persist a decision against the wrong turn and replay the hint
 		// onto the wrong message on later passes.
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -237,7 +357,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("runs a fresh search for a new user message id", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -261,9 +381,93 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
+	it("skips a steer-only user message after the latest real prompt", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "searchAutoHint").mockResolvedValue([
+			memoryResult(),
+		]);
+		try {
+			const messages = [
+				userMessage("explain the historian cache wiring", 1),
+				userMessage(
+					[
+						"<system-reminder>",
+						"[BACKGROUND BASH COMPLETED]",
+						"</system-reminder>",
+						"<!-- OMO_INTERNAL_INITIATOR -->",
+						"<ctx-search-hint>injected hint</ctx-search-hint>",
+						"<instruction>injected instruction</instruction>",
+					].join("\n"),
+					2,
+				),
+			];
+			const before = JSON.stringify(messages);
+
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				entryIds: ["entry-real-prompt", "entry-steer"],
+				decisions: [],
+				options: baseOptions,
+			});
+
+			expect(spy).not.toHaveBeenCalled();
+			expect(getAutoSearchHintDecisions(db, "ses-auto")).toEqual([]);
+			expect(JSON.stringify(messages)).toBe(before);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("replays a persisted hint unchanged when a steer message follows it", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "searchAutoHint").mockResolvedValue([
+			memoryResult(),
+		]);
+		try {
+			const originalMessage = userMessage(
+				"explain the historian cache wiring",
+				1,
+			);
+			const original = [originalMessage];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: original,
+				entryIds: ["entry-real-prompt"],
+				options: baseOptions,
+			});
+			const replay = [
+				originalMessage,
+				userMessage(
+					"<system-reminder><channel-notice>continue</channel-notice></system-reminder>",
+					2,
+				),
+			];
+			const before = JSON.stringify(replay);
+
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: replay,
+				entryIds: ["entry-real-prompt", "entry-steer"],
+				decisions: getAutoSearchHintDecisions(db, "ses-auto"),
+				options: baseOptions,
+			});
+
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(JSON.stringify(replay)).toBe(before);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
 	it("does not append a hint when top score is below threshold", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult(0.2)],
 		);
 		try {
@@ -286,7 +490,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("skips empty user messages", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -306,7 +510,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("skips stacked search augmentation without searching", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {
@@ -337,7 +541,7 @@ describe("runAutoSearchHintForPi", () => {
 	it("strips plugin markers from the prompt before searching", async () => {
 		const db = createTestDb();
 		let capturedPrompt = "";
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async (_db, _session, _project, prompt) => {
 				capturedPrompt = prompt;
 				return [];
@@ -376,7 +580,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("does not append a recovered hint to a buried user message", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch")
+		const spy = spyOn(searchModule, "searchAutoHint")
 			.mockImplementationOnce(async () => {
 				throw new Error("temporary search failure");
 			})
@@ -419,7 +623,7 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("does not persist no-hint decisions for retryable search errors", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => {
 				throw new Error("temporary search failure");
 			},
@@ -449,9 +653,9 @@ describe("runAutoSearchHintForPi", () => {
 		}
 	});
 
-	it("does not persist no-hint decisions for retryable search timeouts", async () => {
+	it("persists a sticky no-hint decision after serving a deadline skip", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			() => new Promise<UnifiedSearchResult[]>(() => undefined),
 		);
 		try {
@@ -466,7 +670,9 @@ describe("runAutoSearchHintForPi", () => {
 			const elapsed = Date.now() - started;
 
 			expect(elapsed).toBeLessThan(4_000);
-			expect(getAutoSearchHintDecisions(db, "ses-auto")).toHaveLength(0);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]?.reason).toBe(
+				"timeout",
+			);
 			expect(textOf(messages[0])).not.toContain("<ctx-search-hint>");
 
 			await runAutoSearchHintForPi({
@@ -475,16 +681,151 @@ describe("runAutoSearchHintForPi", () => {
 				messages,
 				options: baseOptions,
 			});
-			expect(spy).toHaveBeenCalledTimes(2);
+			expect(spy).toHaveBeenCalledTimes(1);
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
 		}
 	}, 10_000);
 
+	it("does not serve a synchronous search result after the whole-operation deadline", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
+			async () => {
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3100);
+				return [memoryResult()];
+			},
+		);
+		try {
+			const messages = [userMessage("What's the current status ?", 1)];
+			const before = JSON.stringify(messages);
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				entryIds: ["user"],
+				options: baseOptions,
+				ensureProjectRegistered: () =>
+					new Promise((resolve) => setTimeout(resolve, 2900)),
+			});
+			expect(JSON.stringify(messages)).toBe(before);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]?.reason).toBe(
+				"timeout",
+			);
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	}, 6000);
+
+	it("aborts at the embedding checkpoint before an overdue search can scan vectors", async () => {
+		const db = createTestDb();
+		let observedAborted = false;
+		const embed = spyOn(
+			embeddingModule,
+			"embedTextForProject",
+		).mockImplementation(async () => {
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3100);
+			return null;
+		});
+		const search = spyOn(searchModule, "searchAutoHint").mockImplementation(
+			async (_db, _session, _project, prompt, options) => {
+				await options?.embedQuery?.(prompt, options.signal);
+				observedAborted = options?.signal?.aborted ?? false;
+				return [memoryResult()];
+			},
+		);
+		try {
+			const messages = [userMessage("What's the current status ?", 1)];
+			const before = JSON.stringify(messages);
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				entryIds: ["user"],
+				options: baseOptions,
+				ensureProjectRegistered: () =>
+					new Promise((resolve) => setTimeout(resolve, 2900)),
+			});
+			expect(observedAborted).toBe(true);
+			expect(JSON.stringify(messages)).toBe(before);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]?.reason).toBe(
+				"timeout",
+			);
+		} finally {
+			embed.mockRestore();
+			search.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("cold preparation is deferred and a later registered turn can hint", async () => {
+		snapshotSpy.mockReturnValue(null);
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
+			async () => [memoryResult()],
+		);
+		let release: (() => void) | undefined;
+		const preparation = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let watchdog: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const messages = [userMessage("What's the current status ?", 1)];
+			const before = JSON.stringify(messages);
+			const pass = runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages,
+				entryIds: ["user"],
+				options: baseOptions,
+				ensureProjectRegistered: () => preparation,
+			});
+			const result = await Promise.race([
+				pass.then(() => "served"),
+				new Promise<string>((resolve) => {
+					watchdog = setTimeout(() => resolve("watchdog"), 3500);
+				}),
+			]);
+			expect(result).toBe("served");
+			expect(JSON.stringify(messages)).toBe(before);
+			expect(getAutoSearchHintDecisions(db, "ses-auto")[0]?.reason).toBe(
+				"empty",
+			);
+			release?.();
+			await pass;
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(spy).toHaveBeenCalledTimes(0);
+			snapshotSpy.mockReturnValue(
+				autoSearchTestSnapshot(baseOptions.projectPath),
+			);
+			const next = [
+				...messages,
+				assistantMessage("already served", 2),
+				userMessage("Let's go with the implementation.", 3),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: next,
+				entryIds: ["user", "assistant", "next-user"],
+				options: baseOptions,
+			});
+			expect(JSON.stringify(next.slice(0, 1))).toBe(before);
+			expect(textOf(next[2])).toContain("<ctx-search-hint>");
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			release?.();
+			if (watchdog) clearTimeout(watchdog);
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	}, 6000);
+
 	it("does not double-append an already present cached hint", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [memoryResult()],
 		);
 		try {

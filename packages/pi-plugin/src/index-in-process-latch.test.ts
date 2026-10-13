@@ -32,7 +32,11 @@ import {
 	createTestTempDir,
 } from "@magic-context/core/shared/test-temp-dir";
 
-import { awaitInFlightHistorians } from "./context-handler";
+import {
+	awaitInFlightHistorians,
+	hasPendingMaterialization,
+	signalPiPendingMaterialization,
+} from "./context-handler";
 import { __test as dreamerTest } from "./dreamer";
 import magicContextPiExtension, { __test } from "./index";
 import { awaitInFlightRecomps, spawnPiRecompRun } from "./pi-recomp-runner";
@@ -147,9 +151,11 @@ function createCountingPi() {
 			for (const handler of eventBusHandlers.get(channel) ?? []) handler(data);
 		},
 		async emitPiEvent(event: string, data: unknown = {}, ctx: unknown = {}) {
+			const results: unknown[] = [];
 			for (const handler of piEventHandlers.get(event) ?? []) {
-				await handler(data, ctx);
+				results.push(await handler(data, ctx));
 			}
+			return results;
 		},
 	};
 }
@@ -566,6 +572,60 @@ describe("Pi in-process child guard (#247)", () => {
 		}
 	}, 15_000);
 
+	it("keeps the current session's in-memory state when a switch does not happen", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		const sessionId = "ses-pi-cancelled-switch";
+		const ctx = {
+			sessionManager: { getSessionId: () => sessionId },
+			ui: { setStatus: () => undefined },
+		};
+		await magicContextPiExtension(runtime.pi);
+		signalPiPendingMaterialization(sessionId);
+
+		// Pi emits session_before_switch before it commits: another extension
+		// can cancel it, and opening the target can still fail (missing cwd).
+		// Either way the user stays in this session and nothing else follows.
+		await runtime.emitPiEvent("session_before_switch", {}, ctx);
+
+		expect(hasPendingMaterialization(sessionId)).toBe(true);
+
+		// A switch Pi carries out tears the outgoing session down with
+		// session_shutdown, which drains the same state.
+		await runtime.emitPiEvent("session_shutdown", {}, ctx);
+		expect(hasPendingMaterialization(sessionId)).toBe(false);
+	}, 15_000);
+
+	it("drains the outgoing session once an OMP session_switch confirms it", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		const outgoing = "ses-omp-switch-outgoing";
+		const incoming = "ses-omp-switch-incoming";
+		let current = outgoing;
+		const ctx = {
+			sessionManager: { getSessionId: () => current },
+			ui: { setStatus: () => undefined },
+		};
+		try {
+			await magicContextPiExtension(runtime.pi);
+			signalPiPendingMaterialization(outgoing);
+			signalPiPendingMaterialization(incoming);
+
+			// OMP keeps one extension runtime across a switch: no
+			// session_shutdown, but a session_switch once it is done.
+			await runtime.emitPiEvent("session_before_switch", {}, ctx);
+			current = incoming;
+			await runtime.emitPiEvent("session_switch", {}, ctx);
+
+			expect(hasPendingMaterialization(outgoing)).toBe(false);
+			expect(hasPendingMaterialization(incoming)).toBe(true);
+		} finally {
+			await runtime.emitPiEvent("session_shutdown", {}, ctx);
+		}
+	}, 15_000);
+
 	it("unsubscribes child lifecycle listeners on session shutdown", async () => {
 		isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
@@ -905,6 +965,86 @@ describe("Pi in-process child guard (#247)", () => {
 		expect(child.tools.length).toBeGreaterThan(0);
 		expect(child.commands.length).toBeGreaterThan(0);
 	}, 15_000);
+});
+
+describe("Pi system-prompt section injection (#649)", () => {
+	it("injects the guidance block as a structured section that composes with later extensions", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		await magicContextPiExtension(runtime.pi);
+
+		// Register a second extension's handler AFTER magic-context, mirroring
+		// Pi's in-order before_agent_start dispatch: a later extension writing
+		// its own section into the same shared, mutable options map.
+		runtime.pi.on("before_agent_start", (event) => {
+			event.systemPromptOptions.sections.later_ext =
+				"<later-ext>snapshot</later-ext>";
+		});
+
+		const ctx = {
+			cwd: process.cwd(),
+			hasUI: false,
+			sessionManager: { getSessionId: () => "ses-section-injection" },
+			ui: { setStatus() {} },
+		};
+		await runtime.emitPiEvent("session_start", {}, ctx);
+
+		// Mirror Pi's BeforeAgentStartEvent: systemPromptOptions.sections is
+		// the normalized, mutable map every extension's handler writes into.
+		const event = {
+			type: "before_agent_start",
+			prompt: "hello",
+			systemPrompt: "BASE PROMPT",
+			systemPromptOptions: { sections: {} as Record<string, string> },
+		};
+		await runtime.emitPiEvent("before_agent_start", event, ctx);
+
+		// The guidance block must land in the shared sections map — not in a
+		// forced prompt, which Pi would render INSTEAD of the sections and
+		// thereby hide the later extension's section from the provider.
+		expect(event.systemPromptOptions.sections.magic_context).toContain(
+			"## Magic Context",
+		);
+		expect(event.systemPromptOptions.sections.later_ext).toBe(
+			"<later-ext>snapshot</later-ext>",
+		);
+
+		await runtime.emitPiEvent("session_shutdown", {}, ctx);
+	}, 20_000);
+
+	it("keeps the forced-prompt fallback on hosts without a sections API (Oh My Pi)", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		await magicContextPiExtension(runtime.pi);
+		const ctx = {
+			cwd: process.cwd(),
+			hasUI: false,
+			sessionManager: { getSessionId: () => "ses-omp-fallback" },
+			ui: { setStatus() {} },
+		};
+		await runtime.emitPiEvent("session_start", {}, ctx);
+
+		// Oh My Pi's before_agent_start event has no systemPromptOptions
+		// (verified on Oh My Pi 18.2.6 and 18.8.7): the handler must not throw
+		// and must keep injecting via a forced prompt return, or requests
+		// would go out with no guidance block at all.
+		const event = {
+			type: "before_agent_start",
+			prompt: "hello",
+			systemPrompt: "BASE PROMPT",
+		};
+		const results = await runtime.emitPiEvent("before_agent_start", event, ctx);
+		const forced = results.find(
+			(r): r is { systemPrompt: string } =>
+				typeof r === "object" && r !== null && "systemPrompt" in r,
+		);
+		expect(forced?.systemPrompt).toContain("BASE PROMPT");
+		expect(forced?.systemPrompt).toContain("## Magic Context");
+
+		await runtime.emitPiEvent("session_shutdown", {}, ctx);
+	}, 20_000);
 });
 
 beforeEach(async () => {

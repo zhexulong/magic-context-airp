@@ -1,14 +1,14 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
 import {
 	appendCompartments,
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
+import * as embeddingModule from "@magic-context/core/features/magic-context/memory/embedding";
 import {
 	__resetProjectIdentityForTests,
 	__setProjectIdentityTestHooks,
@@ -19,7 +19,7 @@ import {
 	isSessionReconciled,
 } from "@magic-context/core/features/magic-context/message-index-async";
 import { readEpochFloorSnapshot } from "@magic-context/core/features/magic-context/protection-window";
-import * as searchModule from "@magic-context/core/features/magic-context/search";
+import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
 import {
 	acquireWrapupInProgress,
 	addNote,
@@ -37,6 +37,7 @@ import {
 	insertTag,
 	queueM0Mutation,
 	queuePendingOp,
+	recordProtectedTailPublicationFloor,
 	setChannel1NudgeState,
 	setLastNudgeUndropped,
 	setPendingPiCompactionMarkerState,
@@ -47,13 +48,17 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
+	DRAIN_WINDOW_MS,
 	getEmergencyInputSample,
 	getMergedReasoningStrippedIds,
 	getOverflowState,
 	recordDetectedContextLimit,
 	recordOverflowDetected,
+	setPersistedNoteNudgeTriggerMessageId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
+import { autoSearchTestSnapshot } from "@magic-context/core/hooks/magic-context/auto-search-snapshot.fixture";
+import * as searchModule from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { resolveExecuteThreshold } from "@magic-context/core/hooks/magic-context/event-resolvers";
@@ -66,7 +71,9 @@ import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface"
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
-
+import { isPrefixBoundThinkingModel } from "../../plugin/src/features/magic-context/overflow-detection";
+import * as decisionLogs from "../../plugin/src/features/magic-context/transform-decision-log";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { clearAutoSearchForPiSession } from "./auto-search-pi";
 import {
 	awaitInFlightHistorians,
@@ -95,6 +102,9 @@ import {
 } from "./ctx-reduce-nudge-pi";
 import { publishGameBuddyAuthoredStableCatalog } from "./gamebuddy-authored-context-bridge.internal";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
+import * as piHistorian from "./pi-historian-runner";
+import { observePiPublicationForTest } from "./publication-observer-fixture.test";
+import { capturePiServedArray } from "./served-array-ledger";
 import {
 	assistantMessage,
 	assistantToolCall,
@@ -105,13 +115,109 @@ import {
 	toolResultMessage,
 	userMessage,
 } from "./test-utils.test";
+import { createCtxReduceTool } from "./tools/ctx-reduce";
 import { createPiTranscript } from "./transcript-pi";
+
+it("Pi spent drain budget prevents historian startup, preserves served bytes, and resumes asynchronously at reset", async () => {
+	const db = createTestDb();
+	const sessionId = "ses-pi-spent-drain-hot-path";
+	const fake = createFakePi();
+	const start = spyOn(piHistorian, "runPiHistorian").mockImplementation(
+		async () => {},
+	);
+	const logger = await import("@magic-context/core/shared/logger");
+	const log = spyOn(logger, "sessionLog");
+	try {
+		updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTags: 0,
+			historian: {
+				runner: {
+					harness: "pi",
+					run: mock(async () => ({
+						ok: true,
+						assistantText: "",
+						durationMs: 1,
+					})),
+				} as unknown as SubagentRunner,
+				model: "test/historian",
+				historianChunkTokens: 20_000,
+				executeThresholdPercentage: 80,
+				protectedTags: 0,
+			},
+		});
+		const handler = fake.handlers.get("context") as (
+			event: { messages: never[] },
+			ctx: never,
+		) => Promise<{ messages: unknown[] }>;
+		const raw = [
+			...Array.from({ length: 12 }, (_, i) =>
+				i % 2
+					? assistantMessage("history ".repeat(6000), i + 1)
+					: userMessage("history ".repeat(6000), i + 1),
+			),
+			...Array.from({ length: 5 }, (_, i) => userMessage("protected", i + 13)),
+		];
+		const pass = (tokens: number) => {
+			const messages = structuredClone(raw);
+			return handler({ messages: messages as never[] }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, i) => `entry-${i + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens,
+					percent: tokens / 2000,
+					contextWindow: 200_000,
+				}),
+			} as never);
+		};
+		const startedAt = Date.now();
+		db.prepare(
+			"UPDATE session_meta SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 500000 WHERE session_id = ?",
+		).run(startedAt, sessionId);
+		const first = await pass(156_000);
+		await awaitInFlightHistorians(sessionId);
+		const bytes = JSON.stringify(first.messages);
+		for (let i = 0; i < 2; i++) {
+			updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+			expect(JSON.stringify((await pass(156_000)).messages)).toBe(bytes);
+			await awaitInFlightHistorians(sessionId);
+		}
+		expect(start).not.toHaveBeenCalled();
+		expect(getOrCreateSessionMeta(db, sessionId).compartmentInProgress).toBe(
+			false,
+		);
+		expect(
+			log.mock.calls.filter(
+				([id, text]) =>
+					id === sessionId && String(text).includes("next eligible at"),
+			),
+		).toHaveLength(1);
+		db.prepare(
+			"UPDATE session_meta SET protected_tail_drain_window_started_at = ? WHERE session_id = ?",
+		).run(Date.now() - DRAIN_WINDOW_MS, sessionId);
+		await pass(156_000);
+		expect(start).not.toHaveBeenCalled();
+		await awaitInFlightHistorians(sessionId);
+		expect(start).toHaveBeenCalledTimes(1);
+	} finally {
+		await awaitInFlightHistorians(sessionId);
+		start.mockRestore();
+		log.mockRestore();
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
 
 describe("Pi context project identity cache", () => {
 	it("serves byte-identical output with cached identity and one host-usage read per context", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-project-identity-cache";
-		const project = mkdtempSync(join(tmpdir(), "mc-pi-project-"));
+		const project = createTestTempDirFromPath(join(tmpdir(), "mc-pi-project-"));
 		const fake = createFakePi();
 		let probes = 0;
 		let usageReads = 0;
@@ -172,7 +278,207 @@ describe("Pi context project identity cache", () => {
 	});
 });
 
+for (const configured of [true, false]) {
+	it(`Pi context pass ${configured ? "applies live user TTL edits without a prompt or model change" : "keeps built-in TTL changes frozen"}`, async () => {
+		const db = createTestDb();
+		const sessionId = `pi-ttl-${configured}`;
+		const fake = createFakePi();
+		let ttl = configured ? "1h" : "5m";
+		const logger = await import("@magic-context/core/shared/logger");
+		const logCalls = spyOn(logger, "sessionLog");
+		const decision = () =>
+			logCalls.mock.calls
+				.filter(
+					([id, message]) =>
+						id === sessionId &&
+						typeof message === "string" &&
+						message.startsWith("transform:") &&
+						message.includes("decision="),
+				)
+				.at(-1)?.[1];
+		try {
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTokens: 0,
+				protectedTags: 0,
+				cacheTtlConfig: ttl,
+				cacheTtlConfigured: configured,
+				resolveForProject: () => ({
+					db,
+					protectedTokens: 0,
+					protectedTags: 0,
+					cacheTtlConfig: ttl,
+					cacheTtlConfigured: configured,
+				}),
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: unknown[] }>;
+			const raw = [
+				userMessage("hello", 1),
+				assistantMessage("keep this cached reply", 2),
+				userMessage("next", 3),
+			];
+			const pass = () => {
+				const messages = structuredClone(raw);
+				const ctx = {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						["u1", "a2", "u3"],
+						messages,
+					),
+					model: { provider: "anthropic", id: "opus" },
+				};
+				return handler({ messages: messages as never[] }, ctx as never);
+			};
+			await pass();
+			queuePendingOp(db, sessionId, 2, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
+			});
+			ttl = configured ? "13h" : "10m";
+			const served = await pass();
+			expect(decision()).toContain(
+				configured ? "decision=defer" : "decision=execute",
+			);
+			expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe(
+				configured ? "13h" : "5m",
+			);
+			if (configured) {
+				updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+				ttl = "1m";
+				expect((await pass()).messages).toEqual(served.messages);
+				expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("1m");
+				expect(getPendingOps(db, sessionId)).toHaveLength(1);
+				expect(decision()).toContain("decision=defer");
+				updateSessionMeta(db, sessionId, {
+					lastResponseTime: Date.now() - 120_000,
+				});
+				await pass();
+				expect(decision()).toContain("decision=execute");
+			}
+		} finally {
+			logCalls.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+}
+
 describe("Pi project binding retry", () => {
+	it("logs an actual binding change once and stays quiet for an unchanged pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-binding-change-log";
+		const logger = await import("@magic-context/core/shared/logger");
+		const log = spyOn(logger, "sessionLog");
+		try {
+			recordSessionProjectIdentity(db, sessionId, "git:old");
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:new",
+				db,
+				"/workspace/new",
+			);
+
+			const changeLogs = () =>
+				log.mock.calls.filter(([, message]) =>
+					String(message).startsWith("project binding changed"),
+				);
+			expect(changeLogs()).toHaveLength(1);
+			expect(changeLogs()[0]).toEqual([
+				sessionId,
+				"project binding changed harness=pi cwd=/workspace/new old=git:old new=git:new",
+			]);
+
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:new",
+				db,
+				"/workspace/new",
+			);
+			expect(changeLogs()).toHaveLength(1);
+		} finally {
+			log.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("rate-limits failed writes and logs one recovery", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-binding-write-log";
+		const logger = await import("@magic-context/core/shared/logger");
+		const log = spyOn(logger, "sessionLog");
+		const clock = spyOn(Date, "now").mockReturnValue(1_000);
+		const schema = (
+			db
+				.prepare(
+					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
+				)
+				.get() as { sql: string }
+		).sql;
+		try {
+			db.exec("DROP TABLE session_projects");
+			const observe = () =>
+				contextHandlerInternals.updateSessionProjectTracking(
+					sessionId,
+					"git:retry",
+					db,
+					"/workspace/retry",
+				);
+			observe();
+			const failureLogs = () =>
+				log.mock.calls.filter(([, message]) =>
+					String(message).startsWith("project binding write failed"),
+				);
+			expect(failureLogs()).toHaveLength(1);
+			expect(failureLogs()[0][1]).toContain(
+				"project binding write failed harness=pi cwd=/workspace/retry attempted=git:retry:",
+			);
+			expect(failureLogs()[0][1]).toContain("no such table: session_projects");
+
+			clock.mockReturnValue(1_000 + 599_999);
+			observe();
+			expect(failureLogs()).toHaveLength(1);
+
+			clock.mockReturnValue(1_000 + 600_000);
+			observe();
+			expect(failureLogs()).toHaveLength(2);
+
+			db.exec(schema);
+			clock.mockReturnValue(1_000 + 600_001);
+			observe();
+			const recoveryLogs = log.mock.calls.filter(([, message]) =>
+				String(message).startsWith("project binding write recovered"),
+			);
+			expect(recoveryLogs).toHaveLength(1);
+			expect(recoveryLogs[0]).toEqual([
+				sessionId,
+				"project binding write recovered harness=pi cwd=/workspace/retry identity=git:retry",
+			]);
+			const changeLogs = log.mock.calls.filter(([, message]) =>
+				String(message).startsWith("project binding changed"),
+			);
+			expect(changeLogs).toHaveLength(1);
+			// Recovery is also the first successful binding write, so it reports the
+			// actual no-binding → project transition.
+			expect(changeLogs[0][1]).toContain("old=none new=git:retry");
+			const persisted = db
+				.prepare(
+					"SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+				)
+				.get(sessionId) as { project_path: string };
+			expect(persisted.project_path).toBe("git:retry");
+		} finally {
+			clock.mockRestore();
+			log.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("retries a failed first write without adding steady-state writes", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-retry-binding";
@@ -181,7 +487,9 @@ describe("Pi project binding retry", () => {
 				.prepare(
 					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
 				)
-				.get() as { sql: string }
+				.get() as {
+				sql: string;
+			}
 		).sql;
 		try {
 			db.exec("DROP TABLE session_projects");
@@ -221,7 +529,9 @@ describe("Pi protected-token floor wiring", () => {
 	it("snapshots the derived floor instead of a project-only decrease", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-project-protected-floor";
-		const project = mkdtempSync(join(tmpdir(), "mc-pi-protected-floor-"));
+		const project = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-protected-floor-"),
+		);
 		const fake = createFakePi();
 		try {
 			registerPiContextHandler(fake.pi as never, {
@@ -278,7 +588,11 @@ describe("Pi pressure guards", () => {
 			expect(src).toContain("let pendingOpsDidMutate = false");
 			expect(src).toContain("let heuristicOrReasoningDidMutate = false");
 			expect(src).toContain(
-				"const isCacheBustingPass = hasReclaimRide(rideSignals)",
+				"let isCacheBustingPass = hasReclaimRide(rideSignals)",
+			);
+			expect(src).toContain("if (identityRebuild) {");
+			expect(src).toContain(
+				'args.schedulerDecision = "execute"; isCacheBustingPass = true;',
 			);
 			expect(src).toContain(
 				"const toolReclaimApplicationOpportunity = isCacheBustingPass",
@@ -457,6 +771,93 @@ describe("Pi scheduler decision observability", () => {
 			expect(consumeDeferredMaterialization(sessionId)).toBe(false);
 		} finally {
 			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("Pi pipeline holds a queued protected tool through priced passes and releases after rotation", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-held-rotation";
+		const fake = createFakePi();
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTools: { custom: 2 },
+			protectedTokens: 4000,
+			protectedTags: 0,
+			heuristics: {},
+			injection: { injectionBudgetTokens: 10000 },
+		});
+		const handler = fake.handlers.get("context") as Parameters<
+			typeof runPass
+		>[0];
+		const messages = [userMessage("start", 1)];
+		for (let n = 1; n <= 3; n++) {
+			messages.push(assistantToolCall(`custom-${n}`, "custom", {}, n * 2), {
+				...toolResultMessage(`custom-${n}`, `custom result ${n}`, n * 2 + 1),
+				toolName: "custom",
+			});
+		}
+		for (let n = 1; n <= 3; n++) {
+			const output = Array.from(
+				{ length: 3000 },
+				(_, i) => `${i * 7919 + n * 104729}:${i * 3571}!`,
+			).join(" ");
+			messages.push(assistantToolCall(`bash-${n}`, "bash", {}, 10 + n * 2), {
+				...toolResultMessage(`bash-${n}`, output, 11 + n * 2),
+				toolName: "bash",
+			});
+		}
+		for (let n = 20; n < 40; n++)
+			messages.push(userMessage(`later work ${n}`, n));
+		try {
+			await runPass(handler, sessionId, structuredClone(messages));
+			const tag = getTagsBySession(db, sessionId).find(
+				(tag) => tag.messageId === "custom-2" && tag.type === "tool",
+			);
+			expect(tag).toBeDefined();
+			if (!tag) throw new Error("The protected tool result was not tagged");
+			const ack = await createCtxReduceTool({
+				db,
+				protectedTools: { custom: 2 },
+				floor: 4000,
+			}).execute(
+				"held-tool",
+				{ drop: String(tag.tagNumber) },
+				new AbortController().signal,
+				undefined,
+				fakeContext(sessionId) as never,
+			);
+			expect((ack.content[0] as { text: string }).text).toContain(
+				`Held: §${tag.tagNumber} is inside the protected working set`,
+			);
+			const status = () =>
+				getTagsBySession(db, sessionId).find(
+					(row) => row.tagNumber === tag.tagNumber,
+				)?.status;
+			for (let n = 0; n < 2; n++) {
+				signalPiPendingMaterialization(sessionId);
+				await runPass(handler, sessionId, structuredClone(messages));
+				expect(status()).toBe("active");
+			}
+			expect(
+				getPendingOps(db, sessionId).some((op) => op.tagId === tag.tagNumber),
+			).toBe(true);
+			messages.push(assistantToolCall("custom-4", "custom", {}, 50), {
+				...toolResultMessage("custom-4", "new custom result", 51),
+				toolName: "custom",
+			});
+			await runPass(handler, sessionId, structuredClone(messages));
+			expect(status()).toBe("active");
+			signalPiPendingMaterialization(sessionId);
+			await runPass(handler, sessionId, structuredClone(messages));
+			expect(status()).toBe("dropped");
+			expect(
+				getPendingOps(db, sessionId).some((op) => op.tagId === tag.tagNumber),
+			).toBe(false);
+			await runPass(handler, sessionId, structuredClone(messages));
+			expect(status()).toBe("dropped");
+		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
@@ -864,35 +1265,10 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("re-probes a stale negative after fingerprint construction before skipping adoption", async () => {
-		const removeTemporaryDirectory = async (dir: string): Promise<void> => {
-			// Windows may retain a just-closed WAL handle for a scheduler tick.
-			// Keep this fixture cleanup bounded rather than turning a passing
-			// concurrency assertion into an EBUSY failure.
-			for (let attempt = 0; attempt < 5; attempt++) {
-				try {
-					rmSync(dir, {
-						recursive: true,
-						force: true,
-						maxRetries: 1,
-						retryDelay: 10,
-					});
-					return;
-				} catch (error) {
-					// Bun's Windows SQLite backend may retain the sibling WAL file past
-					// process teardown. The temporary directory is outside product data;
-					// don't fail a correct race assertion solely because its best-effort
-					// cleanup loses that OS-level race.
-					if (
-						attempt === 4 &&
-						(error as NodeJS.ErrnoException).code !== "EBUSY"
-					)
-						throw error;
-					await sleep(25 * (attempt + 1));
-				}
-			}
-		};
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-fallback-race-"));
+	it("re-probes a stale negative after fingerprint construction before skipping adoption", () => {
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-fallback-race-"),
+		);
 		const dbPath = join(dir, "context.db");
 		const db = createTestDb(dbPath);
 		const siblingDb = createTestDb(dbPath);
@@ -934,7 +1310,9 @@ describe("Pi fallback tag adoption", () => {
 				sessionId,
 				tagger,
 				fingerprints,
-				{ hasFallbackMessageTags: false },
+				{
+					hasFallbackMessageTags: false,
+				},
 			);
 			expect(readTagRow(db, sessionId, 7)?.messageId).toBe(`${realId}:p0`);
 			expect(tagger.getTag(sessionId, `${realId}:p0`, "message")).toBe(7);
@@ -948,9 +1326,8 @@ describe("Pi fallback tag adoption", () => {
 			expect(textOf(messages[0])).toBe("§7§ raced message");
 		} finally {
 			closeQuietly(siblingDb);
-			closeQuietly(db);
-			await removeTemporaryDirectory(dir);
-		}
+		closeQuietly(db);
+	}
 	});
 
 	it("migrates dropped sentinelized tool-only owners without allocating a fresh tag", () => {
@@ -1074,6 +1451,12 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 			saveSource(db, sessionId, 20, "duplicate source");
+			updateTagStatus(db, sessionId, 20, "dropped");
+			capturePiServedArray(
+				sessionId,
+				[toolResultMessage(callId, "[dropped §20§]")],
+				{ servedTagNumbers: [20] },
+			);
 			tagger.bindToolTag(sessionId, callId, piOwner, 10);
 			tagger.bindToolTag(sessionId, callId, realOwner, 20);
 
@@ -1134,6 +1517,11 @@ describe("Pi fallback tag adoption", () => {
 			insertTag(db, sessionId, callId, "tool", 20, 31, 0, "Read", 0, realOwner);
 			queuePendingOp(db, sessionId, 30, "drop", 100);
 			queuePendingOp(db, sessionId, 31, "drop", 101);
+			capturePiServedArray(
+				sessionId,
+				[toolResultMessage(callId, "§31§ result")],
+				{ servedTagNumbers: [31] },
+			);
 			tagger.bindToolTag(sessionId, callId, piOwner, 30);
 			tagger.bindToolTag(sessionId, callId, realOwner, 31);
 
@@ -1308,7 +1696,11 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				null,
 				null,
-				{ tokenCount: 9, inputTokenCount: null, reasoningTokenCount: null },
+				{
+					tokenCount: 9,
+					inputTokenCount: null,
+					reasoningTokenCount: null,
+				},
 			);
 			db.prepare(
 				"UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = 71",
@@ -1317,6 +1709,9 @@ describe("Pi fallback tag adoption", () => {
 			queuePendingOp(db, sessionId, 71, "drop", 200);
 			tagger.bindTag(sessionId, `${fallbackId}:p0`, 70);
 			tagger.bindTag(sessionId, `${realId}:p0`, 71);
+			capturePiServedArray(sessionId, [userMessage("§71§ hello", 70)], {
+				servedTagNumbers: [71],
+			});
 
 			contextHandlerInternals.adoptPiFallbackTags(
 				db,
@@ -1399,6 +1794,11 @@ describe("Pi fallback tag adoption", () => {
 			insertTag(db, sessionId, callId, "tool", 10, 90, 0, "Read", 0, piOwner);
 			insertTag(db, sessionId, callId, "tool", 20, 91, 0, "Read", 0, realOwner);
 			queuePendingOp(db, sessionId, 91, "drop", 110);
+			capturePiServedArray(
+				sessionId,
+				[toolResultMessage(callId, "§91§ result")],
+				{ servedTagNumbers: [91] },
+			);
 			tagger.bindToolTag(sessionId, callId, piOwner, 90);
 			tagger.bindToolTag(sessionId, callId, realOwner, 91);
 
@@ -1455,7 +1855,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("cheap-gate: does not build the owner map when no pi-msg tool owners exist", () => {
+	it("prepares tool owners outside the writer even if discovery found no synthetic owners", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-tool-owner-cheap-gate";
@@ -1473,8 +1873,9 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				"entry-real",
 			);
-			// Split a gate hole from a wrong test premise: the tool-owner gate MUST
-			// be false here (no pi-msg-* owners), so the branch-walk never runs.
+			// A sibling can add a synthetic tool-owner tag before BEGIN. Prepare
+			// assistant/call identities even when no such tag is visible yet, so
+			// resolving the new tag needs no branch walk while holding the writer.
 			expect(hasPiFallbackToolOwnerTags(db, sessionId)).toBe(false);
 
 			let resolverCalls = 0;
@@ -1486,15 +1887,14 @@ describe("Pi fallback tag adoption", () => {
 				{
 					messages: [assistantToolCall("call-real", "Read", {}, 90)],
 					resolveStableId: () => {
+						expect(db.inTransaction).toBe(false);
 						resolverCalls += 1;
 						return "entry-real";
 					},
 				},
 			);
 
-			// The cheap hasPiFallbackToolOwnerTags gate short-circuits before any
-			// branch walk, so the resolver is never consulted.
-			expect(resolverCalls).toBe(0);
+			expect(resolverCalls).toBe(1);
 		} finally {
 			closeQuietly(db);
 		}
@@ -2308,6 +2708,82 @@ describe("registerPiContextHandler", () => {
 		});
 	}
 
+	for (const [name, isSubagent, tokens, queued, applies] of [
+		["subagent execute drains queued drops", true, 70000, true, true],
+		["primary execute holds queued drops", false, 70000, true, false],
+		["subagent defer holds queued drops", true, 20000, true, false],
+		["subagent empty execute is byte-identical", true, 70000, false, false],
+	] as const) {
+		it(`issue 619 ${name}`, async () => {
+			const db = createTestDb();
+			const sessionId = `issue-619-${name}`;
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				updateSessionMeta(db, sessionId, {
+					isSubagent,
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+				});
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: { keepReasoningTokens: 0 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				let passTokens = 20000;
+				const ctx = {
+					...fakeContext(sessionId),
+					getContextUsage: () => ({
+						tokens: passTokens,
+						percent: passTokens / 1000,
+						contextWindow: 100000,
+					}),
+				};
+				const pass = () =>
+					handler(
+						{
+							messages: [
+								userMessage("keep user", 1),
+								assistantMessage("spent assistant", 2),
+								...(applies
+									? [
+											assistantMessage(
+												"Keep <think>issue-619-stale-thought</think> visible",
+												3,
+											),
+											userMessage("new tail", 4),
+											assistantMessage("fresh assistant", 5),
+										]
+									: []),
+							] as never[],
+						},
+						ctx as never,
+					);
+				await pass();
+				const baseline = JSON.stringify((await pass()).messages);
+				if (queued) queuePendingOp(db, sessionId, 2, "drop");
+				passTokens = tokens;
+				const bytes = JSON.stringify((await pass()).messages);
+				expect(getPendingOps(db, sessionId)).toHaveLength(
+					queued && !applies ? 1 : 0,
+				);
+				if (applies) {
+					expect(bytes).not.toBe(baseline);
+					expect(bytes).not.toContain("issue-619-stale-thought");
+				} else expect(bytes).toBe(baseline);
+				for (let replay = 0; replay < 3; replay++)
+					expect(JSON.stringify((await pass()).messages)).toBe(bytes);
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
+
 	it("applies and drains pending drops for the session", async () => {
 		const db = createTestDb();
 		try {
@@ -2396,7 +2872,6 @@ describe("registerPiContextHandler", () => {
 				sessionId: "ses-context",
 				content: "Remember to update docs.",
 			});
-			onNoteTrigger(db, "ses-context", "historian_complete");
 
 			const triggerMsg = userMessage("trigger turn", 1);
 			const newMsg = userMessage("new turn", 2);
@@ -2409,6 +2884,8 @@ describe("registerPiContextHandler", () => {
 					[triggerMsg],
 				) as never,
 			);
+			// Arm after the prior user was served; initial rebuilds may deliver immediately.
+			onNoteTrigger(db, "ses-context", "historian_complete");
 			const result = await handler(
 				{ messages: [newMsg] as never[] },
 				fakeContext(
@@ -2430,6 +2907,86 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("delivers a pending note on a Pi rebuild and replays identical bytes on defer", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-note-rebuild";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const pass = async () => {
+				const messages = [userMessage("latest real user", 1)];
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				return (
+					await handler(
+						{ messages: messages as never[] },
+						fakeContext(
+							sessionId,
+							process.cwd(),
+							["entry-latest"],
+							messages,
+						) as never,
+					)
+				).messages;
+			};
+			addNote(db, "session", { sessionId, content: "Rebuild reminder" });
+			onNoteTrigger(db, sessionId, "historian_complete");
+			setPersistedNoteNudgeTriggerMessageId(db, sessionId, "entry-latest");
+			signalPiPendingMaterialization(sessionId);
+			const rebuilt = await pass();
+			expect(textOf(rebuilt[0] as never)).toContain("deferred_notes");
+			expect(await pass()).toEqual(rebuilt);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("does not append a late note trigger to a served Pi user, including after restart", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-late-note";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const pass = async (fresh = false) => {
+				const messages = [userMessage("already on the wire", 1)];
+				const ids = ["entry-served"];
+				if (fresh) {
+					messages.push(userMessage("new work", 2));
+					ids.push("entry-new");
+				}
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				return (
+					await handler(
+						{ messages: messages as never[] },
+						fakeContext(sessionId, process.cwd(), ids, messages) as never,
+					)
+				).messages;
+			};
+			const served = await pass();
+			addNote(db, "session", { sessionId, content: "Late reminder" });
+			onNoteTrigger(db, sessionId, "historian_complete");
+			setPersistedNoteNudgeTriggerMessageId(db, sessionId, "entry-old-trigger");
+			expect(await pass()).toEqual(served);
+			clearContextHandlerSession(sessionId);
+			registerPiContextHandler(fake.pi as never, { db });
+			expect(await pass()).toEqual(served);
+			expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
+			const delivered = await pass(true);
+			expect(delivered[0]).toEqual(served[0]);
+			expect(textOf(delivered[1] as never)).toContain("deferred_notes");
+			expect(await pass(true)).toEqual(delivered);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("replays sticky note nudges idempotently across passes", async () => {
 		const db = createTestDb();
 		try {
@@ -2446,7 +3003,6 @@ describe("registerPiContextHandler", () => {
 				sessionId,
 				content: "Sticky reminder.",
 			});
-			onNoteTrigger(db, sessionId, "historian_complete");
 			const triggerMsg = userMessage("trigger turn", 1);
 			const newMsg = userMessage("new turn", 2);
 			await handler(
@@ -2458,6 +3014,7 @@ describe("registerPiContextHandler", () => {
 					[triggerMsg],
 				) as never,
 			);
+			onNoteTrigger(db, sessionId, "historian_complete");
 			await handler(
 				{ messages: [newMsg] as never[] },
 				fakeContext(sessionId, process.cwd(), ["entry-new"], [newMsg]) as never,
@@ -2496,7 +3053,11 @@ describe("registerPiContextHandler", () => {
 
 	it("appends an auto-search hint to the latest user message when the threshold is met", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const snapshot = spyOn(
+			embeddingModule,
+			"getProjectEmbeddingSnapshot",
+		).mockImplementation(autoSearchTestSnapshot);
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () =>
 				[
 					{
@@ -2538,6 +3099,7 @@ describe("registerPiContextHandler", () => {
 				"<ctx-search-hint>",
 			);
 		} finally {
+			snapshot.mockRestore();
 			spy.mockRestore();
 			closeQuietly(db);
 		}
@@ -2545,7 +3107,11 @@ describe("registerPiContextHandler", () => {
 
 	it("clearContextHandlerSession preserves persisted auto-search decisions", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const snapshot = spyOn(
+			embeddingModule,
+			"getProjectEmbeddingSnapshot",
+		).mockImplementation(autoSearchTestSnapshot);
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [],
 		);
 		try {
@@ -2583,13 +3149,61 @@ describe("registerPiContextHandler", () => {
 
 			expect(spy).toHaveBeenCalledTimes(1);
 		} finally {
+			snapshot.mockRestore();
 			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("delivers an unavailable smart-note warning once, not on later Pi turns", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-unavailable-once";
+		try {
+			const notice = addNote(db, "session", {
+				sessionId,
+				content:
+					"Smart note #42 cannot be checked.\nCondition: CI fails\nReason: HTTP 403\nRepair the condition.",
+			});
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const turn = async (id: string) => {
+				const msg = userMessage("next turn", 1);
+				return handler(
+					{ messages: [msg] as never[] },
+					fakeContext(sessionId, process.cwd(), [id], [msg]) as never,
+				);
+			};
+			await turn("entry-1");
+			onNoteTrigger(db, sessionId, "historian_complete");
+			const delivered = await turn("entry-2");
+			expect(delivered.messages.map(textOf).join("\n")).toContain(
+				"Smart note check unavailable",
+			);
+			expect(
+				db.prepare("SELECT status FROM notes WHERE id=?").get(notice.id),
+			).toEqual({
+				status: "dismissed",
+			});
+			clearContextHandlerSession(sessionId);
+			onNoteTrigger(db, sessionId, "todos_complete");
+			await turn("entry-3");
+			const later = await turn("entry-4");
+			expect(later.messages.map(textOf).join("\n")).not.toContain(
+				"Smart note check unavailable",
+			);
+		} finally {
+			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
 	});
 
 	it("replays note anchors by message id but skips new note persistence on ref failure", async () => {
 		const db = createTestDb();
+		const publication = observePiPublicationForTest("ses-note-ref-fail");
 		try {
 			const sessionId = "ses-note-ref-fail";
 			clearContextHandlerSession(sessionId);
@@ -2617,7 +3231,9 @@ describe("registerPiContextHandler", () => {
 
 			expect(textOf(result.messages[0] as never)).toContain("existing");
 			expect(getNoteNudgeAnchors(db, sessionId)).toHaveLength(1);
+			publication.expect("numbers_only", "lkg_entry_ids_unavailable", 1);
 		} finally {
+			publication.restore();
 			clearContextHandlerSession("ses-note-ref-fail");
 			closeQuietly(db);
 		}
@@ -2767,11 +3383,10 @@ describe("registerPiContextHandler", () => {
 			const meta = getOrCreateSessionMeta(db, sessionId);
 			expect(meta.observedSafeInputTokens).toBe(0);
 			expect(meta.lastUsageContextLimit).toBe(204_000);
-			// The reply was accepted, so its usage is the real prompt size and
-			// counts in full against the configured limit instead of being clamped
-			// at the configured window; only the persisted proof is healed.
-			expect(meta.lastInputTokens).toBe(593_717);
-			expect(meta.lastContextPercentage).toBeCloseTo((593_717 / 204_000) * 100);
+			// An accepted reply can carry billing usage that exceeds one request's
+			// window. Reject it as pressure as well as healing the stale proof.
+			expect(meta.lastInputTokens).toBe(0);
+			expect(meta.lastContextPercentage).toBe(0);
 			expect(meta.cacheAlertSent).toBe(false);
 		} finally {
 			closeQuietly(db);
@@ -2779,7 +3394,7 @@ describe("registerPiContextHandler", () => {
 	});
 
 	it("clears a stale unkeyed detected limit from the same database after restart", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-stale-limit-"));
+		const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-stale-limit-"));
 		const path = join(dir, "context.db");
 		const sessionId = "ses-pi-stale-detected-restart";
 		let db = createTestDb(path);
@@ -3916,7 +4531,7 @@ describe("registerPiContextHandler", () => {
 				executeThresholdTokens: { default: 40_000 },
 				commitClusterTrigger: { enabled: false, min_clusters: 9 },
 				protectedTags: 3,
-				clearReasoningAge: 11,
+				keepReasoningTokens: 1100,
 			};
 
 			const small = resolvePiHistorianTriggerInputs({
@@ -3938,7 +4553,7 @@ describe("registerPiContextHandler", () => {
 				executeThresholdPercentage: 40,
 				triggerBudget: 5000,
 				protectedTags: 3,
-				clearReasoningAge: 11,
+				keepReasoningTokens: 1100,
 				commitClusterTrigger: { enabled: false, min_clusters: 9 },
 				// ceiling = contextLimit(100k) × execThreshold(40%) = 40000
 				emergencyCeilingTokens: 40_000,
@@ -3976,7 +4591,7 @@ describe("registerPiContextHandler", () => {
 				executeThresholdPercentage,
 				commitClusterTrigger: { enabled: true, min_clusters: 3 },
 				protectedTags: 20,
-				clearReasoningAge: 50,
+				keepReasoningTokens: 10000,
 			};
 			const piInputs = resolvePiHistorianTriggerInputs({
 				db,
@@ -4010,7 +4625,7 @@ describe("registerPiContextHandler", () => {
 						0,
 						piInputs.executeThresholdPercentage,
 						piInputs.triggerBudget,
-						piInputs.clearReasoningAge,
+						piInputs.keepReasoningTokens,
 						piInputs.commitClusterTrigger,
 					);
 
@@ -4088,7 +4703,11 @@ describe("registerPiContextHandler", () => {
 				},
 			});
 
-			await handler(throwingEvent, fakeContext("ses-context") as never);
+			await expect(
+				handler(throwingEvent, fakeContext("ses-context") as never),
+			).rejects.toMatchObject({ name: "PiStorageBusyError" });
+			// Refusal is immediate; storage diagnostics are deliberately deferred.
+			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(getOrCreateSessionMeta(db, "ses-context").lastTransformError).toBe(
 				"boom messages",
 			);
@@ -4154,6 +4773,101 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("serves injection drops and caveman compression identically on the next defer pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-drop-caveman-same-pass";
+		const gates: Array<{
+			shouldRunHeuristics: boolean;
+			shouldRunReasoningCleanup: boolean;
+		}> = [];
+		const restoreObserver =
+			contextHandlerInternals.setMutationGateObserverForTests((snapshot) =>
+				gates.push(snapshot),
+			);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				heuristics: {
+					caveman: { enabled: true, minChars: 20 },
+					keepReasoningTokens: 0,
+				},
+				scheduler: { executeThresholdPercentage: 80 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] } | undefined>;
+			const runPass = async (percent: number) => {
+				const messages = [
+					userMessage(
+						"<system-reminder>\n[BACKGROUND BASH COMPLETED]\nThe task has been completed and the results are available.\n</system-reminder>",
+						1,
+					),
+					assistantMessage(
+						"The implementation has been completed <think>stale private thought</think> and the verification results are available for the reviewer.",
+						2,
+					),
+					userMessage(
+						"Continue with the implementation and review the results carefully.",
+						3,
+					),
+					assistantMessage("latest answer", 4),
+					userMessage("latest request", 5),
+				];
+				const result = await handler({ messages: messages as never[] }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						messages.map((_, i) => `entry-${i}`),
+						messages as never,
+					),
+					getContextUsage: () => ({
+						tokens: percent * 1_000,
+						percent,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				if (!result) throw new Error("expected transformed messages");
+				return result.messages;
+			};
+			const executed = await runPass(90);
+			const tags = getTagsBySession(db, sessionId);
+			expect(tags.some((tag) => tag.status === "dropped")).toBe(true);
+			expect(
+				tags.some((tag) => tag.status === "active" && tag.cavemanDepth > 0),
+			).toBe(true);
+			expect(
+				getOrCreateSessionMeta(db, sessionId).clearedReasoningThroughTag,
+			).toBeGreaterThan(0);
+			expect(JSON.stringify(executed)).not.toContain("stale private thought");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now(),
+				cacheTtl: "59m",
+				lastContextPercentage: 1,
+				lastInputTokens: 1_000,
+			});
+			const deferred = await runPass(1);
+			expect(gates.map((gate) => gate.shouldRunHeuristics)).toEqual([
+				true,
+				false,
+			]);
+			expect(gates.map((gate) => gate.shouldRunReasoningCleanup)).toEqual([
+				true,
+				false,
+			]);
+			expect(JSON.stringify(deferred)).toBe(JSON.stringify(executed));
+			expect(JSON.stringify(executed)).not.toContain(
+				"BACKGROUND BASH COMPLETED",
+			);
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("replays an inline-only watermark after restart without fresh age cleanup", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-inline-reasoning-watermark";
@@ -4161,7 +4875,7 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 1 },
+				heuristics: { keepReasoningTokens: 0 },
 				scheduler: { executeThresholdPercentage: 80 },
 			});
 			let handler = fake.handlers.get("context") as (
@@ -4212,7 +4926,7 @@ describe("registerPiContextHandler", () => {
 			clearContextHandlerSession(sessionId);
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 100 },
+				heuristics: { keepReasoningTokens: 100000 },
 				scheduler: { executeThresholdPercentage: 80 },
 			});
 			handler = fake.handlers.get("context") as typeof handler;
@@ -4238,7 +4952,7 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 1 },
+				heuristics: { keepReasoningTokens: 0 },
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -4368,7 +5082,9 @@ describe("registerPiContextHandler", () => {
 				);
 			};
 
-			expect(await runPass()).toBeUndefined();
+			await expect(runPass()).rejects.toMatchObject({
+				name: "PiStorageBusyError",
+			});
 			expect(getOrCreateSessionMeta(db, sessionId).piStableIdScheme ?? 0).toBe(
 				0,
 			);
@@ -4503,6 +5219,10 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-cleared-historian-publish";
 		let release!: () => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			const runner = {
@@ -4510,6 +5230,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => {
 					await new Promise<void>((resolve) => {
 						release = resolve;
+						markStarted();
 					});
 					return {
 						ok: true as const,
@@ -4547,9 +5268,11 @@ describe("registerPiContextHandler", () => {
 					messages as never,
 				) as never,
 			);
+			await started;
 			expect(runner.run).toHaveBeenCalledTimes(1);
 
 			clearContextHandlerSession(sessionId);
+			await started;
 			release();
 			await awaitInFlightHistorians();
 
@@ -4565,6 +5288,10 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-active-historian-publish";
 		let release!: () => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			const runner = {
@@ -4572,6 +5299,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => {
 					await new Promise<void>((resolve) => {
 						release = resolve;
+						markStarted();
 					});
 					return {
 						ok: true as const,
@@ -4609,6 +5337,7 @@ describe("registerPiContextHandler", () => {
 					messages as never,
 				) as never,
 			);
+			await started;
 			release();
 			await awaitInFlightHistorians();
 
@@ -4625,6 +5354,10 @@ describe("registerPiContextHandler", () => {
 		const clearedSessionId = "ses-pi-cleared-multi-historian";
 		const activeSessionId = "ses-pi-active-multi-historian";
 		const releases: Array<() => void> = [];
+		let markBothStarted!: () => void;
+		const bothStarted = new Promise<void>((resolve) => {
+			markBothStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, clearedSessionId, "previous failure");
 			incrementHistorianFailure(db, activeSessionId, "previous failure");
@@ -4634,6 +5367,7 @@ describe("registerPiContextHandler", () => {
 					const callIndex = releases.length;
 					await new Promise<void>((resolve) => {
 						releases.push(resolve);
+						if (releases.length === 2) markBothStarted();
 					});
 					return {
 						ok: true as const,
@@ -4682,6 +5416,7 @@ describe("registerPiContextHandler", () => {
 					activeMessages as never,
 				) as never,
 			);
+			await bothStarted;
 			expect(runner.run).toHaveBeenCalledTimes(2);
 
 			clearContextHandlerSession(clearedSessionId);
@@ -5708,6 +6443,159 @@ describe("registerPiContextHandler", () => {
 			}
 		});
 
+		it("drains the published Pi marker at ordinal 9 with floor 10 on the first bust after low-usage defers", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-9-floor-10";
+			const fake = createFakePi();
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog");
+			const pending = {
+				endMessageId: "synth-user-38b47eef",
+				firstKeptEntryId: "5fedebb3",
+				ordinal: 9,
+				publishedAt: 1791428662185,
+				summary:
+					"Magic Context compacted: Corrected noisy Tier 0 detectors, validated historical recall, ran canary orders 0-19",
+				tokensBefore: 1186,
+			};
+			const appendCompaction = mock((..._args: unknown[]) => "compact-9");
+			try {
+				updateSessionMeta(db, sessionId, {
+					piStableIdScheme: 1,
+					lastResponseTime: Date.now(),
+				});
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					injection: { injectionBudgetTokens: 10_000 },
+					scheduler: { executeThresholdPercentage: 80 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const pass = async (percent: number) => {
+					const messages = Array.from({ length: 11 }, (_, index) =>
+						index % 2 === 0
+							? userMessage(`request ${index + 1}`, index + 1)
+							: assistantMessage(`answer ${index + 1}`, index + 1),
+					);
+					const entryIds = messages.map((_, index) =>
+						index === 8
+							? pending.endMessageId
+							: index === 9
+								? pending.firstKeptEntryId
+								: `entry-${index + 1}`,
+					);
+					const ctx = fakeContext(sessionId, process.cwd(), entryIds, messages);
+					const branchEntries: unknown[] = ctx.sessionManager.getBranch();
+					return handler({ messages: messages as never[] }, {
+						...ctx,
+						getContextUsage: () => ({
+							tokens: percent * 1000,
+							percent,
+							contextWindow: 100_000,
+						}),
+						sessionManager: {
+							...ctx.sessionManager,
+							getBranch: () => branchEntries,
+							appendCompaction: (...args: unknown[]) => {
+								const id = appendCompaction(...args);
+								branchEntries.push({
+									type: "compaction",
+									id,
+									firstKeptEntryId: args[1],
+								});
+								return id;
+							},
+						},
+					} as never);
+				};
+				const decision = () =>
+					logCalls.mock.calls
+						.filter(
+							([id, message]) =>
+								id === sessionId && message.startsWith("transform:"),
+						)
+						.at(-1)?.[1];
+
+				// Warm an existing history baseline, as in a session that has already
+				// compacted ordinals 1-4, so first publication is not a HARD-fold trigger.
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 0,
+						startMessage: 1,
+						endMessage: 4,
+						startMessageId: "entry-1",
+						endMessageId: "entry-4",
+						title: "Earlier history",
+						content: "Previously compacted requests and answers.",
+					},
+				]);
+				const baseline = await pass(1);
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 1,
+						startMessage: 5,
+						endMessage: 7,
+						startMessageId: "entry-5",
+						endMessageId: "entry-7",
+						title: "Detector corrections",
+						content: "Corrected noisy Tier 0 detectors.",
+					},
+					{
+						sequence: 2,
+						startMessage: 7,
+						endMessage: 9,
+						startMessageId: "entry-7",
+						endMessageId: pending.endMessageId,
+						title: "Recall validation",
+						content: "Validated historical recall, ran canary orders 0-19.",
+					},
+				]);
+				// Publication advances the protected-tail floor to the FIRST kept
+				// ordinal, while the pending marker names the LAST summarized one.
+				recordProtectedTailPublicationFloor(db, sessionId, 10);
+				setPendingPiCompactionMarkerState(db, sessionId, pending);
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				expect(hasPendingMaterialization(sessionId)).toBe(false);
+				for (const percent of [1, 9.555953650947497, 15]) {
+					expect((await pass(percent)).messages).toEqual(baseline.messages);
+					expect(decision()).toContain("decision=defer");
+					expect(appendCompaction).not.toHaveBeenCalled();
+					expect(getPendingPiCompactionMarkerState(db, sessionId)).toEqual(
+						pending,
+					);
+					expect(
+						getOrCreateSessionMeta(db, sessionId).priorBoundaryOrdinal,
+					).toBe(10);
+				}
+
+				// Cross the execute threshold without entering the force band or
+				// sending explicit flush signals. No further publication is needed.
+				const busting = await pass(81);
+				expect(decision()).toContain("decision=execute");
+				expect(busting.messages.map(textOf).join("\n")).toContain(
+					"Recall validation",
+				);
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(appendCompaction).toHaveBeenCalledWith(
+					pending.summary,
+					"5fedebb3",
+					1186,
+					{ source: "magic-context", lastCompactedOrdinal: 9 },
+					true,
+				);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(false);
+			} finally {
+				logCalls.mockRestore();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
 		it("preserves blob_Y and deferred signal when CAS clear loses to a newer blob", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-cas-loss";
@@ -6630,7 +7518,9 @@ for (const withTools of [false, true]) {
 
 describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	it("sums persisted output token counts for dropped tags and records dropped_tokens", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-dropped-tokens-sum-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-dropped-tokens-sum-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		const sessionId = "ses-pi-dropped-tokens-sum";
@@ -6730,7 +7620,9 @@ describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	});
 
 	it("never sends a whole multi-megabyte message array to the exact tokenizer seam during drop pass", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-dropped-tokens-seam-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-dropped-tokens-seam-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		const sessionId = "ses-pi-tokenizer-seam";
@@ -6818,7 +7710,9 @@ describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	});
 
 	it("keeps execute and following defer bytes pinned while draining the same operations", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-dropped-tokens-parity-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-dropped-tokens-parity-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		const sessionId = "ses-pi-wire-parity";
@@ -6905,7 +7799,9 @@ describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	});
 
 	it("constant-mutation test: fails if writer records constant 0 across passes with different reduction masses", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-const-mutation-test-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-const-mutation-test-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		try {
@@ -7379,6 +8275,270 @@ describe("Pi proactive strip of invalidated thinking", () => {
 		).filter?.((part) => part.type === "thinking").length ?? 0;
 	const sha256 = (value: unknown) =>
 		createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	for (const [lane, isSubagent, executePercent, name] of [
+		[
+			"image",
+			true,
+			70,
+			"issue 619 Pi terminal image edit keeps earlier signed thinking and actual-edit telemetry",
+		],
+		[
+			"stale",
+			true,
+			70,
+			"issue 619 Pi terminal stale edit keeps earlier signed thinking and actual-edit telemetry",
+		],
+		[
+			"image",
+			false,
+			96,
+			"issue 619 Pi primary terminal image edit keeps earlier signed thinking and actual-edit telemetry",
+		],
+	] as const) {
+		it(name, async () => {
+			const db = createTestDb();
+			const sessionId = `pi-terminal-${lane}`;
+			const fake = createFakePi();
+			const telemetry = spyOn(decisionLogs, "recordPendingPiTransformDecision");
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				updateSessionMeta(db, sessionId, {
+					isSubagent,
+					piStableIdScheme: 1,
+					cacheTtl: "59m",
+					lastResponseTime: Date.now(),
+				});
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: { clearReasoningAge: 999 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: unknown[] }>;
+				const build = () => {
+					const edits =
+						lane === "image"
+							? [
+									{
+										...userMessage("image request", 4),
+										content: [
+											{
+												type: "image",
+												mimeType: "image/png",
+												data: "a".repeat(220),
+											},
+										],
+									},
+								]
+							: Array.from({ length: 4 }, (_, index) => [
+									assistantToolCall(
+										`terminal-${index}`,
+										"ctx_reduce",
+										{ drop: "1" },
+										index * 2 + 4,
+									),
+									{
+										...toolResultMessage(
+											`terminal-${index}`,
+											"Queued",
+											index * 2 + 5,
+										),
+										toolName: "ctx_reduce",
+									},
+								]).flat();
+					const messages = [
+						userMessage("one", 1),
+						opusAssistant("signed one", "answer one", 2),
+						userMessage("two", 3),
+						...edits,
+						userMessage("three", 19),
+						assistantMessage("plain answer", 20),
+					];
+					return {
+						messages,
+						entryIds: messages.map((_, index) => `entry-${index}`),
+					};
+				};
+				const pass = async (percent: number, warmOnly = false) => {
+					const { messages, entryIds } = build();
+					if (warmOnly) {
+						messages.splice(1);
+						entryIds.splice(1);
+					}
+					const result = await handler({ messages: messages as never[] }, {
+						...fakeContext(
+							sessionId,
+							process.cwd(),
+							entryIds,
+							messages as never,
+						),
+						model: { provider: "anthropic", id: "claude-opus-5-5" },
+						getContextUsage: () => ({
+							tokens: percent * 1000,
+							percent,
+							contextWindow: 100000,
+						}),
+					} as never);
+					return result.messages;
+				};
+				await pass(20, !isSubagent);
+				const baseline = await pass(20);
+				expect(
+					baseline.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(1);
+				if (lane === "image") {
+					const max = Math.max(
+						...getTagsBySession(db, sessionId).map((tag) => tag.tagNumber),
+					);
+					insertTag(db, sessionId, "off-branch-drop", "tool", 10, max + 1);
+					updateTagStatus(db, sessionId, max + 1, "dropped");
+				}
+				telemetry.mockClear();
+				const edited = await pass(executePercent);
+				expect(
+					edited.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(1);
+				expect(sha256(edited.slice(0, 3))).toBe(sha256(baseline.slice(0, 3)));
+				expect(sha256(edited)).not.toBe(sha256(baseline));
+				expect(telemetry).toHaveBeenCalledTimes(1);
+				telemetry.mockClear();
+				for (const percent of [20, executePercent])
+					expect(sha256(await pass(percent))).toBe(sha256(edited));
+				expect(telemetry).not.toHaveBeenCalled();
+			} finally {
+				telemetry.mockRestore();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
+
+	for (const lane of ["image", "stale reduce", "sentinel"] as const) {
+		it(`issue 619 Pi ${lane} first application invalidates thinking and replay is not a new edit`, async () => {
+			const db = createTestDb();
+			const sessionId = `pi-first-application-${lane}`;
+			const fake = createFakePi();
+			const telemetry = spyOn(decisionLogs, "recordPendingPiTransformDecision");
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				updateSessionMeta(db, sessionId, {
+					isSubagent: true,
+					piStableIdScheme: 1,
+					cacheTtl: "59m",
+					lastResponseTime: Date.now(),
+				});
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: { clearReasoningAge: 999 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: unknown[] }>;
+				const build = () => {
+					const head =
+						lane === "image"
+							? [
+									{
+										...userMessage("image request", 1),
+										content: [
+											{
+												type: "image",
+												mimeType: "image/png",
+												data: "a".repeat(220),
+											},
+										],
+									},
+								]
+							: lane === "sentinel"
+								? [assistantMessage("[dropped §1§]", 1)]
+								: Array.from({ length: 4 }, (_, index) => [
+										assistantToolCall(
+											`reduce-${index}`,
+											"ctx_reduce",
+											{ drop: "1" },
+											index * 2 + 1,
+										),
+										{
+											...toolResultMessage(
+												`reduce-${index}`,
+												"Queued",
+												index * 2 + 2,
+											),
+											toolName: "ctx_reduce",
+										},
+									]).flat();
+					const messages = [
+						...head,
+						userMessage("first request", 10),
+						opusAssistant("signed one", "answer one", 11),
+						userMessage("second request", 12),
+						opusAssistant("signed two", "answer two", 13),
+						userMessage("next real turn", 14),
+					];
+					return {
+						messages,
+						entryIds: messages.map((_, index) => `entry-${index}`),
+					};
+				};
+				const pass = async (percent: number) => {
+					const { messages, entryIds } = build();
+					expect(
+						isPrefixBoundThinkingModel("anthropic", "claude-opus-5-5"),
+					).toBe(true);
+					const result = await handler({ messages: messages as never[] }, {
+						...fakeContext(
+							sessionId,
+							process.cwd(),
+							entryIds,
+							messages as never,
+						),
+						model: { provider: "anthropic", id: "claude-opus-5-5" },
+						getContextUsage: () => ({
+							tokens: percent * 1000,
+							percent,
+							contextWindow: 100000,
+						}),
+					} as never);
+					return result.messages;
+				};
+				await pass(20);
+				const baseline = await pass(20);
+				expect(
+					baseline.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(2);
+				telemetry.mockClear();
+				if (lane === "image") {
+					const max = Math.max(
+						...getTagsBySession(db, sessionId).map((tag) => tag.tagNumber),
+					);
+					insertTag(db, sessionId, "off-branch-drop", "tool", 10, max + 1);
+					updateTagStatus(db, sessionId, max + 1, "dropped");
+				}
+				// Pi's splicing placeholder discovery stays restricted to refresh.
+				if (lane === "sentinel") signalPiHistoryRefresh(sessionId);
+				const applied = await pass(70);
+				expect(sha256(applied)).not.toBe(sha256(baseline));
+				expect(
+					applied.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(0);
+				expect(telemetry).toHaveBeenCalledTimes(1);
+				telemetry.mockClear();
+				for (const percent of [20, 70]) {
+					const replay = await pass(percent);
+					expect(sha256(replay)).toBe(sha256(applied));
+				}
+				expect(telemetry).not.toHaveBeenCalled();
+			} finally {
+				telemetry.mockRestore();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
 
 	it("strips on the busting pass that renders a drop and replays on the defer pass", async () => {
 		const db = createTestDb();
@@ -7436,4 +8596,207 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			closeQuietly(db);
 		}
 	});
+
+	// Anthropic's "What counts as an edit" table
+	// (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking):
+	// "Remove `thinking` blocks from the start of the history" is valid.
+	it('"Remove `thinking` blocks from the start of the history" is valid, so a trim-only busting pass keeps every newer signed block and the defer pass replays it', async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-trim-only";
+		const fake = createFakePi();
+		try {
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: { keepReasoningTokens: 200 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: unknown[] } | undefined>;
+			// The age clear empties a block (every Pi serializer then drops it); a
+			// strip removes it. Either way it leaves no thinking text.
+			const liveThinking = (message: unknown): number => {
+				const content = (message as { content?: unknown }).content;
+				if (!Array.isArray(content)) return 0;
+				return (content as { type?: string; thinking?: string }[]).filter(
+					(part) => part.type === "thinking" && part.thinking !== "",
+				).length;
+			};
+			const build = (turns: number) => {
+				const messages: Record<string, unknown>[] = [];
+				const entryIds: string[] = [];
+				for (let turn = 0; turn < turns; turn++) {
+					messages.push(userMessage(`request ${turn}`, turn * 2 + 1));
+					entryIds.push(`entry-u${turn}`);
+					messages.push({
+						...opusAssistant(`thought ${turn}`, `answer ${turn}`, turn * 2 + 2),
+						usage: { reasoning: 100 },
+					});
+					entryIds.push(`entry-a${turn}`);
+				}
+				return { messages, entryIds };
+			};
+			const pass = async (turns: number, percent: number) => {
+				const { messages, entryIds } = build(turns);
+				const result = await handler({ messages: messages as never[] }, {
+					...fakeContext(sessionId, process.cwd(), entryIds, messages as never),
+					model: { provider: "anthropic", id: "claude-opus-5-5" },
+					getContextUsage: () => ({
+						tokens: percent * 1000,
+						percent,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				return (result?.messages ?? messages) as unknown[];
+			};
+
+			// The first render busts and strips the two turns it serves.
+			await pass(2, 10);
+			// Eight newer turns arrive on defer passes and keep their thinking.
+			const served = await pass(10, 10);
+			expect(served.slice(4).map(liveThinking)).toEqual(
+				Array.from({ length: 16 }, (_, i) => i % 2),
+			);
+			const strippedBefore = getMergedReasoningStrippedIds(db, sessionId);
+
+			// A force-band pass whose only edit is the oldest-prefix thinking clear.
+			const trim = await pass(10, 96);
+			const cleared = trim.filter(
+				(message, index) =>
+					index % 2 === 1 && index >= 4 && liveThinking(message) === 0,
+			);
+			expect(cleared.length).toBeGreaterThan(0);
+			// Cleared thinking is a contiguous oldest prefix of the kept turns...
+			const kept = trim
+				.map((message, index) => ({ index, thinking: liveThinking(message) }))
+				.filter(({ index }) => index % 2 === 1 && index >= 4)
+				.map(({ thinking }) => thinking);
+			expect(kept).toEqual([...kept].sort((a, b) => a - b));
+			expect(kept.at(-1)).toBe(1);
+			// ...and nothing newer was stripped: the newer turns are byte-identical.
+			expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
+				strippedBefore,
+			);
+			const firstKept = trim.findIndex(
+				(message, index) =>
+					index >= 4 && index % 2 === 1 && liveThinking(message) === 1,
+			);
+			expect(sha256(trim.slice(firstKept))).toBe(
+				sha256(served.slice(firstKept)),
+			);
+
+			const defer = await pass(10, 10);
+			expect(sha256(defer)).toBe(sha256(trim));
+
+			// "Clear or shorten an earlier `tool_result`" (or any earlier content)
+			// invalidates every later block: a pass that trims and renders a drop
+			// strips them all.
+			const dropped = getTagsBySession(db, sessionId).find(
+				(tag) => tag.messageId === "entry-u3:p0",
+			);
+			if (!dropped) throw new Error("missing tag for an older user message");
+			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
+			signalPiPendingMaterialization(sessionId);
+			const dropPass = await pass(10, 96);
+			// A legacy edit may repair completed turns, never strip the active
+			// turn's latest signed response. Its original thinking stays.
+			expect(dropPass.map(liveThinking)).toEqual([...Array(19).fill(0), 1]);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+});
+it("Pi protected results refuse a successful no-op reclaim before transport", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-protected-pre-send-refusal";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTools: { custom: 8 },
+		protectedTags: 0,
+		heuristics: {},
+		injection: { injectionBudgetTokens: 10000 },
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const messages = [userMessage("start", 1)];
+	for (let n = 1; n <= 8; n++)
+		messages.push(assistantToolCall(`custom-${n}`, "custom", {}, n * 2), {
+			...toolResultMessage(`custom-${n}`, "word ".repeat(20000), n * 2 + 1),
+			toolName: "custom",
+		});
+	const ctx = {
+		...fakeContext(sessionId),
+		getSystemPrompt: () => "You are helpful.",
+		model: {
+			provider: "anthropic",
+			id: "claude-fable-5-1",
+			contextWindow: 50000,
+		},
+		getContextUsage: () => ({
+			tokens: 100000,
+			percent: 200,
+			contextWindow: 50000,
+		}),
+	};
+	try {
+		await expect(
+			handler({ messages: messages as never[] }, ctx as never),
+		).rejects.toMatchObject({
+			code: "protected_tool_results_over_limit",
+			message:
+				"The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.",
+		});
+	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
+
+it("Pi healthy send admits an uncalibrated protected result above the fit upper-envelope limit", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-uncalibrated-protected-admission";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTools: { custom: 1 },
+		protectedTags: 0,
+		heuristics: {},
+		injection: { injectionBudgetTokens: 10000 },
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const messages = [
+		userMessage("start", 1),
+		assistantToolCall("custom-1", "custom", {}, 2),
+		{
+			...toolResultMessage("custom-1", "word ".repeat(8000), 3),
+			toolName: "custom",
+		},
+	];
+	const ctx = {
+		...fakeContext(sessionId),
+		getSystemPrompt: () => "You are helpful.",
+		model: {
+			provider: "unmeasured-provider",
+			id: "unmeasured-model",
+			contextWindow: 16000,
+		},
+		getContextUsage: () => ({
+			tokens: 8000,
+			percent: 50,
+			contextWindow: 16000,
+		}),
+	};
+	try {
+		const result = await handler(
+			{ messages: messages as never[] },
+			ctx as never,
+		);
+		expect(JSON.stringify(result)).toContain("word word");
+	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
 });

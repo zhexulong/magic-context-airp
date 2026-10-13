@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
@@ -8,10 +8,12 @@ import {
 	getMergedReasoningStrippedIds,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
 	resolvePiBindingStripOrder,
+	shouldRunPiProactiveThinkingStrip,
 } from "./provider-error-recovery-pi";
 
 const roots: string[] = [];
@@ -37,15 +39,16 @@ const toolResult = () => ({
 	toolCallId: "call-1",
 	content: [{ type: "text", text: "ok" }],
 });
-const ids = ["assistant-1", "result-1", "assistant-2"];
+const ids = ["assistant-1", "result-1", "assistant-2", "next-user"];
 const input = () => [
 	assistant([thinking(), toolCall()]),
 	toolResult(),
 	assistant([thinking()]),
+	{ role: "user", content: [{ type: "text", text: "Next real turn" }] },
 ];
 
 it("replays strip-all across independent connections, restart, and undo with the same entry ids", () => {
-	const root = mkdtempSync(join(tmpdir(), "mc-strip-gate-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-strip-gate-"));
 	roots.push(root);
 	const path = join(root, "context.db");
 	const first = new Database(path);
@@ -140,5 +143,31 @@ it("a defer branch-away does not silently switch legacy strip order before undo 
 		).toBe("start");
 	} finally {
 		db.close();
+	}
+});
+
+it("runs the proactive strip for subagents as for primaries, never under compaction-off or start order", () => {
+	for (const isSubagent of [false, true]) {
+		expect(
+			shouldRunPiProactiveThinkingStrip({
+				compactionOff: false,
+				bindingStripOrder: "end",
+				isSubagent,
+			}),
+		).toBe(true);
+		expect(
+			shouldRunPiProactiveThinkingStrip({
+				compactionOff: true,
+				bindingStripOrder: "end",
+				isSubagent,
+			}),
+		).toBe(false);
+		expect(
+			shouldRunPiProactiveThinkingStrip({
+				compactionOff: false,
+				bindingStripOrder: "start",
+				isSubagent,
+			}),
+		).toBe(false);
 	}
 });

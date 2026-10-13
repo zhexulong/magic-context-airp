@@ -136,14 +136,12 @@ describe("v2 context hook never registers a persistent tool transform", () => {
         // Include the named body as well as its scope wrapper; registration alone
         // no longer contains the actual context-pass operations.
         const bodyStart = source.indexOf("const runManagedContext =");
-        const hookStart = source.indexOf('context.session.hook("context"');
+        const hookStart = source.indexOf('context.session.hook("context"', bodyStart);
         expect(bodyStart).toBeGreaterThan(0);
         expect(hookStart).toBeGreaterThan(bodyStart);
-        expect(source.slice(hookStart)).toContain(
-            "withSqliteTransformPass(() => runManagedContext(draft))",
-        );
+        expect(source.slice(hookStart)).toContain("await runManagedContext(draft)");
         const hookBody = source.slice(bodyStart);
         expect(hookBody).not.toContain("context.tool.transform(");
-        expect(hookBody).toContain("applyV2PromptSurfaceTools(draft");
+        expect(hookBody).toMatch(/applyV2PromptSurfaceTools\(\s*draft/);
     });
 });

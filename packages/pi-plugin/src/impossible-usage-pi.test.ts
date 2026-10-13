@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +14,7 @@ import {
 	clearWindowOverlayCacheForTest,
 	setWindowOverlayPath,
 } from "@magic-context/core/shared/window-geometry";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import {
 	awaitInFlightHistorians,
@@ -39,7 +40,7 @@ import {
 // is Pi's estimate of its whole raw, unreduced branch, not a provider report,
 // so it must not drive emergency reduction, historian force-firing, or the
 // persisted pressure used by later passes. Provider reports, by contrast,
-// count at any size (see "Pi provider usage above the configured window").
+// never measure one request above an authoritative window.
 const MODEL = {
 	provider: "openai-codex",
 	id: "gpt-6-sol",
@@ -461,7 +462,7 @@ describe("isPiLiveUsageRawBranchEstimate", () => {
 // A measured overlay cell for the model: the strongest configured window the
 // resolver knows, and the one a provider report above 272K contradicts.
 function use272kOverlay(): () => void {
-	const dir = mkdtempSync(join(tmpdir(), "pi-534-overlay-"));
+	const dir = createTestTempDirFromPath(join(tmpdir(), "pi-534-overlay-"));
 	const overlayPath = join(dir, "window-overlay.json");
 	writeFileSync(
 		overlayPath,
@@ -500,7 +501,7 @@ describe("Pi provider usage above the configured window", () => {
 		mock.restore();
 	});
 
-	it("treats a provider-reported 300K on a 272K window as real pressure on every pass", async () => {
+	it("rejects provider-reported input above the 272K overlay on every pass", async () => {
 		const sessionId = "ses-issue-534-provider-above-window";
 		const logs: string[] = [];
 		spyOn(loggerModule, "sessionLog").mockImplementation(
@@ -525,31 +526,27 @@ describe("Pi provider usage above the configured window", () => {
 			await runPass(147_839);
 			expect(emergencyPasses()).toBe(0);
 
-			// The provider accepted a 300K request: a model whose real window is
-			// larger than the configured 272K. The reading is the real prompt size.
+			// Even a successful reply can carry aggregate billing usage. It does
+			// not measure a single request when it exceeds the overlay window.
 			await messageEnd(
 				assistantMessage("ok", 92, codexUsage(300_000)),
 				300_000,
 			);
-			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(
-				300_000,
-			);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(0);
 			await runPass(300_000);
 			await awaitInFlightHistorians();
-			expect(emergencyPasses()).toBe(1);
-			expect(droppedToolCount()).toBeGreaterThan(0);
+			expect(emergencyPasses()).toBe(0);
+			expect(droppedToolCount()).toBe(0);
 
-			// Context stays above the configured window: every reading counts.
+			// Repeated aggregate readings are rejected too.
 			await messageEnd(
 				assistantMessage("ok", 93, codexUsage(310_000)),
 				310_000,
 			);
-			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(
-				310_000,
-			);
+			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(0);
 			await runPass(310_000);
 			await awaitInFlightHistorians();
-			expect(emergencyPasses()).toBe(2);
+			expect(emergencyPasses()).toBe(0);
 		} finally {
 			restoreOverlay();
 			clearContextHandlerSession(sessionId);
@@ -559,7 +556,7 @@ describe("Pi provider usage above the configured window", () => {
 });
 
 describe("Pi message_end provider usage above a trusted window", () => {
-	it("counts every successful reading in full and still clamps after an overflow error", async () => {
+	it("rejects over-window readings instead of clamping them into pressure", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-issue-534-provider-usage";
 		const piModel = {
@@ -587,21 +584,18 @@ describe("Pi message_end provider usage above a trusted window", () => {
 				});
 			await accepted(2, 300_000);
 			let meta = getOrCreateSessionMeta(db, sessionId);
-			// Counted in full against the configured usable limit, and never
-			// recorded as proven capacity that would widen the configured window.
-			expect(meta.lastInputTokens).toBe(300_000);
-			expect(meta.lastContextPercentage).toBeGreaterThan(100);
+			// Neither success nor an overflow error makes an impossible usage
+			// reading a valid pressure numerator or measured capacity proof.
+			expect(meta.lastInputTokens).toBe(0);
+			expect(meta.lastContextPercentage).toBe(0);
 			expect(meta.observedSafeInputTokens).toBe(147_839);
 			const usableLimit = meta.lastUsageContextLimit;
 
 			await accepted(3, 310_000);
 			meta = getOrCreateSessionMeta(db, sessionId);
-			expect(meta.lastInputTokens).toBe(310_000);
+			expect(meta.lastInputTokens).toBe(0);
 			expect(meta.lastUsageContextLimit).toBe(usableLimit);
-			expect(meta.lastContextPercentage).toBeCloseTo(
-				(310_000 / usableLimit) * 100,
-				5,
-			);
+			expect(meta.lastContextPercentage).toBe(0);
 
 			await persistPiPressureFromMessageEnd({
 				db,
@@ -616,7 +610,7 @@ describe("Pi message_end provider usage above a trusted window", () => {
 				piModel,
 			});
 			meta = getOrCreateSessionMeta(db, sessionId);
-			expect(meta.lastInputTokens).toBe(272_000);
+			expect(meta.lastInputTokens).toBe(0);
 		} finally {
 			closeQuietly(db);
 		}

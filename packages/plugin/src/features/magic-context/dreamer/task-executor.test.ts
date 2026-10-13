@@ -7,10 +7,9 @@ import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { userFacingFailureCode } from "../../../shared/user-facing-codes";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
-} from "../context-authority";
+} from "../legacy-authority-fixture.test-support";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -24,6 +23,7 @@ import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { recordCurateSafetyRefusal } from "./curate-memory-safety";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
 import { MAP_BATCH_FLOOR_MS } from "./map-memories";
+import { recordedGeminiQuotaMessages } from "./provider-output-failure.test-support";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
 import {
     PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
@@ -144,7 +144,13 @@ describe("createDreamTaskExecutor — curate", () => {
         let children = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [
+                        { id: "old-dream", title: "magic-context-dream-map-memories" },
+                        { id: "other-child", title: "subagent", parentID: "ses-parent" },
+                        { id: "ses-parent", title: "ordinary session" },
+                    ],
+                })),
                 create: mock(async () => ({ data: { id: `child-${++children}` } })),
                 prompt: mock(async (args: { body: { parts: Array<{ text: string }> } }) => {
                     prompts.push(args.body.parts[0].text);
@@ -173,6 +179,11 @@ describe("createDreamTaskExecutor — curate", () => {
         );
         expect(result.status).toBe("completed");
         expect(children).toBe(3);
+        expect(client.session.create).toHaveBeenCalledWith(
+            expect.objectContaining({
+                body: expect.objectContaining({ parentID: "ses-parent" }),
+            }),
+        );
         expect(prompts).toHaveLength(3);
         expect(prompts.every((prompt) => (prompt.match(/Content: Rule/g) ?? []).length === 1)).toBe(
             true,
@@ -211,7 +222,9 @@ describe("createDreamTaskExecutor — curate", () => {
         const logSpy = spyOn(logger, "log").mockImplementation(() => {});
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => {
                     opencodeDb
                         .prepare(
@@ -319,7 +332,9 @@ describe("createDreamTaskExecutor — curate", () => {
         let capturedPrompt = "";
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child" } })),
                 prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                     capturedPrompt = args.body?.parts?.[0]?.text ?? "";
@@ -391,7 +406,9 @@ describe("createDreamTaskExecutor — curate", () => {
         const prompts: string[] = [];
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: `rotation-${prompts.length}` } })),
                 prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                     prompts.push(args.body?.parts?.[0]?.text ?? "");
@@ -443,7 +460,9 @@ describe("createDreamTaskExecutor — curate", () => {
         let attempts = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: `retry-${attempts}` } })),
                 prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                     prompts.push(args.body?.parts?.[0]?.text ?? "");
@@ -512,7 +531,9 @@ describe("createDreamTaskExecutor — curate", () => {
         const create = mock(async () => ({ data: { id: "must-not-create" } }));
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create,
             },
         };
@@ -571,7 +592,9 @@ describe("createDreamTaskExecutor — curate", () => {
         });
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child-tool-only" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
@@ -624,7 +647,9 @@ describe("createDreamTaskExecutor — curate", () => {
         });
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child-pending-tool" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
@@ -672,7 +697,9 @@ describe("createDreamTaskExecutor — curate", () => {
         const progress: DreamTaskProgress[] = [];
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child-refusal" } })),
                 prompt: mock(async () => {
                     recordCurateSafetyRefusal("dream-child-refusal", {
@@ -739,7 +766,9 @@ describe("createDreamTaskExecutor — curate", () => {
         let promptCalls = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child" } })),
                 prompt: mock(async () => {
                     promptCalls += 1;
@@ -795,7 +824,9 @@ describe("createDreamTaskExecutor — curate", () => {
         let capturedSystem = "";
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child" } })),
                 prompt: mock(async (args: { body?: { system?: string } }) => {
                     capturedSystem = args.body?.system ?? "";
@@ -846,7 +877,9 @@ describe("createDreamTaskExecutor — structured failure telemetry", () => {
             const childId = `failure-child-${suffix}`;
             const client = {
                 session: {
-                    list: mock(async () => ({ data: [] })),
+                    list: mock(async () => ({
+                        data: [{ id: "ses-parent", title: "ordinary session" }],
+                    })),
                     create: mock(async () => ({ data: { id: childId } })),
                     prompt: mock(async (args: { signal?: AbortSignal }) => {
                         if (mode === "provider_error") {
@@ -945,6 +978,49 @@ describe("createDreamTaskExecutor — structured failure telemetry", () => {
 });
 
 describe("createDreamTaskExecutor — verify-broad disposition", () => {
+    test("persists the recorded Gemini quota exhaustion as a transient provider error", async () => {
+        db = freshDb();
+        const project = "git:recorded-gemini-quota";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "Mapped fact.",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+        const client = {
+            session: {
+                list: async () => ({ data: [{ id: "ses-parent", title: "ordinary session" }] }),
+                create: async () => ({ data: { id: "quota-child" } }),
+                prompt: async () => ({}),
+                messages: async () => ({ data: recordedGeminiQuotaMessages() }),
+                delete: async () => ({}),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor("verify", project);
+        const holderId = "quota-holder";
+        expect(acquireLease(db, holderId, leaseKey)).toBe(true);
+        const outcome = await executor(
+            {
+                task: "verify",
+                schedule: "0 3 * * *",
+                timeoutMinutes: 20,
+                model: "google/antigravity-gemini-3.8-flash",
+            },
+            { db, projectIdentity: project, holderId, leaseKey },
+        );
+        expect(outcome).toMatchObject({ status: "failed", transient: true });
+        expect(outcome.error).toContain("primary quota exhausted until");
+        expect(outcome.failureDetail).toContain("primary quota exhausted until");
+        const task = JSON.parse(getDreamRuns(db, project)[0].tasks_json)[0];
+        expect(task.failure.failure_class).toBe("provider_error");
+        expect(task.failure.provider_error).toContain("primary quota exhausted until");
+        expect(task.error).not.toContain("manifest missing");
+    });
     test("keeps a textless assistant completion without a row error as empty_completion", async () => {
         db = freshDb();
         const project = "/repo/verify-plain-empty";
@@ -956,7 +1032,9 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "verify-plain-empty" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
@@ -1027,7 +1105,9 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         ];
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "verify-host-refusal" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({ data: messages })),
@@ -1088,7 +1168,9 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "verify-batch-timeout" } })),
                 // Bun's fetch rejects this way when the host client's request timer fires.
                 prompt: mock(async () => {
@@ -1143,7 +1225,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         const project = "/repo/verify-broad-result";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
         const memories = [];
-        for (let i = 0; i < 51; i += 1) {
+        for (let i = 0; i < 21; i += 1) {
             const memory = insertMemory(db, {
                 projectPath: project,
                 category: "ARCHITECTURE",
@@ -1158,7 +1240,9 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         const manifests = new Map<string, string>();
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: `verify-child-${++childCount}` } })),
                 prompt: mock(
                     async (args: {
@@ -1219,7 +1303,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         expect(task.error).toBeUndefined();
         expect(task.progress).toContain("verify-broad cycle");
         expect(task.progress).toContain("remain");
-        expect(task.backlog).toMatchObject({ pendingAtStart: 51, pendingAtEnd: 1, processed: 50 });
+        expect(task.backlog).toMatchObject({ pendingAtStart: 21, pendingAtEnd: 1, processed: 20 });
     });
 
     test("surfaces provider-outage completions as transient task failures", async () => {
@@ -1234,7 +1318,9 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "verify-provider-outage" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
@@ -1286,7 +1372,9 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => {
                     throw new Error("provider unavailable");
                 }),
@@ -1320,6 +1408,261 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
 });
 
 describe("createDreamTaskExecutor — parent session resolution", () => {
+    test("finds an ordinary project root outside the checkout and behind recent children", async () => {
+        db = freshDb();
+        const project = "/repo/worktree";
+        insertMemory(db, { projectPath: project, category: "ARCHITECTURE", content: "A fact." });
+        const children = Array.from({ length: 100 }, (_, i) => ({
+            id: `recent-child-${i}`,
+            parentID: "ordinary-parent",
+            title: "subagent",
+            directory: project,
+        }));
+        const parent = {
+            id: "ordinary-parent",
+            title: "ordinary session",
+            directory: "/repo/main",
+        };
+        const client = {
+            session: {
+                // Model the host's directory filter, root filter and default 100-row limit.
+                list: mock(
+                    async ({
+                        query,
+                    }: {
+                        query: { scope?: string; roots?: boolean; limit?: number };
+                    }) => ({
+                        data:
+                            query.scope === "project"
+                                ? (query.roots ? [parent] : [...children, parent]).slice(
+                                      0,
+                                      query.limit ?? 100,
+                                  )
+                                : children,
+                    }),
+                ),
+                create: mock(async () => ({ data: { id: "dream-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages("No duplicates in this snapshot."),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const leaseKey = leaseKeyFor("curate", project);
+        expect(acquireLease(db, "holder", leaseKey)).toBe(true);
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const result = await executor(
+            { task: "curate", schedule: "0 3 * * *", timeoutMinutes: 5 },
+            { db, projectIdentity: project, holderId: "holder", leaseKey },
+        );
+        expect(result.status).toBe("completed");
+        expect(client.session.create).toHaveBeenCalledWith({
+            body: expect.objectContaining({ parentID: parent.id }),
+            query: { directory: project },
+        });
+        expect(client.session.prompt).toHaveBeenCalledTimes(1);
+        expect(
+            db
+                .prepare("SELECT parent_session_id FROM dream_runs WHERE project_path = ?")
+                .get(project),
+        ).toEqual({ parent_session_id: parent.id });
+    });
+
+    test("looks beyond a full page of leaked internal roots", async () => {
+        db = freshDb();
+        const project = "/repo/legacy-roots";
+        insertMemory(db, { projectPath: project, category: "ARCHITECTURE", content: "A fact." });
+        const roots = [
+            ...Array.from({ length: 100 }, (_, i) => ({
+                id: `leak-${i}`,
+                title: "magic-context-dream-verify",
+            })),
+            { id: "ordinary-parent", title: "ordinary session" },
+        ];
+        const client = {
+            session: {
+                list: mock(async ({ query }: { query: { limit?: number } }) => ({
+                    data: roots.slice(0, query.limit ?? 100),
+                })),
+                create: mock(async () => ({ data: { id: "dream-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages("No duplicates in this snapshot."),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const leaseKey = leaseKeyFor("curate", project);
+        expect(acquireLease(db, "holder", leaseKey)).toBe(true);
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const result = await executor(
+            { task: "curate", schedule: "0 3 * * *", timeoutMinutes: 5 },
+            { db, projectIdentity: project, holderId: "holder", leaseKey },
+        );
+        expect(result.status).toBe("completed");
+        expect(client.session.list).toHaveBeenCalledTimes(2);
+        expect(client.session.create).toHaveBeenCalledWith({
+            body: expect.objectContaining({ parentID: "ordinary-parent" }),
+            query: { directory: project },
+        });
+    });
+
+    test("skips a parentless verify-broad task once without consuming retries or its backlog", async () => {
+        db = freshDb();
+        const project = "/repo/parentless";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A mapped fact.",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1000);
+        const client = {
+            session: {
+                list: mock(async () => ({
+                    data: [{ id: "old-dream", title: "magic-context-dream-verify" }],
+                })),
+                create: mock(async () => ({ data: { id: "must-not-create" } })),
+                prompt: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const config: DreamTaskRuntimeConfig = {
+            task: "verify-broad",
+            schedule: "0 3 * * *",
+            timeoutMinutes: 5,
+        };
+        const now = Date.now();
+        seedTaskScheduleState(db, project, config.task, now - 1000, null, config.schedule);
+        const lastRunBefore = getTaskScheduleState(db, project, config.task)!.lastRunAt;
+        expect(
+            await runDueTasksForProject({
+                db,
+                projectIdentity: project,
+                tasks: [config],
+                executor,
+                now,
+            }),
+        ).toBe(1);
+        const runs = getDreamRuns(db, project);
+        expect(runs).toHaveLength(1);
+        expect(runs[0]?.tasks_failed).toBe(0);
+        expect(JSON.parse(runs[0]!.tasks_json)[0]).toMatchObject({
+            status: "skipped",
+            skipReason: "no ordinary parent session is available on this host",
+            backlog: { processed: 0 },
+        });
+        const state = getTaskScheduleState(db, project, config.task)!;
+        expect(state.lastStatus).toBe("skipped");
+        expect(state.retryCount).toBe(0);
+        expect(state.lastRunAt).toBe(lastRunBefore);
+        expect(state.nextDueAt).toBeGreaterThan(now);
+        expect(state.taskStateJson).toBeNull();
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(client.session.prompt).not.toHaveBeenCalled();
+        expect(
+            await runDueTasksForProject({
+                db,
+                projectIdentity: project,
+                tasks: [config],
+                executor,
+                now,
+            }),
+        ).toBe(0);
+    });
+
+    test("discovers the first ordinary session after a skipped run", async () => {
+        db = freshDb();
+        const project = "/repo/new-parent";
+        insertMemory(db, { projectPath: project, category: "ARCHITECTURE", content: "A fact." });
+        let hasParent = false;
+        const client = {
+            session: {
+                list: mock(async () => ({
+                    data: hasParent ? [{ id: "new-parent", title: "ordinary session" }] : [],
+                })),
+                create: mock(async () => ({ data: { id: "dream-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages("No duplicates in this snapshot."),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const leaseKey = leaseKeyFor("curate", project);
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const run = async () => {
+            expect(acquireLease(db!, "holder", leaseKey)).toBe(true);
+            try {
+                return await executor(
+                    { task: "curate", schedule: "0 3 * * *", timeoutMinutes: 5 },
+                    { db: db!, projectIdentity: project, holderId: "holder", leaseKey },
+                );
+            } finally {
+                releaseLease(db!, "holder", leaseKey);
+            }
+        };
+        expect((await run()).status).toBe("skipped");
+        hasParent = true;
+        expect((await run()).status).toBe("completed");
+        expect(client.session.list).toHaveBeenCalledTimes(2);
+        expect(client.session.create).toHaveBeenCalledTimes(1);
+    });
+
+    test("does not require a parent for explicitly hidden process-local sessions", async () => {
+        db = freshDb();
+        const project = "/repo/process-local";
+        insertMemory(db, { projectPath: project, category: "ARCHITECTURE", content: "A fact." });
+        const client = {
+            backgroundSessionsAreHidden: true,
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: "process-local-child" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async () => ({
+                    data: assistantMessages("No duplicates in this snapshot."),
+                })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const outcome = await executor(
+            { task: "curate", schedule: "0 3 * * *", timeoutMinutes: 5 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder",
+                leaseKey: leaseKeyFor("curate", project),
+            },
+        );
+        expect(outcome.status).toBe("completed");
+        expect(client.session.list).not.toHaveBeenCalled();
+        expect(client.session.create).toHaveBeenCalledWith({
+            body: expect.not.objectContaining({ parentID: expect.any(String) }),
+            query: { directory: project },
+        });
+    });
+
     test("concurrent tasks share parent resolution while docs without a git repo skip model invocation", async () => {
         db = freshDb();
         const project = "/repo/project";
@@ -1439,7 +1782,7 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
     test("records banked deadline progress as completed and advances lastRunAt", async () => {
         db = freshDb();
         const project = "/repo/map-banked-progress";
-        for (let index = 0; index < 81; index += 1) {
+        for (let index = 0; index < 21; index += 1) {
             insertMemory(db, {
                 projectPath: project,
                 category: "ARCHITECTURE",
@@ -1453,7 +1796,9 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
             let manifest = "";
             const client = {
                 session: {
-                    list: mock(async () => ({ data: [] })),
+                    list: mock(async () => ({
+                        data: [{ id: "ses-parent", title: "ordinary session" }],
+                    })),
                     create: mock(async () => ({ data: { id: "map-child" } })),
                     prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                         promptCalls += 1;
@@ -1523,14 +1868,14 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
                 backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
             };
             expect(summary.progress).toContain(
-                "committed 80 mapping(s) (mapped 0, independent 80); 1 remain",
+                "committed 20 mapping(s) (mapped 0, independent 20); 1 remain",
             );
             expect(summary.backlog).toEqual({
-                pendingAtStart: 81,
-                totalAtStart: 81,
+                pendingAtStart: 21,
+                totalAtStart: 21,
                 pendingAtEnd: 1,
-                totalAtEnd: 81,
-                processed: 80,
+                totalAtEnd: 21,
+                processed: 20,
             });
         } finally {
             nowSpy.mockRestore();
@@ -1550,7 +1895,9 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
         let promptCalls = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "map-timeout-child" } })),
                 prompt: mock(async () => {
                     promptCalls += 1;
@@ -1583,7 +1930,7 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
 });
 
 describe("createDreamTaskExecutor — classify-memories", () => {
-    test("module-managed memory on a TS host returns completed without a prompt or error row", async () => {
+    test("module-managed memory on a TS host records a skipped migration refusal without a prompt", async () => {
         db = freshDb();
         const project = "git:ts-not-owner";
         for (let i = 0; i < 10; i++)
@@ -1595,7 +1942,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         installAuthorityManagedMarker(db, project);
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => {
                     throw new Error("must not prompt");
                 }),
@@ -1613,11 +1962,16 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
             { db, projectIdentity: project, holderId: "ts-holder", leaseKey },
         );
-        expect(outcome.status).toBe("completed");
-        expect(outcome.detail).toContain("not owner");
+        expect(outcome.status).toBe("skipped");
+        expect(outcome.detail).toBe(
+            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+        );
         expect(client.session.create).not.toHaveBeenCalled();
         expect(client.session.list).not.toHaveBeenCalled();
-        expect(getDreamRuns(db, project)).toHaveLength(0);
+        expect(getDreamRuns(db, project)[0]?.tasks_succeeded).toBe(0);
+        expect(JSON.parse(getDreamRuns(db, project)[0]!.tasks_json)[0].skipReason).toContain(
+            "MC-C14",
+        );
     });
     test("runs the non-agentic XML transform and applies the manifest host-side", async () => {
         db = freshDb();
@@ -1644,7 +1998,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             .join("\n")}\n</classify>`;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "dream-child" } })),
                 prompt: mock(
                     async (args: {
@@ -1709,7 +2065,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         let promptCalls = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "classify-provider-outage" } })),
                 prompt: mock(async () => {
                     promptCalls += 1;
@@ -1760,104 +2118,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             retryCount: 1,
         });
     });
-
-    test("direct authority.status selects rust MODULE without a prior transform", async () => {
-        db = freshDb();
-        const project = "/repo/rust-classify";
-        ensureContextStoreUuid(db);
-        const sensitive = insertMemory(db, {
-            projectPath: project,
-            category: "PROJECT_RULES",
-            content: "Use token sk-test-secret only on my localhost machine.",
-        });
-        const contextMemories = [sensitive];
-        for (let i = 0; i < 11; i += 1) {
-            contextMemories.push(
-                insertMemory(db, {
-                    projectPath: project,
-                    category: "ARCHITECTURE",
-                    content: `The cache-neutral classification path is module-owned (${i}).`,
-                }),
-            );
-        }
-        for (const [index, memory] of contextMemories.entries()) {
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(project, 10000 + index, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(project, 10000 + index, memory.category, memory.normalizedHash);
-        }
-        const moduleCalls: Array<{ method: string; body: unknown }> = [];
-        let authorityStatusCalls = 0;
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [{ id: "parent" }] })),
-                create: mock(async () => ({ data: { id: "must-not-create" } })),
-                delete: mock(async () => ({})),
-            },
-        };
-        // This must be a class-backed fake: object-literal mocks cannot expose a detached-method
-        // regression because they do not need instance state through the timer adapter.
-        class StatefulTimerModuleClient {
-            private readonly instanceState = "timer-transport";
-
-            async authorityStatus() {
-                authorityStatusCalls += 1;
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                return { authority: { state: "MODULE", generation: 3 } };
-            }
-
-            async call(args: { method: string; body: unknown }) {
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                moduleCalls.push(args);
-                if (args.method === "dreamer.run_task") {
-                    const body = args.body as { payload: { items: Array<{ memory_id: number }> } };
-                    return {
-                        ok: true,
-                        manifest_text: `<classify>${body.payload.items
-                            .map(
-                                (item) =>
-                                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
-                            )
-                            .join("")}</classify>`,
-                        truncated: false,
-                    };
-                }
-                const rows = (args.body as { arguments: { rows: Array<{ memory_id: number }> } })
-                    .arguments.rows;
-                return { accepted: rows.map((row) => row.memory_id), rejected: [] };
-            }
-        }
-        const moduleClient = createDreamTimerModuleClient(new StatefulTimerModuleClient() as never);
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            moduleClient: moduleClient as never,
-        });
-        const leaseKey = leaseKeyFor("classify-memories", project);
-        expect(acquireLease(db, "holder-rust-classify", leaseKey)).toBe(true);
-        const result = await executor(
-            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
-            { db, projectIdentity: project, holderId: "holder-rust-classify", leaseKey },
-        );
-        expect(result.status).toBe("completed");
-        expect(authorityStatusCalls).toBe(1);
-        expect(client.session.create).not.toHaveBeenCalled();
-        expect(moduleCalls.map((call) => call.method)).toEqual([
-            "dreamer.run_task",
-            "memory.set_classification",
-        ]);
-        const applyBody = moduleCalls[1].body as {
-            arguments: { rows: Array<{ memory_id: number; shareable: boolean }> };
-        };
-        expect(applyBody.arguments.rows.find((row) => row.memory_id === 10000)?.shareable).toBe(
-            false,
-        );
-    });
     test("module failures are transient and never fall back to a TypeScript child", async () => {
         db = freshDb();
         const project = "/repo/rust-classify-failure";
@@ -1878,7 +2138,9 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "must-not-create" } })),
                 delete: mock(async () => ({})),
             },
@@ -1929,161 +2191,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 });
 
 describe("createDreamTaskExecutor — compress-cues", () => {
-    test("rust-authority fixture routes cues through memory.set_mural_cue and leaves no parked facade path", async () => {
-        db = freshDb();
-        const project = "/repo/module-cues";
-        const contextStoreUuid = ensureContextStoreUuid(db);
-        const memory = insertMemory(db, {
-            projectPath: project,
-            category: "ARCHITECTURE",
-            content: "A cue candidate routed through the module facade.",
-        });
-        db.prepare(
-            `INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id)
-             VALUES ('memories', ?, 101, ?)`,
-        ).run(project, memory.id);
-        db.prepare(
-            `INSERT INTO mirror_live_memory_rows(
-                 module_project, module_row_id, category, normalized_hash, full_row_snapshot
-             ) VALUES (?, 101, ?, ?, '{}')`,
-        ).run(project, memory.category, "module-hash");
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [] })),
-                create: mock(async () => ({ data: { id: "cue-child" } })),
-                prompt: mock(async () => ({})),
-                messages: mock(async () => ({
-                    data: assistantMessages(`<cues><cue id="${memory.id}">module cue</cue></cues>`),
-                })),
-                delete: mock(async () => ({})),
-            },
-        };
-        const authorityStatus = mock(async () => ({
-            authority: { state: "MODULE", generation: 12 },
-        }));
-        const moduleCall = mock(async (args: { method: string; body?: unknown }) => {
-            expect(args.method).toBe("memory.set_mural_cue");
-            const body = args.body as {
-                arguments?: { command_id?: unknown; rows?: Array<Record<string, unknown>> };
-            };
-            expect(typeof body.arguments?.command_id).toBe("string");
-            expect(body.arguments?.rows).toEqual([
-                {
-                    memory_id: 101,
-                    content_hash_at_prompt: expect.any(String),
-                    cue: "module cue",
-                    rejection_count: 0,
-                },
-            ]);
-            const update = body.arguments?.rows?.[0];
-            applyMirrorPage({
-                db,
-                page: {
-                    domain: "memories",
-                    cursor: 0,
-                    next_cursor: 1,
-                    has_more: false,
-                    rows: [
-                        {
-                            feed_seq: 1,
-                            domain: "memories",
-                            op: "update",
-                            module_row_id: 101,
-                            content_hash: String(update?.content_hash_at_prompt),
-                            full_row_snapshot: {
-                                id: 101,
-                                project_path: project,
-                                context_store_uuid: contextStoreUuid,
-                                context_row_id: memory.id,
-                                mural_cue: update?.cue,
-                                mural_cue_hash: update?.content_hash_at_prompt,
-                                mural_cue_at: 123,
-                                mural_cue_rejection_count: update?.rejection_count,
-                            },
-                        },
-                    ],
-                },
-            });
-            return { result: { accepted: [101], rejected: [] } };
-        });
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            mural: { enabled: true },
-            moduleClient: { authorityStatus, call: moduleCall } as never,
-        });
-        const leaseKey = leaseKeyFor("compress-cues", project);
-        expect(acquireLease(db, "holder-module-cues", leaseKey)).toBe(true);
-
-        const result = await executor(
-            { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
-            { db, projectIdentity: project, holderId: "holder-module-cues", leaseKey },
-        );
-
-        expect(result).toEqual({ status: "completed" });
-        expect(authorityStatus).toHaveBeenCalledTimes(1);
-        expect(client.session.create).toHaveBeenCalledTimes(1);
-        expect(client.session.prompt).toHaveBeenCalledTimes(1);
-        expect(moduleCall).toHaveBeenCalledTimes(1);
-        expect(
-            db
-                .prepare("SELECT mural_cue, mural_cue_hash FROM memories WHERE id = ?")
-                .get(memory.id),
-        ).toEqual({
-            mural_cue: "module cue",
-            mural_cue_hash: expect.any(String),
-        });
-    });
-
-    test("defers cue mutation while Rust authority is draining", async () => {
-        db = freshDb();
-        const project = "/repo/draining-cues";
-        ensureContextStoreUuid(db);
-        const memory = insertMemory(db, {
-            projectPath: project,
-            category: "ARCHITECTURE",
-            content: "A cue candidate must wait for module drain replay.",
-        });
-        const create = mock(async () => ({ data: { id: "must-not-create" } }));
-        const client = {
-            session: {
-                list: mock(async () => ({ data: [] })),
-                create,
-            },
-        };
-        const authorityStatus = mock(async () => ({
-            authority: { state: "DRAINING", generation: 12 },
-        }));
-        const moduleCall = mock(async () => ({ accepted: [], rejected: [] }));
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            mural: { enabled: true },
-            moduleClient: { authorityStatus, call: moduleCall } as never,
-        });
-        const leaseKey = leaseKeyFor("compress-cues", project);
-        expect(acquireLease(db, "holder-draining-cues", leaseKey)).toBe(true);
-
-        let thrown: unknown;
-        try {
-            await executor(
-                { task: "compress-cues", schedule: "0 7 * * *", timeoutMinutes: 20 },
-                { db, projectIdentity: project, holderId: "holder-draining-cues", leaseKey },
-            );
-        } catch (error) {
-            thrown = error;
-        }
-
-        expect(String(thrown)).toContain("dreamer mutation deferred");
-        expect(create).not.toHaveBeenCalled();
-        expect(moduleCall).not.toHaveBeenCalled();
-        expect(db.prepare("SELECT mural_cue FROM memories WHERE id = ?").get(memory.id)).toEqual({
-            mural_cue: null,
-        });
-    });
-
     test("reports a structural membership failure as transient", async () => {
         db = freshDb();
         const project = "/repo/malformed-cues";
@@ -2094,7 +2201,9 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         });
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "cue-child" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({ data: assistantMessages("<cues></cues>") })),
@@ -2131,7 +2240,9 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         });
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "cue-child" } })),
                 prompt: mock(async () => ({})),
                 messages: mock(async () => ({
@@ -2191,7 +2302,9 @@ describe("createDreamTaskExecutor — retrospective", () => {
         let promptAttempts = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: `retro-overflow-${promptAttempts}` } })),
                 prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                     promptedWindows.push(args.body?.parts?.[0]?.text?.match(/line-\d+/g) ?? []);
@@ -2315,7 +2428,9 @@ describe("createDreamTaskExecutor — retrospective", () => {
         let prompts = 0;
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "retro-child" } })),
                 prompt: mock(async () => {
                     prompts += 1;
@@ -2404,7 +2519,9 @@ describe("createDreamTaskExecutor — retrospective", () => {
         let lastSystem = "";
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "retro-child" } })),
                 prompt: mock(
                     async (args: {
@@ -2513,7 +2630,9 @@ describe("createDreamTaskExecutor — retrospective", () => {
         let lastSystem = "";
         const client = {
             session: {
-                list: mock(async () => ({ data: [] })),
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: mock(async () => ({ data: { id: "retro-child" } })),
                 prompt: mock(async (args: { body?: { system?: string } }) => {
                     lastSystem = args.body?.system ?? "";
@@ -2667,7 +2786,7 @@ test("createDreamTaskExecutor surfaces host-refused verify counts", async () => 
     recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
     const client = {
         session: {
-            list: mock(async () => ({ data: [] })),
+            list: mock(async () => ({ data: [{ id: "ses-parent", title: "ordinary session" }] })),
             create: mock(async () => ({ data: { id: "verify-refusal-child" } })),
             prompt: mock(async () => ({})),
             messages: mock(async () => ({
@@ -2754,3 +2873,135 @@ for (const task of ["curate", "map-memories", "verify", "verify-broad"] as const
         expect(recorded).toContain(userFacingFailureCode("dream_task_needs_tool_loop"));
     });
 }
+
+/**
+ * OpenCode 2's schedule timer has no triggering session, so it hands the
+ * executor a lookup for one. A hidden child created without a parent would be
+ * a separate top-level session in the user's list, so when the lookup finds
+ * nothing the task is skipped, not run parentless and not failed.
+ */
+describe("carrier host with a parent lookup (OpenCode 2 schedule timer)", () => {
+    function carrier(open: ReturnType<typeof mock>) {
+        return {
+            capabilities: { tools: true, harness: "opencode2" as const },
+            open,
+            async attempt(): Promise<never> {
+                throw new Error("unexpected prompt");
+            },
+            async collect(): Promise<never> {
+                throw new Error("unexpected read");
+            },
+            async close() {},
+        };
+    }
+
+    test("skips a task that needs a child session when no parent is found, without a strike", async () => {
+        db = freshDb();
+        const project = "/repo/v2-timer-parentless";
+        const memory = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "A mapped fact.",
+        });
+        recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1000);
+        const open = mock(async () => {
+            throw new Error("must not open a parentless hidden child");
+        });
+        const findParentSessionId = mock(() => undefined);
+        const executor = createDreamTaskExecutor({
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            hiddenCompletionExecutor: carrier(open) as never,
+            findParentSessionId,
+        });
+        const config: DreamTaskRuntimeConfig = {
+            task: "verify-broad",
+            schedule: "0 3 * * *",
+            timeoutMinutes: 5,
+        };
+        const now = Date.now();
+        seedTaskScheduleState(db, project, config.task, now - 1000, null, config.schedule);
+        expect(
+            await runDueTasksForProject({
+                db,
+                projectIdentity: project,
+                tasks: [config],
+                executor,
+                now,
+            }),
+        ).toBe(1);
+        expect(findParentSessionId).toHaveBeenCalled();
+        expect(open).not.toHaveBeenCalled();
+        const runs = getDreamRuns(db, project);
+        expect(runs).toHaveLength(1);
+        expect(runs[0]?.tasks_failed).toBe(0);
+        expect(
+            db
+                .prepare("SELECT parent_session_id FROM dream_runs WHERE project_path = ?")
+                .get(project),
+        ).toEqual({ parent_session_id: null });
+        expect(JSON.parse(runs[0]!.tasks_json)[0]).toMatchObject({
+            status: "skipped",
+            skipReason:
+                "no session in this directory to hold the run's child session; it runs once one exists",
+        });
+        const state = getTaskScheduleState(db, project, config.task)!;
+        expect(state.lastStatus).toBe("skipped");
+        expect(state.retryCount).toBe(0);
+        expect(state.nextDueAt).toBeGreaterThan(now);
+    });
+
+    test("hands the found parent to the carrier and records it on the run", async () => {
+        db = freshDb();
+        const project = "/repo/v2-timer-parented";
+        insertMemory(db, { projectPath: project, category: "ARCHITECTURE", content: "A fact." });
+        const open = mock(async (_identity: { parentSessionId?: string }) => {
+            throw new Error("stop after open");
+        });
+        const executor = createDreamTaskExecutor({
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            hiddenCompletionExecutor: carrier(open) as never,
+            findParentSessionId: async () => "ses-v2-parent",
+        });
+        const leaseKey = leaseKeyFor("curate", project);
+        expect(acquireLease(db, "holder", leaseKey)).toBe(true);
+        await executor(
+            { task: "curate", schedule: "0 3 * * *", timeoutMinutes: 5 },
+            { db, projectIdentity: project, holderId: "holder", leaseKey },
+        );
+        expect(open).toHaveBeenCalled();
+        expect(open.mock.calls[0]?.[0]).toMatchObject({ parentSessionId: "ses-v2-parent" });
+        expect(
+            db
+                .prepare("SELECT parent_session_id FROM dream_runs WHERE project_path = ?")
+                .get(project),
+        ).toEqual({ parent_session_id: "ses-v2-parent" });
+    });
+
+    test("still runs a task that needs no child session when no parent is found", async () => {
+        db = freshDb();
+        const project = "/repo/v2-timer-host-only";
+        const open = mock(async () => {
+            throw new Error("must not open a hidden child");
+        });
+        const executor = createDreamTaskExecutor({
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            hiddenCompletionExecutor: carrier(open) as never,
+            findParentSessionId: () => undefined,
+        });
+        const leaseKey = leaseKeyFor("promote-primers", project);
+        expect(acquireLease(db, "holder", leaseKey)).toBe(true);
+        const result = await executor(
+            { task: "promote-primers", schedule: "0 3 * * *", timeoutMinutes: 5 },
+            { db, projectIdentity: project, holderId: "holder", leaseKey },
+        );
+        expect(result.status).not.toBe("failed");
+        expect(open).not.toHaveBeenCalled();
+        const task = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]")[0] as {
+            skipReason?: string;
+        };
+        expect(task.skipReason ?? "").not.toContain("no session in this directory");
+    });
+});

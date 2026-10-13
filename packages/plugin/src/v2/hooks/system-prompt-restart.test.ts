@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -20,6 +20,7 @@ import { createSystemPromptHashHandler } from "../../hooks/magic-context/system-
 import type { PluginContext } from "../../plugin/types";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { applyV2SystemPrompt } from "./context";
 import type { SessionContext } from "./types";
 
@@ -41,7 +42,7 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalOpenCodeDb = process.env.OPENCODE_DB;
 
 beforeEach(() => {
-    dataHome = mkdtempSync(join(tmpdir(), "v2-system-prompt-restart-"));
+    dataHome = createTestTempDirFromPath(join(tmpdir(), "v2-system-prompt-restart-"));
     process.env.XDG_DATA_HOME = dataHome;
     delete process.env.OPENCODE_DB;
     resetOpenCodeDbPathStateForTesting();
@@ -90,6 +91,7 @@ function draft(hostPrompt: string, messages: SessionContext["messages"]) {
         sessionID: SESSION,
         model: MODEL,
         messages,
+        tools: { ctx_reduce: { description: "reduce", input: {} } } as SessionContext["tools"],
         system: [{ type: "text", text: hostPrompt }] as SessionContext["system"],
     };
 }
@@ -176,6 +178,31 @@ describe("OpenCode 2 system-prompt stage after a restart", () => {
         expect(resolveCtxReduceAvailability(SESSION)).toEqual({ callable: false, frozen: true });
         expect(String(first.system[0]?.text)).toContain("## Magic Context");
         expect(String(first.system[0]?.text)).not.toContain("ctx_reduce");
+    });
+
+    it("freezes ctx_reduce absence from the OC2 host tool set before system guidance", async () => {
+        const { prompt } = hostProcess();
+        const first = draft("Host prompt.", userTurn);
+        first.tools = {};
+        await applyV2SystemPrompt(prompt, first);
+        expect(resolveCtxReduceAvailability(SESSION)).toEqual({ callable: false, frozen: true });
+        expect(String(first.system[0]?.text)).toContain("## Magic Context");
+        expect(String(first.system[0]?.text)).not.toContain("ctx_reduce");
+        // A later agent switch cannot change the already served baseline.
+        const second = draft("Host prompt.", userTurn);
+        await applyV2SystemPrompt(prompt, second);
+        expect(second.system).toEqual(first.system);
+    });
+
+    it("keeps an allowed OC2 first-pass verdict when later tools deny ctx_reduce", async () => {
+        const { prompt } = hostProcess();
+        const first = draft("Host prompt.", userTurn);
+        await applyV2SystemPrompt(prompt, first);
+        const second = draft("Host prompt.", userTurn);
+        second.tools = {};
+        await applyV2SystemPrompt(prompt, second);
+        expect(resolveCtxReduceAvailability(SESSION)).toEqual({ callable: true, frozen: true });
+        expect(second.system).toEqual(first.system);
     });
 
     it("sends the priced pass's system bytes unchanged on the passes after it, and records each pass's input and output", async () => {

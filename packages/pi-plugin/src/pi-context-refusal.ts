@@ -4,11 +4,40 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { findPiTagIdentityConflict } from "@magic-context/core/features/magic-context/storage-tags";
 import { log } from "@magic-context/core/shared/logger";
+import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
+import {
+	isOmpAdvisorRequest,
+	isOmpSideContext,
+	isOmpUnmanagedCaptureRequest,
+} from "./omp-request-kind";
+import { PiContextBudget } from "./pi-context-budget";
+import { resolvePiHarnessKind } from "./pi-harness-kind";
 
 const ENTRY_TYPE = "magic-context-turn-refused";
 const RETRY_MESSAGE =
 	"Magic Context could not safely prepare this turn; send your message again.";
+
+export class PiContextSupersededError extends Error {}
+
+interface Operation {
+	pass?: PiContextBudget;
+	started: boolean;
+	ready: boolean;
+	refused: boolean;
+	ended: boolean;
+}
+const receiptMaps = new Set<Map<string | object, Operation>>();
+export function clearPiContextReceipt(sessionId: string): void {
+	for (const receipts of receiptMaps) receipts.delete(sessionId);
+}
+
+function operationKey(ctx: ExtensionContext): string | object {
+	return (
+		ctx.sessionManager?.getSessionId?.() ?? ctx.sessionManager ?? "no-session"
+	);
+}
 
 /**
  * Pi catches context-hook exceptions and continues with its original messages.
@@ -20,31 +49,231 @@ export function registerPiGuardedContext(
 	handler: (
 		event: ContextEvent,
 		ctx: ExtensionContext,
+		budget: PiContextBudget,
 	) =>
 		| Promise<{ messages: ContextEvent["messages"] } | undefined>
 		| Promise<void>,
+	options: {
+		compactionOff?: (ctx: ExtensionContext) => boolean;
+		onRefusal?: (
+			ctx: ExtensionContext,
+			budget: PiContextBudget,
+			message: string,
+			isCurrent: () => boolean,
+		) => void;
+	} = {},
 ): void {
+	const operations = new Map<string | object, Operation>();
+	const sideSessions = new Map<
+		string | object,
+		{ contexts: number; sides: number }
+	>();
+	receiptMaps.add(operations);
+	// Keep the dispatch backstop disabled for previously observed side sessions
+	// after cache eviction or reload: OMP still erases side-request attribution.
+	// Only per-turn completion records are invalidated by cache cleanup.
+	const newOperation = (): Operation => ({
+		started: false,
+		ready: false,
+		refused: false,
+		ended: false,
+	});
+	const fenceEnabled = resolvePiHarnessKind() === "omp";
+	const refuse = (
+		ctx: ExtensionContext,
+		budget: PiContextBudget,
+		reason: unknown,
+		isCurrent: () => boolean,
+	): void => {
+		if (!isCurrent()) {
+			log(
+				`[magic-context][pi] DISCARDED CONTEXT RESULT ${budget.diagnostic()}`,
+				reason,
+			);
+			return;
+		}
+		budget.abandoned = true;
+		budget.recovery =
+			budget.recovery === "not attempted"
+				? "no managed result; refused"
+				: budget.recovery;
+		const identityConflict = findPiTagIdentityConflict(reason);
+		const message = identityConflict
+			? `${identityConflict.message}. ${budget.diagnostic()}`
+			: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
+		try {
+			ctx.ui?.notify(message, "error");
+		} catch (error) {
+			log("[magic-context][pi] refusal notice failed", error);
+		}
+		try {
+			pi.appendEntry(ENTRY_TYPE, { message });
+		} catch (error) {
+			log("[magic-context][pi] refusal entry failed", error);
+		} finally {
+			if (!budget.sideTurn) ctx.abort();
+		}
+		// This callback only queues a diagnostic; it must never do storage work on
+		// the payload hook's synchronous dispatch stack.
+		try {
+			options.onRefusal?.(ctx, budget, message, isCurrent);
+		} catch (error) {
+			log("[magic-context][pi] refusal diagnostic failed", error);
+		}
+	};
+	if (fenceEnabled) {
+		pi.on("agent_start", (_event, ctx) => {
+			const key = operationKey(ctx);
+			const pending = operations.get(key);
+			// OMP forwards lifecycle events asynchronously. A preceding extension
+			// can delay agent_start until this run's context pass has already finished.
+			// Adopt that pass on its first start, not a receipt from an earlier run.
+			const active =
+				pending && !pending.started && !pending.ended
+					? pending
+					: newOperation();
+			active.started = true;
+			operations.set(key, active);
+		});
+		pi.on("agent_end", (_event, ctx) => {
+			const key = operationKey(ctx);
+			const counts = sideSessions.get(key);
+			if (counts)
+				log(
+					`[magic-context][pi] OMP context counts session=${String(key)} side_contexts=${counts.sides} context_passes=${counts.contexts} dispatch_fence=${counts.sides ? "latched off" : "on"}`,
+				);
+			const operation = operations.get(key);
+			if (operation) {
+				operation.ended = true;
+				operation.ready = false;
+			}
+		});
+		// OMP supplies session identity, but no provider-attempt ID. The latest
+		// context pass is the receipt for this operation, including payload retries.
+		// No awaits, DB access or payload hashing are allowed in this backstop.
+		pi.on("before_provider_request", (event, ctx) => {
+			if (options.compactionOff?.(ctx)) return;
+			// Advisors inherit the payload hook, but review formatted copies of
+			// new messages in their own agent. They neither consume nor grant the
+			// receipt that authorizes the main conversation's managed messages.
+			const payload = (event as { payload?: unknown }).payload;
+			if (isOmpAdvisorRequest(payload)) return;
+			const key = operationKey(ctx);
+			// OMP erases the ephemeral request's attribution before this hook. Its
+			// abort API is session-wide, so after seeing OMP's attributed reminder
+			// and prompt in a context event we cannot safely abort any payload here.
+			// Every other session still requires a completed managed context pass,
+			// even when we do not recognize the provider's body format.
+			if (sideSessions.get(key)?.sides) return;
+			let operation = operations.get(key);
+			if (!operation) {
+				operation = newOperation();
+				operations.set(key, operation);
+			}
+			const active = operation;
+			const isCurrent = () => operations.get(key) === active;
+			const capture = isOmpUnmanagedCaptureRequest(payload);
+			const budget =
+				(capture ? undefined : active.pass) ?? new PiContextBudget();
+			try {
+				if (capture)
+					throw new Error(
+						"no context pass ran for OMP auto-learn capture; raw conversation refused",
+					);
+				if (!active.pass)
+					throw new Error("no context pass ran for this operation");
+				// A context result completed before the preparation deadline remains
+				// valid on provider retries. Ownership, refusal and turn end still apply.
+				budget.assertOwner();
+				if (!budget.completed) budget.assertOutcome();
+				if (!active.ready || active.refused || active.ended || budget.abandoned)
+					throw new Error("context pass ran without a managed context receipt");
+			} catch (error) {
+				active.refused = true;
+				budget.stage = "provider dispatch";
+				refuse(ctx, budget, error, isCurrent);
+			}
+		});
+	}
 	pi.registerEntryRenderer?.<{ message: string }>(
 		ENTRY_TYPE,
 		(entry) => new Text(entry.data?.message ?? RETRY_MESSAGE, 0, 0),
 	);
 	pi.on("context", async (event, ctx) => {
+		const budget = new PiContextBudget();
+		budget.sideTurn = fenceEnabled && isOmpSideContext(event);
+		const key = operationKey(ctx);
+		if (fenceEnabled) {
+			let counts = sideSessions.get(key);
+			if (!counts) {
+				counts = { contexts: 0, sides: 0 };
+				sideSessions.set(key, counts);
+			}
+			counts.contexts++;
+			if (budget.sideTurn && ++counts.sides === 1)
+				log(
+					`[magic-context][pi] OMP dispatch fence disabled for session ${String(key)}: verified ephemeral context; session-wide abort cannot distinguish provider operations (side_contexts=${counts.sides} context_passes=${counts.contexts})`,
+				);
+		}
+		const owner = operations.get(key);
+		let operation = operations.get(key);
+		if (budget.sideTurn || !operation || operation.ended || !fenceEnabled) {
+			operation = newOperation();
+			if (!budget.sideTurn) operations.set(key, operation);
+		}
+		const active = operation;
+		active.pass = budget;
+		active.ready = false;
+		const isOwned = () =>
+			budget.sideTurn
+				? operations.get(key) === owner
+				: operations.get(key) === active && active.pass === budget;
+		const isCurrent = () => isOwned() && (budget.sideTurn || !active.ended);
+		budget.assertOwner = () => {
+			if (!isCurrent())
+				throw new PiContextSupersededError(
+					"Pi context pass superseded before writer admission",
+				);
+		};
 		try {
-			return await handler(event, ctx);
+			// Share at most 250 ms of synchronous waiting for later turn writes,
+			// including autocommit statements. Initial session-meta admission uses
+			// the separate yielding writer budget shared with OpenCode.
+			// Do not rerun the handler: it may already have committed earlier writes.
+			const result = await withSqliteTransformPass(() =>
+				handler(event, ctx, budget),
+			);
+			budget.assertOutcome();
+			if (result?.messages) {
+				budget.completed = true;
+				active.ready = true;
+			}
+			return result;
 		} catch (error) {
+			// A newer pass owns this session now. Calling its session-wide abort
+			// API from the abandoned hook would cancel the replacement turn.
+			if (error instanceof PiContextSupersededError || !isCurrent()) {
+				log(
+					`[magic-context][pi] DISCARDED CONTEXT RESULT ${budget.diagnostic()}`,
+					error,
+				);
+				throw error;
+			}
 			log("[magic-context][pi] turn refused", error);
 			// Direct handler fixtures lack the host abort API; retain their original
 			// exception contract. Real Pi contexts always supply abort().
-			if (typeof ctx.abort !== "function") throw error;
-			try {
-				pi.appendEntry(ENTRY_TYPE, { message: RETRY_MESSAGE });
-			} catch (displayError) {
-				log("[magic-context][pi] refusal entry failed", displayError);
-			} finally {
-				// This is abort-in-flight, not a pre-dispatch veto: Pi may still build
-				// the provider request, but its operation signal is already aborted.
-				ctx.abort();
+			if (typeof ctx.abort !== "function") {
+				budget.abandoned = true;
+				options.onRefusal?.(
+					ctx,
+					budget,
+					error instanceof Error ? error.message : String(error),
+					isOwned,
+				);
+				throw error;
 			}
+			active.refused = true;
+			refuse(ctx, budget, error, isOwned);
 			return { messages: event.messages };
 		}
 	});

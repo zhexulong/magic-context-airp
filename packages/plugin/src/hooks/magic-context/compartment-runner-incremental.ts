@@ -1,32 +1,11 @@
+import { withContentLanguageDirective } from "../../agents/language-directive";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
+import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-import {
-    readCoordinateRebaseNotice,
-    recoverUnresolvedCompartments,
-} from "../../features/magic-context/store-generation-rebase";
-// Re-export the historian-state-file helpers so existing callers
-// (compartment-runner-recomp.ts, compartment-runner.ts, tests) keep working
-// unchanged. The implementation moved to ./historian-state-file.ts so Pi
-// can import it without pulling in the full incremental runner.
-import { beginSqliteWriterAsync } from "../../shared/sqlite";
-import { producerSourceLocalBudget, resolveHistorianProducerLimits } from "./derive-budgets";
-import {
-    finishHistorianPublishStage,
-    startHistorianPublishStage,
-} from "./historian-publish-stage-logger";
-import { cleanupHistorianStateFile } from "./historian-state-file";
-
-export {
-    cleanupHistorianStateFile,
-    HISTORIAN_STATE_INLINE_THRESHOLD,
-    maybeWriteHistorianStateFile,
-} from "./historian-state-file";
-
-import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
@@ -65,38 +44,55 @@ import {
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { insertPrimerCandidates } from "../../features/magic-context/storage-primers";
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
+import {
+    readCoordinateRebaseNotice,
+    recoverUnresolvedCompartments,
+} from "../../features/magic-context/store-generation-rebase";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { normalizeSDKResponse } from "../../shared";
 import { describeError } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
-import { getSdkOutputLimit } from "../../shared/models-dev-cache";
 import {
     claimOpenCodeDbDiagnosticOnce,
     openCodeDbPathExists,
     resolveOpenCodeDbPath,
 } from "../../shared/opencode-db-path";
 import { toModelEntry } from "../../shared/resolve-fallbacks";
+import { beginSqliteWriterAsync } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
-import { buildCompartmentAgentPrompt } from "./compartment-prompt";
-import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
+import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
+import {
+    prepareCompartmentDrops,
+    queuePreparedCompartmentDrops,
+} from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
 import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
+    buildHistorianWindowTooSmallNotice,
     buildStoredCompartmentsInvalidNotice,
     HISTORIAN_BOUNDARY_HEALING_SLACK,
     shouldDiscardLastHistorianCompartment,
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { producerSourceLocalBudget } from "./derive-budgets";
+import {
+    describeHistorianPromptTrim,
+    fitHistorianPrompt,
+    resolveHistorianProducerWindow,
+} from "./historian-prompt-fit";
+import {
+    finishHistorianPublishStage,
+    startHistorianPublishStage,
+} from "./historian-publish-stage-logger";
 import { snapTerminalCompartmentToServedRow } from "./host-served-rows";
-import { clearInjectionCache, renderHistorianMemoryBlock } from "./inject-compartments";
+import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
 import { persistFilteredNoise } from "./persist-filtered-noise";
 import {
     fitAtomicHistorianSourceToProducerWindow,
-    historianProducerReserve,
     producerInputTokenLimit,
     producerWindowFailureReason,
 } from "./producer-window-guard";
@@ -113,6 +109,7 @@ import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
     hasRawSessionMessageById,
+    prepareRawSessionOrdinals,
     readRawSessionMessageOrdinalById,
     readRawSessionMessageRange,
     readSessionChunk,
@@ -120,7 +117,6 @@ import {
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { isStrictGapHealingMessage } from "./read-session-raw";
-import { buildReferenceBlocks } from "./reference-retrieval";
 import { sendStatusNotification } from "./send-session-notification";
 
 const inconsistentProducerWindows = new Set<string>();
@@ -253,10 +249,17 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         providerHistorianChunkTokens,
         producerKey,
     );
+    // A historian run follows a transform pass of the same session, which has
+    // already waited for the canonical ordinal warm-up; this wait is normally
+    // instant and covers a run started any other way.
+    const ordinalsReady = await prepareRawSessionOrdinals(sessionId);
     let completedSuccessfully = false;
+    // Set at COMMIT of the publish transaction. From then on the new compartments are
+    // durable and already signaled, so a later throw is a failed side step, not a
+    // failed historian run.
+    let publishCommitted = false;
     let retainDrainReservationForRetryThrottle = false;
     let issueNotified = false;
-    let stateFilePath: string | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 
     // historian_runs telemetry (migration v24). Captured across the run and
@@ -340,6 +343,8 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
     updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
     try {
+        if (!ordinalsReady)
+            throw new Error("Session ordinals are warming; retry the historian shortly.");
         const openCodeDbResolution = resolveOpenCodeDbPath();
         if (!openCodeDbPathExists(openCodeDbResolution) && !hasRawMessageProvider(sessionId)) {
             telemetry.status = "noop";
@@ -532,6 +537,64 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             return;
         }
 
+        // Size the prompt to the producer model before reserving drain budget or
+        // reading the chunk: the fixed prompt parts and the output reserve come off
+        // the window first, and the chunk gets what is left.
+        const producerModel = toModelEntry(deps.model)?.model ?? deps.fallbackModelId;
+        const producerWindow = resolveHistorianProducerWindow(
+            producerModel,
+            deps.historianMaxOutputTokens,
+            deps.historianContextLimit,
+        );
+        const producerContext = producerWindow.contextLimitTokens;
+        const producerLimits = { input: producerWindow.inputLimitTokens };
+        const producerReserve = producerWindow.maxOutputTokens;
+        const projectPath = resolveProjectIdentity(directory ?? process.cwd());
+        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        const promptFit = fitHistorianPrompt({
+            window: producerWindow,
+            systemPrompt: withContentLanguageDirective(
+                COMPARTMENT_AGENT_SYSTEM_PROMPT,
+                deps.language,
+            ),
+            requestedChunkTokens: historianChunkTokens,
+            sessionId,
+            chunkStart: Math.max(1, offset),
+            lastOrdinal: eligibleEndOrdinal - 1,
+            sessionCompartments: priorCompartments,
+            memories,
+            memoryEnabled: deps.memoryEnabled !== false,
+        });
+        if (!promptFit.ok) {
+            telemetry.failureReason = promptFit.reason;
+            if (getHistorianFailureState(db, sessionId).lastError === promptFit.reason) {
+                // The same model and window already failed this way. Nothing but a
+                // model, window or instruction change alters the reason, so running
+                // again would only repeat the failure and its notice.
+                telemetry.status = "noop";
+                sessionLog(
+                    sessionId,
+                    `historian no-op: prompt still cannot fit the historian model (${promptFit.reason}); waiting for a model or window change`,
+                );
+                return;
+            }
+            sessionLog(
+                sessionId,
+                `historian failure: source=prompt-fit reason="${promptFit.reason}"`,
+            );
+            incrementHistorianFailure(db, sessionId, promptFit.reason);
+            retainDrainReservationForRetryThrottle = true;
+            await notifyHistorianIssue(buildHistorianWindowTooSmallNotice());
+            return;
+        }
+        const chunkTokens = promptFit.chunkTokens;
+        if (promptFit.trimmed || chunkTokens < historianChunkTokens) {
+            sessionLog(
+                sessionId,
+                `historian prompt fit: sized to ${producerModel ?? "unknown"} (${describeHistorianPromptTrim(promptFit)}; requestedChunkTokens=${historianChunkTokens})`,
+            );
+        }
+
         const perRunCap = selectPerRunCap(boundarySnapshot);
         const usable = Math.max(
             1,
@@ -559,7 +622,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
         drainReservation = reserve.reservation;
 
-        const chunk = readSessionChunk(sessionId, historianChunkTokens, offset, eligibleEndOrdinal);
+        const chunk = readSessionChunk(sessionId, chunkTokens, offset, eligibleEndOrdinal, {
+            expandTools: deps.historianExpandTools,
+        });
         const forceKeepLastCompartmentForChunk =
             deps.forceKeepLastCompartment === true && !chunk.hasMore;
         telemetry.chunkStartOrdinal = chunk.startIndex;
@@ -589,19 +654,6 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             rollbackDrainReservation();
             return;
         }
-        const producerModel = toModelEntry(deps.model)?.model ?? deps.fallbackModelId;
-        const modelParts = producerModel?.split("/");
-        const producerLimits = resolveHistorianProducerLimits(producerModel);
-        const producerContext =
-            producerLimits.context ??
-            (producerLimits.input === undefined ? deps.historianContextLimit : undefined);
-        const producerReserve = historianProducerReserve(
-            producerContext,
-            deps.historianMaxOutputTokens,
-            modelParts && modelParts.length > 1
-                ? getSdkOutputLimit(modelParts[0], modelParts.slice(1).join("/"))
-                : undefined,
-        );
         const fittedAtomicSource = chunk.oversizeAtomicUnit
             ? fitAtomicHistorianSourceToProducerWindow({
                   text: chunk.text,
@@ -609,16 +661,17 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                   contextLimitTokens: producerContext,
                   inputLimitTokens: producerLimits.input,
                   maxOutputTokens: producerReserve,
+                  maxSourceTokens: promptFit.roomTokens,
               })
             : null;
         const chunkText = chunk.oversizeAtomicUnit
             ? (fittedAtomicSource?.text ?? chunk.text)
-            : truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+            : truncateHistorianInputIfNeeded(chunk.text, chunkTokens);
         const producerSourceTokens = estimateTokens(chunkText);
         if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
             sessionLog(
                 sessionId,
-                `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+                `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${chunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
             );
         }
         if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
@@ -657,7 +710,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         if (chunkText !== chunk.text) {
             sessionLog(
                 sessionId,
-                `historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${historianChunkTokens} tokens`,
+                `historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${chunkTokens} tokens`,
             );
         }
 
@@ -687,30 +740,19 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         deps.onHistorianRunStarted?.();
 
         // v2 bounded reference model (replaces the unbounded existing_state dump):
-        //   - 4 rotating cross-project seeds + last-6 recency compartments (no
-        //     embedding at historian time), built from this session's prior
-        //     compartments.
-        //   - <project-memory> for fact dedup (consolidation-bounded).
-        // No temp-file offload needed — the bounded blocks stay well within
-        // serialization limits.
-        const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
-        // The historian dedups facts by content and never addresses a memory by
-        // id, so its block uses the id-free historian renderer (not the m0/m1
-        // `#id` wire that <memory-updates> corrections address). Byte-parity
-        // with the Rust port is pinned by the historian prompt golden.
-        const projectMemory = renderHistorianMemoryBlock(memories) ?? "";
-
-        const references = buildReferenceBlocks({
-            sessionId,
-            chunkStart: chunk.startIndex,
-            sessionCompartments: priorCompartments,
-        });
-
+        //   - 3 rotating seeds + 3 diverse older + 4 recent session compartments
+        //     (no embedding at historian time). Only seeds and diverse references
+        //     show scores, preventing recent-score anchoring in one-compartment runs.
+        //   - <project-memory> for fact dedup, rendered id-free because the
+        //     historian dedups by content and never addresses a memory by id.
+        //     Byte-parity with the Rust port is pinned by the historian prompt
+        //     golden.
+        // The prompt fit above rendered these blocks, trimmed if the producer
+        // window needed room for the chunk.
         const prompt = buildCompartmentAgentPrompt({
-            seedExamples: references.seedExamples,
-            sessionReferences: references.sessionReferences,
-            projectMemory,
+            seedExamples: promptFit.seedExamples,
+            sessionReferences: promptFit.sessionReferences,
+            projectMemory: promptFit.projectMemory,
             inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
             memoryEnabled: deps.memoryEnabled !== false,
         });
@@ -758,16 +800,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             twoPass: deps.historianTwoPass,
             language: deps.language,
         });
-        if (
-            !validatedPass.ok &&
-            /producer_prompt_(?:exceeds_window|fit_unavailable)/.test(validatedPass.error)
-        ) {
-            telemetry.failureReason = validatedPass.error;
-            retainDrainReservationForRetryThrottle = false;
-            rollbackDrainReservation();
-            sessionLog(sessionId, `historian producer admission refused: ${validatedPass.error}`);
-            return;
-        }
+        // A window refusal here comes from a fallback model (the primary was fitted
+        // above). Treat it like any other failed pass: count it, notify, and keep
+        // the reserved drain budget spent so the next trigger does not retry at once.
         if (!validatedPass.ok) {
             // Always track historian failures regardless of usage percentage.
             // The emergency abort path at 95% checks failureCount > 0, so failures
@@ -1013,9 +1048,16 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             lastCompartmentEnd,
             { db, fromMessageIndex: offset },
         );
+        const preparedDrops = prepareCompartmentDrops(
+            db,
+            sessionId,
+            lastCompartmentEnd,
+            compartmentTagKeys,
+            offset,
+        );
         let published = false;
         const transactionStartedAt = startHistorianPublishStage(sessionId, "publish-txn");
-        await beginSqliteWriterAsync(db, "historian-publish");
+        const lockAcquiredAt = await beginSqliteWriterAsync(db, "historian-publish");
         try {
             if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
                 db.exec("ROLLBACK");
@@ -1096,13 +1138,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 }
             }
 
-            queueDropsForCompartmentalizedMessages(
-                db,
-                sessionId,
-                lastCompartmentEnd,
-                compartmentTagKeys,
-                offset,
-            );
+            queuePreparedCompartmentDrops(db, preparedDrops);
             finishHistorianPublishStage(
                 sessionId,
                 "post-publish-drops",
@@ -1134,6 +1170,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             }
             db.exec("COMMIT");
             published = true;
+            publishCommitted = true;
             finishHistorianPublishStage(
                 sessionId,
                 "publish-txn",
@@ -1141,7 +1178,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 "completed",
                 `compartments=${persistedCompartments.length}`,
             );
-            logSlowWriteTransaction("historian-publish", transactionStartedAt);
+            // Held time only: the publish stage above already includes the wait
+            // for the writer lock.
+            logSlowWriteTransaction("historian-publish", lockAcquiredAt);
         } catch (error) {
             finishHistorianPublishStage(sessionId, "publish-txn", transactionStartedAt, "failed");
             throw error;
@@ -1176,12 +1215,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         if (deferMarkerApplication) {
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
-            (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
-                db,
-                sessionId,
-                lastCompartmentEnd,
-                sessionDirectory,
-            );
+            try {
+                (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
+                    db,
+                    sessionId,
+                    lastCompartmentEnd,
+                    sessionDirectory,
+                );
+            } catch (error) {
+                // Same outcome as the update reporting false: the compartments stand and
+                // the marker catches up on a later publication.
+                sessionLog(sessionId, "compaction-marker update after publish failed:", error);
+            }
         }
 
         // v2: the LLM compressor is gone — deterministic decay-tier rendering
@@ -1369,8 +1414,20 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             `historian publish completed: compartments=${persistedCompartments.length} range=${offset}-${lastCompartmentEnd}`,
         );
     } catch (error: unknown) {
-        // Historian runs are fail-closed because they update durable compartment state.
         const desc = describeError(error);
+        if (publishCommitted) {
+            // The publication is durable and was signaled right after COMMIT. Counting this
+            // as a historian failure would warn the user about a run that succeeded and
+            // feed the failure backoff.
+            telemetry.status = "success";
+            telemetry.failureReason = `post_publish_exception: ${desc.brief}`;
+            sessionLog(
+                sessionId,
+                `historian post-publish step failed; publication stands: ${desc.brief}`,
+            );
+            return;
+        }
+        // Historian runs are fail-closed because they update durable compartment state.
         telemetry.failureReason = `exception: ${desc.brief}`;
         sessionLog(
             sessionId,
@@ -1396,6 +1453,5 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
         // Record one historian_runs row for this attempt (every exit path).
         recordTelemetry();
-        cleanupHistorianStateFile(stateFilePath);
     }
 }

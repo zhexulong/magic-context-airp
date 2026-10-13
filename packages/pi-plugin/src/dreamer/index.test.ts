@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -27,6 +27,7 @@ import { getSubagentInvocations } from "@magic-context/core/features/magic-conte
 import * as logger from "@magic-context/core/shared/logger";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
 import { PiSubagentRunner } from "../subagent-runner";
 import {
@@ -369,6 +370,32 @@ describe("Pi dreamer wiring", () => {
 		expect(tasks[0].modelChainUnavailable).toBe(true);
 	});
 
+	test("re-probes a model that becomes registered after an early miss", () => {
+		// OMP queues a dynamic-only extension provider (`litellm`) during extension
+		// loading and merges its catalogue in a fire-and-forget boot refresh, so a
+		// miss at registration normally means "not hydrated yet". Caching the miss
+		// kept the historian chain empty for the whole process even after the model
+		// appeared -- observed in the field as `registered historian trigger:
+		// DISABLED` in two of four OMP processes started within one minute.
+		let hydrated = false;
+		const registry = {
+			find: (_provider: string, model: string) =>
+				hydrated && model === "historian" ? {} : undefined,
+		};
+		const task = {
+			task: "classify-memories" as const,
+			schedule: "0 4 * * *",
+			timeoutMinutes: 20,
+			model: "litellm/historian",
+		};
+		expect(validatePiDreamerModels([task], registry)[0].model).toBeUndefined();
+		hydrated = true;
+		expect(validatePiDreamerModels([task], registry)[0]).toMatchObject({
+			model: "litellm/historian",
+			modelChainUnavailable: false,
+		});
+	});
+
 	test("does not register the filesystem root or home for dreaming", () => {
 		db = createDb();
 		let starts = 0;
@@ -393,7 +420,9 @@ describe("Pi dreamer wiring", () => {
 	// against project "" and log "registered project " with a blank name.
 	test("does not register a project with an empty identity", () => {
 		db = createDb();
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-dreamer-empty-identity-"));
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-dreamer-empty-identity-"),
+		);
 		try {
 			let starts = 0;
 			__test.setStartDreamScheduleTimerFactory(async () => {
@@ -607,6 +636,27 @@ describe("Pi dreamer wiring", () => {
 		expect(registration?.embeddingConfig?.provider).toBe("local");
 	});
 
+	// Pi schedules through the plugin's dream timer, which stops scheduling and
+	// deletes the schedule rows of a project whose `memory.enabled` is false. Pi
+	// must pass that setting through, not leave it unset (which means enabled).
+	test("threads a disabled project memory into scheduled maintenance", async () => {
+		db = createDb();
+		let registration: { memoryEnabled?: boolean } | undefined;
+		__test.setStartDreamScheduleTimerFactory(async (captured) => {
+			registration = captured;
+			return mock(() => {});
+		});
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity: "git:pi-memory-disabled",
+		});
+
+		registerPiDreamerProject({ ...opts, memoryEnabled: false });
+		await flushMicrotasks();
+
+		expect(registration?.memoryEnabled).toBe(false);
+	});
+
 	test("threads OMP identity into scheduled dreamer model resolution", async () => {
 		db = createDb();
 		let harness: string | undefined;
@@ -778,7 +828,7 @@ describe("Pi dreamer wiring", () => {
 	});
 
 	test("persists an OMP 18.1.11 dreamer task stream with tokens and task label", async () => {
-		const testDataDir = mkdtempSync(
+		const testDataDir = createTestTempDirFromPath(
 			join(tmpdir(), "mc-pi-dreamer-accounting-"),
 		);
 		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;

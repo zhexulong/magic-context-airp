@@ -12,18 +12,16 @@
 import { createMemo, createSignal, onCleanup } from "solid-js"
 import type { TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
 import packageJson from "../../../package.json"
-import { statusSummaryFromDetail } from "../../shared/status-summary"
 import {
-    buildStatusView,
+    buildStatusViewFor,
     distributeBarWidths,
     statusColumnsFor,
     type StatusRow,
     type StatusSection,
     type StatusTone,
-    type StatusViewSource,
 } from "../../shared/status-view"
 import { RUST_MODE_HOST_PATHS_LINE } from "../../shared/rust-mode-status"
-import type { StatusDetail } from "../data/context-db"
+import type { StatusDetailResult } from "../data/context-db"
 
 const R = (props: { t: TuiThemeCurrent; l: string; v: string; fg?: string }) => (
     <box width="100%" flexDirection="row" justifyContent="space-between">
@@ -48,10 +46,13 @@ function toneColor(theme: TuiThemeCurrent, tone: StatusTone): string {
 
 /**
  * Width the dialog is actually laid out at, which is NOT the terminal width:
- * each host sizes its own dialog surface (OpenCode 2's widest is 88 columns on
- * a 200-column terminal), and that is the width the sections have to fit into.
- * Renderables carry their laid-out width and emit "resized" when it changes, so
- * the component reads it from its own root box.
+ * each host sizes its own dialog surface (OpenCode 1's default is 60 columns,
+ * OpenCode 2's widest is 88 columns on a 200-column terminal), and that is the
+ * width the sections have to fit into. Renderables carry their laid-out width
+ * and emit "resize" when a layout pass changes it, so the component reads it
+ * from its own root box. ("resized", with a d, is emitted only by the
+ * renderer's root; a box never sends it, and listening for it left the dialog
+ * sizing its sections from the terminal width forever.)
  *
  * Until the first layout there is no width to read; the terminal width is the
  * fallback, and an unknown terminal keeps the wide layout the dialog has always
@@ -83,35 +84,27 @@ const StatusSectionView = (props: { t: TuiThemeCurrent; section: StatusSection }
     </box>
 )
 
-export const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
+/**
+ * `status` is the checked result of the status RPC (`loadStatusDetail`), never
+ * the raw reply: a reply the view cannot draw arrives as the reason it cannot,
+ * and the shared model turns that into a "status unavailable" view. An
+ * unchecked reply used to reach the view model directly, where a missing field
+ * threw inside this component's first render and crashed the whole TUI.
+ */
+export const StatusDialog = (props: { api: TuiPluginApi; status: StatusDetailResult }) => {
     const theme = createMemo(() => (props.api as any).theme.current)
     const t = () => theme()
-    const s = () => props.s
-    const compactionOff = () => s().compaction_enabled === false
-
-    // Prefer the RPC-provided model context limit (what the sidebar shows) so the
-    // two surfaces never disagree. Fall back to deriving from usage% only when the
-    // RPC limit is absent (0) — and that derivation is itself undefined at 0%, so
-    // it stays "?" rather than showing a number inconsistent with the sidebar.
-    const contextLimit = () =>
-        s().contextLimit > 0
-            ? s().contextLimit
-            : s().usagePercentage > 0
-              ? Math.round(s().inputTokens / (s().usagePercentage / 100))
-              : 0
+    const ready = () => (props.status.state === "ready" ? props.status : null)
+    const compactionOff = () => ready()?.source.compaction_enabled === false
+    const recompProgress = () => ready()?.extras.recompProgress ?? null
+    const hostBackendsModuleSide = () => ready()?.extras.hostBackendsModuleSide === true
 
     // Which rows exist, what they are called and which colour they carry is
     // decided by the shared model, so this dialog and Pi's overlay cannot drift
-    // apart. This component only draws what the model returns.
+    // apart. This component only draws what the model returns, and the model
+    // never throws: a result it cannot draw becomes the unavailable view.
     const view = createMemo(() =>
-        buildStatusView(
-            {
-                ...(s() as unknown as StatusViewSource),
-                contextLimit: contextLimit(),
-                warnings: statusSummaryFromDetail(s()).warnings,
-            },
-            { version: packageJson.version },
-        ),
+        buildStatusViewFor(props.status, { version: packageJson.version }),
     )
     // The dialog's own laid-out width, which is what the sections have to fit
     // into; the terminal width is only the pre-layout fallback.
@@ -122,8 +115,8 @@ export const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
             if (Number.isFinite(width) && width > 0) setDialogWidth(width)
         }
         read()
-        element?.on?.("resized", read)
-        onCleanup(() => element?.off?.("resized", read))
+        element?.on?.("resize", read)
+        onCleanup(() => element?.off?.("resize", read))
     }
     // paddingLeft + paddingRight below; what the sections get is what is left.
     const contentWidth = () => (dialogWidth() > 0 ? dialogWidth() - 4 : terminalColumns())
@@ -206,8 +199,8 @@ export const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 running or just finished — dogfood 2026-05-30). This is live run
                 state rather than status content, so it stays out of the shared
                 section model. */}
-            {!compactionOff() && s().recompProgress && (() => {
-                const p = s().recompProgress!
+            {!compactionOff() && recompProgress() && (() => {
+                const p = recompProgress()!
                 // Label follows the flow that started the run, so a plain
                 // /ctx-recomp never reads as an "Upgrade" (dogfood 2026-06-04).
                 const verb = p.kind === "upgrade" ? "Upgrade" : p.kind === "embed" ? "Embed" : "Recomp"
@@ -242,21 +235,31 @@ export const StatusDialog = (props: { api: TuiPluginApi; s: StatusDetail }) => {
                 )
             })()}
 
-            {s().hostBackendsModuleSide && (
+            {hostBackendsModuleSide() && (
                 <box marginTop={1} width="100%" flexDirection="column">
                     <text fg={t().text}><b>Rust Mode</b></text>
                     <text fg={t().textMuted}>{RUST_MODE_HOST_PATHS_LINE}</text>
                 </box>
             )}
 
+            {/* Each column asks for the width its sections need, but may
+                shrink: until the dialog has measured itself the grid is chosen
+                against the terminal width, and a column that could not shrink
+                would then run past the dialog's right edge. Shrinking wraps a
+                value inside its column instead, and anything still wider
+                than a squeezed column (a fixed-width label) is clipped at the
+                column's edge rather than drawn past the dialog. The request is
+                a flexBasis, not a width: OpenTUI turns flexShrink back to 0
+                whenever a box gets a numeric width, so a fixed-width column
+                never shrinks. */}
             {columns().twoColumn ? (
                 <box flexDirection="row" width="100%" gap={4}>
-                    <box flexDirection="column" width={columns().leftWidth} flexShrink={0}>
+                    <box flexDirection="column" flexBasis={columns().leftWidth} flexGrow={0} flexShrink={1} minWidth={0} overflow="hidden">
                         {columnSections(0).map((section) => (
                             <StatusSectionView t={t()} section={section} />
                         ))}
                     </box>
-                    <box flexDirection="column" width={columns().rightWidth} flexShrink={0}>
+                    <box flexDirection="column" flexBasis={columns().rightWidth} flexGrow={0} flexShrink={1} minWidth={0} overflow="hidden">
                         {columnSections(1).map((section) => (
                             <StatusSectionView t={t()} section={section} />
                         ))}

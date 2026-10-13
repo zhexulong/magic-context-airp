@@ -22,7 +22,7 @@ const GUIDANCE_LIGHT_NO_REDUCE: Option<&str> =
 const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = Some(&[
     (
         "ctx_reduce",
-        r#"Stamp an item as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays readable until Magic Context clears stamped items in one sweep, newest tags are protected, and a cleared item goes to the archive (recent: a [dropped §N§] placeholder; older: removed) recoverable via ctx_expand(message=N). The question is "does this need to stay on my desk for what comes next?" — a file you keep editing stays, the grep that found it goes. Stamp used reads/searches/outputs, acted-on build/test output, redundant dumps, extracted pasted payloads; keep user messages, your own text, unresolved errors, raw evidence, exact wording that may matter. Look at each tag; never blanket-stamp "1-50". Grammar: "3-5", "1,2,9", "1-5,8,12-15"."#,
+        r#"Stamp an item as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays readable until Magic Context clears stamped items in one sweep, newest tags are protected, and a cleared item goes to the archive (recent: a [dropped §N§] placeholder; older: removed) recoverable via ctx_expand(tag=N). The question is "does this need to stay on my desk for what comes next?" — a file you keep editing stays, the grep that found it goes. Stamp used reads/searches/outputs, acted-on build/test output, redundant dumps, extracted pasted payloads; keep user messages, your own text, unresolved errors, raw evidence, exact wording that may matter. Look at each tag; never blanket-stamp "1-50". Grammar: "3-5", "1,2,9", "1-5,8,12-15"."#,
     ),
     (
         "ctx_memory",
@@ -30,11 +30,11 @@ const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = Some(&[
     ),
     (
         "ctx_search",
-        r#"Search the archive — everything that ever happened here that is not on your desk: memories not in <project-memory>, compacted conversation, commits, notes. Phrase query as a natural-language question carrying the exact terms you expect ("where is the opencode source code path?", "why did we choose SQLite over postgres?", "how does the dreamer lease work?") — a keyword stack finds less. Sources (omit for all): memory (rules, conventions), message (compacted conversation; hits carry ordinals for ctx_expand), git_commit (when did this change), note (parked follow-ups). Memory ids alone (`#7234`) resolve directly. from/to restrict every source to an inclusive UTC date range."#,
+        r#"Search the archive — everything that ever happened here that is not on your desk: memories not in <project-memory>, compacted conversation, commits, notes. Phrase query as a natural-language question carrying the exact terms you expect ("where is the opencode source code path?", "why did we choose SQLite over postgres?", "how does the dreamer lease work?") — a keyword stack finds less. Sources (omit for all): memory (rules, conventions), message (compacted conversation; hits carry ordinals for ctx_expand), git_commit (when did this change), primer (reusable project Q&A the dreamer distils from recurring questions), note (parked follow-ups). Memory ids alone (`#7234`) resolve directly. from/to restrict every source to an inclusive UTC date range."#,
     ),
     (
         "ctx_expand",
-        "Recover raw conversation behind a <session-history> heading or around a ctx_search hit: ctx_expand(start, end) returns [N] U:/A: lines (~15K-token cap; oversized ranges return the head and where to continue). verbose=true lists messages with per-part previews to pick one; message=N returns that message in full, including a tool output released with ctx_reduce. Ranges after the last compartment are your live tail, not expandable.",
+        "Recover one item with tag=N (a §N§ or dropped placeholder number), not a message ordinal; text or one tool call with full input/output. message=N and start/end are whole-message ordinals from history/search, never tag numbers. Recover raw conversation behind a <session-history> heading or around a ctx_search hit: ctx_expand(start, end) returns [N] U:/A: lines (~15K-token cap; oversized ranges return the head and where to continue). verbose=true lists messages with per-part previews to pick one; message=N returns that message in full, including a tool output released with ctx_reduce. Ranges after the last compartment are your live tail, not expandable.",
     ),
     (
         "ctx_note",
@@ -42,7 +42,7 @@ const TOOL_LIGHT_DESCRIPTIONS: Option<&[(&str, &str)]> = Some(&[
     ),
 ]);
 
-const CTX_REDUCE_DESCRIPTION: &str = r#"Stamp an item on your desk as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays fully readable until Magic Context clears stamped items in one sweep, and the newest tags are protected so stamping recent output is harmless. A cleared item goes to the archive — a recent one leaves a `[dropped §N§]` placeholder, an older one leaves nothing — and `ctx_expand(message=N)` is the way back. So the question before stamping is not "have I finished reading this?" but "does this need to stay on my desk for what comes next?" — a file you read and will keep editing stays; the grep that found it goes.
+const CTX_REDUCE_DESCRIPTION: &str = r#"Stamp an item on your desk as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays fully readable until Magic Context clears stamped items in one sweep, and the newest tags are protected so stamping recent output is harmless. A cleared item goes to the archive — a recent one leaves a `[dropped §N§]` placeholder, an older one leaves nothing — and `ctx_expand(tag=N)` is the way back. So the question before stamping is not "have I finished reading this?" but "does this need to stay on my desk for what comes next?" — a file you read and will keep editing stays; the grep that found it goes.
 
 Stamp: file reads, search results and tool outputs the work ahead no longer needs; build/test output after you acted on it; repeated or redundant dumps; data written to disk; status/log output that only confirmed what you expected; a large block pasted inside a user message once you have used it.
 Keep: user messages (never stamp one for its directive), your own conversation text, unresolved errors, raw evidence you haven't extracted yet, and outputs whose exact wording may still matter.
@@ -60,19 +60,20 @@ fn schema_with_preset_descriptions(
     let descriptions: &[(&str, &str)] = match tool_id {
         "ctx_reduce" => &[("drop", "Tag IDs: \"3-5\", \"1,2,9\", \"1-5,8,12-15\".")],
         "ctx_expand" => &[
-            ("start", "First ordinal — a compartment's start or a search hit."),
-            ("end", "Last ordinal, inclusive."),
+            ("tag", "Tag number from a §N§ tag or a [dropped §N§] placeholder, not a message ordinal. Returns that one item in full. Use alone."),
+            ("start", "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number."),
+            ("end", "Last message ordinal of the range, inclusive, not a tag number."),
             ("verbose", "With start/end: one entry per message with previews instead of the transcript."),
-            ("message", "Recover ONE message in full by ordinal; use without start/end."),
+            ("message", "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone."),
         ],
         "ctx_note" => &[
             ("action", "write | read | update | dismiss (default: write with content, else read)."),
             ("content", "Note text: first line title (<80 chars), then detail."),
             ("surface_condition", "A condition an outside checker can verify on its own, periodically (repository, releases, web — anything it can look up); never something only this conversation knows."),
-            ("filter", "Read filter: active (default), all, pending, ready, dismissed."),
+            ("filter", "Read filter: all, active, pending, ready, dismissed. Omitted: active notes plus every current smart note (pending included); active: only active-status notes."),
             ("limit", "Rows per read (default 25)."),
             ("offset", "Skip newest rows (default 0)."),
-            ("note_ids", "One id for update, 1–50 for dismiss, any for read (full bodies). Ignored by write."),
+            ("note_ids", "One id for update, 1–50 for dismiss or read (full bodies). Ignored by write."),
         ],
         "ctx_memory" => &[
             ("action", "write | update | archive | merge | get"),
@@ -190,6 +191,108 @@ pub fn guidance_asset(preset: PromptSurfacePreset, variant: GuidanceVariant) -> 
 
 pub fn is_known_tool_id(tool_id: &str) -> bool {
     PROMPT_SURFACE_TOOL_IDS.contains(&tool_id)
+}
+
+pub(crate) fn disable_smart_note_schema(schema: &mut serde_json::Value) {
+    if let Some(properties) = schema.get_mut("properties").and_then(|v| v.as_object_mut()) {
+        properties.remove("surface_condition");
+        if let Some(filter) = properties.get_mut("filter") {
+            filter["description"] = json!("Read filter: all, active, pending, ready, dismissed. Omitted: active session notes plus every current project note; active shows only active-status notes.");
+        }
+    }
+}
+
+pub(crate) fn without_smart_note_description(text: &str) -> String {
+    text.replace("ready smart notes first, then newest", "newest first")
+        .split("\n- surface_condition:")
+        .next()
+        .unwrap_or_default()
+        .split(" surface_condition parks")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+pub(crate) fn without_smart_note_guidance(text: &str) -> String {
+    let plain = text.replace(" A note with a `surface_condition` is left with an outside checker that looks the condition up periodically and returns the note only when it holds.", "")
+        .replace("; a `surface_condition` leaves the note with an outside checker that returns it when the condition holds", "");
+    let mut smart_section_level = 0;
+    plain
+        .split('\n')
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            let mentions = [
+                "smart note",
+                "smart-note",
+                "smart_note",
+                "surface_condition",
+                "outside checker",
+            ]
+            .iter()
+            .any(|term| lower.contains(term));
+            let trimmed = line.trim_start();
+            let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
+            if (1..=6).contains(&heading_level)
+                && trimmed
+                    .chars()
+                    .nth(heading_level)
+                    .is_some_and(char::is_whitespace)
+                && (smart_section_level == 0 || heading_level <= smart_section_level)
+            {
+                smart_section_level = if mentions { heading_level } else { 0 };
+            }
+            smart_section_level == 0 && !mentions
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn disable_smart_notes_in_tools(tools: &mut [Tool], preset: PromptSurfacePreset) {
+    for tool in tools.iter_mut().filter(|tool| tool.name == "ctx_note") {
+        disable_smart_note_schema(&mut tool.schema);
+        let description = if preset == PromptSurfacePreset::Light {
+            TOOL_LIGHT_DESCRIPTIONS
+                .and_then(|descriptions| {
+                    descriptions
+                        .iter()
+                        .find_map(|(id, text)| (*id == "ctx_note").then_some(*text))
+                })
+                .map(str::to_string)
+                .unwrap_or_else(ctx_note_description)
+        } else {
+            ctx_note_description()
+        };
+        tool.description = Some(without_smart_note_description(&description));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn disabled_legacy_facade_tool_and_guidance_surfaces_have_no_smart_note_clauses() {
+    for preset in [PromptSurfacePreset::Full, PromptSurfacePreset::Light] {
+        let mut tools = session_tools(&PromptSurfaceSelection {
+            preset,
+            ..Default::default()
+        });
+        disable_smart_notes_in_tools(&mut tools, preset);
+        let note = tools.iter().find(|tool| tool.name == "ctx_note").unwrap();
+        let text = serde_json::to_string(note).unwrap();
+        assert!(!text.contains("surface_condition"), "{text}");
+        assert!(!text.contains("smart note"), "{text}");
+        for variant in [GuidanceVariant::Full, GuidanceVariant::NoReduce] {
+            let text = without_smart_note_guidance(guidance_asset(preset, variant).bytes);
+            assert!(!text.contains("surface_condition"), "{text}");
+            assert!(!text.contains("outside checker"), "{text}");
+        }
+    }
+    let manifest = crate::manifest_with_route_targets_and_smart_notes(
+        crate::DEFAULT_MODULE_ID,
+        &crate::route_targets::RouteTargetConfig::default(),
+        false,
+    );
+    let text = serde_json::to_string(&manifest).unwrap();
+    assert!(!text.contains("surface_condition"), "{text}");
+    assert!(!text.contains("smart note"), "{text}");
 }
 
 pub fn warn_ignored_unknown_tool_description(tool_id: &str) {

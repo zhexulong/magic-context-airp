@@ -10,9 +10,11 @@ import {
     classifyProcessKind,
     discoverLivePiProcessIds,
     inspectLivePiProcesses,
+    inspectWindowsProcessesSync,
     isPidAlive,
     isPidIdentityPlausible,
     parseTasklistOutput,
+    processCannotBeRpcHost,
     type RpcPortFileRecord,
     readProcessProbeEvidence,
 } from "./rpc-utils";
@@ -629,18 +631,43 @@ describe("isPidIdentityPlausible", () => {
         ]);
 
         calls.length = 0;
+        // With the start time unreadable, the image is read next: only an image
+        // that cannot be a host would prove the record stale, and OpenCode.exe can.
         expect(isPidIdentityPlausible(record(NOW_MS))).toBe("inconclusive");
-        expect(calls).toEqual([
-            {
-                file: "powershell",
-                args: [
-                    "-NoProfile",
-                    "-Command",
-                    "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress",
-                ],
-            },
-        ]);
+        expect(calls.map((call) => call.file)).toEqual(["powershell", "tasklist"]);
+        expect(calls[0]?.args.slice(0, 2)).toEqual(["-NoProfile", "-Command"]);
+        expect(String(calls[0]?.args[2])).toContain("Get-CimInstance Win32_Process");
+        expect(String(calls[0]?.args[2])).toContain("ToString('o')");
     });
+});
+
+test("the synchronous Windows process list allows more output than the 1 MiB default", () => {
+    // Bun's execFileSync throws ENOBUFS past 1 MiB, and a Win32_Process listing
+    // with command lines passes that on a busy desktop; the snapshot then falls
+    // back to tasklist, which has no start times.
+    const limits: unknown[] = [];
+    __setRpcIdentityTestHooks({
+        platform: "win32",
+        processListExecFileSync: ((
+            _file: string,
+            _args: readonly string[],
+            options?: { maxBuffer?: number },
+        ) => {
+            limits.push(options?.maxBuffer);
+            return JSON.stringify([
+                {
+                    ProcessId: 7,
+                    ParentProcessId: 1,
+                    Name: "opencode.exe",
+                    CommandLine: "opencode",
+                    CreationDate: "2026-09-30T10:15:00Z",
+                },
+            ]);
+        }) as unknown as typeof execFileSync,
+    });
+    const inspection = inspectWindowsProcessesSync();
+    expect(inspection.processSnapshot?.source).toBe("cim");
+    expect(limits).toEqual([8 * 1024 * 1024]);
 });
 
 test("Spanish tasklist no-match is not running", () => {
@@ -663,4 +690,131 @@ test("tasklist CSV live process is running", () => {
     expect(parseTasklistOutput('"opencode.exe","1234","Console","1","10,000 K"')).toEqual([
         { pid: 1234, command: "opencode.exe" },
     ]);
+});
+
+describe("proving a discovery record stale from the record's own start time", () => {
+    // Values from a Windows machine where PIDs from old records had been reused.
+    const RECORDED = Date.parse("2026-08-16T22:49:55Z");
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const windowsRecord = (startedAt: number): RpcPortFileRecord => ({
+        port: 54209,
+        pid: 15520,
+        started_at: startedAt,
+    });
+
+    test("a PID whose process started after the record was written is a reused PID", () => {
+        expect(
+            isPidIdentityPlausible(windowsRecord(RECORDED), {
+                startTime: RECORDED + 42 * DAY_MS,
+                commandLine: "C:\\Windows\\System32\\RuntimeBroker.exe -Embedding",
+                imageName: "RuntimeBroker.exe",
+            }),
+        ).toBe("implausible");
+        // The start time alone is proof, even when the new process is a runtime a
+        // host could use.
+        expect(
+            isPidIdentityPlausible(windowsRecord(RECORDED), {
+                startTime: RECORDED + 42 * DAY_MS,
+                commandLine: "node.exe C:\\tools\\unrelated.js",
+                imageName: "node.exe",
+            }),
+        ).toBe("implausible");
+    });
+
+    test("a host that started at or before its record is genuine", () => {
+        for (const startTime of [RECORDED - 13_000, RECORDED]) {
+            expect(
+                isPidIdentityPlausible(windowsRecord(RECORDED), {
+                    startTime,
+                    commandLine: null,
+                    imageName: "RuntimeBroker.exe",
+                }),
+            ).toBe("plausible");
+        }
+    });
+
+    test("an unreadable start time with an image no host can run is a reused PID", () => {
+        for (const imageName of ["svchost.exe", "WinAutomation.UserAgent.exe"]) {
+            expect(
+                isPidIdentityPlausible(windowsRecord(RECORDED), {
+                    startTime: null,
+                    commandLine: imageName,
+                    imageName,
+                }),
+            ).toBe("implausible");
+        }
+    });
+
+    test("an unreadable start time with a host-like image stays inconclusive", () => {
+        for (const imageName of [
+            "opencode.exe",
+            "OpenChamber.exe",
+            "pi.exe",
+            "omp.exe",
+            "bun.exe",
+            "node.exe",
+            "ck-mc.exe",
+        ]) {
+            expect(
+                isPidIdentityPlausible(windowsRecord(RECORDED), {
+                    startTime: null,
+                    commandLine: null,
+                    imageName,
+                }),
+            ).toBe("inconclusive");
+        }
+        expect(
+            isPidIdentityPlausible(windowsRecord(RECORDED), {
+                startTime: null,
+                commandLine: null,
+                imageName: null,
+            }),
+        ).toBe("inconclusive");
+    });
+
+    test("an unreadable start time is resolved from the probed image when no evidence is passed", () => {
+        __setRpcIdentityTestHooks({
+            platform: "win32",
+            execFileSync: ((file: string | URL) => {
+                if (String(file) === "powershell") throw new Error("CIM unavailable");
+                return tasklistOutput([[15520, "svchost.exe"]]);
+            }) as typeof execFileSync,
+        });
+        expect(isPidIdentityPlausible(windowsRecord(RECORDED))).toBe("implausible");
+    });
+
+    test("a record without a start time is stale only when its image cannot be a host", () => {
+        expect(
+            isPidIdentityPlausible(windowsRecord(0), {
+                startTime: null,
+                commandLine: "dllhost.exe",
+                imageName: "dllhost.exe",
+            }),
+        ).toBe("implausible");
+        expect(
+            isPidIdentityPlausible(windowsRecord(0), {
+                startTime: null,
+                commandLine: "pi.exe",
+                imageName: "pi.exe",
+            }),
+        ).toBe("inconclusive");
+    });
+
+    test("host markers are matched in either the image name or the command line", () => {
+        expect(processCannotBeRpcHost({ commandLine: null, imageName: "Cherry Studio.exe" })).toBe(
+            true,
+        );
+        expect(
+            processCannotBeRpcHost({
+                commandLine: "C:\\Users\\a\\.bun\\bin\\omp.exe",
+                imageName: "unknown",
+            }),
+        ).toBe(false);
+        expect(
+            processCannotBeRpcHost({
+                commandLine: "/usr/bin/env node /opt/pi-coding-agent/dist/cli.js",
+            }),
+        ).toBe(false);
+        expect(processCannotBeRpcHost({ commandLine: "  ", imageName: null })).toBe(false);
+    });
 });

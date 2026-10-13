@@ -44,6 +44,12 @@
  * Pi session because `getBranch()` returns the linear sequence from
  * root to leaf — entries are append-only on the active branch.
  *
+ * One exception: when the session's stored compartments prove the walk no
+ * longer starts where it did when they were written (the walk lost entries
+ * in front of them), readers pass an ordinal offset and the branch is
+ * numbered from offset + 1, behind empty slots for the unreachable ordinals.
+ * `pi-ordinal-alignment.ts` derives that offset.
+ *
  * # Entry types we skip
  *
  * `getBranch()` may return non-message entries (thinking_level_change,
@@ -69,8 +75,10 @@
  *      sessionId. Different storage, different lifecycle.
  */
 
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
+import { stableStringify } from "@magic-context/core/shared/stable-json";
 
 /**
  * Prefix for the synthetic-user RawMessage id emitted when a run of `toolResult`
@@ -128,6 +136,24 @@ export function resolvePiStableId(
 	entryIdByRef?: ReadonlyMap<object, string>,
 ): string | undefined {
 	if (!msg || typeof msg !== "object") return undefined;
+	const real = resolvePiRealStableId(msg, index, entryIds, entryIdByRef);
+	if (real !== undefined) return real;
+	// 3. Unstable index id — last resort (synthetic / unresolved messages only).
+	const m = msg as { role?: string; timestamp?: number };
+	const role = m.role ?? "unknown";
+	return typeof m.timestamp === "number"
+		? `pi-msg-${index}-${m.timestamp}-${role}`
+		: `pi-msg-${index}-${role}`;
+}
+
+/** Lanes 1 and 2 of resolvePiStableId: the real SessionEntry id, or undefined. */
+export function resolvePiRealStableId(
+	msg: unknown,
+	index: number,
+	entryIds?: readonly (string | undefined)[],
+	entryIdByRef?: ReadonlyMap<object, string>,
+): string | undefined {
+	if (!msg || typeof msg !== "object") return undefined;
 	// 1. Reference identity — preferred, splice-safe (misses cloned objects).
 	const byRef = entryIdByRef?.get(msg as object);
 	if (typeof byRef === "string" && byRef.length > 0) return byRef;
@@ -135,12 +161,73 @@ export function resolvePiStableId(
 	const positional = entryIds?.[index];
 	if (typeof positional === "string" && positional.length > 0)
 		return positional;
-	// 3. Unstable index id — last resort (synthetic / unresolved messages only).
-	const m = msg as { role?: string; timestamp?: number };
-	const role = m.role ?? "unknown";
-	return typeof m.timestamp === "number"
-		? `pi-msg-${index}-${m.timestamp}-${role}`
-		: `pi-msg-${index}-${role}`;
+	return undefined;
+}
+
+const PI_CONTENT_FALLBACK_ID = /^pi-msg-c[0-9a-f]{16}o\d+-/;
+
+/** True for an id made by piContentFallbackIds (position-independent). */
+export function isPiContentFallbackId(id: string): boolean {
+	return PI_CONTENT_FALLBACK_ID.test(id);
+}
+
+/**
+ * True for the older index-bearing fallback form `pi-msg-<index>-…`, whose id
+ * changes whenever the message's array position changes.
+ */
+export function isPiIndexFallbackId(id: string): boolean {
+	return /^pi-msg-\d+-/.test(id);
+}
+
+/**
+ * Position-independent fallback ids for the messages of one context pass that
+ * have no real SessionEntry id: `pi-msg-c<digest>o<occurrence>-<ts>-<role>`.
+ *
+ * The digest covers the message header (response id, timestamp, role, tool
+ * call id) and its content, so the same message gets the same id wherever it
+ * sits in the array. The index-bearing form changed as soon as something ahead
+ * of the message appeared or disappeared (a compaction, a custom message, a
+ * request-built message), and its tags were then orphaned or refused. The
+ * occurrence counter separates exact duplicates in one array: the k-th
+ * unresolved message with a given digest gets `o<k>`. The timestamp and role
+ * suffix keep the shape `parsePiFallbackToolOwnerId` reads.
+ *
+ * Compute this once per pass on the input array, before any stage rewrites
+ * message content: the digest is of the raw message, so later consumers must
+ * read the id by index from the returned array rather than recompute it from
+ * an edited copy. Entries with a real id are undefined.
+ */
+export function piContentFallbackIds(
+	messages: readonly unknown[],
+	resolveReal: (msg: unknown, index: number) => string | undefined,
+): (string | undefined)[] {
+	const occurrences = new Map<string, number>();
+	return messages.map((message, index) => {
+		if (!message || typeof message !== "object") return undefined;
+		if (resolveReal(message, index) !== undefined) return undefined;
+		const m = message as Record<string, unknown>;
+		const role = typeof m.role === "string" ? m.role : "unknown";
+		const digest = createHash("sha256")
+			.update(
+				stableStringify([
+					typeof m.responseId === "string" ? m.responseId : null,
+					typeof m.timestamp === "number" || typeof m.timestamp === "string"
+						? m.timestamp
+						: null,
+					role,
+					typeof m.toolCallId === "string" ? m.toolCallId : null,
+					m.content ?? null,
+				]),
+			)
+			.digest("hex")
+			.slice(0, 16);
+		const occurrence = occurrences.get(digest) ?? 0;
+		occurrences.set(digest, occurrence + 1);
+		const base = `pi-msg-c${digest}o${occurrence}`;
+		return typeof m.timestamp === "number"
+			? `${base}-${m.timestamp}-${role}`
+			: `${base}-${role}`;
+	});
 }
 
 /**
@@ -159,8 +246,27 @@ export interface PiSessionSnapshot {
 	rawMessages: RawMessage[];
 }
 
+/**
+ * How many ordinals the session's stored coordinates place before the first
+ * message of the branch walk (see `pi-ordinal-alignment.ts`). Either a known
+ * count, or a function that derives it from the branch entries the reader
+ * itself loaded, so the count always describes the entries being numbered.
+ */
+export type PiOrdinalOffsetSource =
+	| number
+	| ((branchEntries: readonly unknown[]) => number);
+
+function resolveOrdinalOffset(
+	source: PiOrdinalOffsetSource,
+	entries: readonly unknown[],
+): number {
+	const value = typeof source === "function" ? source(entries) : source;
+	return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
 export function readPiSessionSnapshot(
 	ctx: ExtensionContext,
+	ordinalOffset: PiOrdinalOffsetSource = 0,
 ): PiSessionSnapshot {
 	const sm = ctx.sessionManager;
 	if (sm === undefined) return { branchEntries: [], rawMessages: [] };
@@ -179,12 +285,18 @@ export function readPiSessionSnapshot(
 
 	return {
 		branchEntries: entries,
-		rawMessages: convertEntriesToRawMessages(entries),
+		rawMessages: convertEntriesToRawMessages(
+			entries,
+			resolveOrdinalOffset(ordinalOffset, entries),
+		),
 	};
 }
 
-export function readPiSessionMessages(ctx: ExtensionContext): RawMessage[] {
-	return readPiSessionSnapshot(ctx).rawMessages;
+export function readPiSessionMessages(
+	ctx: ExtensionContext,
+	ordinalOffset: PiOrdinalOffsetSource = 0,
+): RawMessage[] {
+	return readPiSessionSnapshot(ctx, ordinalOffset).rawMessages;
 }
 
 export function readPiSessionMessagePage(
@@ -192,6 +304,7 @@ export function readPiSessionMessagePage(
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
+	ordinalOffset: PiOrdinalOffsetSource = 0,
 ): RawMessage[] {
 	const sessionManager = ctx.sessionManager;
 	const getBranch = (
@@ -206,6 +319,7 @@ export function readPiSessionMessagePage(
 					afterOrdinal,
 					limit,
 					finalWatermark,
+					resolveOrdinalOffset(ordinalOffset, entries),
 				)
 			: [];
 	} catch {
@@ -257,6 +371,56 @@ export function findLastModelKeyFromBranch(
 	return undefined;
 }
 
+/**
+ * The model to seed the live model pin with on the first context pass after a
+ * restart (`provider/model`).
+ *
+ * Usually the last `model_change` (see findLastModelKeyFromBranch). But when
+ * a `model_change` is newer than the newest assistant message, the user
+ * switched models after the last reply, possibly before the restart: that
+ * entry already names the model in use now, so seeding from it would make the
+ * first pass compare the new model with itself and miss the switch. The
+ * newest assistant message's model (failed or aborted replies included) is
+ * then the model the pin held when the last reply ended, which is what a
+ * process that never restarted would compare against.
+ */
+export function findRestartModelSeedFromBranch(
+	entries: readonly unknown[] | null | undefined,
+): string | undefined {
+	if (!Array.isArray(entries)) return undefined;
+	let switchedAfterLastReply = false;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const e = entries[i] as {
+			type?: unknown;
+			message?: unknown;
+			provider?: unknown;
+			modelId?: unknown;
+		} | null;
+		if (e?.type === "model_change") {
+			if (typeof e.provider === "string" && typeof e.modelId === "string")
+				switchedAfterLastReply = true;
+			continue;
+		}
+		if (e?.type !== "message") continue;
+		const m = e.message as
+			| { role?: unknown; provider?: unknown; model?: unknown }
+			| undefined;
+		if (m?.role !== "assistant") continue;
+		if (
+			typeof m.provider !== "string" ||
+			m.provider.length === 0 ||
+			typeof m.model !== "string" ||
+			m.model.length === 0
+		) {
+			continue;
+		}
+		return switchedAfterLastReply
+			? `${m.provider}/${m.model}`
+			: findLastModelKeyFromBranch(entries);
+	}
+	return findLastModelKeyFromBranch(entries);
+}
+
 function rawEntryVersion(entry: MessageEntry): string | number {
 	const record = entry as unknown as Record<string, unknown>;
 	const updated = record.updatedAt ?? record.updated_at ?? record.timestamp;
@@ -296,11 +460,37 @@ function attachPiPartVersion(
 	});
 }
 
+const UNREACHABLE_PI_STORE_TYPE = "unavailable";
+
+/**
+ * The slot for an ordinal the stored coordinates count but the branch walk no
+ * longer reaches (see `pi-ordinal-alignment.ts`). It has no id and no content:
+ * like a protocol entry it keeps the numbering dense, and readers that need
+ * text (historian chunks, the search index, ctx_expand) find nothing in it.
+ * It carries a non-enumerable `storeType` of "unavailable" (the same
+ * non-enumerable convention OpenCode 2 rows use), so a reader can tell it from
+ * a real message without changing serialized output.
+ */
+export function unreachablePiOrdinalSlot(ordinal: number): RawMessage {
+	const slot: RawMessage = { ordinal, id: "", role: "system", parts: [] };
+	Object.defineProperty(slot, "storeType", {
+		value: UNREACHABLE_PI_STORE_TYPE,
+		enumerable: false,
+	});
+	return slot;
+}
+
+/** True for a slot whose message is no longer in the session's history. */
+export function isUnreachablePiOrdinalSlot(message: RawMessage): boolean {
+	return message.storeType === UNREACHABLE_PI_STORE_TYPE;
+}
+
 export function* iterateEntriesToRawMessageRange(
 	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
+	ordinalOffset = 0,
 ): Generator<RawMessage> {
 	let emitted = 0;
 	const normalizedAfter = Math.max(0, Math.floor(afterOrdinal));
@@ -309,8 +499,28 @@ export function* iterateEntriesToRawMessageRange(
 		normalizedAfter,
 		Math.floor(finalWatermark),
 	);
-	let nextOrdinal = 1;
-	let pendingToolParts: unknown[] = [];
+	const prefix =
+		Number.isSafeInteger(ordinalOffset) && ordinalOffset > 0
+			? ordinalOffset
+			: 0;
+	// Ordinals 1..prefix belong to messages the branch walk cannot reach; emit
+	// their empty slots before numbering the branch from prefix + 1.
+	const prefixEnd = Math.min(prefix, normalizedWatermark);
+	for (let ordinal = normalizedAfter + 1; ordinal <= prefixEnd; ordinal++) {
+		emitted++;
+		yield unreachablePiOrdinalSlot(ordinal);
+		if (emitted >= normalizedLimit) return;
+	}
+	if (prefix >= normalizedWatermark) return;
+	let nextOrdinal = prefix + 1;
+	let pendingToolResults: Array<{ msg: unknown; version: string | number }> =
+		[];
+	const buildToolParts = (
+		results: ReadonlyArray<{ msg: unknown; version: string | number }>,
+	): unknown[] =>
+		results.flatMap(({ msg, version }) =>
+			attachPiPartVersion(synthesizeToolResultParts(msg), version),
+		);
 	let hasPendingToolParts = false;
 	let pendingFirstRealId = "";
 	let pendingFirstRealVersion: string | number = "";
@@ -344,13 +554,15 @@ export function* iterateEntriesToRawMessageRange(
 		const msg = entry.message;
 		const role = (msg as { role?: string }).role;
 		if (role === "toolResult") {
-			const synthesized = synthesizeToolResultParts(msg);
-			if (synthesized.length === 0) continue;
+			const callId = (msg as { toolCallId?: unknown }).toolCallId;
+			if (typeof callId !== "string" || callId.length === 0) continue;
 			const version = rawEntryVersion(entry);
 			hasPendingToolParts = true;
-			if (nextOrdinal > normalizedAfter && nextOrdinal <= normalizedWatermark) {
-				pendingToolParts.push(...attachPiPartVersion(synthesized, version));
-			}
+			// Keep the result itself and build its parts only once the carrier's
+			// ordinal is known: a non-chat entry (bashExecution, ...) between the
+			// result and the next chat message takes an ordinal first, so the
+			// result's position says nothing about whether its carrier is in range.
+			pendingToolResults.push({ msg, version });
 			if (pendingFirstRealId === "") {
 				pendingFirstRealId = entry.id;
 				pendingFirstRealVersion = version;
@@ -361,18 +573,18 @@ export function* iterateEntriesToRawMessageRange(
 
 		if (role === "user") {
 			const version = rawEntryVersion(entry);
-			const bufferedToolParts = pendingToolParts;
+			const bufferedToolResults = pendingToolResults;
 			const done = yield* appendMessage(
 				entry.id,
 				"user",
 				version,
 				parsePiEntryTimestamp(entry),
 				() => [
-					...bufferedToolParts,
+					...buildToolParts(bufferedToolResults),
 					...attachPiPartVersion(synthesizeUserParts(msg), version),
 				],
 			);
-			pendingToolParts = [];
+			pendingToolResults = [];
 			hasPendingToolParts = false;
 			pendingFirstRealId = "";
 			pendingFirstRealVersion = "";
@@ -383,7 +595,7 @@ export function* iterateEntriesToRawMessageRange(
 
 		if (role === "assistant") {
 			if (hasPendingToolParts) {
-				const bufferedToolParts = pendingToolParts;
+				const bufferedToolResults = pendingToolResults;
 				const pendingId = pendingFirstRealId;
 				const pendingVersion = pendingFirstRealVersion;
 				const done = yield* appendMessage(
@@ -391,9 +603,9 @@ export function* iterateEntriesToRawMessageRange(
 					"user",
 					pendingVersion,
 					pendingFirstCreatedAt,
-					() => bufferedToolParts,
+					() => buildToolParts(bufferedToolResults),
 				);
-				pendingToolParts = [];
+				pendingToolResults = [];
 				hasPendingToolParts = false;
 				pendingFirstRealId = "";
 				pendingFirstRealVersion = "";
@@ -442,7 +654,7 @@ export function* iterateEntriesToRawMessageRange(
 			"user",
 			pendingFirstRealVersion,
 			pendingFirstCreatedAt,
-			() => pendingToolParts,
+			() => buildToolParts(pendingToolResults),
 		);
 	}
 }
@@ -450,6 +662,7 @@ export function* iterateEntriesToRawMessageRange(
 /** Pure full conversion exposed for callers that need an entire Pi branch. */
 export function convertEntriesToRawMessages(
 	entries: readonly unknown[],
+	ordinalOffset = 0,
 ): RawMessage[] {
 	return [
 		...iterateEntriesToRawMessageRange(
@@ -457,8 +670,42 @@ export function convertEntriesToRawMessages(
 			0,
 			Number.MAX_SAFE_INTEGER,
 			Number.MAX_SAFE_INTEGER,
+			ordinalOffset,
 		),
 	];
+}
+
+/** Convert a located assistant without hydrating unrelated historical bodies. */
+export function convertPiAssistantEntryById(
+	entries: readonly unknown[],
+	entryId: string,
+	ordinalOffset = 0,
+): RawMessage | null {
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
+		if (!isMessageEntry(entry) || entry.id !== entryId) continue;
+		if (
+			(entry.message as { role?: unknown }).role !== "assistant" ||
+			entryId.startsWith(SYNTH_USER_ID_PREFIX)
+		) {
+			return (
+				convertEntriesToRawMessages(entries, ordinalOffset).find(
+					(message) => message.id === entryId,
+				) ?? null
+			);
+		}
+		const raw = convertEntriesToRawMessages([entry])[0];
+		return raw
+			? {
+					...raw,
+					ordinal: countPiRawMessages(
+						entries.slice(0, index + 1),
+						ordinalOffset,
+					),
+				}
+			: null;
+	}
+	return null;
 }
 
 /** Convert only one raw-message page without hydrating the rest of the Pi branch. */
@@ -467,6 +714,7 @@ export function convertEntriesToRawMessagePage(
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
+	ordinalOffset = 0,
 ): RawMessage[] {
 	return [
 		...iterateEntriesToRawMessageRange(
@@ -474,6 +722,7 @@ export function convertEntriesToRawMessagePage(
 			afterOrdinal,
 			limit,
 			finalWatermark,
+			ordinalOffset,
 		),
 	];
 }
@@ -597,4 +846,88 @@ function synthesizeToolResultParts(msg: unknown): unknown[] {
 			},
 		},
 	];
+}
+
+/** Count folded ordinals without constructing historical tool output or copying content. */
+export function countPiRawMessages(
+	entries: readonly unknown[],
+	ordinalOffset = 0,
+): number {
+	let count =
+		Number.isSafeInteger(ordinalOffset) && ordinalOffset > 0
+			? ordinalOffset
+			: 0;
+	let pendingTools = false;
+	for (const entry of entries) {
+		if (!isMessageEntry(entry)) continue;
+		const message = entry.message as { role?: unknown; toolCallId?: unknown };
+		if (message.role === "toolResult") {
+			if (
+				typeof message.toolCallId === "string" &&
+				message.toolCallId.length > 0
+			)
+				pendingTools = true;
+			continue;
+		}
+		if (message.role === "user") pendingTools = false;
+		else if (message.role === "assistant" && pendingTools) {
+			count++;
+			pendingTools = false;
+		}
+		count++;
+	}
+	return count + Number(pendingTools);
+}
+
+/**
+ * The branch-walk ordinal (numbered from 1, no offset) of each requested raw
+ * message id that the branch contains, synthetic folded-tool ids included.
+ * Counts exactly as `iterateEntriesToRawMessageRange` numbers, without
+ * building any message content; ids the branch does not contain are absent
+ * from the result.
+ */
+export function locatePiRawOrdinals(
+	entries: Iterable<unknown>,
+	wanted: ReadonlySet<string>,
+): Map<string, number> {
+	const found = new Map<string, number>();
+	if (wanted.size === 0) return found;
+	let ordinal = 0;
+	let pendingFirstId: string | null = null;
+	const note = (id: string): void => {
+		if (wanted.has(id) && !found.has(id)) found.set(id, ordinal);
+	};
+	for (const entry of entries) {
+		if (!isMessageEntry(entry)) continue;
+		const message = entry.message as { role?: unknown; toolCallId?: unknown };
+		if (message.role === "toolResult") {
+			if (
+				typeof message.toolCallId === "string" &&
+				message.toolCallId.length > 0 &&
+				pendingFirstId === null
+			) {
+				pendingFirstId = entry.id;
+			}
+			continue;
+		}
+		if (message.role === "user") {
+			ordinal++;
+			note(entry.id);
+			pendingFirstId = null;
+		} else {
+			if (message.role === "assistant" && pendingFirstId !== null) {
+				ordinal++;
+				note(`${SYNTH_USER_ID_PREFIX}${pendingFirstId}`);
+				pendingFirstId = null;
+			}
+			ordinal++;
+			note(entry.id);
+		}
+		if (found.size === wanted.size) return found;
+	}
+	if (pendingFirstId !== null) {
+		ordinal++;
+		note(`${SYNTH_USER_ID_PREFIX}${pendingFirstId}`);
+	}
+	return found;
 }

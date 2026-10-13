@@ -46,7 +46,12 @@ import {
 	setNoteLastReadAt,
 	updateNote,
 } from "@magic-context/core/features/magic-context/storage";
-import { CTX_NOTE_DESCRIPTION } from "@magic-context/core/tools/ctx-note/constants";
+import {
+	CTX_NOTE_DESCRIPTION,
+	NOTES_FILTER_DESCRIPTION,
+	SMART_NOTES_DISABLED_REPLY,
+	withoutSmartNoteText,
+} from "@magic-context/core/tools/ctx-note/constants";
 import {
 	EMPTY_READ_REPLY,
 	formatWriteReply,
@@ -101,7 +106,7 @@ const ParamsSchema = Type.Object(
 					minItems: 1,
 					maxItems: 50,
 					description:
-						"Note ids: one for update, 1–50 for dismiss, any number for read (returns full bodies). Ignored by write.",
+						"Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write.",
 				},
 			),
 		),
@@ -110,7 +115,7 @@ const ParamsSchema = Type.Object(
 				FILTER_VALUES.map((value) => Type.Literal(value)),
 				{
 					description:
-						"Read filter: active (default: active + ready), all, pending (unsurfaced smart notes), ready, dismissed.",
+						"Read filter: all, active, pending (unsurfaced smart notes), ready, dismissed. Omitted, it shows active session notes plus every current smart note (pending included); active shows only notes whose stored status is active.",
 				},
 			),
 		),
@@ -237,6 +242,7 @@ function writeTray(
 
 export interface CtxNoteToolDeps {
 	db: ContextDatabase;
+	smartNotesEnabled?: boolean;
 	/** When true, smart notes (with `surface_condition`) are accepted and
 	 *  the dreamer will evaluate them. When false, smart-note writes are
 	 *  rejected because they'd be stuck `pending` forever with no
@@ -255,11 +261,21 @@ export function createCtxNoteTool(
 ): ToolDefinition<typeof ParamsSchema> {
 	const resolveProject =
 		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
+	const parameters = structuredClone(ParamsSchema);
+	if (deps.smartNotesEnabled === false) {
+		delete (parameters.properties as Record<string, unknown>).surface_condition;
+		(
+			parameters.properties.filter as unknown as { description: string }
+		).description = NOTES_FILTER_DESCRIPTION;
+	}
 	return {
 		name: "ctx_note",
 		label: "Magic Context: Notes",
-		description: CTX_NOTE_DESCRIPTION,
-		parameters: ParamsSchema,
+		description:
+			deps.smartNotesEnabled === false
+				? withoutSmartNoteText(CTX_NOTE_DESCRIPTION)
+				: CTX_NOTE_DESCRIPTION,
+		parameters,
 		async execute(_toolCallId, params: CtxNoteParams, _signal, _onUpdate, ctx) {
 			params = unwrapImitatedReducedArgs(params, ["action", "content"], {
 				action: {
@@ -273,6 +289,12 @@ export function createCtxNoteTool(
 				limit: "number",
 				offset: "number",
 			});
+			if (
+				deps.smartNotesEnabled === false &&
+				params.surface_condition !== undefined
+			) {
+				return err(SMART_NOTES_DISABLED_REPLY);
+			}
 			const sessionId = ctx.sessionManager.getSessionId();
 			const dreamerEnabled =
 				deps.resolveDreamerEnabled?.(ctx) ?? deps.dreamerEnabled;

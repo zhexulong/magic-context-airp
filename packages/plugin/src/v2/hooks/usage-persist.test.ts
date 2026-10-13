@@ -1,20 +1,25 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createScheduler } from "../../features/magic-context/scheduler";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
     openDatabase,
+    recordOverflowDetected,
+    updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { resolveContextLimit } from "../../hooks/magic-context/event-resolvers";
 import type { TransformDeps } from "../../hooks/magic-context/transform";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import { persistV2UsageReading } from "./usage-persist";
+import { resolveUsageReading } from "./usage-reading";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -31,7 +36,7 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -190,7 +195,7 @@ describe("persistV2UsageReading", () => {
     // from. A reply the provider refused (a spent quota) can be stored with zero
     // tokens and a completion time; it refreshed no cache, so it must not move
     // the clock, or the first pass after a long idle would defer queued drops.
-    it("moves last_response_time only for a reading with provider tokens", () => {
+    it("does not move last_response_time for an errored zero-token reading", () => {
         process.env.XDG_DATA_HOME = makeTempDir("v2-usage-persist-");
         const db = openDatabase();
         const sessionID = "ses-v2-idle-clock";
@@ -206,6 +211,7 @@ describe("persistV2UsageReading", () => {
                     admissionLimit: 200_000,
                     modelKey: "test-provider/test-model",
                     completed,
+                    ...(inputTokens === 0 ? { finish: "error", error: { name: "APIError" } } : {}),
                 },
                 contextUsageMap,
             });
@@ -216,5 +222,180 @@ describe("persistV2UsageReading", () => {
         expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(1_000);
         persist(41_000, 3_000);
         expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(3_000);
+    });
+
+    it("expires once after switching to a completed provider with no usage, preserving measured pressure", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("v2-usage-less-completion-");
+        const db = openDatabase();
+        const sessionID = "ses-v2-no-usage-switch";
+        const contextUsageMap: TransformDeps["contextUsageMap"] = new Map();
+        const now = Date.now();
+        const draftModel = { providerID: "test", id: "usage-less" };
+        persistV2UsageReading({
+            db,
+            sessionID,
+            draftModel,
+            contextUsageMap,
+            reading: {
+                inputTokens: 1_000,
+                limit: 100_000,
+                admissionLimit: 100_000,
+                modelKey: "test/old-model",
+                completed: now - 2 * 3_600_000,
+            },
+        });
+        updateSessionMeta(db, sessionID, { cacheTtl: "1h" });
+        const scheduler = createScheduler({ executeThresholdPercentage: 90 });
+        const usage = { inputTokens: 1_000, percentage: 1 };
+        expect(scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now)).toBe(
+            "execute",
+        );
+        for (const error of [{ name: "MessageAbortedError" }, { name: "APIError" }]) {
+            const reading = resolveUsageReading({
+                draftModel,
+                tokens: { input: 0 },
+                completed: now,
+                finish: "stop",
+                error,
+                limitFor: () => 100_000,
+            })!;
+            persistV2UsageReading({ db, sessionID, draftModel, contextUsageMap, reading });
+        }
+        expect(scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now)).toBe(
+            "execute",
+        );
+        const reading = resolveUsageReading({
+            draftModel,
+            completed: now,
+            finish: "stop",
+            limitFor: () => 0,
+        });
+        if (reading) persistV2UsageReading({ db, sessionID, draftModel, contextUsageMap, reading });
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(now);
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(1_000);
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now + 1_000),
+        ).toBe("defer");
+        persistV2UsageReading({
+            db,
+            sessionID,
+            draftModel,
+            contextUsageMap,
+            reading: { ...reading!, completed: now + 2_000 },
+        });
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(db, sessionID), usage, now + 3_000),
+        ).toBe("defer");
+    });
+
+    it("retains rejection-derived usage reading on a subsequent context pass with no new reply", () => {
+        process.env.XDG_DATA_HOME = makeTempDir("v2-usage-persist-rejection-");
+        const db = openDatabase();
+        const sessionID = "ses_f026cf502ffegwOeLMe8Oaw5l3";
+        const contextUsageMap: TransformDeps["contextUsageMap"] = new Map();
+        const draftModel = { providerID: "google", id: "probe-model" };
+        // Rejection pressure is distinct from the cache clock: only a served
+        // response advances the clock, and the old reply must remain stale.
+        const firstReplyCompleted = Date.now() - 60_000;
+
+        // 1. Initial accepted assistant reading (seq 158 with 129,777 input tokens)
+        persistV2UsageReading({
+            db,
+            sessionID,
+            draftModel,
+            reading: {
+                inputTokens: 129_777,
+                limit: 100_000,
+                admissionLimit: 100_000,
+                modelKey: "google/probe-model",
+                completed: firstReplyCompleted,
+            },
+            contextUsageMap,
+        });
+
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(129_777);
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(firstReplyCompleted);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(129_777);
+
+        // 2. Provider rejection records pressure without refreshing the cache clock.
+        recordOverflowDetected(
+            db,
+            sessionID,
+            100_000,
+            "google/probe-model",
+            "provider_overflow",
+            "prompt_only",
+            123_456,
+        );
+        contextUsageMap.set(sessionID, {
+            usage: { inputTokens: 123_456, percentage: (123_456 / 100_000) * 100 },
+            hasUsageTokens: true,
+            updatedAt: Date.now(),
+        });
+
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(123_456);
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(firstReplyCompleted);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(123_456);
+
+        // 3. Next context pass runs before any new reply exists; the newest accepted reply is still seq 158
+        persistV2UsageReading({
+            db,
+            sessionID,
+            draftModel,
+            reading: {
+                inputTokens: 129_777,
+                limit: 100_000,
+                admissionLimit: 100_000,
+                modelKey: "google/probe-model",
+                completed: firstReplyCompleted,
+            },
+            contextUsageMap,
+        });
+
+        // The rejection-derived reading must NOT be overwritten by the older reply
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(123_456);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(123_456);
+
+        // 4. A genuinely new accepted reply arrives (seq 169 with 10,458 input tokens)
+        const newReplyCompleted = Date.now() + 60_000;
+        persistV2UsageReading({
+            db,
+            sessionID,
+            draftModel,
+            reading: {
+                inputTokens: 10_458,
+                limit: 100_000,
+                admissionLimit: 100_000,
+                modelKey: "google/probe-model",
+                completed: newReplyCompleted,
+            },
+            contextUsageMap,
+        });
+
+        // The new reply must update the reading
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(10_458);
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(newReplyCompleted);
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(10_458);
+
+        // 5. Subsequent accepted reply (10,502 input tokens)
+        persistV2UsageReading({
+            db,
+            sessionID,
+            draftModel,
+            reading: {
+                inputTokens: 10_502,
+                limit: 100_000,
+                admissionLimit: 100_000,
+                modelKey: "google/probe-model",
+                completed: newReplyCompleted + 1_000,
+            },
+            contextUsageMap,
+        });
+
+        expect(getOrCreateSessionMeta(db, sessionID).lastInputTokens).toBe(10_502);
+        expect(getOrCreateSessionMeta(db, sessionID).lastResponseTime).toBe(
+            newReplyCompleted + 1_000,
+        );
+        expect(contextUsageMap.get(sessionID)?.usage.inputTokens).toBe(10_502);
     });
 });

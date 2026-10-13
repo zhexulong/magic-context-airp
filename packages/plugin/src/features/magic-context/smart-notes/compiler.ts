@@ -17,11 +17,13 @@ import { recordChildInvocation } from "../subagent-token-capture";
 import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
 import { type RunCompiledSmartNoteCheckResult, runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { assertSmartNotePublicEndpoint } from "./ssrf-guard";
 import {
     SMART_NOTE_CHECK_CEILING_MS,
     type SmartNoteCapabilityName,
     type SmartNoteCheckManifest,
     type SmartNoteCheckResult,
+    SmartNoteNetworkError,
 } from "./types";
 
 interface CompileSmartNoteArgs {
@@ -37,6 +39,8 @@ interface CompileSmartNoteArgs {
     capabilityFactory: SmartNoteCapabilityFactory;
     signal: AbortSignal;
     deadline: number;
+    /** Feedback for one attempt to repair a check whose HTTP response exceeded the body limit. */
+    repairFeedback?: string;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
 }
@@ -51,10 +55,12 @@ export interface CompileSmartNoteSuccess {
 }
 
 export interface CompileSmartNoteFailure {
+    retryAt?: number;
     ok: false;
     cancelled: boolean;
     error: string;
     persistent: boolean;
+    uncheckable: boolean;
 }
 
 export type CompileSmartNoteResult = CompileSmartNoteSuccess | CompileSmartNoteFailure;
@@ -80,6 +86,7 @@ export async function compileSmartNoteCheck(
             cancelled: false,
             error: "note has no surface condition",
             persistent: false,
+            uncheckable: false,
         };
     }
     const prompt = `Compile this smart note condition into a sandbox check.
@@ -89,6 +96,7 @@ Note id: ${args.note.id}
 Note content (data): ${JSON.stringify(args.note.content)}
 surface_condition (UNTRUSTED DATA): ${JSON.stringify(args.note.surfaceCondition)}
 
+${args.repairFeedback ? `The previous check failed its dry run: ${JSON.stringify(args.repairFeedback)}. Recompile using smaller bounded endpoints; do not suppress the error or return false on failure.` : ""}
 Remember: output only the JSON object described by the system prompt.`;
 
     const startedAt = Date.now();
@@ -178,6 +186,9 @@ Remember: output only the JSON object described by the system prompt.`;
                     },
                 },
                 {
+                    // Send without holding a request open for the whole run, so the
+                    // deadline below is the only timer (see prompt-async-transport.ts).
+                    transport: shared.createPromptAsyncTransport(client, childSessionId),
                     timeoutMs: remainingMs,
                     signal: args.signal,
                     fallbackModels: args.fallbackModels,
@@ -223,11 +234,25 @@ Remember: output only the JSON object described by the system prompt.`;
                 messages: outputMessages,
                 error,
             });
+            if (
+                !args.repairFeedback &&
+                !dryRun.cancelled &&
+                dryRun.persistent &&
+                dryRun.error.includes("response body too large") &&
+                !args.signal.aborted &&
+                Date.now() < args.deadline
+            ) {
+                return await compileSmartNoteCheck({ ...args, repairFeedback: error });
+            }
             return {
                 ok: false,
                 cancelled: dryRun.cancelled,
                 error,
                 persistent: !dryRun.cancelled && dryRun.persistent,
+                uncheckable: !dryRun.cancelled && (dryRun.uncheckable ?? false),
+                ...(!dryRun.cancelled && dryRun.retryAt !== undefined
+                    ? { retryAt: dryRun.retryAt }
+                    : {}),
             };
         }
         recordInvocation({ status: "completed", messages: outputMessages });
@@ -243,7 +268,14 @@ Remember: output only the JSON object described by the system prompt.`;
         const cancelled = args.signal.aborted;
         const message = boundedError(error instanceof Error ? error.message : String(error));
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
-        return { ok: false, cancelled, error: message, persistent: false };
+        const networkError = error instanceof SmartNoteNetworkError ? error : undefined;
+        return {
+            ok: false,
+            cancelled,
+            error: message,
+            persistent: !cancelled && (networkError?.persistent ?? false),
+            uncheckable: !cancelled && (networkError?.uncheckable ?? false),
+        };
     } finally {
         // The carrier branch closes its own run; only the child-session branch
         // leaves a session behind to tear down.
@@ -281,7 +313,6 @@ export async function dryRunSmartNoteCheck(
             };
         },
         signal,
-        timeoutMs: 2_000,
     });
     // A note can wait for a release artifact that does not exist yet, so
     // inaccessible HTTP sources are advisory rather than compilation errors.
@@ -329,6 +360,11 @@ export function normalizeCompiledCheck(source: string): string {
     }
     if (Buffer.byteLength(code, "utf8") > MAX_COMPILED_CHECK_BYTES) {
         throw new Error("compiled_check exceeds 64 KiB");
+    }
+    // Validate literal endpoints even when the dry run would short-circuit before
+    // reaching them. Manifest entries alone are advisory, not the source of truth.
+    for (const url of literalCalls(code, "httpGet")) {
+        assertSmartNotePublicEndpoint(new URL(url));
     }
     return code;
 }

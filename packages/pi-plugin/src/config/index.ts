@@ -10,11 +10,13 @@ import { existsSync } from "node:fs";
 import { migrateLegacyAgentEnabledInMemory } from "@magic-context/core/config/agent-disable";
 import { migrateDreamerV2 } from "@magic-context/core/config/migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "@magic-context/core/config/migrate-experimental";
+import { warnDeprecatedMuralModel } from "@magic-context/core/config/mural-model-deprecation";
 import { resolveConfigProfile } from "@magic-context/core/config/profiles";
 import {
 	attachProtectedTokensTierOverrides,
 	constrainProjectThresholdOverrides,
 	dropInheritedEmbeddingKeyOnRedirect,
+	restoreTrustedValuesOverInvalidProjectValues,
 	stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
 import { pruneNestedConfigLeaf } from "@magic-context/core/config/prune-config-leaf";
@@ -299,6 +301,11 @@ function parsePiConfig(
 	warnings: string[];
 } {
 	const preMigrationWarnings: string[] = [];
+	if (Object.hasOwn(rawConfig, "clear_reasoning_age")) {
+		preMigrationWarnings.push(
+			"clear_reasoning_age is deprecated and ignored. Magic Context now keeps reasoning up to a token budget, keep_reasoning_tokens (default 10,000). Remove the key, or set keep_reasoning_tokens to a token count.",
+		);
+	}
 	const configWithoutRemovedAgent = stripRemovedAgentConfig(
 		rawConfig,
 		preMigrationWarnings,
@@ -321,10 +328,12 @@ function parsePiConfig(
 	// top-level; auto_search, git_commit_indexing → memory.*; user_memories,
 	// pin_key_files → dreamer.*). Shared with OpenCode so both harnesses preserve
 	// a user's opt-in/opt-out across the upgrade.
-	const migrated = migrateDreamerV2(
-		migrateLegacyExperimental(agentMigrated, preMigrationWarnings),
+	const migratedExperimental = migrateLegacyExperimental(
+		agentMigrated,
 		preMigrationWarnings,
 	);
+	warnDeprecatedMuralModel(migratedExperimental, preMigrationWarnings);
+	const migrated = migrateDreamerV2(migratedExperimental, preMigrationWarnings);
 	const parsed = MagicContextConfigSchema.safeParse(migrated);
 	if (parsed.success) {
 		return { config: parsed.data, warnings: preMigrationWarnings };
@@ -436,6 +445,33 @@ function parsePiConfig(
 
 	warnings.push("Config recovery failed, using all defaults.");
 	return { config: defaults, warnings };
+}
+
+/**
+ * Every schema issue path parsePiConfig's real parse would report for
+ * `rawConfig`, after the same pre-schema migrations (their warnings are
+ * discarded here; the real parse reports them). Empty when valid.
+ */
+function collectPiSchemaIssuePaths(
+	rawConfig: Record<string, unknown>,
+): PropertyKey[][] {
+	const scratch: string[] = [];
+	const configToMigrate = { ...stripRemovedAgentConfig(rawConfig, scratch) };
+	delete configToMigrate.protected_tags;
+	const migrated = migrateDreamerV2(
+		migrateLegacyExperimental(
+			migrateLegacyAgentEnabledInMemory(configToMigrate, scratch),
+			scratch,
+		),
+		scratch,
+	);
+	const parsed = MagicContextConfigSchema.safeParse(migrated);
+	if (parsed.success) return [];
+	return parsed.error.issues.flatMap((issue) =>
+		issue.code === "unrecognized_keys"
+			? issue.keys.map((key) => [...issue.path, key])
+			: [[...issue.path]],
+	);
 }
 
 export function loadPiConfig(
@@ -608,6 +644,7 @@ export function loadPiConfigDetailed(
 	);
 	let rawConfig = trustedProfiledRaw;
 	const trustedBaseConfig = parsePiConfig(trustedProfiledRaw).config;
+	let projectRestoredTopLevelKeys: string[] = [];
 	if (projectLayer) {
 		rawConfig = mergeRawConfigs(rawConfig, profileResolution.projectBase);
 		for (const warning of dropInheritedEmbeddingKeyOnRedirect(
@@ -624,6 +661,16 @@ export function loadPiConfigDetailed(
 		})) {
 			warnings.push(`[project config] ${warning}`);
 		}
+		const restoredOverProject = restoreTrustedValuesOverInvalidProjectValues({
+			mergedRaw: rawConfig,
+			trustedRaw: trustedProfiledRaw,
+			projectRaw: profileResolution.projectBase,
+			collectIssuePaths: collectPiSchemaIssuePaths,
+		});
+		for (const warning of restoredOverProject.warnings) {
+			warnings.push(`[project config] ${warning}`);
+		}
+		projectRestoredTopLevelKeys = restoredOverProject.restoredTopLevelKeys;
 	}
 
 	const hasDeprecatedProtectedTags =
@@ -633,6 +680,15 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const cacheTtlConfigured = Object.hasOwn(rawConfig, "cache_ttl");
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
+	// This runtime-only flag records whether cache_ttl was present; do not expose it as a user setting.
+	Object.defineProperty(parsed.config, "cacheTtlConfigured", {
+		value: cacheTtlConfigured,
+	});
+	// An ignored invalid project value is still a config the user must fix, so
+	// keep reporting it as schema recovery (parity with the OpenCode loader).
+	for (const key of projectRestoredTopLevelKeys) {
+		if (!recoveredTopLevelKeys.includes(key)) recoveredTopLevelKeys.push(key);
+	}
 	attachProtectedTokensTierOverrides(parsed.config, {
 		trustedUser: trustedBaseConfig.protected_tokens,
 		project: projectLayer

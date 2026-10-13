@@ -9,8 +9,8 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import { getModuleNoteEvaluationBridge } from "../context-authority";
-import { createSmartNoteCapabilities } from "../smart-notes/capabilities";
+
+import { createSmartNoteCapabilities, readSmartNoteGithubToken } from "../smart-notes/capabilities";
 import { compileSmartNoteCheck } from "../smart-notes/compiler";
 import { runDueCompiledSmartNoteChecks } from "../smart-notes/runner";
 import { runCompiledSmartNoteCheck } from "../smart-notes/sandbox-runner";
@@ -20,6 +20,7 @@ import {
     getSmartNotesNeedingCompilation,
     getStaleCompiledSmartNotes,
     markCompiledCheckFalse,
+    markCompiledCheckNetworkFailure,
     markSmartNoteCheckStatus,
     markSmartNoteCompilationFailure,
     markSmartNoteLivenessChecked,
@@ -57,6 +58,7 @@ export interface EvaluateSmartNotesArgs {
     fallbackModels?: readonly ModelInput[];
     /** When true, authoring-compiled provider conditions are owned by retina. */
     retinaHandoff?: boolean;
+    smartNotesEnabled?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;
 }
 
@@ -104,15 +106,15 @@ function createPromptAbortSignal(
 export async function evaluateSmartNotes(
     args: EvaluateSmartNotesArgs,
 ): Promise<EvaluateSmartNotesResult> {
-    if ((await wakePlaneStatus()) === "present") {
+    if (args.smartNotesEnabled === false || (await wakePlaneStatus()) === "present") {
         const pending = getPendingSmartNotes(args.db, args.projectIdentity).length;
-        log("[dreamer] evaluate-smart-notes: skipped (wake plane active)");
+        log(
+            `[dreamer] evaluate-smart-notes: skipped (${args.smartNotesEnabled === false ? "smart notes disabled" : "wake plane active"})`,
+        );
         return { surfaced: 0, pending, ran: false };
     }
 
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
-    const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
-    await moduleBridge?.sync();
     const pendingNotes = () =>
         getPendingSmartNotes(args.db, args.projectIdentity).filter(
             (note) => !args.retinaHandoff || note.compileStatus !== "compiled",
@@ -122,6 +124,7 @@ export async function evaluateSmartNotes(
         log("[dreamer] smart notes: no pending notes");
         return { surfaced: 0, pending: 0, ran: false };
     }
+    const githubToken = await readSmartNoteGithubToken();
 
     let leaseLost = false;
     const leaseAbortController = new AbortController();
@@ -149,37 +152,6 @@ export async function evaluateSmartNotes(
     let surfaced = 0;
     let didWork = false;
     try {
-        if (moduleBridge) {
-            const candidates = pendingNotes().slice(0, MAX_COMPILE_PER_RUN);
-            for (const note of candidates) {
-                if (Date.now() >= args.deadline) break;
-                assertLeaseHeld("module evaluation start");
-                const sessionId = note.sessionId ?? args.parentSessionId;
-                if (!sessionId) {
-                    throw new Error(
-                        `Smart-note evaluation unavailable: note #${note.id} has no module session binding`,
-                    );
-                }
-                didWork = true;
-                const met = await confirmReadOnly(
-                    args,
-                    note.id,
-                    note.content,
-                    note.surfaceCondition,
-                    leaseAbortController.signal,
-                );
-                assertLeaseHeld("module evaluation commit");
-                await moduleBridge.evaluate({
-                    contextNoteId: note.id,
-                    sessionId,
-                    verdict: met,
-                });
-                if (met) surfaced += 1;
-            }
-            await moduleBridge.sync();
-            const pending = pendingNotes().length;
-            return { surfaced, pending, ran: didWork };
-        }
         const dueRun = await runDueCompiledSmartNoteChecks({
             db: args.db,
             projectIdentity: args.projectIdentity,
@@ -189,6 +161,7 @@ export async function evaluateSmartNotes(
             leaseHeld,
             signal: leaseAbortController.signal,
             retinaHandoff: args.retinaHandoff,
+            githubToken,
         });
         surfaced += dueRun.surfaced;
         didWork ||= dueRun.ran > 0;
@@ -208,6 +181,7 @@ export async function evaluateSmartNotes(
                 args,
                 note,
                 projectRoot,
+                githubToken,
                 assertLeaseHeld,
                 leaseHeld,
                 leaseAbortController.signal,
@@ -230,6 +204,7 @@ export async function evaluateSmartNotes(
                 args,
                 note,
                 projectRoot,
+                githubToken,
                 assertLeaseHeld,
                 leaseHeld,
                 leaseAbortController.signal,
@@ -289,6 +264,7 @@ async function compileNote(
     args: EvaluateSmartNotesArgs,
     note: SmartNoteCheckNote,
     projectRoot: string,
+    githubToken: string | null,
     assertLeaseHeld: (phase: string) => void,
     leaseHeld: () => boolean,
     leaseSignal: AbortSignal,
@@ -307,7 +283,8 @@ async function compileNote(
             sessionDirectory: args.sessionDirectory,
             projectIdentity: args.projectIdentity,
             note,
-            capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
+            capabilityFactory: (signal) =>
+                createSmartNoteCapabilities({ projectRoot, signal, githubToken }),
             signal: promptSignal.signal,
             deadline: args.deadline,
             model: args.model,
@@ -330,6 +307,9 @@ async function compileNote(
                         MAX_COMPILATION_FAILURES,
                         result.error,
                         result.persistent,
+                        args.parentSessionId,
+                        result.retryAt,
+                        result.uncheckable,
                     );
                 },
             });
@@ -375,6 +355,7 @@ async function runLivenessCheck(
     args: EvaluateSmartNotesArgs,
     note: SmartNoteCheckNote,
     projectRoot: string,
+    githubToken: string | null,
     assertLeaseHeld: (phase: string) => void,
     leaseHeld: () => boolean,
     leaseSignal: AbortSignal,
@@ -383,9 +364,9 @@ async function runLivenessCheck(
     const compiledCheck = note.compiledCheck;
     const result = await runCompiledSmartNoteCheck({
         compiledCheck,
-        capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
+        capabilityFactory: (signal) =>
+            createSmartNoteCapabilities({ projectRoot, signal, githubToken }),
         signal: leaseSignal,
-        timeoutMs: 2_000,
     });
     if (!result.ok && result.cancelled) return false;
 
@@ -413,6 +394,26 @@ async function runLivenessCheck(
                 );
             } else if (result.ok && nextDueAt !== null) {
                 markCompiledCheckFalse(args.db, note.id, nextDueAt, now);
+            } else if (!result.ok && result.persistent) {
+                markSmartNoteCompilationFailure(
+                    args.db,
+                    note.id,
+                    now,
+                    MAX_COMPILATION_FAILURES,
+                    result.error,
+                    true,
+                    args.parentSessionId,
+                    result.retryAt,
+                    result.uncheckable,
+                );
+            } else if (!result.ok && result.retryAt !== undefined) {
+                markCompiledCheckNetworkFailure(
+                    args.db,
+                    note.id,
+                    now,
+                    MAX_COMPILATION_FAILURES,
+                    result.retryAt,
+                );
             } else if (!result.ok && !result.network) {
                 markSmartNoteCheckStatus(args.db, note.id, "failing", now);
             }

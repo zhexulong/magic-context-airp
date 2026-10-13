@@ -9,12 +9,14 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inspectHostOpenFiles } from "../src/host-open-files";
 
 type ReplayPass = {
 	pass: number;
@@ -30,6 +32,7 @@ type RefReplay = {
 	ref: string;
 	commit: string;
 	passes: ReplayPass[];
+	hostFiles?: { pid: number; databases: string[] };
 	priced?: {
 		mode: string;
 		hardMessagesSha256: string;
@@ -109,7 +112,9 @@ async function createReplayHarness() {
 				);
 			harness.env.workdir = fixtureWorkdir;
 		}
-		return Object.assign(harness, schedulerObserver(harness.logPath));
+		return Object.assign(harness, schedulerObserver(harness.logPath), {
+			inspectIsolation: () => inspectReplayHost(harness.opencode.pid, harness.env.dataDir),
+		});
 	}
 
 	// TS comparisons need no native daemon. Keep the original provider route
@@ -148,13 +153,10 @@ async function createReplayHarness() {
 			config.small_model = config.model;
 			config.enabled_providers = [options.providerID];
 			writeFileSync(path, JSON.stringify(config, null, 2));
-			const canonicalConfig = join(
+			const userConfig = join(
 				harness.opencode.env.configDir,
 				"cortexkit/magic-context.jsonc",
 			);
-			const userConfig = existsSync(canonicalConfig)
-				? canonicalConfig
-				: join(harness.opencode.env.configDir, "opencode/magic-context.jsonc");
 			writeFileSync(
 				userConfig,
 				readFileSync(userConfig, "utf8").replaceAll(
@@ -172,6 +174,7 @@ async function createReplayHarness() {
 		};
 		await configure();
 		return {
+			inspectIsolation: () => inspectReplayHost(harness.opencode.pid, harness.opencode.env.dataDir),
 			mock: harness.mock,
 			createSession: () => harness.createSession(),
 			contextDb: () => harness.contextDb(),
@@ -219,6 +222,21 @@ async function createReplayHarness() {
 	}
 }
 
+/** Retain real host descriptors, not just the environment intended for that host. */
+function inspectReplayHost(pid: number, dataDir: string) {
+	const proof = inspectHostOpenFiles(
+		pid,
+		realpathSync(dirname(dataDir)),
+		join(dataDir, "cortexkit/magic-context/context.db"),
+	);
+	const output = process.env.MC_REPLAY_ISOLATION_DIR;
+	if (output) {
+		mkdirSync(output, { recursive: true });
+		writeFileSync(join(output, `host-${pid}-lsof.txt`), proof.inventory);
+	}
+	return { pid: proof.pid, databases: proof.databases };
+}
+
 async function captureCurrentCheckout(
 	ref: string,
 	commit: string,
@@ -259,6 +277,7 @@ async function captureCurrentCheckout(
 			});
 			await harness.sendPrompt(sessionId, `[[warm-generation-${warm}]]`);
 		}
+		const hostFiles = harness.inspectIsolation();
 		const generation = db
 			.prepare(
 				"SELECT cached_m0_bytes, cached_m0_materialized_at FROM session_meta WHERE session_id = ?",
@@ -320,7 +339,7 @@ async function captureCurrentCheckout(
 				toolsSha256: createHash("sha256").update(tools).digest("hex"),
 			});
 		}
-		return { ref, commit, passes };
+		return { ref, commit, passes, hostFiles };
 	} finally {
 		await harness.dispose();
 	}
@@ -426,6 +445,7 @@ function captureRef(
 
 function printRef(result: RefReplay): void {
 	console.log(`REF ${result.ref} ${result.commit}`);
+	if (result.hostFiles) console.log(`ISOLATION ${JSON.stringify(result.hostFiles)}`);
 	if (result.priced) console.log(`PRICED ${JSON.stringify(result.priced)}`);
 	for (const pass of result.passes) {
 		console.log(
@@ -499,9 +519,9 @@ if (singleRef) {
 	}
 	// One fixed parent for every run's scratch tree, so a file watcher can exclude a
 	// single path; macOS watch exclusions are fixed paths, not globs.
-	const scratchParent = join(REPO_ROOT, ".pure-replay-differential");
+	const scratchParent = process.env.MC_REPLAY_SCRATCH_ROOT ?? join(REPO_ROOT, ".pure-replay-differential");
 	mkdirSync(scratchParent, { recursive: true });
-	const sharedRoot = mkdtempSync(join(scratchParent, "run-"));
+	const sharedRoot = mkdtempSync(join(realpathSync(scratchParent), "run-"));
 	try {
 		const left = captureRef(refs[0], "left", sharedRoot);
 		const right = captureRef(refs[1], "right", sharedRoot);

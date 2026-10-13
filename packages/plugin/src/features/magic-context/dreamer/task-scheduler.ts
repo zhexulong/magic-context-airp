@@ -7,12 +7,14 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import type { Database } from "../../../shared/sqlite";
 import { isUsableProjectIdentity } from "../memory/project-identity";
 import { nextDueAtMs } from "./cron";
+import { pruneIdleScheduleIdentities } from "./idle-schedule-prune";
 import {
     acquireLeaseWithAcquisition,
     type LeaseAcquisition,
     reacquireOwnedLease,
     releaseLease,
 } from "./lease";
+import { withDreamerModelCooldown } from "./provider-output-failure";
 import { getDreamState } from "./storage-dream-state";
 import {
     getTaskScheduleState,
@@ -20,7 +22,7 @@ import {
     seedTaskScheduleState,
     writeTaskScheduleState,
 } from "./storage-task-schedule";
-import { evaluateTaskGate, getDreamTaskBacklogs } from "./task-gates";
+import { evaluateTaskGate, getDreamTaskBacklogs, taskHasSchedulableInput } from "./task-gates";
 import {
     CANONICAL_DREAM_TASKS,
     compareTaskOrder,
@@ -58,7 +60,7 @@ export interface DreamTaskRuntimeConfig {
 }
 
 export interface TaskExecOutcome {
-    status: "completed" | "failed";
+    status: "completed" | "failed" | "skipped";
     /** A transient failure (provider/network/rate-limit/timeout) hot-retries up to
      *  MAX_TASK_RETRIES; a permanent failure advances to the next cron slot. */
     transient?: boolean;
@@ -66,7 +68,7 @@ export interface TaskExecOutcome {
     /** Structured user-facing diagnostic while `error` remains the legacy value
      *  persisted in task schedule state. */
     failureDetail?: string;
-    /** Successful task detail surfaced by a manual `/ctx-dream` run. */
+    /** Completed task detail or explicit skip reason surfaced by `/ctx-dream`. */
     detail?: string;
     /** Run-local backlog when a task's scope differs from its next scheduled scope. */
     backlog?: DreamTaskBacklog;
@@ -100,12 +102,21 @@ export interface RunDueTasksDeps {
     tasks: readonly DreamTaskRuntimeConfig[];
     executor: TaskExecutor;
     now?: number;
+    /**
+     * The host's `memory.enabled` for this project. `false` means this caller
+     * schedules nothing (existing rows are kept); omitted means on.
+     */
+    projectMemoryEnabled?: boolean;
 }
 
 /** First-seed a task's schedule row if absent. next_due_at from cron(after now);
  *  last_run_at seeded from the legacy per-project `last_dream_at` so a freshly
  *  upgraded project doesn't treat every task as never-run (full historical pass).
- *  Idempotent — ON CONFLICT DO NOTHING (see storage). */
+ *  Idempotent — ON CONFLICT DO NOTHING (see storage).
+ *
+ *  A task is seeded only once the identity has the input it works on (see
+ *  taskHasSchedulableInput); until then it gets no row, so a directory that
+ *  never produces a memory never carries memory-maintenance schedules. */
 function ensureSeeded(
     db: Database,
     projectIdentity: string,
@@ -113,6 +124,7 @@ function ensureSeeded(
     now: number,
 ): void {
     if (getTaskScheduleState(db, projectIdentity, config.task)) return;
+    if (!taskHasSchedulableInput(config.task, db, projectIdentity, now)) return;
     const legacy = getDreamState(db, `last_dream_at:${projectIdentity}`);
     const legacyLastRun = legacy ? Number(legacy) : null;
     const lastRunAt = legacyLastRun && Number.isFinite(legacyLastRun) ? legacyLastRun : null;
@@ -153,8 +165,10 @@ function reconcileSchedule(
     now: number,
 ): void {
     ensureSeeded(db, projectIdentity, config, now);
-    if (getTaskScheduleState(db, projectIdentity, config.task)?.schedule === config.schedule)
-        return;
+    const current = getTaskScheduleState(db, projectIdentity, config.task);
+    // No row means the task has no input yet: nothing to reconcile, and
+    // reconciling must not create the row seeding just declined to create.
+    if (!current || current.schedule === config.schedule) return;
 
     // Cron search can scan years for an impossible expression. Do it before
     // taking the write lock; only the row-dependent decision belongs inside.
@@ -231,6 +245,14 @@ export function planDueTasks(
     const pruned = pruneNonCanonicalTaskRows(db, projectIdentity, CANONICAL_DREAM_TASKS);
     if (pruned > 0) {
         log(`[dreamer] pruned ${pruned} retired task row(s) for ${projectIdentity}`);
+    }
+    // Identities that can do nothing (no memories, no recent sessions, no task
+    // input) are removed across the whole store, at most once a day. A failure
+    // here must not stop this identity's own tasks.
+    try {
+        pruneIdleScheduleIdentities(db, now);
+    } catch (error) {
+        log("[dreamer] idle schedule pruning failed:", error);
     }
 
     const due: DueTask[] = [];
@@ -352,6 +374,7 @@ interface DomainGroupCallbacks {
      */
     leaseWaitMs?: number;
     onRan?: (task: DreamTaskName, detail?: string, backlog?: DreamTaskBacklog) => void;
+    onSkipped?: (task: DreamTaskName, reason?: string) => void;
     onFailed?: (task: DreamTaskName, error?: string) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
@@ -362,6 +385,14 @@ const LEASE_WAIT_POLL_MS = 2_000;
 export const MANUAL_RUN_LEASE_WAIT_MS = 60_000;
 
 async function runDomainGroup(
+    deps: RunDueTasksDeps,
+    group: DueTask[],
+    cb?: DomainGroupCallbacks,
+): Promise<void> {
+    return withDreamerModelCooldown(() => runDomainGroupWithCooldown(deps, group, cb));
+}
+
+async function runDomainGroupWithCooldown(
     deps: RunDueTasksDeps,
     group: DueTask[],
     cb?: DomainGroupCallbacks,
@@ -446,7 +477,17 @@ async function runDomainGroup(
             }
 
             const finishedAt = Date.now();
-            if (outcome.status === "completed") {
+            if (outcome.status === "skipped") {
+                advanceAfterRun(
+                    db,
+                    projectIdentity,
+                    due,
+                    finishedAt,
+                    "skipped",
+                    outcome.detail ?? null,
+                );
+                cb?.onSkipped?.(due.config.task, outcome.detail);
+            } else if (outcome.status === "completed") {
                 advanceAfterRun(
                     db,
                     projectIdentity,
@@ -487,10 +528,12 @@ async function runDomainGroup(
 }
 
 export interface ManualRunResult {
-    /** Tasks that actually executed (gate passed, lease acquired). */
+    /** Tasks that completed work (gate passed, lease acquired), excluding unavailable runs. */
     ran: string[];
     /** Tasks that were skipped because their activity gate failed. */
     skippedNoWork: string[];
+    /** Tasks unavailable or disabled, with their explicit skip reasons. */
+    skipped?: string[];
     /** Tasks whose domain lease was busy (another run in progress). */
     deferredBusy: string[];
     /** Tasks that ran but failed. */
@@ -548,7 +591,9 @@ export async function runManualDream(
     result.backlogBefore = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
     result.backlogAfter = { ...result.backlogBefore };
 
-    // Seed rows so completion advancement has a row to update.
+    // Seed rows for tasks that have input. A forced run of a task without a row
+    // still records its outcome: the completion and failure writes create the
+    // row when it is missing.
     for (const cfg of selected) ensureSeeded(deps.db, deps.projectIdentity, cfg, now);
 
     // Build synthetic DueTasks (scheduledAt = now, since manual ignores schedule).
@@ -607,6 +652,8 @@ export async function runManualDream(
                     if (detail) result.details?.push(detail);
                     if (backlog) runLocalBacklogs[t] = backlog;
                 },
+                onSkipped: (task, reason) =>
+                    (result.skipped ??= []).push(`${task}: ${reason ?? "unavailable"}`),
                 onFailed: (task, error) => {
                     result.failed.push(task);
                     if (error) result.failureDetails?.push(`${task}: ${error}`);
@@ -632,6 +679,13 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // A blank identity is an unresolved directory, not a project; running tasks
     // for it would read and write project-scoped rows under the key "".
     if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
+    // Project memory is off for this caller: schedule nothing and leave the
+    // rows alone. A `git:` identity is shared by every worktree and host of the
+    // repository, and one with memory on keeps using those rows and the progress
+    // they record (retrospective watermark, open verify-broad cycle, curate
+    // rotation). An identity with no memories and nothing else to do loses its
+    // rows to the daily idle prune instead.
+    if (deps.projectMemoryEnabled === false) return 0;
     const now = deps.now ?? Date.now();
     const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
     if (due.length === 0) return 0;

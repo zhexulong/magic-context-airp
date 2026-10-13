@@ -1,11 +1,12 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import { getSubagentInvocations } from "../../features/magic-context/storage-subagent-invocations";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     resolveHiddenCompletionExecutor,
     runValidatedHistorianPass,
@@ -40,7 +41,7 @@ test("missing v2 hidden executor names the historian or dream entry point", () =
 });
 
 test("historian ledger distinguishes empty, reasoning-only, length-capped and valid output", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "mc-historian-ledger-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-ledger-"));
     tempDirs.push(directory);
     process.env.XDG_DATA_HOME = directory;
     const db = openDatabase();
@@ -83,7 +84,7 @@ test("historian ledger distinguishes empty, reasoning-only, length-capped and va
 });
 
 test("a resolving timed-out historian prompt is archived and recorded as timed_out", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "mc-historian-timeout-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-timeout-"));
     tempDirs.push(directory);
     process.env.XDG_DATA_HOME = directory;
     const db = openDatabase();
@@ -124,7 +125,7 @@ test("a resolving timed-out historian prompt is archived and recorded as timed_o
 // Both historian lanes share one rule: a timed-out attempt moves on to the next model in
 // the chain (the Rust module's firing loop mirrors this). This pins the TypeScript side.
 test("a timed-out primary historian falls back to the next model and publishes its output", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "mc-historian-timeout-fallback-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-timeout-fallback-"));
     tempDirs.push(directory);
     process.env.XDG_DATA_HOME = directory;
     const db = openDatabase();
@@ -177,13 +178,15 @@ test("a timed-out primary historian falls back to the next model and publishes i
     expect(attempted).toEqual(["prov/primary", "prov/fallback"]);
     expect(result.ok).toBe(true);
     expect(result.compartments?.[0]?.content).toContain("Fallback kept this.");
-    const statuses = getSubagentInvocations(db, "parent-timeout-fallback").map((row) => row.status);
+    const invocations = getSubagentInvocations(db, "parent-timeout-fallback");
+    const statuses = invocations.map((row) => row.status);
     expect(statuses).toContain("timed_out");
     expect(statuses).toContain("completed");
+    expect(invocations.find((row) => row.status === "completed")?.task).toBe("fallback");
 });
 
 test("32k historian reaches the provider without a configured output cap and surfaces its assistant error", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "mc-historian-assistant-error-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-assistant-error-"));
     tempDirs.push(directory);
     process.env.XDG_DATA_HOME = directory;
     const db = openDatabase();
@@ -259,7 +262,7 @@ test("32k historian reaches the provider without a configured output cap and sur
 // the same prompt reaches the provider there, which proves the refusal comes
 // from the window value and not from something else in the prompt.
 test("historian refuses a prompt sized for an advertised window larger than the configured limit.context", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "mc-historian-configured-window-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-configured-window-"));
     tempDirs.push(directory);
     process.env.XDG_DATA_HOME = directory;
     const db = openDatabase();
@@ -319,3 +322,58 @@ test("historian refuses a prompt sized for an advertised window larger than the 
     expect(configured.result.ok).toBe(false);
     expect(configured.result.error).toContain("producer_prompt_exceeds_window");
 }, 60_000);
+
+// Each refused attempt used to open a hidden child session first and then let
+// the transport refuse the prompt, so an over-window session left one hidden
+// session behind per trigger. The refusal now comes before the child is opened.
+test("a prompt refused for the selected model's window opens no child session", async () => {
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-refusal-no-child-"));
+    tempDirs.push(directory);
+    process.env.XDG_DATA_HOME = directory;
+    const db = openDatabase();
+    await refreshModelLimitsFromApi({
+        config: {
+            providers: async () => ({
+                data: {
+                    providers: [
+                        {
+                            id: "small-provider",
+                            models: {
+                                "small-model": { limit: { context: 40_000, output: 4_096 } },
+                            },
+                        },
+                    ],
+                },
+            }),
+        },
+    });
+    const create = mock(async () => ({ data: { id: "child-refused" } }));
+    const prompted = mock(async () => ({ data: { info: { role: "assistant" }, parts: [] } }));
+    const client = {
+        session: {
+            create,
+            prompt: prompted,
+            messages: async () => ({ data: [] }),
+            delete: async () => ({}),
+        },
+    } as unknown as PluginContext["client"];
+
+    const result = await runValidatedHistorianPass({
+        model: "small-provider/small-model",
+        client,
+        db,
+        parentSessionId: "parent-refused-no-child",
+        sessionDirectory: directory,
+        prompt: `Messages 1-1:\n1: U: ${"alpha beta gamma delta ".repeat(20_000)}`,
+        timeoutMs: 500,
+        chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
+        priorCompartments: [],
+        sequenceOffset: 0,
+        dumpLabelBase: "refused-no-child",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("producer_prompt_exceeds_window");
+    expect(create).toHaveBeenCalledTimes(0);
+    expect(prompted).toHaveBeenCalledTimes(0);
+});

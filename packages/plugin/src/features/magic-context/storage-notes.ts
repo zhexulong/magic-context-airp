@@ -1,10 +1,10 @@
 import { getHarness } from "../../shared/harness";
-import type { Database } from "../../shared/sqlite";
+import { type Database, isTransientSqliteError } from "../../shared/sqlite";
 import { managedAuthorityNoteRow } from "./migrations";
 
 export type NoteType = "session" | "smart";
 export type NoteStatus = "active" | "pending" | "ready" | "dismissed";
-export type NoteCheckStatus = "uncompiled" | "compiled" | "failing" | "fallback";
+export type NoteCheckStatus = "uncompiled" | "compiled" | "failing" | "fallback" | "parked";
 export type ConditionCompileStatus = "compiled" | "plain" | "refused";
 
 export interface Note {
@@ -139,6 +139,7 @@ const NOTE_CHECK_STATUSES = new Set<NoteCheckStatus>([
     "compiled",
     "failing",
     "fallback",
+    "parked",
 ]);
 const CONDITION_COMPILE_STATUSES = new Set<ConditionCompileStatus>([
     "compiled",
@@ -229,12 +230,19 @@ function noteCheckColumnsExist(db: Database): boolean {
     }
 }
 
-const PENDING_SESSION_NOTE_HEAL =
-    "UPDATE notes SET status = 'active', surface_condition = NULL WHERE type = 'session' AND status = 'pending' AND surface_condition IS NOT NULL";
+const PENDING_SESSION_NOTE_PREDICATE =
+    "type = 'session' AND status = 'pending' AND surface_condition IS NOT NULL";
 
 /**
  * Return session notes that an older update parked as pending with a condition
  * to active. Runs on every note read.
+ *
+ * The read side stays read-only: a plain SELECT looks for a row to heal first,
+ * and the UPDATE runs only when one exists. An UPDATE needs the SQLite write
+ * lock even when it matches no row, so running it unconditionally made every
+ * note read, including the note-nudge check on each transform pass, wait for
+ * or fail on another connection's write transaction. If the heal itself cannot
+ * take the lock it is left for a later read; the caller still gets its notes.
  *
  * Rows of a project whose notes the Rust module owns are skipped. In that
  * table they are a read model the module mirrors from its own store; the module
@@ -244,15 +252,24 @@ const PENDING_SESSION_NOTE_HEAL =
  * including the note-nudge check a Rust-mode transform pass runs.
  */
 function healPendingSessionNotes(db: Database): void {
+    let predicate = `${PENDING_SESSION_NOTE_PREDICATE} AND NOT ${managedAuthorityNoteRow("notes")}`;
+    let healable: unknown;
     try {
-        db.prepare(
-            `${PENDING_SESSION_NOTE_HEAL} AND NOT ${managedAuthorityNoteRow("notes")}`,
-        ).run();
+        healable = db.prepare(`SELECT 1 FROM notes WHERE ${predicate} LIMIT 1`).get();
     } catch (error) {
         // A database without the authority tables has no module-owned rows and
         // no authority triggers, so every row is ours to heal.
         if (!(error instanceof Error) || !error.message.includes("no such table")) throw error;
-        db.prepare(PENDING_SESSION_NOTE_HEAL).run();
+        predicate = PENDING_SESSION_NOTE_PREDICATE;
+        healable = db.prepare(`SELECT 1 FROM notes WHERE ${predicate} LIMIT 1`).get();
+    }
+    if (healable == null) return;
+    try {
+        db.prepare(
+            `UPDATE notes SET status = 'active', surface_condition = NULL WHERE ${predicate}`,
+        ).run();
+    } catch (error) {
+        if (!isTransientSqliteError(error)) throw error;
     }
 }
 

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { replaceAllCompartmentState } from "@magic-context/core/features/magic-context/compartment-storage";
+import { writeTaskScheduleState } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
 	getPendingPiCompactionMarkerState,
@@ -438,6 +439,46 @@ describe("Pi Magic Context commands", () => {
 		expect(sent[0]?.data.text).toContain("/ctx-dream");
 	});
 
+	it("/ctx-dream returns to an interactive Pi while the run continues", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		let finishRegistration: () => void = () => {};
+		const registration = new Promise<void>((resolve) => {
+			finishRegistration = resolve;
+		});
+
+		registerCtxDreamCommand(pi as never, {
+			db,
+			projectDir: "/tmp/project",
+			projectIdentity: "/tmp/project",
+			registrationOwner: {},
+			// Stands in for a dream run that takes minutes.
+			ensureRegistered: () => registration,
+		});
+
+		// In interactive Pi the command handler is the user's turn: awaiting
+		// the run would freeze the REPL until every dream task finished.
+		const handled = await Promise.race([
+			Promise.resolve(
+				handlers.get("ctx-dream")?.("", { ...createCtx(), hasUI: true }),
+			).then(() => "returned"),
+			new Promise((resolve) => setTimeout(() => resolve("blocked"), 500)),
+		]);
+
+		expect(handled).toBe("returned");
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.data.text).toContain("Starting dream run");
+
+		// The detached run still reports its outcome when it ends (here the
+		// project is not registered with the dreamer, so it reports a failure).
+		finishRegistration();
+		for (let i = 0; i < 50 && sent.length < 2; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(sent).toHaveLength(2);
+		expect(sent[1]?.data.title).toBe("/ctx-dream");
+	});
+
 	it("/ctx-dream accepts split memory tasks and rejects retired task names", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
@@ -546,6 +587,33 @@ describe("Pi Magic Context commands", () => {
 				scheduleSummary: "verify 0 3 * * *",
 			},
 		});
+	});
+
+	it("/ctx-status hides disabled smart-note backlog and past failures", async () => {
+		for (const enabled of [true, false]) {
+			const db = createDb();
+			writeTaskScheduleState(db, {
+				projectPath: "/tmp/project",
+				task: "evaluate-smart-notes",
+				schedule: "0 3 * * *",
+				lastRunAt: null,
+				nextDueAt: 1,
+				lastStatus: "failed",
+				lastError: "old evaluation failure",
+				retryCount: 2,
+			});
+			const { pi, handlers, sent } = createMockPi();
+			registerCtxStatusCommand(pi as never, {
+				db,
+				projectIdentity: "/tmp/project",
+				smartNotesEnabled: enabled,
+				dreamer: { runnable: true },
+			});
+			await handlers.get("ctx-status")?.("", createCtx());
+			expect(JSON.stringify(sent[0]).includes("evaluate-smart-notes")).toBe(
+				enabled,
+			);
+		}
 	});
 
 	it("registers /ctx-recomp and requires confirmation before running", async () => {

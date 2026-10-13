@@ -143,6 +143,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "cfg_aliases"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,6 +174,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "cortexkit-cache-core"
 version = "0.1.0"
+source = "git+https://github.com/cortexkit/commons?rev=067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7#067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7"
 dependencies = [
  "serde",
  "serde_json",
@@ -176,29 +183,20 @@ dependencies = [
 [[package]]
 name = "cortexkit-lease"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9a8fc97760adc623eddc8e092b6361b91f4449dd6c93443fde9e221fa727161"
 dependencies = [
  "fs2",
 ]
 
 [[package]]
 name = "cortexkit-log"
-version = "0.3.3"
-dependencies = [
- "chrono",
- "cortexkit-store-types 0.2.2",
- "regex",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "cortexkit-log"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceae091889f52b64ef218ca24346fd18ed14d24053396d7a8cad031a78c430e7"
+checksum = "1d75f333ade3e19da329eecd3aafb0af8ffab2ae3f915242f0d3216c31c0a248"
 dependencies = [
  "chrono",
- "cortexkit-store-types 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cortexkit-store-types",
  "regex",
  "tracing",
  "tracing-subscriber",
@@ -211,19 +209,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 
 [[package]]
-name = "cortexkit-store"
-version = "0.2.0"
+name = "cortexkit-role-harness"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54901f6290132d5f70ffbf6bd3e06d31c128cb70566a73fb201866b8394bb8aa"
 dependencies = [
- "cortexkit-lease",
- "cortexkit-store-types 0.2.2",
- "rusqlite",
+ "async-trait",
 ]
 
 [[package]]
-name = "cortexkit-store-types"
-version = "0.2.2"
+name = "cortexkit-role-tool-provider"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ebda321fc7f00d1604b17e5e7e54139f8053d267c75ce60325b23bcc973994"
 dependencies = [
  "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "subc-protocol",
+]
+
+[[package]]
+name = "cortexkit-role-tool-provider-conformance"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8455bb4bd0da2770ed67d10c3bbdc94394c880d17d86bb41e67ed5c42d367907"
+dependencies = [
+ "async-trait",
+ "cortexkit-role-harness",
+ "cortexkit-role-tool-provider",
+ "futures-util",
+ "serde_json",
+ "subc-protocol",
+]
+
+[[package]]
+name = "cortexkit-store"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a6cc64ebbed57cb7f006b2b5fec9983c634d69334e4c966072b39b9433a907c"
+dependencies = [
+ "cortexkit-lease",
+ "cortexkit-store-types",
+ "rusqlite",
 ]
 
 [[package]]
@@ -233,6 +262,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94feb32be066be355bd3191fdf3de1f733a54a9cb84932413145b7b7f4b2135e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -631,18 +670,26 @@ dependencies = [
 name = "mc-module"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "cortexkit-lease",
- "cortexkit-log 0.3.3",
+ "cortexkit-log",
+ "cortexkit-role-tool-provider",
+ "cortexkit-role-tool-provider-conformance",
  "cortexkit-store",
- "cortexkit-store-types 0.2.2",
+ "cortexkit-store-types",
+ "cpu-time",
  "filetime",
  "mc-core",
  "mc-store",
  "mc-tokenizer",
+ "nix",
+ "proc-macro2",
+ "quote",
  "regex",
  "rusqlite",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "subc-client-rs",
@@ -651,6 +698,7 @@ dependencies = [
  "subc-os",
  "subc-protocol",
  "subc-transport",
+ "syn 2.0.119",
  "tempfile",
  "tokio",
  "tracing",
@@ -663,7 +711,7 @@ version = "0.1.0"
 dependencies = [
  "cortexkit-cache-core",
  "cortexkit-store",
- "cortexkit-store-types 0.2.2",
+ "cortexkit-store-types",
  "flate2",
  "md5",
  "rusqlite",
@@ -716,6 +764,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -884,6 +944,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu-js"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -917,6 +983,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "serde_jcs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3a60f3fda61525e439ef6d67422118f11e986566997d9021c56867ad814a0aa"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1017,14 +1094,18 @@ dependencies = [
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.3"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4afcb6c12344b14fb6d840a8f28214d30a2faf6d0260fae206a5bfa1d6475966"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "subc-client-rs"
-version = "0.23.2"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d671a838c7777805070da19080045ef5149882636b3bd8193c5e913a590c7315"
 dependencies = [
  "async-trait",
  "serde",
@@ -1035,11 +1116,14 @@ dependencies = [
  "subc-transport",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
 name = "subc-control"
-version = "0.24.0"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cb088c665dcce2507c7e480087b2d0235caa5e9adbfb2277545022869b909de"
 dependencies = [
  "serde",
  "serde_json",
@@ -1048,10 +1132,11 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.44"
+version = "0.20.55"
+source = "git+https://github.com/cortexkit/subconscious?rev=1a14993c120725fa1dce7267b6e7d0823835930c#1a14993c120725fa1dce7267b6e7d0823835930c"
 dependencies = [
  "base64",
- "cortexkit-log 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cortexkit-log",
  "cortexkit-paths",
  "ed25519-dalek",
  "hex-literal",
@@ -1074,9 +1159,11 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.25.0"
+version = "0.31.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f360da598a27fe62013728b3f7672cfb702ce811ca03fb3d4f2487e9a24d8acd"
 dependencies = [
- "cortexkit-log 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cortexkit-log",
  "cortexkit-paths",
  "fs4",
  "getrandom 0.2.17",
@@ -1100,7 +1187,9 @@ dependencies = [
 
 [[package]]
 name = "subc-jobobject"
-version = "0.1.1"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac4734f44009281f03ad97049846c7258f0b2e339ae7f51c2d8c599d78b33412"
 dependencies = [
  "tokio",
  "windows-sys",
@@ -1108,14 +1197,18 @@ dependencies = [
 
 [[package]]
 name = "subc-jsonc"
-version = "0.1.1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34bce1b750055f70b5eb2d64088f577812c618f0b0ac9fab1b2f10a84a9522f4"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "subc-os"
-version = "0.1.4"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c0ef4799271438331fb4a0b94eca21c8fc9ed09adf870f5dd57f6eac941140a"
 dependencies = [
  "libc",
  "rustix",
@@ -1123,7 +1216,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.27.0"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bcb6c2bd02e6ab43479ae87791eb3cd5eb98d9a23ef8e12f1077248fd480a85"
 dependencies = [
  "serde",
  "serde_json",
@@ -1131,7 +1226,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.8.1"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edb5dfb8ff70b1f585c2d13337dbabab75a06a20531eedfba31ceee3a565047"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
@@ -1147,6 +1244,8 @@ dependencies = [
 [[package]]
 name = "subc-uptime"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23ff6076dc9ff66f432a0e4f1501a3a07abfc3c2d040ec809dced117a6e83919"
 dependencies = [
  "rustix",
  "windows-sys",

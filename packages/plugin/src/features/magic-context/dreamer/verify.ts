@@ -19,6 +19,7 @@ import type { Database } from "../../../shared/sqlite";
 import {
     archiveMemory,
     clearMemoryVerifications,
+    getMemoryByHash,
     getMemoryById,
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
@@ -45,6 +46,7 @@ import {
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
+    withDreamerModelCooldown,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import { DreamTokenBudgetExceeded } from "./token-budget";
@@ -66,25 +68,29 @@ import {
  * Per-memory verified_at (no global watermark): a timed-out batch banks what it
  * checked; the next run continues. Cost is unique-file-bounded like map, but
  * verify reads DEEPER (it checks claims, not just locates files), so it batches
- * SMALLER than map (~50 vs 80; harness: 96 memories peaked ~177K). No max-turns;
+ * SMALLER than map because deeper reads replay more prompt tokens. No max-turns;
  * a batch that fails to emit a manifest banks nothing and is retried next run.
  *
- * Apply is cache-NEUTRAL: update/archive route through queueMemoryMutation (the
- * m[1] supersede-delta), never bumping the project memory epoch — the dreamer
+ * Apply is cache-NEUTRAL: update/archive route through queueMemoryMutation,
+ * never bumping the project memory epoch — the dreamer
  * must never bust the prompt cache.
  */
 
-// Verify reads deeper than map → smaller batch keeps peak context under a 128K
-// window with margin (harness: 96 mapped → ~177K on a large-window model).
-const VERIFY_BATCH_SIZE = 50;
+// A 14-day Gemini fit predicts ~1.73M prompt tokens for 20 memories, including
+// ~600K fixed per-child overhead (~69% of the 2.5M incremental default budget).
+// Broad verification fits ~2.00M at 20, below 70% of its 3M default budget.
+// Both leave room to finalize without repeatedly paying overhead for tiny batches.
+// Observed costs vary widely around these means; heavy batches can still finalize
+// early (docs/reports/verify-token-budget-2026-09-30.md).
+const VERIFY_BATCH_SIZE = 20;
 // One batch already exhausts the configured model fallback chain. A second
 // identical provider-shaped completion means continuing this run only hammers
 // the same outage, so leave the remaining memories for the scheduler retry.
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
 
 /**
- * Minimum wall-clock budget for one 50-memory verify batch. Verify reads deeper
- * than map, whose 80-memory batch already gets this floor, so an even split of
+ * Minimum wall-clock budget for one verify batch. Verify reads deeper
+ * than map, which already gets this floor, so an even split of
  * the task deadline across many batches (120 s for ten batches in 20 minutes)
  * cannot finish one tool loop. A batch below the floor is not started; its
  * memories keep their old verified_at and a later run picks them up.
@@ -174,6 +180,10 @@ function closeBroadCycle(args: VerifyArgs, cycleStartAt: number | undefined): vo
 }
 
 export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
+    return withDreamerModelCooldown(() => runVerifyWithCooldown(args));
+}
+
+async function runVerifyWithCooldown(args: VerifyArgs): Promise<VerifyResult> {
     const runStartedAt = Date.now();
     const result: VerifyResult = {
         verified: 0,
@@ -350,8 +360,11 @@ async function verifyOneBatch(
                 language: args.language,
                 timeoutMs: sliceMs,
                 signal,
-                parse: (text) => {
-                    const providerFailure = providerOutputFailureFromInvalidManifest([], text);
+                parse: (text, completion) => {
+                    const providerFailure = providerOutputFailureFromInvalidManifest(
+                        completion.messages ?? [],
+                        text,
+                    );
                     if (providerFailure) throw providerFailure;
                     return validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
                 },
@@ -374,7 +387,9 @@ async function verifyOneBatch(
             client,
             db: args.db,
             parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-verify",
+            title: args.forceBroad
+                ? "magic-context-dream-verify-broad"
+                : "magic-context-dream-verify",
             directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
@@ -669,7 +684,7 @@ async function applyParsedVerifyManifest(
             if (!identity)
                 throw new DreamerModuleFailureError(
                     "memory.set_verification",
-                    new Error(`missing mirror identity for ${write.id}`),
+                    new Error(`shared memory no longer belongs to the project: ${write.id}`),
                 );
             return {
                 memory_id: identity.moduleId,
@@ -689,8 +704,6 @@ async function applyParsedVerifyManifest(
                     name: "memory.set_verification",
                     arguments: {
                         memory_project: args.projectIdentity,
-                        context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
-                        authority_generation: args.moduleRoute.moduleAuthorityGeneration,
                         command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
                             .update(rows.map((row) => row.memory_id).join(","))
                             .digest("hex")
@@ -731,6 +744,24 @@ async function applyParsedVerifyManifest(
                 if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
                 verified += 1;
             } else if (w.kind === "update") {
+                // memories has UNIQUE(project_path, category, normalized_hash).
+                // A rewrite that lands on another memory's exact content would
+                // throw and roll back the whole batch, so skip it instead. Two
+                // memories saying the same thing is a merge, which verify does
+                // not decide; curate or an agent can merge them.
+                const duplicate = getMemoryByHash(
+                    args.db,
+                    memory.projectPath,
+                    memory.category,
+                    w.hash,
+                );
+                if (duplicate && duplicate.id !== memory.id) {
+                    log(
+                        `[dreamer] verify safety refusal: memory_id=${w.id} verdict=update reason=duplicate-of duplicate_id=${duplicate.id}`,
+                    );
+                    refused += 1;
+                    continue;
+                }
                 rewriteMemoryContent(args.db, memory, w.content, w.hash);
                 queueMemoryMutation(args.db, {
                     projectPath: args.projectIdentity,

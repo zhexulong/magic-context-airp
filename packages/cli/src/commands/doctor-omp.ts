@@ -1,8 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
-import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
+import { isAbsolute, join, resolve } from "node:path";
 import {
     formatDreamerTickFailure,
     getDreamerTickFailure,
@@ -82,6 +81,8 @@ interface DoctorDeps {
 export interface RunOmpDoctorOptions {
     force?: boolean;
     issue?: boolean;
+    /** With `issue`, write the report here without prompting (relative to `cwd`). */
+    report?: string;
     cwd?: string;
     prompts?: PromptIO;
     deps?: Partial<DoctorDeps>;
@@ -184,82 +185,98 @@ async function runHealthChecks(options: {
         add(results, "fail", "OMP binary not found on PATH or in standard user bin directories");
     } else {
         const version = options.deps.getOmpVersion(omp.path);
-        if (!version) add(results, "fail", `OMP at ${omp.path} could not report its version`);
-        else if (isOlderThan(version, MIN_OMP_VERSION)) {
-            add(results, "fail", `OMP ${version} is older than tested minimum ${MIN_OMP_VERSION}`);
-        } else add(results, "pass", `OMP ${version} detected at ${omp.path}`);
-
         const plugins = options.deps.listOmpPlugins(omp.path);
         if (!plugins) {
             add(results, "fail", "`omp plugin list --json` failed or returned invalid JSON");
         } else {
             const plugin = plugins.find((entry) => entry.name === OMP_PLUGIN_PACKAGE);
             if (!plugin) {
-                add(results, "fail", `${OMP_PLUGIN_PACKAGE} is not installed in OMP`);
-                repairPlan.installPlugin = true;
-            } else if (!plugin.enabled) {
-                add(results, "fail", `${OMP_PLUGIN_PACKAGE} is installed but disabled in OMP`);
-                repairPlan.installPlugin = true;
-            } else {
-                add(results, "pass", `${OMP_PLUGIN_PACKAGE} ${plugin.version} is enabled`);
-                const manifest = pluginDeclaresOmp(plugin.path);
-                if (manifest === true)
-                    add(results, "pass", "Plugin exposes an OMP/Pi extension manifest");
-                else if (manifest === false)
-                    add(results, "fail", "Installed plugin has no OMP/Pi extension manifest");
-                else add(results, "warn", "Could not inspect the installed plugin manifest");
-            }
-        }
-
-        const compaction = options.deps.getOmpSetting(omp.path, "compaction.enabled");
-        if (compaction === false) add(results, "pass", "OMP native compaction is disabled");
-        else if (compaction === true) {
-            add(
-                results,
-                "fail",
-                "OMP native compaction is enabled and conflicts with Magic Context",
-            );
-            repairPlan.disableCompaction = true;
-        } else add(results, "fail", "Could not read OMP compaction.enabled");
-
-        const memory = options.deps.getOmpSetting(omp.path, "memory.backend");
-        if (memory === "off") add(results, "pass", "OMP automatic memory backend is disabled");
-        else if (typeof memory === "string") {
-            add(
-                results,
-                "fail",
-                `OMP memory.backend=${memory} duplicates Magic Context memory injection`,
-            );
-            repairPlan.disableMemory = true;
-        } else add(results, "fail", "Could not read OMP memory.backend");
-
-        const nonGlobalSources = getOmpNonGlobalConfigSources(options.cwd);
-        if (
-            nonGlobalSources.length > 0 &&
-            (repairPlan.disableCompaction || repairPlan.disableMemory)
-        ) {
-            add(
-                results,
-                "warn",
-                "OMP project/overlay config owns effective conflicting settings; automatic global repair is disabled: " +
-                    nonGlobalSources.join(", "),
-            );
-        }
-
-        const reportedAgentDir = options.deps.runOmpCommand(omp.path, ["config", "path"], 10_000);
-        if (!reportedAgentDir.ok) {
-            add(results, "warn", "Could not verify OMP active agent directory");
-        } else {
-            const reportedPath = resolve(reportedAgentDir.stdout);
-            const expectedPath = resolve(getOmpAgentDir());
-            if (reportedPath === expectedPath) {
-                add(results, "pass", `OMP agent directory resolved to ${getOmpAgentDir()}`);
-            } else {
                 add(
                     results,
-                    "fail",
-                    `OMP reports agent directory ${reportedAgentDir.stdout}, but Magic Context resolved ${getOmpAgentDir()}`,
+                    "info",
+                    `${version ? `Oh My Pi ${version}` : "Oh My Pi"} found; Magic Context is not installed there (run setup to add it)`,
                 );
+                repairPlan.installPlugin = true;
+            } else {
+                if (!version) {
+                    add(results, "fail", `OMP at ${omp.path} could not report its version`);
+                } else if (isOlderThan(version, MIN_OMP_VERSION)) {
+                    add(
+                        results,
+                        "fail",
+                        `OMP ${version} is older than tested minimum ${MIN_OMP_VERSION}`,
+                    );
+                } else add(results, "pass", `OMP ${version} detected at ${omp.path}`);
+
+                if (!plugin.enabled) {
+                    add(results, "fail", `${OMP_PLUGIN_PACKAGE} is installed but disabled in OMP`);
+                    repairPlan.installPlugin = true;
+                } else {
+                    add(results, "pass", `${OMP_PLUGIN_PACKAGE} ${plugin.version} is enabled`);
+                    const manifest = pluginDeclaresOmp(plugin.path);
+                    if (manifest === true)
+                        add(results, "pass", "Plugin exposes an OMP/Pi extension manifest");
+                    else if (manifest === false)
+                        add(results, "fail", "Installed plugin has no OMP/Pi extension manifest");
+                    else add(results, "warn", "Could not inspect the installed plugin manifest");
+                }
+
+                const compaction = options.deps.getOmpSetting(omp.path, "compaction.enabled");
+                if (compaction === false) add(results, "pass", "OMP native compaction is disabled");
+                else if (compaction === true) {
+                    add(
+                        results,
+                        "fail",
+                        "OMP native compaction is enabled and conflicts with Magic Context",
+                    );
+                    repairPlan.disableCompaction = true;
+                } else add(results, "fail", "Could not read OMP compaction.enabled");
+
+                const memory = options.deps.getOmpSetting(omp.path, "memory.backend");
+                if (memory === "off")
+                    add(results, "pass", "OMP automatic memory backend is disabled");
+                else if (typeof memory === "string") {
+                    add(
+                        results,
+                        "fail",
+                        `OMP memory.backend=${memory} duplicates Magic Context memory injection`,
+                    );
+                    repairPlan.disableMemory = true;
+                } else add(results, "fail", "Could not read OMP memory.backend");
+
+                const nonGlobalSources = getOmpNonGlobalConfigSources(options.cwd);
+                if (
+                    nonGlobalSources.length > 0 &&
+                    (repairPlan.disableCompaction || repairPlan.disableMemory)
+                ) {
+                    add(
+                        results,
+                        "warn",
+                        "OMP project/overlay config owns effective conflicting settings; automatic global repair is disabled: " +
+                            nonGlobalSources.join(", "),
+                    );
+                }
+
+                const reportedAgentDir = options.deps.runOmpCommand(
+                    omp.path,
+                    ["config", "path"],
+                    10_000,
+                );
+                if (!reportedAgentDir.ok) {
+                    add(results, "warn", "Could not verify OMP active agent directory");
+                } else {
+                    const reportedPath = resolve(reportedAgentDir.stdout);
+                    const expectedPath = resolve(getOmpAgentDir());
+                    if (reportedPath === expectedPath) {
+                        add(results, "pass", `OMP agent directory resolved to ${getOmpAgentDir()}`);
+                    } else {
+                        add(
+                            results,
+                            "fail",
+                            `OMP reports agent directory ${reportedAgentDir.stdout}, but Magic Context resolved ${getOmpAgentDir()}`,
+                        );
+                    }
+                }
             }
         }
     }
@@ -344,13 +361,13 @@ async function runHealthChecks(options: {
 }
 
 function writeDefaultConfig(path: string): void {
-    mkdirSync(dirname(path), { recursive: true });
+    // Only the editor schema reference: writing every schema default explicitly
+    // would pin those values, so later default changes would never take effect.
     const config = {
         $schema:
             "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
-        ...MagicContextConfigSchema.parse({}),
     };
-    writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`);
+    writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`, { ownerOnly: true });
 }
 
 async function repair(
@@ -403,6 +420,20 @@ function timestamp(date: Date): string {
         .replace(/\.\d{3}Z$/, "Z");
 }
 
+function ompIssueBody(description: string, report: HealthReport): string {
+    return [
+        "## Description",
+        sanitizeDiagnosticText(description),
+        "",
+        "## OMP diagnostics",
+        `- Magic Context CLI: ${selfVersion()}`,
+        ...report.results.map(
+            (result) =>
+                `- ${result.status.toUpperCase()}: ${sanitizeDiagnosticText(result.message)}`,
+        ),
+    ].join("\n");
+}
+
 function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
     if (args[0] === "issue") {
         const result = deps.spawnSync("gh", args, {
@@ -438,7 +469,22 @@ async function runIssueFlow(options: {
     cwd: string;
     prompts: PromptIO;
     deps: DoctorDeps;
+    reportPath?: string;
 }): Promise<number> {
+    if (options.reportPath) {
+        // Scripted runs (CI, bug templates) need a report without prompts.
+        const report = await runHealthChecks({ ...options, quiet: true });
+        const path = isAbsolute(options.reportPath)
+            ? options.reportPath
+            : join(options.cwd, options.reportPath);
+        writeFileAtomic(
+            path,
+            `${ompIssueBody("Generated non-interactively by `doctor --issue --report`.", report)}\n`,
+        );
+        options.prompts.log.success(`Sanitized report written to ${path}`);
+        return 0;
+    }
+
     const title = await options.prompts.text("Issue title", {
         placeholder: "Short summary of the OMP problem",
         validate: (value) => (value.trim() ? undefined : "Title is required"),
@@ -448,19 +494,8 @@ async function runIssueFlow(options: {
         validate: (value) => (value.trim() ? undefined : "Description is required"),
     });
     const report = await runHealthChecks({ ...options, quiet: true });
-    const body = [
-        "## Description",
-        sanitizeDiagnosticText(description),
-        "",
-        "## OMP diagnostics",
-        `- Magic Context CLI: ${selfVersion()}`,
-        ...report.results.map(
-            (result) =>
-                `- ${result.status.toUpperCase()}: ${sanitizeDiagnosticText(result.message)}`,
-        ),
-    ].join("\n");
     const path = join(options.cwd, `magic-context-omp-issue-${timestamp(options.deps.now())}.md`);
-    writeFileAtomic(path, `${body}\n`);
+    writeFileAtomic(path, `${ompIssueBody(description, report)}\n`);
     options.prompts.log.success(`Sanitized report written to ${path}`);
     if (await options.prompts.confirm("Submit this issue on GitHub now?", false)) {
         const result = submitGithubIssue(`[omp] ${title}`, path, (args) =>
@@ -488,7 +523,7 @@ export async function runDoctor(options: RunOmpDoctorOptions = {}): Promise<numb
     const cwd = options.cwd ?? process.cwd();
     const migrationWarnings = migrateConfigLocationsForCli(cwd, prompts.log);
     const migrationRefused = hasUserConfigLocationMigrationRefusal(migrationWarnings);
-    if (options.issue) return runIssueFlow({ cwd, prompts, deps });
+    if (options.issue) return runIssueFlow({ cwd, prompts, deps, reportPath: options.report });
 
     prompts.intro("Magic Context for Oh My Pi (OMP) Doctor");
     const first = await runHealthChecks({ cwd, prompts, deps });

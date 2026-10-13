@@ -1,4 +1,6 @@
+import { sessionLog } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
+import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getDatabasePath } from "./storage-db";
 
@@ -38,7 +40,8 @@ export type CanonicalMaterializeReason =
     | "epoch_change"
     | "coverage_fold"
     | "profile_transition"
-    | "host_compaction";
+    | "host_compaction"
+    | "tag_identity_repair";
 
 export interface PendingTransformDecision {
     tsMs: number;
@@ -97,6 +100,7 @@ interface TransformDecisionRow extends PendingTransformDecision {
 
 interface PendingPiTransformDecision extends PendingTransformDecision {
     snapshotNewestAssistantEntryId: string | null;
+    publicationGuard?: () => void;
 }
 
 type TransformDecisionWriter = (dbPath: string, row: TransformDecisionRow) => void;
@@ -120,6 +124,7 @@ const canonicalReasons = new Set<string>([
     "coverage_fold",
     "profile_transition",
     "host_compaction",
+    "tag_identity_repair",
 ]);
 
 const piReasonAliases: Record<string, CanonicalMaterializeReason> = {
@@ -188,7 +193,9 @@ export function writeRustTransformDecision(args: {
     const mapped =
         decisionUpper === "HARD" || decisionUpper === "MIGRATE_HARD"
             ? { decision: "execute" as const, materialized: true, bustedThisPass: true }
-            : decisionUpper === "SOFT" || decisionUpper === "EXECUTE"
+            : decisionUpper === "SOFT" ||
+                decisionUpper === "EXECUTE" ||
+                args.materializeReason === "ttl_idle"
               ? { decision: "execute" as const, materialized: false, bustedThisPass: true }
               : decisionUpper === "SOFT+"
                 ? { decision: "defer" as const, materialized: false, bustedThisPass: false }
@@ -243,11 +250,14 @@ export function recordPendingPiTransformDecision(
     sessionId: string,
     decision: PendingTransformDecision,
     snapshotNewestAssistantEntryId: string | null,
+    publicationGuard?: () => void,
 ): void {
+    publicationGuard?.();
     if (!decision.bustedThisPass) return;
     pendingPiDecisionBySession.set(sessionId, {
         ...decision,
         snapshotNewestAssistantEntryId,
+        publicationGuard,
     });
 }
 
@@ -312,9 +322,18 @@ export function schedulePiTransformDecisionResolve(args: {
     db: Database;
     sessionId: string;
     branchEntries: readonly unknown[] | null;
+    assertCurrentPass?: () => void;
 }): boolean {
     const pending = pendingPiDecisionBySession.get(args.sessionId);
     if (!pending) return false;
+    try {
+        pending.publicationGuard?.();
+        args.assertCurrentPass?.();
+    } catch {
+        pendingPiDecisionBySession.delete(args.sessionId);
+        sessionLog(args.sessionId, "DISCARDED CONTEXT RESULT: pending Pi transform decision");
+        return false;
+    }
     const targetMessageId = findNewestPiAssistantEntryIdAfter(
         args.branchEntries,
         pending.snapshotNewestAssistantEntryId,
@@ -328,6 +347,16 @@ export function schedulePiTransformDecisionResolve(args: {
     setTimeout(() => {
         try {
             if (!hasScheduledWriteToken(args.sessionId, token)) return;
+            try {
+                pending.publicationGuard?.();
+                args.assertCurrentPass?.();
+            } catch {
+                sessionLog(
+                    args.sessionId,
+                    "DISCARDED CONTEXT RESULT: queued Pi transform decision",
+                );
+                return;
+            }
             writeTransformDecisionBestEffort(dbPath, {
                 ...pending,
                 sessionId: args.sessionId,
@@ -428,6 +457,8 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
 function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
     const db = new Database(dbPath);
     try {
+        db.exec("PRAGMA busy_timeout=0");
+        configureContextDatabasePragmas(db);
         writeTransformDecisionRowOnDatabase(db, row, true);
     } finally {
         closeQuietly(db);

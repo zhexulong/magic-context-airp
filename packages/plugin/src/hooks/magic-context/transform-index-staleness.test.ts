@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Scheduler } from "../../features/magic-context/scheduler";
@@ -14,6 +14,7 @@ import {
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { createTransform } from "./transform";
 
 type TextPart = { type: "text"; text: string };
@@ -49,7 +50,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -76,7 +77,7 @@ function createTestTransform(sessionId: string) {
         historyRefreshSessions: new Set<string>(),
         pendingMaterializationSessions,
         lastHeuristicsTurnId: new Map<string, string>(),
-        clearReasoningAge: 2,
+        keepReasoningTokens: 0,
         protectedTokens: 0,
     });
     return { transform, shouldExecute, pendingMaterializationSessions };
@@ -407,6 +408,11 @@ describe("createTransform index staleness regressions", () => {
             },
         ];
 
+        // This regression concerns historical reasoning after a closed turn.
+        secondPass.push({
+            info: { id: "follow-up", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "next request" }],
+        });
         await transform({}, { messages: secondPass });
 
         // The tool drop removed m-assistant-call and m-tool-drop via pruneEmptyMessages, so array shifts:

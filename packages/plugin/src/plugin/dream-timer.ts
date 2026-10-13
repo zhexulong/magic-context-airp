@@ -1,7 +1,6 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
-import { getAuthorityManagedMarker } from "../features/magic-context/context-authority";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { logDreamerNotOwnerOnce } from "../features/magic-context/dreamer/module-apply";
@@ -53,17 +52,20 @@ import { isUsableProjectIdentity } from "../features/magic-context/memory/projec
 import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
 import {
     drainCommitBacklogForProject,
-    sweepStaleEmbeddingIdentitiesForProject,
+    drainProjectEmbeddingIdentityMaintenance,
+    drainStaleEmbeddingIdentitiesForProject,
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
 import {
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     retryPendingRustSessionCleanupsForProject,
-    retryPendingSessionCleanups,
     runSqliteOptimize,
 } from "../features/magic-context/storage";
-import { pruneStaleLkgSlots } from "../hooks/magic-context/lkg-persist";
+import { retryPendingSessionCleanups } from "../features/magic-context/storage-meta-session";
+import type { HiddenCompletionExecutor } from "../hooks/magic-context/compartment-runner-types";
+import { drainStaleLkgSlots } from "../hooks/magic-context/lkg-persist";
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
+import { projectNeedsSingleStoreMigration } from "../hooks/magic-context/single-store-refusal";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { ModelHarness } from "../shared/model-resolution";
@@ -90,11 +92,30 @@ const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
  * its dream schedule checked, and its config respected.
  */
 interface ProjectRegistration {
+    smartNotesEnabled?: boolean;
     directory: string;
     projectIdentity: string;
     /** The runtime selecting models for this registration. */
     harness: ModelHarness;
-    client: PluginContext["client"];
+    /** OpenCode 1 and Pi run dream tasks through child sessions of this client. */
+    client?: PluginContext["client"];
+    /**
+     * OpenCode 2 has no such client: its dream tasks run through the hidden
+     * completion carrier of the plugin context that registered the project.
+     * When set, the executor uses it instead of `client`.
+     */
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    /**
+     * Finds the session a timer-started run's child session hangs under. A
+     * timer run has no triggering session; see `DreamTaskExecutorDeps`.
+     */
+    findParentSessionId?: () => Promise<string | undefined> | string | undefined;
+    /**
+     * Opens OpenCode 1's store read-only for dream tasks that scan it. Defaults
+     * to the shared opener; OpenCode 2 passes one returning null, because its
+     * sessions are not in that store.
+     */
+    openOpenCodeDb?: () => Database | null;
     dreamerConfig?: DreamerConfig;
     validateTaskModels?: (tasks: DreamTaskRuntimeConfig[]) => DreamTaskRuntimeConfig[];
     sampleDreamRun?: () => Partial<
@@ -118,7 +139,7 @@ interface ProjectRegistration {
         fallbackModelCount: number;
         keepSubagents: boolean;
     };
-    mural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean };
     retinaHandoff?: boolean;
     embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
@@ -160,6 +181,7 @@ interface ProjectRegistration {
 
 /** Singleton timer state. */
 let activeTimer: ReturnType<typeof setInterval> | null = null;
+let tickInFlight = false;
 let startupTickTimer: ReturnType<typeof setTimeout> | null = null;
 const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const startupJitters = new Map<string, number>();
@@ -356,6 +378,10 @@ export function _setDreamTimerStagesForTests(overrides: Partial<typeof tickStage
  * task scheduling for every project, on every tick, forever (issue 496).
  */
 function runTick(origin: "startup" | "interval"): void {
+    // Maintenance can outlive the interval under a busy writer or a slow task.
+    // One tick already covers every project, so do not start duplicate work.
+    if (tickInFlight) return;
+    tickInFlight = true;
     log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
     void (async () => {
         try {
@@ -402,6 +428,8 @@ function runTick(origin: "startup" | "interval"): void {
             runSqliteOptimize(db);
         } catch (error) {
             log("[magic-context] timer-triggered maintenance check failed:", error);
+        } finally {
+            tickInFlight = false;
         }
     })();
 }
@@ -422,7 +450,7 @@ function persistTickOutcome(db: Database, failure: DreamerTickFailure | null): v
 
 async function runMessageHistoryMaintenance(db: Database): Promise<void> {
     try {
-        pruneStaleLkgSlots(db);
+        await drainStaleLkgSlots(db);
     } catch (error) {
         // A busy writer should not prevent unrelated maintenance from running.
         log("[magic-context] LKG pruning deferred:", error);
@@ -456,6 +484,7 @@ async function runMessageHistoryMaintenance(db: Database): Promise<void> {
     }
 
     const sweep = sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb);
+    if (sweep.reason) log(`[message-index] orphan sweep parked: ${sweep.reason}`);
     if (sweep.deleted > 0) {
         log(
             `[message-index] orphan sweep: scanned=${sweep.scanned} deleted=${sweep.deleted} cursor=${sweep.cursor || "<complete>"}`,
@@ -482,7 +511,18 @@ function scheduleInitialProjectRun(reg: ProjectRegistration, db: Database): void
     const timer = scheduleAfterBootQuiet(() => {
         startupTimers.delete(reg.directory);
         if (registeredProjects.get(reg.directory) !== reg) return;
-        void runProjectMaintenance(reg, "startup", db);
+        // This run is detached from the tick that scheduled it, so nothing
+        // upstream catches its failure. An uncaught rejection here (for example
+        // SQLITE_BUSY in ensureRegistered) would be an unhandled rejection that
+        // can end the host process; record it like an interval tick failure.
+        tickStages.runProjectMaintenance(reg, "startup", db).catch((error: unknown) => {
+            log(`[magic-context] startup maintenance failed for ${reg.projectIdentity}:`, error);
+            persistTickOutcome(db, {
+                at: Date.now(),
+                stage: `project ${reg.projectIdentity}`,
+                message: getErrorMessage(error),
+            });
+        });
     }, startupJitterMs(reg.directory));
     startupTimers.set(reg.directory, timer);
 }
@@ -492,8 +532,12 @@ async function runProjectMaintenance(
     origin: "startup" | "interval",
     db: Database,
 ): Promise<void> {
+    // Sampled before the gate, so a dreamer turned on or off in the live config
+    // (`dreamer.disable` is a live key) is honoured on this tick.
+    const sampled = reg.sampleDreamRun?.();
+    const current = sampled ? { ...reg, ...sampled } : reg;
     const projectMaintenanceEnabled =
-        Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
+        Boolean(current.dreamerConfig && current.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
         reg.gitCommitIndexing?.enabled === true ||
         reg.historianChildSweep !== undefined;
@@ -511,8 +555,7 @@ async function runProjectMaintenance(
         // Compartment-chunk backfill remains demand-driven to avoid bursty
         // requests to local embedding endpoints.
     }
-    const sampled = reg.sampleDreamRun?.();
-    await sweepProject(sampled ? { ...reg, ...sampled } : reg, origin, db);
+    await sweepProject(current, origin, db);
 }
 
 /**
@@ -567,7 +610,8 @@ async function sweepProject(
     await reg.ensureRegistered(reg.directory, db);
     const embeddingSnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
     const commitIndexingEnabled = gitCommitEnabled ?? embeddingSnapshot?.gitCommitEnabled === true;
-    const gc = sweepStaleEmbeddingIdentitiesForProject(db, reg.projectIdentity);
+    await drainProjectEmbeddingIdentityMaintenance(db, reg.projectIdentity);
+    const gc = await drainStaleEmbeddingIdentitiesForProject(db, reg.projectIdentity);
     const gcDeleted = gc.memoryRowsDeleted + gc.commitRowsDeleted + gc.chunkRowsDeleted;
     if (gcDeleted > 0) {
         log(
@@ -584,7 +628,7 @@ async function sweepProject(
                   dreamerConfig,
                   reg.harness,
                   reg.language,
-                  reg.mural?.model,
+                  reg.smartNotesEnabled,
               )
             : [];
     const runtimeConfigs = reg.validateTaskModels?.(configuredTasks) ?? configuredTasks;
@@ -623,8 +667,10 @@ async function sweepProject(
         // worktree the shared git:<sha> identity might resolve to).
         const executor = createDreamTaskExecutor({
             client: reg.client,
+            hiddenCompletionExecutor: reg.hiddenCompletionExecutor,
+            findParentSessionId: reg.findParentSessionId,
             sessionDirectory: reg.directory,
-            openOpenCodeDb,
+            openOpenCodeDb: reg.openOpenCodeDb ?? openOpenCodeDb,
             // Each registration brings its own provider factory (Pi supplies the
             // JSONL provider); default to OpenCode when none is given.
             retrospectiveRawProvider:
@@ -642,6 +688,7 @@ async function sweepProject(
             mural: reg.mural,
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             retinaHandoff: reg.retinaHandoff,
+            smartNotesEnabled: reg.smartNotesEnabled,
             transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,
             onProgress: (progress, completedTask) =>
@@ -652,6 +699,7 @@ async function sweepProject(
             projectIdentity: reg.projectIdentity,
             tasks: runtimeConfigs,
             executor,
+            projectMemoryEnabled: reg.memoryEnabled !== false,
         });
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
@@ -666,14 +714,17 @@ async function sweepOrphanedInternalChildren(
     privacyTimeoutMinutes: readonly number[],
 ): Promise<void> {
     const config = reg.historianChildSweep;
-    if (!config) return;
+    // The sweep removes leftover children through OpenCode 1's session client;
+    // a host without one (OpenCode 2) cleans up its hidden children itself.
+    const client = reg.client;
+    if (!config || !client) return;
 
     const ocDb = openOpenCodeDb();
     if (!ocDb) return;
     try {
         await sweepOrphanedRetrospectiveChildren({
             opencodeDb: ocDb,
-            client: reg.client,
+            client,
             sessionDirectory: reg.directory,
             staleMs: {
                 privacy: retrospectiveOrphanStaleMs(privacyTimeoutMinutes),
@@ -689,6 +740,11 @@ async function sweepOrphanedInternalChildren(
     } finally {
         closeQuietly(ocDb);
     }
+}
+
+/** What the process-wide timer holds right now, for tests of host registration. */
+export function _getDreamTimerStateForTests(): { active: boolean; directories: string[] } {
+    return { active: activeTimer !== null, directories: [...registeredProjects.keys()] };
 }
 
 export function _resetDreamTimerForTests(): void {
@@ -711,7 +767,8 @@ export function _resetDreamTimerForTests(): void {
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
-    if (getAuthorityManagedMarker(db, reg.projectIdentity)) {
+    if (reg.smartNotesEnabled === false) return;
+    if (projectNeedsSingleStoreMigration(db, reg.projectIdentity)) {
         logDreamerNotOwnerOnce(reg.projectIdentity);
         return;
     }

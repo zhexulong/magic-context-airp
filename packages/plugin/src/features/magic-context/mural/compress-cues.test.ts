@@ -5,8 +5,11 @@ import { describe, expect, test } from "bun:test";
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { ensureContextStoreUuid, installAuthorityManagedMarker } from "../context-authority";
 import { acquireLease } from "../dreamer/lease";
+import {
+    ensureContextStoreUuid,
+    installAuthorityManagedMarker,
+} from "../legacy-authority-fixture.test-support";
 import { getMemoryById, insertMemory, updateMemoryContent } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { runMigrations } from "../migrations";
@@ -147,7 +150,7 @@ function cueArgs(db: Database, projectIdentity: string): CompressCuesArgs {
         db,
         client: {} as never,
         projectIdentity,
-        parentSessionId: undefined,
+        parentSessionId: "ses-parent",
         sessionDirectory: process.cwd(),
         holderId,
         leaseKey,

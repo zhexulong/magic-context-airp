@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 
+import { getMagicContextBuiltinCommands } from "../shared/builtin-commands";
 import {
     CONFIG_WARNING_CLASS,
     type ConfigParseFailure,
@@ -10,6 +11,7 @@ import {
     isPrototypePollutionKey,
     parseJsoncRecovering,
 } from "../shared/jsonc-parser";
+import { log } from "../shared/logger";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
 import { setWindowOverlayPath } from "../shared/window-geometry";
@@ -23,11 +25,14 @@ import {
 } from "./migrate-config-location";
 import { migrateDreamerV2 } from "./migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "./migrate-experimental";
+import { warnDeprecatedMuralModel } from "./mural-model-deprecation";
 import { resolveConfigProfile } from "./profiles";
 import {
     attachProtectedTokensTierOverrides,
+    constrainProjectCommands,
     constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
+    restoreTrustedValuesOverInvalidProjectValues,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
 import { pruneNestedConfigLeaf } from "./prune-config-leaf";
@@ -280,10 +285,22 @@ function deepMergeRawConfig(
             typeof overrideVal === "object" &&
             !Array.isArray(overrideVal)
         ) {
-            mergedValue = deepMergeRawConfig(
-                baseVal as Record<string, unknown>,
-                overrideVal as Record<string, unknown>,
-            );
+            mergedValue =
+                key === "protected_tools"
+                    ? Object.fromEntries(
+                          [baseVal, overrideVal].flatMap((value) =>
+                              Object.entries(value as Record<string, unknown>).map(
+                                  ([name, count]) => [
+                                      name.toLowerCase().replace(/^mcp_/, ""),
+                                      count,
+                                  ],
+                              ),
+                          ),
+                      )
+                    : deepMergeRawConfig(
+                          baseVal as Record<string, unknown>,
+                          overrideVal as Record<string, unknown>,
+                      );
         } else if (
             key === "disabled_hooks" &&
             Array.isArray(baseVal) &&
@@ -385,7 +402,7 @@ export function resetProtectedTagsDeprecationWarningForTest(): void {
 export function warnProtectedTagsDeprecationOnce(): void {
     if (!warnedProtectedTagsDeprecation) {
         warnedProtectedTagsDeprecation = true;
-        console.warn(
+        log(
             "[magic-context] protected_tags is deprecated and ignored; use protected_tokens instead.",
         );
     }
@@ -399,10 +416,21 @@ export function parsePluginConfig(
     // opt-in/out state survives upgrades even when they never run `doctor`.
     const preMigrationWarnings: string[] = [];
     const configWithoutRemovedAgent = stripRemovedAgentConfig(rawConfig, preMigrationWarnings);
+    if (Object.hasOwn(rawConfig, "clear_reasoning_age")) {
+        const warning =
+            "clear_reasoning_age is deprecated and ignored. Magic Context now keeps reasoning up to a token budget, keep_reasoning_tokens (default 10,000). Remove the key, or set keep_reasoning_tokens to a token count.";
+        preMigrationWarnings.push(warning);
+        log(`[magic-context] ${warning}`);
+    }
     if (Object.hasOwn(rawConfig, "protected_tags")) {
         warnProtectedTagsDeprecationOnce();
         preMigrationWarnings.push(
             "protected_tags is deprecated and ignored; use protected_tokens instead.",
+        );
+    }
+    if (Object.hasOwn(rawConfig, "smart_drops")) {
+        preMigrationWarnings.push(
+            "smart_drops is deprecated and ignored; supersession reclaim is always on. This key no longer does anything; remove it.",
         );
     }
     preMigrationWarnings.push(...misplacedAgentModelWarnings(rawConfig));
@@ -410,6 +438,7 @@ export function parsePluginConfig(
         configWithoutRemovedAgent,
         preMigrationWarnings,
     );
+    warnDeprecatedMuralModel(migratedExperimental, preMigrationWarnings);
     // Dreamer v2: convert the legacy v1 dreamer shape (window schedule, tasks
     // array, user_memories/pin_key_files blocks) into the per-task `tasks` record.
     // Runs AFTER migrate-experimental so experimental.user_memories (already
@@ -586,6 +615,29 @@ export function parsePluginConfig(
         command,
         configWarnings: [...preMigrationWarnings, ...warnings],
     };
+}
+
+/**
+ * Every schema issue path the loader's real parse would report for `rawConfig`,
+ * after the same pre-schema migrations parsePluginConfig runs (their warnings
+ * are discarded here; the real parse reports them). Empty when valid.
+ */
+function collectSchemaIssuePaths(rawConfig: Record<string, unknown>): PropertyKey[][] {
+    const scratch: string[] = [];
+    const migrated = migrateLegacyAgentEnabledInMemory(
+        migrateDreamerV2(
+            migrateLegacyExperimental(stripRemovedAgentConfig(rawConfig, scratch), scratch),
+            scratch,
+        ),
+        scratch,
+    );
+    const parsed = MagicContextConfigSchema.safeParse(migrated);
+    if (parsed.success) return [];
+    return parsed.error.issues.flatMap((issue) =>
+        issue.code === "unrecognized_keys"
+            ? issue.keys.map((key) => [...issue.path, key])
+            : [[...issue.path]],
+    );
 }
 
 export function loadPluginConfig(
@@ -766,6 +818,7 @@ export function loadPluginConfigDetailed(
     // a cloned repo may delay compaction, but it may not lower thresholds in a
     // way that forces extra historian work on the user's account.
     const trustedBaseConfig = parsePluginConfig(trustedProfiledRaw);
+    let projectRestoredTopLevelKeys: string[] = [];
 
     if (projectLoaded) {
         mergedRaw = deepMergeRawConfig(mergedRaw, profileResolution.projectBase);
@@ -783,11 +836,35 @@ export function loadPluginConfigDetailed(
         })) {
             allWarnings.push(`[project config] ${warning}`);
         }
+        const restoredOverProject = restoreTrustedValuesOverInvalidProjectValues({
+            mergedRaw,
+            trustedRaw: trustedProfiledRaw,
+            projectRaw: profileResolution.projectBase,
+            collectIssuePaths: collectSchemaIssuePaths,
+        });
+        for (const warning of restoredOverProject.warnings) {
+            allWarnings.push(`[project config] ${warning}`);
+        }
+        projectRestoredTopLevelKeys = restoredOverProject.restoredTopLevelKeys;
+        for (const warning of constrainProjectCommands({
+            mergedRaw,
+            trustedRaw: trustedProfiledRaw,
+            projectRaw: profileResolution.projectBase,
+            reservedNames: Object.keys(getMagicContextBuiltinCommands()),
+        })) {
+            allWarnings.push(`[project config] ${warning}`);
+        }
     }
 
     const recoveredTopLevelKeys: string[] = [];
     const cacheTtlConfigured = Object.hasOwn(mergedRaw, "cache_ttl");
     const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
+    // An ignored invalid project value is still a config the user must fix, so
+    // keep reporting it as schema recovery (live reload keeps the last good
+    // config on that outcome, as it did before the user's value was restored).
+    for (const key of projectRestoredTopLevelKeys) {
+        if (!recoveredTopLevelKeys.includes(key)) recoveredTopLevelKeys.push(key);
+    }
     attachProtectedTokensTierOverrides(config, {
         trustedUser: trustedBaseConfig.protected_tokens,
         project: projectLoaded ? profileResolution.projectBase.protected_tokens : undefined,

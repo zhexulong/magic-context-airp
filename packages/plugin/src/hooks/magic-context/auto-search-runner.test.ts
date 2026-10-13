@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as embedding from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
-import * as searchModule from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { _resetAutoSearchCache, runAutoSearchHint } from "./auto-search-runner";
+import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
+import * as searchModule from "./auto-search-worker-client";
 import type { MessageLike } from "./transform-operations";
 
 function makeUserMsg(id: string, text: string): MessageLike {
@@ -26,6 +28,7 @@ function findUserPromptText(msg: MessageLike): string {
 }
 
 describe("auto-search-runner", () => {
+    let snapshotSpy: ReturnType<typeof spyOn<typeof embedding, "getProjectEmbeddingSnapshot">>;
     let db: Database;
     const baseOptions = {
         enabled: true,
@@ -38,6 +41,9 @@ describe("auto-search-runner", () => {
     };
 
     beforeEach(() => {
+        snapshotSpy = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(
+            autoSearchTestSnapshot(baseOptions.projectPath),
+        );
         db = new Database(":memory:");
         initializeDatabase(db);
         runMigrations(db);
@@ -46,11 +52,12 @@ describe("auto-search-runner", () => {
 
     afterEach(() => {
         _resetAutoSearchCache();
+        snapshotSpy.mockRestore();
         closeQuietly(db);
     });
 
     test("caches no-hint decision on empty results so defer passes don't re-search", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [
                 makeUserMsg("u1", "please explain how the historian decides when to run"),
@@ -82,8 +89,49 @@ describe("auto-search-runner", () => {
         }
     });
 
+    test("cold preparation is deferred and its late continuation never searches the skipped turn", async () => {
+        snapshotSpy.mockReturnValue(null);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
+        let release: (() => void) | undefined;
+        const preparation = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const messages = [makeUserMsg("u1", "What's the current status ?")];
+        const before = JSON.stringify(messages);
+        let watchdog: ReturnType<typeof setTimeout> | undefined;
+        const pass = runAutoSearchHint({
+            sessionId: "s1",
+            db,
+            messages,
+            options: {
+                ...baseOptions,
+                directory: "/copied-project",
+                ensureProjectRegistered: () => preparation,
+            },
+        });
+        try {
+            const outcome = await Promise.race([
+                pass,
+                new Promise<string>((resolve) => {
+                    watchdog = setTimeout(() => resolve("watchdog"), 3500);
+                }),
+            ]);
+            expect(outcome).toEqual({ ok: true });
+            expect(JSON.stringify(messages)).toBe(before);
+            release?.();
+            await pass;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(spy).toHaveBeenCalledTimes(0);
+        } finally {
+            release?.();
+            await pass;
+            if (watchdog) clearTimeout(watchdog);
+            spy.mockRestore();
+        }
+    }, 6000);
+
     test("excludes Primers from transform-time auto-search hints", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [
                 makeUserMsg(
@@ -107,10 +155,10 @@ describe("auto-search-runner", () => {
     });
 
     test("caches no-hint decision on below-threshold score", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async () =>
                 [{ source: "memory", score: 0.4, id: 1, text: "x" }] as unknown as Awaited<
-                    ReturnType<typeof searchModule.unifiedSearch>
+                    ReturnType<typeof searchModule.searchAutoHint>
                 >,
         );
         try {
@@ -140,8 +188,9 @@ describe("auto-search-runner", () => {
 
     test("timeout path: returns without hanging transform and does NOT inject a hint", async () => {
         // Hanging search: never resolves.
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-            () => new Promise(() => {}) as unknown as ReturnType<typeof searchModule.unifiedSearch>,
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
+            () =>
+                new Promise(() => {}) as unknown as ReturnType<typeof searchModule.searchAutoHint>,
         );
         try {
             const messages: MessageLike[] = [
@@ -167,18 +216,15 @@ describe("auto-search-runner", () => {
             // Timeout must not inject a hint into the user message.
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
 
-            // Timeout is RETRYABLE: it does NOT persist a permanent no-hint
-            // decision, so a later pass (with the user message still at the tail)
-            // re-attempts the search rather than being suppressed forever. The
-            // live-tail gate (user message must be the last element) is what bounds
-            // re-search to new-turn passes, not a cached no-hint decision.
+            // A served timeout skip is sticky. Adding a hint on a later pass of
+            // the same tail turn would rewrite bytes already sent to the provider.
             await runAutoSearchHint({
                 sessionId: "s1",
                 db,
                 messages,
                 options: baseOptions,
             });
-            expect(spy).toHaveBeenCalledTimes(2);
+            expect(spy).toHaveBeenCalledTimes(1);
             expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
         } finally {
             spy.mockRestore();
@@ -187,7 +233,7 @@ describe("auto-search-runner", () => {
 
     test("strips magic-context tag prefix, temporal markers, and system-reminder content before search", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -242,7 +288,7 @@ describe("auto-search-runner", () => {
      */
     test("strips nested system-reminders without leaking the outer reminder's tail or close tag", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -290,7 +336,7 @@ describe("auto-search-runner", () => {
 
     test("strips orphan system-reminder close tag (malformed input) without leaving it in the prompt", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -321,7 +367,7 @@ describe("auto-search-runner", () => {
 
     test("strips arbitrary XML/HTML tags and HTML comments (generic, not allowlisted) before embedding", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -374,7 +420,7 @@ describe("auto-search-runner", () => {
 
     test("preserves canonical whitespace bytes while sanitizing adversarial multi-part prompts", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -413,7 +459,7 @@ describe("auto-search-runner", () => {
 
     test("strips week-format temporal markers (+Xw / +Xw Yd) before embedding", async () => {
         let capturedPrompt = "";
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _s, _p, prompt) => {
                 capturedPrompt = prompt;
                 return [];
@@ -444,7 +490,7 @@ describe("auto-search-runner", () => {
     });
 
     test("skips suppressed context (existing augmentation) without running search", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [
                 makeUserMsg(
@@ -487,12 +533,12 @@ describe("auto-search-runner", () => {
 
     test("timeout triggers AbortSignal so underlying search can cancel in-flight work", async () => {
         let capturedSignal: AbortSignal | undefined;
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             (_db, _s, _p, _prompt, options) => {
                 capturedSignal = (options as { signal?: AbortSignal } | undefined)?.signal;
                 // Hang forever — simulates a stuck embedding fetch.
                 return new Promise(() => {}) as unknown as ReturnType<
-                    typeof searchModule.unifiedSearch
+                    typeof searchModule.searchAutoHint
                 >;
             },
         );
@@ -517,7 +563,7 @@ describe("auto-search-runner", () => {
     }, 10_000);
 
     test("caches skip when prompt is shorter than minPromptChars", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             const messages: MessageLike[] = [makeUserMsg("u1", "short")];
 
@@ -542,7 +588,7 @@ describe("auto-search-runner", () => {
     });
 
     test("skips ignored plugin-internal messages — does not embed announcements/warnings", async () => {
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(async () => []);
         try {
             // Mimic the startup announcement (or any sendIgnoredMessage payload) —
             // text part with `ignored: true`. These are persisted as ordinary
@@ -575,7 +621,7 @@ describe("auto-search-runner", () => {
 
     test("ignored part next to a real user message: real prompt embedded, ignored text excluded", async () => {
         let capturedQuery: string | undefined;
-        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+        const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
             async (_db, _sessionId, _projectPath, query) => {
                 capturedQuery = query as string;
                 return [];

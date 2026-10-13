@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getMagicContextLogPath } from "./data-path";
 import { sanitizeConfigValue, sanitizeDiagnosticText } from "./redaction";
+import { stalePluginBuildDiagnostic } from "./stale-plugin-build";
 
 const isTestEnv = process.env.NODE_ENV === "test";
 
@@ -189,9 +190,43 @@ function scheduleFlush(): void {
     }, FLUSH_INTERVAL_MS);
 }
 
-export function log(message: string, data?: unknown): void {
+// Set inside a worker thread so its lines reach the main thread's log file. The
+// log path depends on which host (OpenCode or Pi) the main thread registered,
+// and only the main thread's buffer and flush timer write that file.
+let lineForwarder: ((line: string) => void) | null = null;
+
+/**
+ * Hand every formatted log line to `forward` instead of this thread's buffer.
+ * Pass null to log locally again.
+ */
+export function setLogLineForwarder(forward: ((line: string) => void) | null): void {
+    lineForwarder = forward;
+}
+
+/** Append a line formatted by `log` on another thread, keeping its timestamp. */
+export function writeForwardedLogLine(line: string): void {
     if (isTestEnv) return;
     try {
+        buffer.push(line);
+        bufferedBytes += Buffer.byteLength(line);
+        boundBuffer();
+        if (buffer.length >= BUFFER_SIZE_LIMIT) flush();
+        else scheduleFlush();
+    } catch {
+        // Intentional: logging must never throw
+    }
+}
+
+export function log(message: string, data?: unknown): void {
+    try {
+        let diagnostic = stalePluginBuildDiagnostic(data);
+        if (diagnostic === undefined) diagnostic = stalePluginBuildDiagnostic(message);
+        if (diagnostic === null) return;
+        if (diagnostic !== undefined) {
+            message = diagnostic;
+            data = undefined;
+        }
+        if (isTestEnv) return;
         const timestamp = new Date().toISOString();
         const serialized =
             data === undefined
@@ -202,6 +237,10 @@ export function log(message: string, data?: unknown): void {
                     )}`
                   : ` ${JSON.stringify(sanitizeConfigValue(data))}`;
         const line = `[${timestamp}] ${sanitizeDiagnosticText(message)}${serialized}\n`;
+        if (lineForwarder) {
+            lineForwarder(line);
+            return;
+        }
         buffer.push(line);
         bufferedBytes += Buffer.byteLength(line);
         boundBuffer();

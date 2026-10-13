@@ -16,6 +16,7 @@ import { Database } from "bun:sqlite";
  * | accounted_hard_epoch | yes | matched HARD/m0 pass records a project, render, or session epoch change |
  * | accounted_hard_pressure_refold | yes | matched HARD/m0 pass records materialize_reason=pressure_refold |
  * | accounted_hard_fold | yes | matched pass records another materialized HARD/m0 fold; tiny mid-history defer/first_render seams are excluded |
+ * | accounted_tag_identity_repair | yes | matched pass records materialize_reason=tag_identity_repair (Pi kept the newest of two tag numbers for one call or message and rebuilt once) |
  * | accounted_ctx_reduce | yes | matched pass applies drops at an agent ctx_reduce landing |
  * | accounted_drop_applied | yes | matched pass records applied drops |
  * | accounted_soft_m1_execute | yes | matched canonical execute pass refreshes m1 |
@@ -33,11 +34,16 @@ import { Database } from "bun:sqlite";
  * high-urgency registry peer message through prefrontal-core's agent.deliver op.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { type ManagedCallOptions, SubcClient } from "@cortexkit/subc-client";
 
+import { loadPluginConfig } from "../src/config";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../src/shared/storage-permissions";
 import { resolveOpenCodeDbPath } from "../src/shared/opencode-db-path";
 import { analyzeOpenCodeCacheBustSession } from "./analyze-cache-busts";
 import {
@@ -122,6 +128,8 @@ export interface AgentDeliverRequest {
         from_session_id: "health-sentinel-mc";
         from_harness: "magic-context";
         content: string;
+        /** The sender is a script with no session, so replies cannot reach it. */
+        one_way: true;
     };
     urgency: "high";
     expected_residence_epoch?: number;
@@ -308,10 +316,7 @@ export function loadSentinelState(path: string): CacheBustSentinelState {
 }
 
 export function saveSentinelState(path: string, state: CacheBustSentinelState): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function parsePositiveInteger(value: string | undefined, flag: string): number {
@@ -587,7 +592,36 @@ export function loadSessionDecisions(
             .query("SELECT * FROM mc_pass_trace WHERE session_id = ?")
             .all(session.sessionId) as Array<Record<string, unknown>>;
         addRows(rows, source);
-        for (const row of rows) {
+        if (rows.length === 0) return;
+        // Store migration 63 moved the histories into ring rows and dropped the array columns;
+        // its read-only view rebuilds each session's arrays in sequence order. Older stores
+        // still carry the columns on the trace row itself.
+        const ringView = Boolean(
+            db
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'mc_pass_trace_history_arrays'",
+                )
+                .get(),
+        );
+        const histories = ringView
+            ? (db
+                  .query(
+                      "SELECT scheduler_history, scheduler_interesting_history FROM mc_pass_trace_history_arrays WHERE session_id = ?",
+                  )
+                  .all(session.sessionId) as Array<Record<string, unknown>>)
+            : rows.filter(
+                  (row) =>
+                      typeof row.scheduler_history === "string" ||
+                      typeof row.scheduler_interesting_history === "string",
+              );
+        if (histories.length === 0) {
+            // Reading zero decisions here would look like a quiet session, not a schema the
+            // sentinel no longer understands.
+            throw new CacheBustSentinelInputError(
+                `${source} has a trace row for ${session.sessionId} but neither ring-row histories nor history columns`,
+            );
+        }
+        for (const row of histories) {
             for (const column of ["scheduler_history", "scheduler_interesting_history"] as const) {
                 if (typeof row[column] !== "string") continue;
                 try {
@@ -876,6 +910,7 @@ export function agentDeliverRequest(
             from_session_id: SENTINEL_FROM_SESSION_ID,
             from_harness: SENTINEL_FROM_HARNESS,
             content: `${event.session_id}: cache bust detected in directory ${event.directory} at ${event.payload.at}; rewritten_tokens=${event.payload.rewritten_tokens}; divergence_class=${event.payload.divergence_class}; first_divergence=${event.payload.first_divergence}${event.payload.identity_delta ? `; identity_delta=${event.payload.identity_delta.join(",")}` : ""}; analyzer_cmd=${event.payload.analyzer_cmd}`,
+            one_way: true,
         },
         urgency: "high",
     };
@@ -1116,6 +1151,19 @@ export async function runSentinelOnce(
             const windows = groupBustWindows(requests, sessionState.openWindow);
             counters.bustWindows += windows.length;
             for (const window of windows) {
+                for (const row of window.rows) {
+                    if (row.divergenceClass !== "tail_shrink_no_rewrite") continue;
+                    stderr(
+                        JSON.stringify({
+                            kind: "cache_bust_sentinel_observation",
+                            session_id: row.session,
+                            at: row.at,
+                            divergence_class: row.divergenceClass,
+                            rewritten_tokens: Math.max(0, row.rewrittenTokens ?? 0),
+                            first_divergence: row.firstDivergence,
+                        }),
+                    );
+                }
                 const hasUnaccounted = window.rows.some((row) =>
                     isUnaccountedCacheBustClass(row.divergenceClass as string),
                 );
@@ -1223,6 +1271,9 @@ export async function runSentinelOnce(
 }
 
 async function main(): Promise<void> {
+    setStoragePrivatePermissionEnforcement(
+        loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+    );
     const options = parseSentinelArgs(process.argv);
     await runSentinelOnce(options);
     while (!options.once) {

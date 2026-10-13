@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
@@ -67,7 +67,7 @@ import {
     UnsupportedSchemaVersionError,
 } from "../lib/database-access";
 import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
-import { collectDiagnostics } from "../lib/diagnostics-opencode";
+import { collectDiagnostics, type DiagnosticReport } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
@@ -87,6 +87,7 @@ import {
     selectOpenCodeStoreHost,
 } from "../lib/opencode-helpers";
 import {
+    describeUnusedOpenCodePluginCache,
     getOpenCodePluginCacheRoots,
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
@@ -106,7 +107,6 @@ import {
     readStorageVersions,
 } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
-import { reportAuthorityMarkers } from "./doctor-authority";
 import {
     compareCachedPluginFences,
     listCachedOpenCodePluginFences,
@@ -119,24 +119,31 @@ import {
     formatOpenCodeV2MissingMarkerNotice,
 } from "./doctor-compaction-markers";
 import {
-    formatDanglingCompartmentBoundary,
+    formatDanglingCompartmentBoundaryDetails,
+    formatDanglingCompartmentBoundaryHeadline,
     listDanglingCompartmentBoundaries,
 } from "./doctor-compartment-boundaries";
 import { reportUnresolvedHarnessRelabel } from "./doctor-harness-relabel";
-import { cleanupRetiredHiddenChildren } from "./doctor-hidden-children";
-import { clearPluginCache } from "./doctor-opencode-cache";
+import {
+    clearPluginCache,
+    type OpenCodePluginConfigUse,
+    readOpenCodePluginConfigUse,
+} from "./doctor-opencode-cache";
 import { checkPluginDuplicates } from "./doctor-opencode-plugin-duplicates";
 import {
     checkOpenCodePluginEntry,
+    isOpenCodePluginRegistered,
     isPinnedOpenCodePluginSpecifier,
     withPluginEntrySpecifier,
 } from "./doctor-opencode-plugin-entry";
 import {
     checkOpenCodeV2PluginCache,
+    compareSemverPrecedence,
     configuredOpenCodeV2DistTag,
     openCodeHostDatabaseFiles,
     reportOpenCodeV2PluginCache,
 } from "./doctor-opencode2-cache";
+import { runDiscoveryDoctorCheck } from "./doctor-prune-discovery";
 import {
     countPendingCoordinateRebases,
     formatPendingCoordinateRebases,
@@ -144,6 +151,7 @@ import {
     listUnresolvedCompartments,
     supportsCoordinateGenerationReporting,
 } from "./doctor-store-generation";
+import { removeDeprecatedReasoningAge } from "./reasoning-config-migration";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
 
@@ -570,18 +578,13 @@ export function collectNpmReleaseAgeWarnings(): string[] {
 }
 
 /** Compare semver-like strings. Returns -1 if a<b, 0 if equal, 1 if a>b. */
-function compareVersions(a: string, b: string): number {
-    const pa = a.split(/[.-]/).map((s) => Number.parseInt(s, 10));
-    const pb = b.split(/[.-]/).map((s) => Number.parseInt(s, 10));
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const x = pa[i] ?? 0;
-        const y = pb[i] ?? 0;
-        if (Number.isNaN(x) || Number.isNaN(y)) return 0;
-        if (x < y) return -1;
-        if (x > y) return 1;
-    }
-    return 0;
+/**
+ * Semver precedence of the CLI version against npm's: a prerelease ranks
+ * below its release, so a beta CLI is reported as behind the matching
+ * release. Null when either version is not semver.
+ */
+export function compareVersions(a: string, b: string): number | null {
+    return compareSemverPrecedence(a, b);
 }
 
 // ── Issue flow ──────────────────────────────────────────────────────
@@ -606,7 +609,33 @@ function openBrowser(url: string): void {
     }
 }
 
-async function runIssueFlow(): Promise<number> {
+export async function runIssueFlow(
+    options: { reportPath?: string } = {},
+    deps: { collectDiagnostics: () => Promise<DiagnosticReport> } = { collectDiagnostics },
+): Promise<number> {
+    if (options.reportPath) {
+        // Scripted runs (CI, bug templates) need a report without prompts.
+        try {
+            const report = await deps.collectDiagnostics();
+            const bundled = await bundleIssueReport(
+                report,
+                "Generated non-interactively by `doctor --issue --report`.",
+                "Magic Context diagnostic report",
+                null,
+                { outputPath: resolve(process.cwd(), options.reportPath) },
+            );
+            log.info(
+                bundled.fullPath
+                    ? `Report written to ${bundled.path}; full bundle at ${bundled.fullPath}`
+                    : `Report written to ${bundled.path}`,
+            );
+            return 0;
+        } catch (error) {
+            log.error(error instanceof Error ? error.message : String(error));
+            return 1;
+        }
+    }
+
     intro("Magic Context Issue Report");
 
     const title = await text("Issue title", {
@@ -622,19 +651,19 @@ async function runIssueFlow(): Promise<number> {
     s.start("Collecting diagnostics");
 
     try {
-        const report = await collectDiagnostics();
+        const report = await deps.collectDiagnostics();
         s.stop("Diagnostics collected");
 
         // Ask the user which session this issue relates to. Only show the
         // picker when there's more than one recent session — otherwise the
         // single-session case is unambiguous, and the no-session case
-        // (Node-only run without bun:sqlite) skips filtering entirely.
+        // or unavailable-store case skips filtering entirely.
         let sessionFilter: string | null = null;
-        if (report.recentSessions.length > 1) {
+        if (report.recentSessions.available && report.recentSessions.rows.length > 1) {
             const choice = await selectOne(
                 "Which session is this issue about? (filters log lines from other sessions)",
                 [
-                    ...report.recentSessions.map((session, index) => {
+                    ...report.recentSessions.rows.map((session, index) => {
                         const displayTitle = session.title.trim() || "(no title)";
                         const truncatedTitle =
                             displayTitle.length > 50
@@ -732,7 +761,7 @@ function checkLocalEmbeddingRuntimeForDoctor(runtimePreference: LocalEmbeddingRu
         runtimePreference,
     );
     if (runtime.state === "wasm-selected") {
-        log.info(formatLocalEmbeddingRuntimeWasmSelected(runtime));
+        log.warn(formatLocalEmbeddingRuntimeWasmSelected(runtime));
         return { issues: 0 };
     }
     if (runtime.state === "wasm-fallback") {
@@ -981,13 +1010,48 @@ function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[
     }
 }
 
+export function describeOpenCode2SessionAPIRequirement(hostVersion: string): string {
+    return `OpenCode host ${hostVersion}; Magic Context requires OpenCode 2.0.22 or newer with session.remove and session.compact.`;
+}
+
+export function getOpenCodePluginHostStatus(
+    hostLabel: string,
+    hostVersion: string,
+    installed: boolean,
+): { status: "info" | "fail"; message: string } | null {
+    if (!installed) {
+        return {
+            status: "info",
+            message: `${hostLabel} found; Magic Context is not installed there (run setup to add it)`,
+        };
+    }
+    if (
+        openCodeHostGenerationFromVersion(hostVersion) === "v2" &&
+        compareVersions(hostVersion, "2.0.22") === -1
+    ) {
+        return {
+            status: "fail",
+            message: describeOpenCode2SessionAPIRequirement(hostVersion),
+        };
+    }
+    return null;
+}
+
 export async function runDoctor(
-    options: { force?: boolean; fix?: boolean; issue?: boolean } & V22BackfillCommandArgs = {},
+    options: {
+        force?: boolean;
+        fix?: boolean;
+        issue?: boolean;
+        /** With `issue`, write the report here without prompting. */
+        report?: string;
+        /** Print every row of long listings instead of a capped summary. */
+        verbose?: boolean;
+    } & V22BackfillCommandArgs = {},
 ): Promise<number> {
     migrateConfigLocationsForCli(process.cwd(), log);
 
     if (options.issue) {
-        return runIssueFlow();
+        return runIssueFlow({ reportPath: options.report });
     }
 
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
@@ -1041,16 +1105,15 @@ export async function runDoctor(
     try {
         authorityDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
         if (authorityDb) {
-            await reportAuthorityMarkers({ db: authorityDb, info: log.info, warn });
             // Sessions whose OpenCode harness label the v87 repair could not verify
             // because no OpenCode store was readable when it ran.
             reportUnresolvedHarnessRelabel({ db: authorityDb, warn, detail: log.warn });
         } else {
-            log.info("Authority: no context database found");
+            log.info("Harness relabel: no context database found");
         }
     } catch (error) {
         warn(
-            `Authority check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            `Harness relabel check unavailable: ${error instanceof Error ? error.message : String(error)}`,
         );
     } finally {
         authorityDb?.close();
@@ -1096,6 +1159,25 @@ export async function runDoctor(
     }
 
     const hostGeneration = openCodeHostGenerationFromVersion(activeInstallation.version);
+    const paths = detectConfigPaths();
+    let magicContextInstalled = false;
+    let magicContextStatusKnown = paths.opencodeConfigFormat === "none";
+    if (!magicContextStatusKnown) {
+        try {
+            const config = parse(readFileSync(paths.opencodeConfig, "utf-8")) as Record<
+                string,
+                unknown
+            >;
+            magicContextInstalled = isOpenCodePluginRegistered(
+                config,
+                dirname(paths.opencodeConfig),
+            );
+            magicContextStatusKnown = true;
+        } catch {
+            // An unreadable config cannot establish that the plugin is absent.
+            // Keep store failures visible until registration can be determined.
+        }
+    }
     // Plugin registration follows the active (PATH) install; store checks follow the
     // OpenCode 2 CLI when one is installed beside an OpenCode 1 that PATH resolves
     // first, because that is the host converting and serving the store.
@@ -1122,24 +1204,13 @@ export async function runDoctor(
     }
     const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(openCodeDbResolution);
     if (openCodeDbCheck.ok) pass(openCodeDbCheck.message);
-    else fail(openCodeDbCheck.message);
+    else if (magicContextStatusKnown && !magicContextInstalled) {
+        log.info(
+            "OpenCode session database not yet created (will be created on first OpenCode session)",
+        );
+    } else fail(openCodeDbCheck.message);
 
     if (openCodeDbCheck.ok) {
-        if (storeGeneration === "v2") {
-            try {
-                const cleanup = await cleanupRetiredHiddenChildren({
-                    contextDbPath: authorityDbPath,
-                    hostDbPath: openCodeDbResolution.path,
-                    fix: options.fix,
-                    report: (line) => log.info(line),
-                });
-                fixed += cleanup.deleted;
-            } catch (error) {
-                fail(
-                    `Retired hidden-child cleanup refused: ${error instanceof Error ? error.message : String(error)}`,
-                );
-            }
-        }
         let markerDb: Database | null = null;
         try {
             markerDb = new Database(openCodeDbResolution.path, {
@@ -1160,7 +1231,9 @@ export async function runDoctor(
             } else if (report.migrationCompleted) {
                 // The backfill only matters for a conversion that has not run yet; this
                 // store's conversion is finished and will not run again on its own.
-                log.info(`${summary}; OpenCode 2 already converted this store`);
+                log.info(
+                    `${summary}; OpenCode 2 already converted this store, so these markers no longer matter (informational, no action needed)`,
+                );
             } else {
                 warn(`${summary}; run \`magic-context doctor --fix\` before upgrading OpenCode`);
             }
@@ -1204,16 +1277,18 @@ export async function runDoctor(
                     // never completed, so a compartment anchored there loses its id.
                     // Magic Context places such a compartment from its neighbours; one
                     // it cannot place is reported by the unresolved-compartment check.
-                    log.info(
-                        `${dangling.length} compartment(s) point at OpenCode message ids that are not in the OpenCode 2 store. Magic Context places these from the neighbouring compartments; any it cannot place are listed as excluded from range recovery below.`,
-                    );
-                    for (const boundary of dangling) {
-                        log.info(`  ${formatDanglingCompartmentBoundary(boundary)}`);
+                    log.info(formatDanglingCompartmentBoundaryHeadline(dangling, "opencode2"));
+                    for (const line of formatDanglingCompartmentBoundaryDetails(dangling, {
+                        verbose: options.verbose,
+                    })) {
+                        log.info(`  ${line}`);
                     }
                 } else {
-                    warn(`${dangling.length} compartment(s) have dangling OpenCode boundary ids`);
-                    for (const boundary of dangling) {
-                        log.warn(`  ${formatDanglingCompartmentBoundary(boundary)}`);
+                    warn(formatDanglingCompartmentBoundaryHeadline(dangling, "other"));
+                    for (const line of formatDanglingCompartmentBoundaryDetails(dangling, {
+                        verbose: options.verbose,
+                    })) {
+                        log.warn(`  ${line}`);
                     }
                 }
 
@@ -1270,23 +1345,21 @@ export async function runDoctor(
 
     // 1b. CLI vs npm latest
     const selfVersion = getSelfVersion();
-    const [npmLatest, pluginNpmLatest] = await Promise.all([
-        fetchNpmLatest(CLI_PACKAGE_NAME),
-        fetchNpmLatest(PLUGIN_NAME),
-    ]);
+    const npmLatest = await fetchNpmLatest(CLI_PACKAGE_NAME);
+    const cliComparison = npmLatest ? compareVersions(selfVersion, npmLatest) : null;
     if (!npmLatest) {
         log.info(`Magic Context CLI v${selfVersion}; npm latest check unavailable`);
-    } else if (compareVersions(selfVersion, npmLatest) < 0) {
+    } else if (cliComparison === null) {
+        log.info(`Magic Context CLI v${selfVersion}; cannot compare with npm latest v${npmLatest}`);
+    } else if (cliComparison < 0) {
         warn(`Magic Context CLI v${selfVersion} is older than npm latest v${npmLatest}`);
     } else {
         pass(`Magic Context CLI v${selfVersion} is current (npm latest v${npmLatest})`);
     }
 
     // 2. Check config paths exist
-    const paths = detectConfigPaths();
-
     if (paths.opencodeConfigFormat === "none") {
-        fail(`No opencode.json found at ${paths.opencodeConfig}`);
+        magicContextStatusKnown = true;
     } else {
         pass(`OpenCode config: ${paths.opencodeConfig}`);
     }
@@ -1387,6 +1460,12 @@ export async function runDoctor(
                 fixed++;
             }
 
+            const reasoningMessages = removeDeprecatedReasoningAge(mcConfig);
+            if (reasoningMessages.length > 0) {
+                mcChanged = true;
+                fixed++;
+                for (const message of reasoningMessages) log.success(message);
+            }
             // Remove deprecated auto_drop_tool_age / drop_tool_structure — Phase 2
             // replaced need-blind routine tool drops with the tiered target-headroom
             // emergency drop (always full-drop), so both knobs are gone from the
@@ -1558,14 +1637,22 @@ export async function runDoctor(
             }
 
             if (mcChanged) {
-                writeFileAtomic(paths.magicContextConfig, `${stringify(mcConfig, null, 2)}\n`);
+                writeFileAtomic(paths.magicContextConfig, `${stringify(mcConfig, null, 2)}\n`, {
+                    ownerOnly: true,
+                });
             }
         } catch {
             log.warn("Could not migrate deprecated config keys in magic-context.jsonc");
         }
     }
 
-    // 4. Check plugin is in opencode.json
+    // 4. Check whether the plugin is registered before running install checks.
+    const openCodeHostLabel =
+        activeInstallation.kind === "desktop"
+            ? "OpenCode Desktop"
+            : activeInstallation.version === "unknown"
+              ? "OpenCode"
+              : `OpenCode ${activeInstallation.version}`;
     const reportedAutoUpdateStalls = new Set<string>();
     const reportAutoUpdateStall = (specifier: string): void => {
         const message = describeAutoUpdateStall(specifier, autoUpdateEnabled);
@@ -1579,121 +1666,153 @@ export async function runDoctor(
             const config = parse(raw) as Record<string, unknown>;
             const configName =
                 paths.opencodeConfigFormat === "jsonc" ? "opencode.jsonc" : "opencode.json";
-            // Duplicates first, so the single-entry checks below see the
-            // deduplicated config when --fix removed the extra entries.
-            if (
-                checkPluginDuplicates(config, configName, options, {
-                    warn,
-                    pass: (message) => {
-                        pass(message);
-                        fixed++;
-                    },
-                    info: (message) => log.info(message),
-                })
-            ) {
-                writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
-            }
-            // OpenCode 2 loads the legacy `plugin` array and its native `plugins`
-            // array together, so an entry under either key is a live registration
-            // and a fresh entry must go under the running host's own key.
-            const allEntries = readPluginEntries(config);
-            if (
-                allEntries.some(
-                    ({ entry }) =>
-                        isLocalPathPluginEntry(entry) &&
-                        String(entry).includes("magic-context") &&
-                        !isDevPathPluginEntry(entry),
-                )
-            ) {
-                warn(
-                    "An unverifiable local OpenCode plugin path was ignored because its package name is not Magic Context",
-                );
-            }
-            // String, tuple and OpenCode 2 `{ package, options }` entries are all
-            // read, and a rewrite keeps the entry's shape and options.
-            if (
-                checkOpenCodePluginEntry(
-                    config,
-                    configName,
-                    { force: options.force, registrationKey: pluginConfigKeyFor(hostGeneration) },
-                    {
-                        pass,
-                        warn,
-                        fixed: (message) => {
-                            pass(message);
-                            fixed++;
+            // Relative checkout paths resolve against the config file's directory.
+            const configDir = dirname(paths.opencodeConfig);
+            magicContextInstalled = isOpenCodePluginRegistered(config, configDir);
+            magicContextStatusKnown = true;
+            if (magicContextInstalled) {
+                // Duplicates first, so the single-entry checks below see the
+                // deduplicated config when --fix removed the extra entries.
+                if (
+                    checkPluginDuplicates(
+                        config,
+                        configName,
+                        { fix: options.fix, configDir },
+                        {
+                            warn,
+                            pass: (message) => {
+                                pass(message);
+                                fixed++;
+                            },
+                            info: (message) => log.info(message),
                         },
-                        autoUpdateStall: reportAutoUpdateStall,
-                    },
-                )
-            ) {
-                writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
+                    )
+                ) {
+                    writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
+                }
+                // OpenCode 2 loads both plugin arrays. A registration in either is
+                // present, and repairs preserve the existing entry shape/options.
+                const allEntries = readPluginEntries(config);
+                if (
+                    allEntries.some(
+                        ({ entry }) =>
+                            isLocalPathPluginEntry(entry) &&
+                            String(entry).includes("magic-context") &&
+                            !isDevPathPluginEntry(entry, configDir),
+                    )
+                ) {
+                    warn(
+                        "An unverifiable local OpenCode plugin path was ignored because its package name is not Magic Context",
+                    );
+                }
+                if (
+                    checkOpenCodePluginEntry(
+                        config,
+                        configName,
+                        {
+                            force: options.force,
+                            registrationKey: pluginConfigKeyFor(hostGeneration),
+                            configDir,
+                        },
+                        {
+                            pass,
+                            warn,
+                            fixed: (message) => {
+                                pass(message);
+                                fixed++;
+                            },
+                            autoUpdateStall: reportAutoUpdateStall,
+                        },
+                    )
+                ) {
+                    writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
+                }
             }
         } catch {
             warn("Could not parse opencode config to verify plugin entry");
         }
+    } else {
+        magicContextStatusKnown = true;
     }
 
+    // When the config can't be read, whether Magic Context is registered is
+    // unknown. Run the install checks rather than silently skipping them.
+    if (!magicContextStatusKnown) magicContextInstalled = true;
+    const hostPluginStatus = magicContextStatusKnown
+        ? getOpenCodePluginHostStatus(
+              openCodeHostLabel,
+              activeInstallation.version,
+              magicContextInstalled,
+          )
+        : null;
+    if (hostPluginStatus?.status === "info") log.info(hostPluginStatus.message);
+    else if (hostPluginStatus?.status === "fail") fail(hostPluginStatus.message);
+    else if (magicContextInstalled && hostGeneration === "v2") {
+        log.info(describeOpenCode2SessionAPIRequirement(activeInstallation.version));
+    }
+    const pluginNpmLatest = magicContextInstalled ? await fetchNpmLatest(PLUGIN_NAME) : null;
+
     // 5. Check for conflicts
-    // The resolved MC compaction mode is threaded in explicitly via the same
-    // loader + accessor the plugin boot uses. On load failure the helper takes
-    // the preserve-existing-native-fields branch (returns false) and emits a
-    // diagnostic, so doctor never assumes either mode.
-    const cwd = process.cwd();
-    const compactionEnabled = resolveCompactionEnabledForDoctor();
-    const conflictResult = detectConflicts(cwd, { compactionEnabled });
+    if (magicContextInstalled) {
+        // The resolved MC compaction mode is threaded in explicitly via the same
+        // loader + accessor the plugin boot uses. On load failure the helper takes
+        // the preserve-existing-native-fields branch (returns false) and emits a
+        // diagnostic, so doctor never assumes either mode.
+        const cwd = process.cwd();
+        const compactionEnabled = resolveCompactionEnabledForDoctor();
+        const conflictResult = detectConflicts(cwd, { compactionEnabled });
 
-    // Doctor has no OpenCode server handle, so it uses the file-based
-    // compaction check (the same one the plugin falls back to when its
-    // resolved-config fetch fails). Name the arm so a #309-shaped report tells
-    // us which check produced the verdict — the running server's resolved
-    // config may differ from what the file reader sees.
-    log.info(
-        "Compaction check: file-based; the running server's resolved config may differ — `opencode debug config` is authoritative",
-    );
+        // Doctor has no OpenCode server handle, so it uses the file-based
+        // compaction check (the same one the plugin falls back to when its
+        // resolved-config fetch fails). Name the check in reports because the
+        // running server's resolved config may differ from what the file reader sees.
+        log.info(
+            "Compaction check: file-based; the running server's resolved config may differ — `opencode debug config` is authoritative",
+        );
 
-    if (conflictResult.hasConflict) {
-        for (const reason of conflictResult.reasons) {
-            fail(`Conflict: ${reason}`);
-        }
-        // Auto-fix conflicts. In compaction-off mode the fixer skips native
-        // compaction fields (compaction.auto/prune) — it may report, never
-        // repair, native compaction fields in that mode. DCP and OMO hook
-        // fixes keep their existing policy in BOTH modes.
-        const actions = fixConflicts(cwd, conflictResult.conflicts, { compactionEnabled });
-        for (const action of actions) {
-            pass(`Fixed: ${action}`);
-            fixed++;
-        }
-        if (actions.length > 0) {
-            warn("Restart OpenCode for conflict fixes to take effect");
-        }
-    } else {
-        // Honest compaction state label in both modes. When MC compaction is
-        // OFF, native compaction.auto=true is the intended state (native
-        // compaction active), not a conflict; when auto=false as well, nothing
-        // manages the window (no-manager configuration) — report it plainly.
-        if (!compactionEnabled) {
-            if (conflictResult.nativeCompaction.auto || conflictResult.nativeCompaction.prune) {
-                pass(
-                    "No conflicts detected (compaction, DCP, OMO hooks) — native compaction active (compaction-off mode)",
-                );
-            } else {
-                warn(
-                    "No compaction manager is active: Magic Context compaction is off and OpenCode auto-compaction is disabled",
-                );
+        if (conflictResult.hasConflict) {
+            for (const reason of conflictResult.reasons) {
+                fail(`Conflict: ${reason}`);
+            }
+            // Auto-fix conflicts. In compaction-off mode the fixer skips native
+            // compaction fields (compaction.auto/prune) — it may report, never
+            // repair, native compaction fields in that mode. DCP and OMO hook
+            // fixes keep their existing policy in BOTH modes.
+            const actions = fixConflicts(cwd, conflictResult.conflicts, { compactionEnabled });
+            for (const action of actions) {
+                pass(`Fixed: ${action}`);
+                fixed++;
+            }
+            if (actions.length > 0) {
+                warn("Restart OpenCode for conflict fixes to take effect");
             }
         } else {
-            pass("No conflicts detected (compaction, DCP, OMO hooks)");
+            // Honest compaction state label in both modes. When MC compaction is
+            // OFF, native compaction.auto=true is the intended state (native
+            // compaction active), not a conflict; when auto=false as well, nothing
+            // manages the window (no-manager configuration) — report it plainly.
+            if (!compactionEnabled) {
+                if (conflictResult.nativeCompaction.auto || conflictResult.nativeCompaction.prune) {
+                    pass(
+                        "No conflicts detected (compaction, DCP, OMO hooks) — native compaction active (compaction-off mode)",
+                    );
+                } else {
+                    warn(
+                        "No compaction manager is active: Magic Context compaction is off and OpenCode auto-compaction is disabled",
+                    );
+                }
+            } else {
+                pass("No conflicts detected (compaction, DCP, OMO hooks)");
+            }
         }
     }
 
     // 6. Check tui.json. OpenCode 2 loads the sidebar from the plugin entry itself
     // (its host resolves a `tui` entrypoint next to `server`), so tui.json is a
     // 1.x-only surface and writing it on a 2.x host would register nothing.
-    if (hostGeneration === "v2") {
+    if (magicContextInstalled && hostGeneration === "v2") {
         pass("TUI sidebar loads from the plugin entry on OpenCode 2 (tui.json not used)");
-    } else {
+    } else if (magicContextInstalled) {
         const tuiAdded = ensureTuiPluginEntry();
         if (tuiAdded) {
             pass("Added TUI sidebar plugin to tui.json");
@@ -1705,19 +1824,21 @@ export async function runDoctor(
             try {
                 const tuiRaw = readFileSync(paths.tuiConfig, "utf-8");
                 const tuiConfig = parse(tuiRaw) as Record<string, unknown>;
+                const tuiConfigDir = dirname(paths.tuiConfig);
                 const tuiRawPlugins: unknown[] = Array.isArray(tuiConfig?.plugin)
                     ? tuiConfig.plugin
                     : [];
                 const tuiIdx = tuiRawPlugins.findIndex(
                     (entry) =>
-                        matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
+                        matchesPluginEntry(entry, PLUGIN_NAME) ||
+                        isDevPathPluginEntry(entry, tuiConfigDir),
                 );
                 if (
                     tuiRawPlugins.some(
                         (entry) =>
                             isLocalPathPluginEntry(entry) &&
                             String(entry).includes("magic-context") &&
-                            !isDevPathPluginEntry(entry),
+                            !isDevPathPluginEntry(entry, tuiConfigDir),
                     )
                 ) {
                     warn(
@@ -1727,7 +1848,7 @@ export async function runDoctor(
                 if (tuiIdx >= 0) {
                     const tuiEntry = tuiRawPlugins[tuiIdx];
                     const tuiEntryStr = pluginEntryPackage(tuiEntry) ?? "";
-                    if (isDevPathPluginEntry(tuiEntry)) {
+                    if (isDevPathPluginEntry(tuiEntry, tuiConfigDir)) {
                         pass(`TUI sidebar plugin configured (dev path: ${tuiEntryStr})`);
                     } else {
                         const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
@@ -1895,85 +2016,156 @@ export async function runDoctor(
         }
     }
 
-    // 8. Check plugin npm cache — clear only if outdated
-    const cacheResult = await clearPluginCache({
-        force: options.force,
-        latestVersion: pluginNpmLatest,
-    });
-    if (cacheResult.action === "cleared") {
-        const versionInfo = cacheResult.cached
-            ? ` (cached: ${cacheResult.cached}${cacheResult.latest ? `, latest: ${cacheResult.latest}` : ""})`
-            : "";
-        const reason = cacheResult.latest
-            ? "outdated plugin cache"
-            : "plugin cache (latest version check unavailable)";
-        pass(`Cleared ${reason}${versionInfo} — latest will download on restart`);
-        log.info(`  ${cacheResult.path}`);
-        fixed++;
-    } else if (cacheResult.action === "up_to_date") {
-        pass(`Plugin cache up to date (v${cacheResult.cached})`);
-    } else if (cacheResult.action === "check_unavailable") {
+    // 7d. RPC discovery records. Inspection removes records proven stale; any
+    // left unresolved block offline maintenance such as merge-identities, so
+    // they count as an issue instead of passing silently. --fix also removes
+    // empty discovery directories.
+    try {
+        if (
+            runDiscoveryDoctorCheck(
+                storage.path,
+                { fix: options.fix },
+                { pass, warn, info: (message) => log.info(message) },
+            )
+        ) {
+            issues++;
+        }
+    } catch (error) {
         warn(
-            `Plugin cache version check unavailable; preserving cached plugin${cacheResult.cached ? ` (cached: ${cacheResult.cached})` : ""}. Use doctor --force to reinstall it.`,
+            `RPC discovery check unavailable: ${error instanceof Error ? error.message : String(error)}`,
         );
-    } else if (cacheResult.action === "error") {
-        warn(`Could not clear plugin cache: ${cacheResult.error}`);
-        if (cacheResult.clearedPaths && cacheResult.clearedPaths.length > 0) {
-            log.info(`  Cleared roots: ${cacheResult.clearedPaths.join(", ")}`);
-        }
-        if (cacheResult.failedPaths && cacheResult.failedPaths.length > 0) {
-            log.info(`  Failed roots: ${cacheResult.failedPaths.join(", ")}`);
-        } else {
-            log.info(`  Manually delete: ${cacheResult.path}`);
-        }
         issues++;
-    } else if (hostGeneration !== "v2") {
-        // OpenCode 2 never uses the 1.x `packages/` tree; its own cache is
-        // reported by the next step, so an empty 1.x tree says nothing there.
-        pass("Plugin cache clean (no cached version found)");
     }
 
-    // 8b. OpenCode 2 caches plugins under `npm/<name>@<spec>/<generation>/` and
-    // never replaces an `@latest` install on its own. An entry that follows
-    // another dist-tag (`@beta`, `@next`) loads from that tag's slot, which is
-    // stale against the tag's current version, not against `latest`. The config
-    // is read again here because the entry check above may have rewritten it.
-    let v2DistTag: string | undefined;
-    if (paths.opencodeConfigFormat !== "none") {
-        try {
-            v2DistTag = configuredOpenCodeV2DistTag(
-                parse(readFileSync(paths.opencodeConfig, "utf-8")) as Record<string, unknown>,
-            );
-        } catch {
-            // An unreadable config was already reported; check the `@latest` slot.
+    // 8. Check plugin npm cache — clear only if outdated. A cached copy counts
+    // only when the host's config references that package spec; one the config
+    // never loads (a local checkout or a pinned version) is reported as unused.
+    // The config is read again here because the entry check above may have
+    // rewritten it; an unreadable config leaves every copy counted.
+    if (magicContextInstalled) {
+        let pluginConfigUse: OpenCodePluginConfigUse | undefined;
+        if (paths.opencodeConfigFormat !== "none") {
+            try {
+                pluginConfigUse = readOpenCodePluginConfigUse(
+                    parse(readFileSync(paths.opencodeConfig, "utf-8")) as Record<string, unknown>,
+                    dirname(paths.opencodeConfig),
+                );
+            } catch {
+                // An unreadable config was already reported above.
+            }
         }
-    }
-    const v2Cache = reportOpenCodeV2PluginCache(
-        checkOpenCodeV2PluginCache({
-            fix: options.fix,
+        const cacheResult = await clearPluginCache({
             force: options.force,
-            latestVersion: v2DistTag
-                ? await fetchNpmLatest(PLUGIN_NAME, v2DistTag)
-                : pluginNpmLatest,
-            distTag: v2DistTag,
+            latestVersion: pluginNpmLatest,
             hostFiles: openCodeHostDatabaseFiles([openCodeDbResolution.path]),
-        }),
-        { pass, warn, info: (message) => log.info(message) },
-        { reportMissing: hostGeneration === "v2" },
-    );
-    if (v2Cache.fixed) fixed++;
-    if (v2Cache.issue) issues++;
+            referencedSpecs: pluginConfigUse?.referencedSpecs.opencode1,
+        });
+        if (cacheResult.action === "unused") {
+            log.info(
+                describeUnusedOpenCodePluginCache({
+                    host: "OpenCode 1",
+                    spec: "latest",
+                    cached: cacheResult.cached,
+                    paths: cacheResult.paths ?? [cacheResult.path],
+                    loadedFrom: pluginConfigUse?.loadedFrom.opencode1,
+                }),
+            );
+        } else if (cacheResult.action === "cleared") {
+            const versionInfo = cacheResult.cached
+                ? ` (cached: ${cacheResult.cached}${cacheResult.latest ? `, latest: ${cacheResult.latest}` : ""})`
+                : "";
+            const reason = cacheResult.latest
+                ? "outdated plugin cache"
+                : "plugin cache (latest version check unavailable)";
+            pass(`Cleared ${reason}${versionInfo} — latest will download on restart`);
+            log.info(`  ${cacheResult.path}`);
+            fixed++;
+        } else if (cacheResult.action === "up_to_date") {
+            pass(`Plugin cache up to date (v${cacheResult.cached})`);
+        } else if (cacheResult.action === "check_unavailable") {
+            warn(
+                `Plugin cache version check unavailable; preserving cached plugin${cacheResult.cached ? ` (cached: ${cacheResult.cached})` : ""}. Use doctor --force to reinstall it.`,
+            );
+        } else if (cacheResult.action === "in_use" || cacheResult.action === "in_use_unknown") {
+            const versionInfo = cacheResult.cached
+                ? ` (cached: ${cacheResult.cached}${cacheResult.latest ? `, latest: ${cacheResult.latest}` : ""})`
+                : "";
+            const why =
+                cacheResult.action === "in_use"
+                    ? `OpenCode is running (pid ${cacheResult.pids?.join(", ")})`
+                    : (cacheResult.reason ?? "could not tell whether OpenCode is running");
+            warn(`Plugin cache${versionInfo} was not cleared: ${why}`);
+            log.info("  Quit OpenCode and rerun doctor to clear it.");
+            for (const path of cacheResult.paths ?? [cacheResult.path]) log.info(`  ${path}`);
+            issues++;
+        } else if (cacheResult.action === "error") {
+            warn(`Could not clear plugin cache: ${cacheResult.error}`);
+            if (cacheResult.clearedPaths && cacheResult.clearedPaths.length > 0) {
+                log.info(`  Cleared roots: ${cacheResult.clearedPaths.join(", ")}`);
+            }
+            if (cacheResult.failedPaths && cacheResult.failedPaths.length > 0) {
+                log.info(`  Failed roots: ${cacheResult.failedPaths.join(", ")}`);
+            } else {
+                log.info(`  Manually delete: ${cacheResult.path}`);
+            }
+            issues++;
+        } else if (hostGeneration !== "v2") {
+            // OpenCode 2 never uses the 1.x `packages/` tree; its own cache is
+            // reported by the next step, so an empty 1.x tree says nothing there.
+            pass("Plugin cache clean (no cached version found)");
+        }
 
-    // 8c. OpenCode 1 and OpenCode 2 share context.db but cache Magic Context
-    // separately. Once the newer copy migrates the database, every cached copy
-    // whose compiled schema fence is behind it fails closed in its host. Runs
-    // after the cache steps above so a copy they just removed is not reported.
-    const sharedDbVersion = readContextDbSchemaVersion(dbPath);
-    if (sharedDbVersion !== null) {
-        reportCachedPluginFences(
-            compareCachedPluginFences(listCachedOpenCodePluginFences(), sharedDbVersion),
-            { pass, fail, info: (message) => log.info(message) },
+        // 8b. OpenCode 2 caches plugins under `npm/<name>@<spec>/<generation>/` and
+        // never replaces an `@latest` install on its own. An entry that follows
+        // another dist-tag (`@beta`, `@next`) loads from that tag's slot, which is
+        // stale against the tag's current version, not against `latest`. The config
+        // is read again here because the entry check above may have rewritten it.
+        let v2DistTag: string | undefined;
+        if (paths.opencodeConfigFormat !== "none") {
+            try {
+                v2DistTag = configuredOpenCodeV2DistTag(
+                    parse(readFileSync(paths.opencodeConfig, "utf-8")) as Record<string, unknown>,
+                );
+            } catch {
+                // An unreadable config was already reported; check the `@latest` slot.
+            }
+        }
+        const v2Cache = reportOpenCodeV2PluginCache(
+            checkOpenCodeV2PluginCache({
+                fix: options.fix,
+                force: options.force,
+                latestVersion: v2DistTag
+                    ? await fetchNpmLatest(PLUGIN_NAME, v2DistTag)
+                    : pluginNpmLatest,
+                distTag: v2DistTag,
+                hostFiles: openCodeHostDatabaseFiles([openCodeDbResolution.path]),
+                referencedSpecs: pluginConfigUse?.referencedSpecs.opencode2,
+            }),
+            { pass, warn, info: (message) => log.info(message) },
+            {
+                reportMissing: hostGeneration === "v2",
+                loadedFrom: pluginConfigUse?.loadedFrom.opencode2,
+            },
         );
+        if (v2Cache.fixed) fixed++;
+        if (v2Cache.issue) issues++;
+
+        // 8c. OpenCode 1 and OpenCode 2 share context.db but cache Magic Context
+        // separately. Once the newer copy migrates the database, every cached copy
+        // whose compiled schema fence is behind it fails closed in its host. Runs
+        // after the cache steps above so a copy they just removed is not reported.
+        const sharedDbVersion = readContextDbSchemaVersion(dbPath);
+        if (sharedDbVersion !== null) {
+            reportCachedPluginFences(
+                compareCachedPluginFences(
+                    listCachedOpenCodePluginFences({
+                        referencedSpecs: pluginConfigUse?.referencedSpecs,
+                    }),
+                    sharedDbVersion,
+                ),
+                { pass, fail, info: (message) => log.info(message) },
+            );
+        }
     }
 
     // 9. Check for min-release-age / before restrictions in ~/.npmrc.
@@ -1981,7 +2173,7 @@ export async function runDoctor(
     // apply. We don't check Bun's bunfig.toml anymore — the unified CLI uses
     // npx and the auto-update checker uses npm install, neither of which read
     // bunfig.
-    {
+    if (magicContextInstalled) {
         const ageWarnings = collectNpmReleaseAgeWarnings();
 
         if (ageWarnings.length > 0) {
@@ -2005,21 +2197,25 @@ export async function runDoctor(
 
     // The OpenCode 2 plugin writes its own log (under the `opencode2` temp subtree),
     // so a machine running both hosts needs both files read.
-    const logHarnesses: Array<"opencode" | "opencode2"> = [
-        ...(hostGeneration === "v1" ? ["opencode" as const] : []),
-        ...(hostGeneration === "v2" || storeGeneration === "v2" ? ["opencode2" as const] : []),
-    ];
-    const logFiles = logHarnesses
-        .flatMap((harness) => inspectMagicContextLogs(harness))
-        .filter((file, index, all) => all.findIndex((other) => other.path === file.path) === index);
-    const existingLogFiles = logFiles.filter((file) => file.exists);
-    if (existingLogFiles.length === 0) {
-        log.info(
-            `No plugin log file yet; checked: ${logFiles.map((file) => file.path).join(", ")}`,
-        );
-    } else {
-        for (const file of existingLogFiles) {
-            log.info(`Log file read: ${formatLogFileInspection(file)}`);
+    if (magicContextInstalled) {
+        const logHarnesses: Array<"opencode" | "opencode2"> = [
+            ...(hostGeneration === "v1" ? ["opencode" as const] : []),
+            ...(hostGeneration === "v2" || storeGeneration === "v2" ? ["opencode2" as const] : []),
+        ];
+        const logFiles = logHarnesses
+            .flatMap((harness) => inspectMagicContextLogs(harness))
+            .filter(
+                (file, index, all) => all.findIndex((other) => other.path === file.path) === index,
+            );
+        const existingLogFiles = logFiles.filter((file) => file.exists);
+        if (existingLogFiles.length === 0) {
+            log.info(
+                `No plugin log file yet; checked: ${logFiles.map((file) => file.path).join(", ")}`,
+            );
+        } else {
+            for (const file of existingLogFiles) {
+                log.info(`Log file read: ${formatLogFileInspection(file)}`);
+            }
         }
     }
 

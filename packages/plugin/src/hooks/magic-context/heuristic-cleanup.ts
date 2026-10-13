@@ -1,3 +1,4 @@
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
@@ -26,7 +27,21 @@ import { stripSystemInjection } from "./system-injection-stripper";
 import type { MessageLike, TagTarget } from "./tag-messages";
 import { stripTagPrefix } from "./tag-part-guards";
 
+// Read-only tools whose parallel calls with identical arguments return identical output.
+// Hosts hand the transform bare tool names (OpenCode 1.18.30 stores `read`, `grep`,
+// `glob`; Pi stores `read`, `grep`), so the bare names are what actually match. The
+// `mcp_`-prefixed forms are kept for MCP servers that expose the same tools under that
+// prefix.
 const DEDUP_SAFE_TOOLS = new Set([
+    "grep",
+    "read",
+    "glob",
+    "ast_grep_search",
+    "lsp_diagnostics",
+    "lsp_symbols",
+    "lsp_find_references",
+    "lsp_goto_definition",
+    "lsp_prepare_rename",
     "mcp_grep",
     "mcp_read",
     "mcp_glob",
@@ -44,6 +59,8 @@ export function applyHeuristicCleanup(
     targets: Map<number, TagTarget>,
     messageTagNumbers: Map<MessageLike, number>,
     config: {
+        protectedTools?: Readonly<Record<string, number>>;
+        protectedToolTags?: ReadonlySet<number>;
         /** Exact token-window membership in tag-number space. */
         protectedTagNumbers: ReadonlySet<number>;
         /**
@@ -61,6 +78,8 @@ export function applyHeuristicCleanup(
             currentTotalInputTokens: number;
             ceilingTokens: number;
             usagePercentage?: number;
+            /** Another mutation already rewrites the cached prefix on this pass. */
+            passAlreadyPriced?: boolean;
         };
         /**
          * Whether ordinary deduplication, injection stripping, and caveman
@@ -90,6 +109,8 @@ export function applyHeuristicCleanup(
     // preload is provided we now load active-only directly (the partial
     // index makes this O(active rows) instead of O(all rows)).
     const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
+    const protectedTools =
+        config.protectedToolTags ?? protectedToolTagNumbers(tags, config.protectedTools);
     // Emergency floor accounting still needs the true session max, including
     // dropped and compacted rows. Protection itself comes only from the canonical
     // window projections supplied by the transform entry.
@@ -160,6 +181,8 @@ export function applyHeuristicCleanup(
             usagePercentage: emergency.usagePercentage,
             priorInputSample,
             hasPriorDrop: priorInputSample > 0,
+            passAlreadyPriced: emergency.passAlreadyPriced === true,
+            protectedToolTags: protectedTools,
         });
         if (plan.shouldDrop) {
             const toDrop = new Set(plan.tagNumbers);
@@ -227,6 +250,7 @@ export function applyHeuristicCleanup(
                 const strippedSource = stripTagPrefix(stripped);
 
                 if (strippedSource.trim().length === 0) {
+                    if (target.thinkingDropProtected) continue;
                     const dropResult = target.drop?.() ?? "absent";
                     const replacement = `[dropped §${tag.tagNumber}§]`;
                     const didReplace =
@@ -251,7 +275,9 @@ export function applyHeuristicCleanup(
                         }
                     }
                 } else {
-                    const didSet = target.setContent(stripped);
+                    // Only the injected reminder leaves; the message's own text
+                    // and the reasoning that produced it stay.
+                    const didSet = target.setContent(stripped, { keepReasoning: true });
                     if (didSet) {
                         replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
                         droppedInjections++;
@@ -291,11 +317,13 @@ export function applyHeuristicCleanup(
             }
         }
 
-        // Group tags by fingerprint
+        // Group tags by fingerprint. Protected tags join their group so a protected
+        // newest copy still anchors it; they are never dropped themselves (below).
+        // Leaving them out kept one unprotected copy alive beside the protected one.
         const fingerprintGroups = new Map<string, TagEntry[]>();
         for (const [compositeKey, fingerprint] of toolFingerprints) {
             const tag = tagsByCompositeKey.get(compositeKey);
-            if (!tag || config.protectedTagNumbers.has(tag.tagNumber)) continue;
+            if (!tag) continue;
             const group = fingerprintGroups.get(fingerprint) ?? [];
             group.push(tag);
             fingerprintGroups.set(fingerprint, group);
@@ -309,7 +337,9 @@ export function applyHeuristicCleanup(
                 // Keep the newest (last), drop the rest
                 for (let i = 0; i < group.length - 1; i++) {
                     const tag = group[i];
+                    if (config.protectedTagNumbers.has(tag.tagNumber)) continue;
                     const target = targets.get(tag.tagNumber);
+                    if (protectedTools.has(tag.tagNumber)) continue;
                     if (target?.canDrop?.() === false) continue;
                     // Deduplication remains a full drop; only the emergency newest-window
                     // arm preserves skeleton bytes. A call that cannot be removed keeps
@@ -348,6 +378,7 @@ export function applyHeuristicCleanup(
         const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
             enabled: true,
             minChars: config.caveman.minChars,
+            wordRules: config.caveman.wordRules,
             protectedCutoff: config.protectedCutoff,
         });
         compressedTextTags =

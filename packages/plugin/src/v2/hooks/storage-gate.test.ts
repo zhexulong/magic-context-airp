@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, type readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, type readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -17,9 +17,14 @@ import {
     LATEST_SUPPORTED_VERSION,
     openDatabase,
 } from "../../features/magic-context/storage-db";
+import {
+    __resetOffThreadMigrationClockForTests,
+    beginOffThreadMigration,
+} from "../../shared/off-thread-migration-clock";
 import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     createV2StorageGate,
     probeV2StorageAtBoot,
@@ -61,15 +66,15 @@ function thrownBy(run: () => unknown): unknown {
 }
 
 describe("createV2StorageGate", () => {
-    it("restores the native write busy window after a non-blocking boot open", async () => {
-        const dataHome = mkdtempSync(join(tmpdir(), "v2-storage-busy-window-"));
+    it("restores the steady-state busy timeout after the nonblocking default open", async () => {
+        const dataHome = createTestTempDirFromPath(join(tmpdir(), "v2-storage-gate-timeout-"));
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataHome;
-        const gate = createV2StorageGate();
-        const db = await gate.probe();
-        expect(db).toBeDefined();
-        expect(db!.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+        __setRpcIdentityTestHooks({ processListExecFileSync: (() => "") as typeof execFileSync });
+        const database = await createV2StorageGate().probe();
+        expect(database).toBeDefined();
+        expect(database!.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
     });
 
     it("re-attempts a failed open at most once per interval and names the failure", async () => {
@@ -136,7 +141,7 @@ describe("createV2StorageGate", () => {
 
 describe("createV2StorageGate against a migration blocked by another live host", () => {
     function blockedStore(): { dbPath: string; blocker: string } {
-        const dataHome = mkdtempSync(join(tmpdir(), "v2-storage-gate-"));
+        const dataHome = createTestTempDirFromPath(join(tmpdir(), "v2-storage-gate-"));
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataHome;
@@ -161,6 +166,7 @@ describe("createV2StorageGate against a migration blocked by another live host",
         seeded
             .prepare("DELETE FROM schema_migrations WHERE version = ?")
             .run(LATEST_SUPPORTED_VERSION);
+        seeded.exec("DROP TABLE single_store_state");
         closeQuietly(seeded);
         const dir = join(dirname(dbPath), "rpc", "older-host");
         mkdirSync(dir, { recursive: true });
@@ -273,6 +279,24 @@ test("boot wait retains a healthy database that opens after two seconds", async 
     });
     expect(await probeV2StorageAtBoot(gate)).toBe(database);
     expect(gate.require()).toBe(database);
+});
+
+test("boot wait does not count time an off-thread schema migration spends", async () => {
+    const database = openDatabase();
+    const endMigration = beginOffThreadMigration();
+    const gate = createV2StorageGate({
+        open: async () => {
+            await Bun.sleep(150);
+            endMigration();
+            return database;
+        },
+    });
+    try {
+        expect(await probeV2StorageAtBoot(gate, 30)).toBe(database);
+    } finally {
+        endMigration();
+        __resetOffThreadMigrationClockForTests();
+    }
 });
 
 test("boot wait gives up on an unresolved open after fifteen seconds", async () => {

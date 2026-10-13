@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -22,6 +22,7 @@ import {
     resolveLimit,
     setOutputReserveConfig,
 } from "./models-dev-cache";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 /**
  * Model context limits resolve from OpenCode's SDK only (`config.providers()`),
@@ -137,7 +138,7 @@ describe("models-dev-cache (SDK-only)", () => {
     }
 
     beforeEach(() => {
-        tempDir = mkdtempSync(join(tmpdir(), "mc-models-dev-"));
+        tempDir = createTestTempDirFromPath(join(tmpdir(), "mc-models-dev-"));
         // Isolate the persisted-cache file under a temp data dir so tests never
         // touch the real ~/.local/share/cortexkit/magic-context cache.
         originalXdgData = process.env.XDG_DATA_HOME;
@@ -644,5 +645,76 @@ describe("getSdkContextLimit prompt_only pre-carve arm", () => {
                 reservation: "none",
             }),
         ).toBe(167000);
+    });
+});
+
+describe("prompt_only detected limit above a declared input cap", () => {
+    beforeEach(() => clearModelsDevCache());
+    afterEach(() => clearModelsDevCache());
+
+    const seed = () =>
+        refreshModelLimitsFromApi({
+            config: {
+                providers: async () => ({
+                    data: {
+                        providers: [
+                            {
+                                id: "anthropic",
+                                models: {
+                                    "capped-model": {
+                                        limit: {
+                                            context: 400_000,
+                                            input: 272_000,
+                                            output: 128_000,
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                }),
+            },
+        });
+
+    test("baseline: no detection resolves to the declared cap", async () => {
+        await seed();
+        expect(getSdkContextLimit("anthropic", "capped-model")).toBe(272_000);
+    });
+
+    test("reservation none keeps the declared cap", async () => {
+        await seed();
+        expect(
+            getSdkContextLimit("anthropic", "capped-model", 1_000_000, {
+                detectedLimitProvenance: "prompt_only",
+                reservation: "none",
+            }),
+        ).toBe(272_000);
+    });
+
+    test("combined keeps the declared cap", async () => {
+        await seed();
+        expect(
+            getSdkContextLimit("anthropic", "capped-model", 1_000_000, {
+                detectedLimitProvenance: "combined",
+            }),
+        ).toBe(272_000);
+    });
+
+    test("default arm: prompt_only keeps the declared cap", async () => {
+        await seed();
+        expect(
+            getSdkContextLimit("anthropic", "capped-model", 1_000_000, {
+                detectedLimitProvenance: "prompt_only",
+            }),
+        ).toBe(272_000);
+    });
+
+    test("default arm: geometry usableSoft keeps the declared cap", async () => {
+        await seed();
+        const geometry = getSdkWindowGeometry("anthropic", "capped-model", 1_000_000, {
+            detectedLimitProvenance: "prompt_only",
+        });
+        expect(geometry?.usableSoft).toBe(272_000);
+        expect(geometry?.usableHard).toBeGreaterThanOrEqual(geometry?.usableSoft ?? 0);
     });
 });

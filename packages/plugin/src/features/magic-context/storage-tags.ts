@@ -1,7 +1,16 @@
+import { isMainThread } from "node:worker_threads";
 import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
-import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
-import { newestCtxReduceTagNumbers } from "./reclaim-protection";
+import {
+    type Database,
+    getSqliteDatabasePath,
+    getTagIdentityWriteGeneration,
+    type Statement as PreparedStatement,
+} from "../../shared/sqlite";
+import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
+import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
+import { queuePendingOp, removePendingOp } from "./storage-ops";
+import { tagIdentityRevisionKey } from "./storage-tag-identity-revision";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -130,7 +139,6 @@ export interface MessageTokenTotal {
     hasNull: boolean;
 }
 
-const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
 const RECENT_OWNER_SCAN_PAGE_SIZE = 128;
 const recentTagOwnerStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -142,7 +150,7 @@ function ownerMessageIdForTagRow(row: {
     if (row.type === "tool") {
         return row.tool_owner_message_id ?? row.message_id;
     }
-    return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+    return contentTagOwnerMessageId(row.message_id);
 }
 
 function getRecentTagOwnerStatement(db: Database): PreparedStatement {
@@ -189,7 +197,7 @@ export function getRecentTagOwnerMessageIds(
                     ? typeof row.tool_owner_message_id === "string"
                         ? row.tool_owner_message_id
                         : null
-                    : row.message_id.replace(CONTENT_ID_SUFFIX, "");
+                    : contentTagOwnerMessageId(row.message_id);
             // Reclaim selectors withhold legacy tool rows whose owner is unknown.
             // Skip them here too so they do not consume a known-owner slot.
             if (!ownerId || recent.has(ownerId)) continue;
@@ -356,7 +364,7 @@ const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedS
 
 /**
  * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * Protection is applied by the caller using its shared per-selection snapshot.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -394,8 +402,7 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
-    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
+    return tags;
 }
 
 /**
@@ -441,17 +448,66 @@ export function getTriggerTagTokenUpperBound(
     return { bound: row?.bound ?? 0, nullCount: row?.null_count ?? 0 };
 }
 
+const scopedActiveTokenTotalStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getActiveTagTokenTotalsByMessage(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): Map<string, MessageTokenTotal> {
-    const rows = db
-        .prepare(
-            `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+    if (messageIds?.length === 0) return new Map();
+    const fields =
+        "id, tag_number, type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count"
+            .split(", ")
+            .map((field) => `tags.${field}`)
+            .join(", ");
+    let scoped = scopedActiveTokenTotalStatements.get(db);
+    if (messageIds && !scoped) {
+        // Seek exact owners through existing indexes. Do not use a tag-number
+        // floor: a visible result can belong to an older invocation below it.
+        // UNION includes id so overlapping owner ranges cannot double-count a row.
+        scoped = db.prepare(`
+            SELECT ${fields} FROM json_each(?) AS owners
+            CROSS JOIN tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND tags.type != 'tool' AND +status = 'active'
+              AND message_id >= owners.value || ':' AND message_id < owners.value || ';'
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type != 'tool' AND +status = 'active'
+              AND message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IS NULL AND message_id IN (SELECT value FROM json_each(?))
+            ORDER BY tag_number, id`);
+        scopedActiveTokenTotalStatements.set(db, scoped);
+    }
+    const owners = messageIds ? new Set(messageIds) : undefined;
+    const encoded = owners ? JSON.stringify([...owners]) : "";
+    const rows = (
+        messageIds && scoped
+            ? scoped.all(
+                  encoded,
+                  sessionId,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+              )
+            : db
+                  .prepare(
+                      `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
              FROM tags
              WHERE session_id = ? AND status = 'active'`,
-        )
-        .all(sessionId) as Array<{
+                  )
+                  .all(sessionId)
+    ) as Array<{
         type: string;
         message_id: string;
         tool_owner_message_id: string | null;
@@ -462,6 +518,7 @@ export function getActiveTagTokenTotalsByMessage(
     const out = new Map<string, MessageTokenTotal>();
     for (const row of rows) {
         const owner = ownerMessageIdForTagRow(row);
+        if (owners && !owners.has(owner)) continue;
         let entry = out.get(owner);
         if (!entry) {
             entry = { conversation: 0, toolCall: 0, toolOutput: 0, hasNull: false };
@@ -652,6 +709,545 @@ export function getAllStatusTagTokenTotalsFlat(
     return { totals, nullMessageIds };
 }
 
+/** Only message tags prove ownership of their own assistant's reasoning group.
+ * Tool tags describe the preceding thought, not their tool owner, and parallel
+ * tools repeat that estimate. Repeated text tags likewise charge the group once.
+ *
+ * The returned map belongs to the session's cache: read it, never change it.
+ * It stays valid until the next read of this session, which may extend it.
+ */
+export function getReasoningTokenEstimatesByMessage(
+    db: Database,
+    sessionId: string,
+    proseRatio: number,
+): ReadonlyMap<string, number> {
+    const summary = readTagOwnerSummary(db, sessionId, proseRatio);
+    return summary.reasoningEstimatesByRatio.get(proseRatio) ?? new Map();
+}
+
+/** Missing ownership information must defer a new reasoning removal, not price it as zero. */
+export function tryGetReasoningTokenEstimatesByMessage(
+    db: Database,
+    sessionId: string,
+    ratio: number,
+): ReadonlyMap<string, number> | undefined {
+    try {
+        return getReasoningTokenEstimatesByMessage(db, sessionId, ratio);
+    } catch (error) {
+        if (error instanceof TagOwnerSummaryNotReady) return undefined;
+        throw error;
+    }
+}
+
+/**
+ * Highest tag number per owning message, as the reasoning budget projection
+ * groups tags: a tool tag belongs to its tool owner message (and is skipped
+ * without one), any other tag to the message its content id names.
+ *
+ * The returned map belongs to the session's cache: read it, never change it.
+ * It stays valid until the next read of this session, which may extend it.
+ */
+export function getMaxTagNumberByOwnerMessage(
+    db: Database,
+    sessionId: string,
+): ReadonlyMap<string, number> {
+    return readTagOwnerSummary(db, sessionId).maxTagByOwner;
+}
+
+interface TagOwnerRow {
+    id: number;
+    type: string | null;
+    message_id: string | null;
+    tool_owner_message_id: string | null;
+    tag_number: number;
+    reasoning_token_count: number | null;
+}
+
+/**
+ * Cached message ownership and reasoning-token estimates for one session.
+ * An owner is the message that a tag belongs to; prose ratios scale its stored
+ * reasoning count to the session's calibrated token estimate. The cache is kept
+ * per connection and extended with tags appended since the last read.
+ *
+ * The identity-write generation is a single process-wide counter that moves
+ * whenever any session's tag ownership or reasoning data is rewritten in this
+ * process. It only says "something may have changed somewhere", so it never
+ * invalidates this session's cache by itself: it triggers the cheap revision
+ * and shape check described below. Only an actual change to this session's
+ * existing ownership/reasoning data, a deletion, or a previously uncached prose
+ * ratio requires a worker rebuild. Status, drop-mode and size writes do not
+ * affect this digest.
+ *
+ * A commit by another connection (`data_version` moved) is checked against the
+ * session's shape first: the number of its tags and its highest tag id, read
+ * from the `(session_id, ...)` index together with the rows above the cached
+ * highest id in one statement. When the count grew by exactly the number of
+ * new rows, the other connection only appended, and those rows are folded in.
+ * A delete, or an insert below the cached highest id (only possible with an
+ * explicit id, since `tags.id` is AUTOINCREMENT), leaves the count short of
+ * that and rebuilds. A delete and an explicit-id insert below the highest id in
+ * the same interval would cancel out; no writer inserts tags with an explicit id.
+ *
+ * Tool tags written before owners were recorded have no owner and count for
+ * no message. Another process can give them one later (the tool-owner backfill
+ * that runs when an OpenCode process opens the store), so their ids are kept
+ * and re-read by primary key after each such commit; there are none in
+ * sessions created since owners were recorded.
+ *
+ * In-place rewrites of a tag's id, session, message id, number, type, owner or
+ * reasoning count are counted in the session's tag identity revision by every
+ * Magic Context connection (a connection-local trigger, see
+ * storage-tag-identity-revision.ts), read in the same statement as the count;
+ * a changed revision rebuilds. Rewrites by a connection that never installed
+ * that trigger (a tool editing the file directly) are not seen while the
+ * count and highest id still fit an append.
+ *
+ * Inside an open transaction it is neither used nor stored, since uncommitted
+ * rows can still roll back. File-store callers defer cold reads; warm foreign
+ * commits use bounded appended rows and index-only shape checks in a read snapshot.
+ */
+export interface TagOwnerSummary {
+    dataVersion: number;
+    schemaVersion: number;
+    generation: number;
+    lastRowId: number;
+    globalLastRowId: number;
+    /** Tag rows of the session folded into this summary. */
+    rowCount: number;
+    /** Ids of tool tags folded without an owner; another process may still adopt them. */
+    unownedToolRows: Set<number>;
+    /** The session's tag identity revision when the summary was built or last checked. */
+    identityRevision: string | null;
+    maxTagByOwner: Map<string, number>;
+    /** Reasoning estimates per prose ratio, folded exactly as a full read would. */
+    reasoningEstimatesByRatio: Map<number, Map<string, number>>;
+}
+
+const tagOwnerSummaries = new WeakMap<Database, Map<string, TagOwnerSummary>>();
+/** The prose ratio comes from session calibration and changes rarely; keep the most recent few. */
+const MAX_CACHED_PROSE_RATIOS = 4;
+const TAG_OWNER_PAGE_LIMIT = 512;
+
+export class TagOwnerSummaryNotReady extends Error {
+    constructor() {
+        super("tag owner summary needs off-thread preparation");
+    }
+}
+
+/** A worker builds the same digest as a synchronous read, inside one snapshot. */
+export function scanTagOwnerSummary(
+    db: Database,
+    sessionId: string,
+    ratio: number,
+    ratios: number[] = [],
+): TagOwnerSummary {
+    db.exec("BEGIN");
+    try {
+        return readTagOwnerSummary(db, sessionId, ratio, ratios);
+    } finally {
+        db.exec("ROLLBACK");
+    }
+}
+
+export function cachedTagOwnerRatios(db: Database, sessionId: string): number[] {
+    return [...(tagOwnerSummaries.get(db)?.get(sessionId)?.reasoningEstimatesByRatio.keys() ?? [])];
+}
+
+export type TagOwnerWarmupState = Pick<
+    TagOwnerSummary,
+    | "dataVersion"
+    | "generation"
+    | "schemaVersion"
+    | "globalLastRowId"
+    | "lastRowId"
+    | "rowCount"
+    | "identityRevision"
+    | "unownedToolRows"
+>;
+export interface TagOwnerDelta {
+    rows: TagOwnerRow[];
+    adopted: TagOwnerRow[];
+    globalLastRowId: number;
+}
+
+export function tagOwnerWarmupState(
+    db: Database,
+    sessionId: string,
+): TagOwnerWarmupState | undefined {
+    const cached = tagOwnerSummaries.get(db)?.get(sessionId);
+    if (!cached || cached.unownedToolRows.size > TAG_OWNER_PAGE_LIMIT) return undefined;
+    return {
+        dataVersion: cached.dataVersion,
+        generation: cached.generation,
+        schemaVersion: cached.schemaVersion,
+        globalLastRowId: cached.globalLastRowId,
+        lastRowId: cached.lastRowId,
+        rowCount: cached.rowCount,
+        identityRevision: cached.identityRevision,
+        unownedToolRows: new Set(cached.unownedToolRows),
+    };
+}
+
+/** Foreign-commit shape counts run on the worker too, without transferring the cached maps. */
+export function scanTagOwnerDelta(
+    db: Database,
+    sessionId: string,
+    state: TagOwnerWarmupState,
+): TagOwnerDelta | null {
+    db.exec("BEGIN");
+    try {
+        const globalLastRowId = (
+            db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM tags").get() as { id: number }
+        ).id;
+        if (globalLastRowId - state.globalLastRowId > TAG_OWNER_PAGE_LIMIT) return null;
+        const rows = appendedSinceForeignCommit(db, sessionId, state);
+        if (!rows) return null;
+        return { rows, adopted: adoptedSinceForeignCommit(db, state), globalLastRowId };
+    } finally {
+        db.exec("ROLLBACK");
+    }
+}
+
+export function installTagOwnerDelta(
+    db: Database,
+    sessionId: string,
+    state: TagOwnerWarmupState,
+    delta: TagOwnerDelta,
+    versions: { dataVersion: number; schemaVersion: number; generation: number },
+): boolean {
+    const cached = tagOwnerSummaries.get(db)?.get(sessionId);
+    if (
+        !cached ||
+        cached.rowCount !== state.rowCount ||
+        cached.globalLastRowId !== state.globalLastRowId ||
+        cached.identityRevision !== state.identityRevision ||
+        delta.rows.length > TAG_OWNER_PAGE_LIMIT ||
+        delta.adopted.length > TAG_OWNER_PAGE_LIMIT
+    )
+        return false;
+    tagOwnerShapeChecks++;
+    tagOwnerRowsRead += delta.rows.length + delta.adopted.length;
+    for (const row of delta.rows) foldTagOwnerRow(cached, row);
+    for (const row of delta.adopted) foldTagOwnerRow(cached, row, false);
+    cached.globalLastRowId = delta.globalLastRowId;
+    cached.dataVersion = versions.dataVersion;
+    cached.schemaVersion = versions.schemaVersion;
+    cached.generation = versions.generation;
+    return true;
+}
+
+/** Use the original dataVersion, schemaVersion and generation validated by the caller. */
+export function installTagOwnerSummary(
+    db: Database,
+    sessionId: string,
+    summary: TagOwnerSummary,
+    versions: { dataVersion: number; schemaVersion: number; generation: number },
+    shapeChecked = false,
+): void {
+    if (shapeChecked) tagOwnerShapeChecks++;
+    summary.dataVersion = versions.dataVersion;
+    summary.schemaVersion = versions.schemaVersion;
+    summary.generation = versions.generation;
+    const sessions = tagOwnerSummaries.get(db) ?? new Map<string, TagOwnerSummary>();
+    sessions.set(sessionId, summary);
+    tagOwnerSummaries.set(db, sessions);
+}
+
+/** Readiness is checked through the ordinary invalidation and append path. */
+export function isTagOwnerSummaryReady(db: Database, sessionId: string, ratio: number): boolean {
+    try {
+        readTagOwnerSummary(db, sessionId, ratio);
+        return true;
+    } catch (error) {
+        if (error instanceof TagOwnerSummaryNotReady) return false;
+        throw error;
+    }
+}
+let tagOwnerRowsRead = 0;
+let tagOwnerShapeChecks = 0;
+
+/** @internal Tag rows the owner summary has read since the last reset. */
+export function getTagOwnerRowsReadForTest(): number {
+    return tagOwnerRowsRead;
+}
+
+/** @internal Shape checks made after another connection's commit since the last reset. */
+export function getTagOwnerShapeChecksForTest(): number {
+    return tagOwnerShapeChecks;
+}
+
+/** @internal */
+export function resetTagOwnerRowsReadForTest(): void {
+    tagOwnerRowsRead = 0;
+    tagOwnerShapeChecks = 0;
+}
+
+function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow, newRow = true): void {
+    summary.lastRowId = Math.max(summary.lastRowId, row.id);
+    if (newRow) summary.rowCount += 1;
+    if (row.type === "tool" && typeof row.tool_owner_message_id !== "string")
+        summary.unownedToolRows.add(row.id);
+    else summary.unownedToolRows.delete(row.id);
+    const owner =
+        row.type === "tool"
+            ? typeof row.tool_owner_message_id === "string"
+                ? row.tool_owner_message_id
+                : null
+            : typeof row.message_id === "string"
+              ? contentTagOwnerMessageId(row.message_id)
+              : null;
+    if (owner) {
+        summary.maxTagByOwner.set(
+            owner,
+            Math.max(summary.maxTagByOwner.get(owner) ?? 0, row.tag_number),
+        );
+    }
+    if (row.type !== "message" || row.reasoning_token_count === null) return;
+    const reasoningOwner = ownerMessageIdForTagRow({
+        type: row.type,
+        message_id: row.message_id as string,
+        tool_owner_message_id: row.tool_owner_message_id,
+    });
+    for (const [ratio, estimates] of summary.reasoningEstimatesByRatio) {
+        estimates.set(
+            reasoningOwner,
+            Math.max(estimates.get(reasoningOwner) ?? 0, row.reasoning_token_count * ratio),
+        );
+    }
+}
+
+const TAG_OWNER_COLUMNS =
+    "id, type, message_id, tool_owner_message_id, tag_number, reasoning_token_count";
+
+/**
+ * Whether the connection has a transaction open. A handle whose state cannot be
+ * read (a wrapping proxy, for instance) is treated as in a transaction. A
+ * file-store read then defers rather than caching an uncommitted view.
+ */
+function connectionInTransaction(db: Database): boolean {
+    try {
+        const state = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
+        return state.inTransaction !== false && state.isTransaction !== false;
+    } catch {
+        return true;
+    }
+}
+
+/**
+ * The rows above the cached highest id together with the session's tag count
+ * and highest id, from one statement so all three describe the same commit.
+ * The count and highest id come from the `(session_id, ...)` index alone.
+ */
+export const TAG_OWNER_APPENDED_WITH_SHAPE_SQL = `SELECT ${TAG_OWNER_COLUMNS}, 0 AS shape, NULL AS tag_count, NULL AS max_id, NULL AS revision
+    FROM tags WHERE id > ? AND +session_id = ?
+    UNION ALL
+    SELECT NULL, NULL, NULL, NULL, NULL, NULL, 1, COUNT(*), MAX(id), (SELECT value FROM schema_migrations_meta WHERE key = ?)
+    FROM tags WHERE session_id = ?`;
+
+function readTagIdentityRevision(db: Database, sessionId: string): string | null {
+    const row = db
+        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+        .get(tagIdentityRevisionKey(sessionId)) as { value?: unknown } | null;
+    return typeof row?.value === "string" ? row.value : null;
+}
+
+/**
+ * After another connection's commit: the rows it appended to the session, or
+ * null when the session changed in a way appends cannot explain.
+ */
+function appendedSinceForeignCommit(
+    db: Database,
+    sessionId: string,
+    cached: TagOwnerWarmupState,
+): TagOwnerRow[] | null {
+    tagOwnerShapeChecks += 1;
+    const rows = db
+        .prepare(TAG_OWNER_APPENDED_WITH_SHAPE_SQL)
+        .all(
+            cached.globalLastRowId,
+            sessionId,
+            tagIdentityRevisionKey(sessionId),
+            sessionId,
+        ) as Array<
+        TagOwnerRow & {
+            shape: number;
+            tag_count: number | null;
+            max_id: number | null;
+            revision: string | null;
+        }
+    >;
+    const shape = rows.find((row) => row.shape === 1);
+    const appended = rows.filter((row) => row.shape === 0);
+    const highest = appended.reduce((max, row) => Math.max(max, row.id), cached.lastRowId);
+    if (
+        !shape ||
+        // Another Magic Context connection rewrote a tag's identity or reasoning
+        // count in this session; the count and highest id cannot show that.
+        (shape.revision ?? null) !== cached.identityRevision ||
+        shape.tag_count !== cached.rowCount + appended.length ||
+        (shape.max_id ?? 0) !== highest
+    )
+        return null;
+    return appended;
+}
+
+/** Ownerless tool tags of the summary that another process has since given an owner. */
+function adoptedSinceForeignCommit(db: Database, cached: TagOwnerWarmupState): TagOwnerRow[] {
+    if (cached.unownedToolRows.size === 0) return [];
+    return db
+        .prepare(
+            `SELECT ${TAG_OWNER_COLUMNS} FROM tags
+             WHERE id IN (SELECT value FROM json_each(?)) AND tool_owner_message_id IS NOT NULL LIMIT ${TAG_OWNER_PAGE_LIMIT + 1}`,
+        )
+        .all(JSON.stringify([...cached.unownedToolRows])) as TagOwnerRow[];
+}
+
+function readTagOwnerSummary(
+    db: Database,
+    sessionId: string,
+    proseRatio?: number,
+    extraRatios: number[] = [],
+): TagOwnerSummary {
+    const inTransaction = connectionInTransaction(db);
+    const versions = inTransaction
+        ? null
+        : (db
+              .prepare(
+                  "SELECT data_version AS dataVersion, (SELECT schema_version FROM pragma_schema_version) AS schemaVersion FROM pragma_data_version",
+              )
+              .get() as { dataVersion?: number; schemaVersion?: number } | null);
+    const dataVersion = versions?.dataVersion ?? -1;
+    const schemaVersion = versions?.schemaVersion ?? -1;
+    const generation = getTagIdentityWriteGeneration();
+    const offThreadOnly = isMainThread && Boolean(getSqliteDatabasePath(db));
+    const sessions = tagOwnerSummaries.get(db) ?? new Map<string, TagOwnerSummary>();
+    const cached = inTransaction ? undefined : sessions.get(sessionId);
+    if (
+        cached &&
+        (cached.generation === generation ||
+            cached.identityRevision === readTagIdentityRevision(db, sessionId)) &&
+        // A rebuilt or altered table can keep the session's count and highest id.
+        cached.schemaVersion === schemaVersion &&
+        (proseRatio === undefined || cached.reasoningEstimatesByRatio.has(proseRatio))
+    ) {
+        let rows: TagOwnerRow[] | null;
+        let globalLastRowId = (
+            db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM tags").get() as { id: number }
+        ).id;
+        if (
+            offThreadOnly &&
+            (globalLastRowId - cached.globalLastRowId > TAG_OWNER_PAGE_LIMIT ||
+                (cached.dataVersion !== dataVersion &&
+                    cached.unownedToolRows.size > TAG_OWNER_PAGE_LIMIT))
+        )
+            throw new TagOwnerSummaryNotReady();
+        if (cached.dataVersion === dataVersion && cached.generation === generation) {
+            // Only this connection wrote, and only appends. `+session_id` keeps
+            // SQLite on the rowid range, so this reads the rows appended since,
+            // in any session.
+            const statement = db.prepare(
+                `SELECT ${TAG_OWNER_COLUMNS} FROM tags WHERE id > ? AND +session_id = ? ORDER BY id LIMIT ${TAG_OWNER_PAGE_LIMIT + 1}`,
+            );
+            rows = statement.all(cached.globalLastRowId, sessionId) as TagOwnerRow[];
+            // Memory stores cannot delegate to another connection. Drain every
+            // page before advancing the high watermark, or later reads lose rows.
+            if (!offThreadOnly) {
+                let page = rows;
+                while (page.length === TAG_OWNER_PAGE_LIMIT + 1) {
+                    page = statement.all(page[page.length - 1].id, sessionId) as TagOwnerRow[];
+                    rows.push(...page);
+                }
+            }
+        } else {
+            // The count, revision and appended rows must describe one commit.
+            // Unrelated context writes are not owner-digest invalidations.
+            if (offThreadOnly) db.exec("BEGIN");
+            try {
+                globalLastRowId = (
+                    db.prepare("SELECT COALESCE(MAX(id),0) AS id FROM tags").get() as { id: number }
+                ).id;
+                if (
+                    offThreadOnly &&
+                    globalLastRowId - cached.globalLastRowId > TAG_OWNER_PAGE_LIMIT
+                )
+                    throw new TagOwnerSummaryNotReady();
+                rows = appendedSinceForeignCommit(db, sessionId, cached);
+                const adopted = rows ? adoptedSinceForeignCommit(db, cached) : [];
+                if (
+                    !rows ||
+                    rows.length > TAG_OWNER_PAGE_LIMIT ||
+                    adopted.length > TAG_OWNER_PAGE_LIMIT
+                ) {
+                    if (offThreadOnly) throw new TagOwnerSummaryNotReady();
+                } else if (offThreadOnly) {
+                    tagOwnerRowsRead += rows.length + adopted.length;
+                    for (const row of rows) foldTagOwnerRow(cached, row);
+                    for (const row of adopted) foldTagOwnerRow(cached, row, false);
+                    cached.dataVersion = dataVersion;
+                    cached.generation = generation;
+                    cached.globalLastRowId = globalLastRowId;
+                    return cached;
+                }
+            } finally {
+                if (offThreadOnly) db.exec("ROLLBACK");
+            }
+        }
+        if (rows) {
+            const adopted =
+                cached.dataVersion === dataVersion ? [] : adoptedSinceForeignCommit(db, cached);
+            if (
+                isMainThread &&
+                getSqliteDatabasePath(db) &&
+                (rows.length > TAG_OWNER_PAGE_LIMIT || adopted.length > TAG_OWNER_PAGE_LIMIT)
+            )
+                throw new TagOwnerSummaryNotReady();
+            tagOwnerRowsRead += rows.length + adopted.length;
+            for (const row of rows) foldTagOwnerRow(cached, row);
+            for (const row of adopted) foldTagOwnerRow(cached, row, false);
+            cached.dataVersion = dataVersion;
+            cached.generation = generation;
+            cached.globalLastRowId = globalLastRowId;
+            return cached;
+        }
+    }
+    if (isMainThread && getSqliteDatabasePath(db)) throw new TagOwnerSummaryNotReady();
+    const ratios = [
+        ...new Set([...(cached?.reasoningEstimatesByRatio.keys() ?? []), ...extraRatios]),
+    ];
+    if (proseRatio !== undefined && !ratios.includes(proseRatio)) ratios.push(proseRatio);
+    const summary: TagOwnerSummary = {
+        dataVersion,
+        schemaVersion,
+        generation,
+        lastRowId: 0,
+        globalLastRowId: (
+            db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM tags").get() as { id: number }
+        ).id,
+        rowCount: 0,
+        unownedToolRows: new Set(),
+        // Read the revision before the rows. A rewrite committed between the two
+        // reads is already in the rows, and the revision check after the next
+        // foreign commit sees the newer revision and rebuilds once more; the
+        // other order could store a revision that already includes a rewrite
+        // the rows miss.
+        identityRevision: readTagIdentityRevision(db, sessionId),
+        maxTagByOwner: new Map(),
+        reasoningEstimatesByRatio: new Map(
+            ratios.slice(-MAX_CACHED_PROSE_RATIOS).map((ratio) => [ratio, new Map()]),
+        ),
+    };
+    const rows = db
+        .prepare(`SELECT ${TAG_OWNER_COLUMNS} FROM tags WHERE session_id = ? ORDER BY id`)
+        .all(sessionId) as TagOwnerRow[];
+    tagOwnerRowsRead += rows.length;
+    for (const row of rows) foldTagOwnerRow(summary, row);
+    if (!inTransaction) {
+        sessions.set(sessionId, summary);
+        tagOwnerSummaries.set(db, sessions);
+    }
+    return summary;
+}
+
 /** Bump a tag's input_token_count — the token mirror of `updateTagInputByteSize`. */
 export function updateTagInputTokenCount(
     db: Database,
@@ -724,7 +1320,7 @@ function getTagNumbersByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumbersByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\') ORDER BY tag_number ASC",
+            "SELECT tag_number FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\') ORDER BY tag_number ASC",
         );
         getTagNumbersByMessageIdStatements.set(db, stmt);
     }
@@ -735,7 +1331,7 @@ function getDeleteTagsByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = deleteTagsByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "DELETE FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\')",
+            "DELETE FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\')",
         );
         deleteTagsByMessageIdStatements.set(db, stmt);
     }
@@ -757,7 +1353,9 @@ function getTagNumberByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumberByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
+            // Without the owner index SQLite may walk the entire session in tag
+            // order to satisfy LIMIT, making repeated whitespace probes quadratic.
+            "SELECT tag_number FROM tags INDEXED BY idx_tags_session_message_id WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
         );
         getTagNumberByMessageIdStatements.set(db, stmt);
     }
@@ -968,11 +1566,47 @@ export function markWhitespaceAssistantTagInert(
     );
 }
 
+const inertWhitespaceStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Load legacy whitespace tags for cache-stable prefix replay; these rows are never active. */
 export function getInertWhitespaceAssistantTags(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): InertWhitespaceAssistantTag[] {
+    if (messageIds) {
+        // The fingerprint index lets the wire reader seek each visible owner instead
+        // of scanning every compacted tag. Keep the unscoped API for reduction tools.
+        let statement = inertWhitespaceStatements.get(db);
+        if (!statement) {
+            // CROSS JOIN keeps the small owner list outside the fingerprint index
+            // seek, rather than scanning every retired row in a long session.
+            statement = db.prepare(
+                `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+                 FROM json_each(?) AS owners CROSS JOIN tags
+                 WHERE tags.session_id = ? AND tags.type = 'message' AND tags.status = 'compacted'
+                   AND entry_fingerprint >= ? || owners.value || ':p'
+                   AND entry_fingerprint < ? || owners.value || ':q'
+                 ORDER BY CAST(owners.key AS INTEGER), entry_fingerprint, tags.id`,
+            );
+            inertWhitespaceStatements.set(db, statement);
+        }
+        const rows = statement.all(
+            JSON.stringify([...new Set(messageIds)]),
+            sessionId,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+        ) as Array<{
+            tagNumber: number;
+            entryFingerprint: string;
+        }>;
+        return rows.map((row) => ({
+            tagNumber: row.tagNumber,
+            contentId: row.entryFingerprint.slice(
+                WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+            ),
+        }));
+    }
     const rows = db
         .prepare(
             `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
@@ -1402,9 +2036,14 @@ function foldDuplicateIntoSurvivor(
      * duplicate, which lets a bulk fold skip the per-tag queue lookup.
      */
     duplicateMayHaveQueuedOps = true,
+    /**
+     * False when the duplicate's content is now only a fragment of the
+     * survivor's, so its executed drop must not hide the survivor.
+     */
+    propagateDroppedStatus = true,
 ): void {
     mergeSizeAndTokenColumnsIntoSurvivor(db, sessionId, survivor, duplicate);
-    applyDroppedStatusIfNeeded(db, sessionId, survivor, duplicate);
+    if (propagateDroppedStatus) applyDroppedStatusIfNeeded(db, sessionId, survivor, duplicate);
     if (duplicateMayHaveQueuedOps) {
         retargetPendingOps(db, sessionId, duplicate.tagNumber, survivor.tagNumber);
     }
@@ -1520,6 +2159,11 @@ function readQueuedTagNumbers(
  * after the merge that same operation would remove the whole joined text, which
  * is a larger deletion than the one they asked for. Those queue entries are
  * removed and reported to the caller instead.
+ *
+ * An executed drop follows the same rule: a folded tag's `dropped` status is
+ * not copied onto the surviving tag, because the survivor now stands for the
+ * whole joined text. When every fragment was dropped the survivor is one of
+ * them and is already `dropped`, so the joined text stays hidden.
  */
 export function foldShrunkPartTags(
     db: Database,
@@ -1583,6 +2227,7 @@ export function foldShrunkPartTags(
                 survivor,
                 orphan,
                 queuedTags.any.has(orphan.tagNumber),
+                false,
             );
             result.foldedTagNumbers.push(orphan.tagNumber);
         }
@@ -1631,6 +2276,73 @@ export function findPiFallbackToolOwnerTags(
         .filter(isPiFallbackToolOwnerTag);
 }
 
+export class PiTagIdentityConflictError extends Error {
+    readonly code = "PI_TAG_IDENTITY_CONFLICT";
+    constructor(detail: string, kind: "tool" | "message" = "tool") {
+        super(
+            `Magic Context ${kind}-tag identity conflict: ${detail}. This turn was refused without sending raw history; resending alone will not repair it`,
+        );
+        this.name = "PiTagIdentityConflictError";
+    }
+}
+
+/** Message and tool tags keep the number proven by returned bytes or a sole served receipt, not allocation order. */
+function selectPiTagSurvivor<T extends { tagNumber: number; status: string }>(
+    rows: readonly T[],
+    servedTagNumbers: ReadonlySet<number>,
+    cachedSurvivor: number | undefined,
+    kind: "tool" | "message",
+    rebuildingSurvivor?: number,
+): T {
+    const served = rows.filter((row) => servedTagNumbers.has(row.tagNumber));
+    const cached =
+        cachedSurvivor === undefined
+            ? undefined
+            : rows.find((row) => row.tagNumber === cachedSurvivor);
+    const rebuilding = rows.find((row) => row.tagNumber === rebuildingSurvivor);
+    if (
+        (cachedSurvivor !== undefined && !cached) ||
+        (served.length !== 1 && !cached && !rebuilding)
+    ) {
+        throw new PiTagIdentityConflictError(
+            served.length > 1
+                ? `Conflicting served Pi ${kind} tag numbers; no byte-safe cached survivor is proven`
+                : `duplicate ${kind} tag identities have no proven served-byte survivor`,
+            kind,
+        );
+    }
+    const kept = cached ?? rebuilding ?? served[0];
+    if (!kept) throw new PiTagIdentityConflictError("no served survivor is proven", kind);
+    return kept;
+}
+
+function foldPiIdentityDuplicate(
+    db: Database,
+    sessionId: string,
+    kept: PiFallbackFoldTagRow,
+    duplicate: PiFallbackFoldTagRow,
+): void {
+    const owesDrop = kept.status !== "dropped" && duplicate.status === "dropped";
+    // Keep the status already shown for this number. A dropped duplicate's
+    // removal must not turn the active result into a dropped placeholder now;
+    // queue that drop for a later pass permitted to edit managed history.
+    foldDuplicateIntoSurvivor(db, sessionId, kept, duplicate, true, false);
+    if (owesDrop) queuePendingOp(db, sessionId, kept.tagNumber, "drop");
+}
+
+export function getPiMessageTagCandidates(db: Database, sessionId: string, messageId: string) {
+    return getPiFallbackMessageFoldTagRowsByMessageId(db, sessionId, messageId);
+}
+
+export function findPiTagIdentityConflict(error: unknown): PiTagIdentityConflictError | undefined {
+    const seen = new Set<unknown>();
+    while (error instanceof Error && !seen.has(error)) {
+        if (error instanceof PiTagIdentityConflictError) return error;
+        seen.add(error);
+        error = error.cause;
+    }
+}
+
 export function adoptPiFallbackToolOwnerTag(
     db: Database,
     sessionId: string,
@@ -1638,6 +2350,9 @@ export function adoptPiFallbackToolOwnerTag(
     callId: string,
     oldOwnerMessageId: string,
     newOwnerMessageId: string,
+    servedTagNumbers: ReadonlySet<number> = new Set(),
+    cachedSurvivor?: number,
+    rebuildingSurvivor?: number,
 ): PiFallbackTagAdoptionResult {
     const survivor = getPiFallbackFoldTagRowByNumber(db, sessionId, tagNumber);
     if (
@@ -1670,10 +2385,23 @@ export function adoptPiFallbackToolOwnerTag(
         return { action: "skipped" };
     }
 
-    // The real-id row may have been allocated by a racing pass after adoption's
-    // probe. Preserve that row's tag number so the §N§ already sent on the wire
-    // remains stable, and fold the stale fallback row into it.
-    foldDuplicateIntoSurvivor(db, sessionId, existing, survivor);
+    const kept = selectPiTagSurvivor(
+        [survivor, existing],
+        servedTagNumbers,
+        cachedSurvivor,
+        "tool",
+        rebuildingSurvivor,
+    );
+    if (kept.tagNumber === survivor.tagNumber) {
+        foldPiIdentityDuplicate(db, sessionId, survivor, existing);
+        db.prepare(
+            "UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?",
+        ).run(newOwnerMessageId, sessionId, tagNumber);
+        return { action: "folded", tagNumber, deletedTagNumbers: [existing.tagNumber] };
+    }
+    // The existing real-owner row's number was proved by returned bytes or the
+    // served-number ledger, so it survives even if the fallback was allocated first.
+    foldPiIdentityDuplicate(db, sessionId, existing, survivor);
     return {
         action: "folded",
         tagNumber: existing.tagNumber,
@@ -1687,6 +2415,9 @@ export function adoptPiFallbackMessageTag(
     tagNumber: number,
     oldFallbackMessageId: string,
     newRealMessageId: string,
+    servedTagNumbers: ReadonlySet<number> = new Set(),
+    cachedSurvivor?: number,
+    rebuildingSurvivor?: number,
 ): PiFallbackTagAdoptionResult {
     if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) {
         return { action: "skipped" };
@@ -1720,16 +2451,27 @@ export function adoptPiFallbackMessageTag(
         return (result.changes ?? 0) > 0 ? { action: "rekeyed", tagNumber } : { action: "skipped" };
     }
 
-    // A real-id row can appear after the adoption probe but before allocation.
-    // Keep its already-visible tag identity and merge every fallback/duplicate
-    // row into it, rather than replacing the §N§ emitted by the racing pass.
-    const realSurvivor = duplicates[0];
-    if (!realSurvivor) return { action: "skipped" };
-    const deletedTagNumbers = [tagNumber];
-    foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, survivor);
-    for (const duplicate of duplicates.slice(1)) {
-        foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, duplicate);
+    // An allocated row may never have reached Pi. A real entry-id key alone
+    // cannot authorize choosing its number when returned-byte evidence is absent.
+    const realSurvivor = selectPiTagSurvivor(
+        [survivor, ...duplicates],
+        servedTagNumbers,
+        cachedSurvivor,
+        "message",
+        rebuildingSurvivor,
+    );
+    const deletedTagNumbers: number[] = [];
+    for (const duplicate of [survivor, ...duplicates]) {
+        if (duplicate.tagNumber === realSurvivor.tagNumber) continue;
+        foldPiIdentityDuplicate(db, sessionId, realSurvivor, duplicate);
         deletedTagNumbers.push(duplicate.tagNumber);
+    }
+    if (realSurvivor.tagNumber === tagNumber) {
+        db.prepare("UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ?").run(
+            newRealMessageId,
+            sessionId,
+            tagNumber,
+        );
     }
     return {
         action: "folded",
@@ -1747,37 +2489,120 @@ export function markTagsCompactedByMessageIds(
     db: Database,
     sessionId: string,
     messageIds: Iterable<string>,
+    eligibleTagNumbers?: ReadonlySet<number>,
 ): number {
-    // RETURNING counts top-level tag rows without including writes made by triggers.
-    const update = db.prepare(
-        `UPDATE tags
-         SET status = 'compacted'
-         WHERE session_id = ?
-           AND status IN ('active', 'dropped')
-           AND (
-               message_id = ?
-               OR message_id LIKE ? ESCAPE '\\'
-               OR message_id LIKE ? ESCAPE '\\'
-               OR tool_owner_message_id = ?
-           )
-         RETURNING id`,
+    const ids = new Set(messageIds);
+    if (ids.size === 0 || eligibleTagNumbers?.size === 0) return 0;
+
+    // SQLite's default LIKE folds ASCII only, whereas String.toLowerCase also
+    // folds Unicode. Wildcards in the source id were escaped by the old query.
+    const asciiLower = (value: string) => value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+    const foldedIds = new Set(Array.from(ids, asciiLower));
+    const nulPrefixes = new Set(
+        Array.from(ids)
+            .filter((id) => id.includes("\0"))
+            .map((id) => asciiLower(id.split("\0")[0])),
     );
-    return db
-        .transaction(() => {
-            let changed = 0;
-            for (const messageId of new Set(messageIds)) {
-                const escaped = escapeLikePattern(messageId);
-                changed += update.all(
-                    sessionId,
-                    messageId,
-                    `${escaped}:p%`,
-                    `${escaped}:file%`,
-                    messageId,
-                ).length;
+    const matches = (messageId: string | null, owner: string | null): boolean => {
+        if (messageId !== null && ids.has(messageId)) return true;
+        if (owner !== null && ids.has(owner)) return true;
+        if (messageId === null) return false;
+        // LIKE treats NUL as the end of both pattern and value; exact equality
+        // above does not. Keep that behavior even for malformed source ids.
+        const nul = messageId.indexOf("\0");
+        const value = nul < 0 ? messageId : messageId.slice(0, nul);
+        if (nulPrefixes.size > 0 && nulPrefixes.has(asciiLower(value))) return true;
+        // Check EVERY delimiter: ids themselves may contain :p or :file. Do not
+        // restrict :p% to numeric parts, or include Pi's :mc-text-v1: identity.
+        for (let colon = value.indexOf(":"); colon >= 0; colon = value.indexOf(":", colon + 1)) {
+            const suffix = value[colon + 1];
+            if (
+                (suffix === "p" ||
+                    suffix === "P" ||
+                    asciiLower(value.slice(colon + 1, colon + 5)) === "file") &&
+                foldedIds.has(asciiLower(value.slice(0, colon)))
+            )
+                return true;
+        }
+        return false;
+    };
+
+    // Discover candidates once, WITHOUT a writer transaction. The former OR /
+    // LIKE update used only the session prefix of the index once per source id.
+    // Scan in tag-number order: the message-id index visits the table in random
+    // source-id order, making even a single read expensive on a large store.
+    // Materialize the id sets once inside SQLite so ordinary unmatched rows
+    // never cross the JS boundary. Delimiter-bearing and NUL-bearing source ids
+    // use the general matcher above rather than assuming a single base id.
+    // All subsequent writes are primary-key lookups, not session scans.
+    const rows = db
+        .prepare(`WITH ids AS MATERIALIZED (
+            SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
+        )
+        SELECT id, tag_number, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
+        WHERE session_id = ? AND status IN ('active', 'dropped') AND (
+            message_id IN (SELECT source_id FROM ids)
+            OR tool_owner_message_id IN (SELECT source_id FROM ids)
+            OR (instr(lower(message_id), ':p') > 0 AND
+                lower(substr(message_id, 1, instr(lower(message_id), ':p') - 1)) IN (SELECT folded_id FROM ids))
+            OR (instr(lower(message_id), ':file') > 0 AND
+                lower(substr(message_id, 1, instr(lower(message_id), ':file') - 1)) IN (SELECT folded_id FROM ids))
+            OR (? AND instr(message_id, ':') > 0)
+            OR ?
+        )`)
+        .all(
+            JSON.stringify(Array.from(ids)),
+            sessionId,
+            Array.from(ids).some((id) => id.includes(":")) ? 1 : 0,
+            nulPrefixes.size > 0 ? 1 : 0,
+        ) as {
+        id: number;
+        tag_number: number;
+        message_id: string | null;
+        tool_owner_message_id: string | null;
+    }[];
+    const candidates = rows.filter(
+        (row) =>
+            (eligibleTagNumbers === undefined || eligibleTagNumbers.has(row.tag_number)) &&
+            matches(row.message_id, row.tool_owner_message_id),
+    );
+    if (candidates.length === 0) return 0;
+
+    // Recheck identity as well as status: another process can retarget or retire
+    // a tag between the read and a batch. RETURNING excludes trigger writes.
+    const update = db.prepare(
+        `UPDATE tags SET status = 'compacted'
+         WHERE id = ? AND session_id = ?
+            AND status IN ('active', 'dropped')
+            AND message_id IS ? AND tool_owner_message_id IS ?
+          RETURNING tag_number`,
+    );
+    let cursor = 0;
+    let changed = 0;
+    const batch = db.transaction(() => {
+        const start = performance.now();
+        let processed = 0;
+        do {
+            const row = candidates[cursor++];
+            const retired = update.get(
+                row.id,
+                sessionId,
+                row.message_id,
+                row.tool_owner_message_id,
+            ) as { tag_number: number } | null;
+            if (retired) {
+                // Retiring this source removes it from the request, so delete its queued
+                // operation in the same transaction instead of waiting for another drain.
+                removePendingOp(db, sessionId, retired.tag_number);
+                changed++;
             }
-            return changed;
-        })
-        .immediate();
+            processed++;
+        } while (cursor < candidates.length && processed < 128 && performance.now() - start < 8);
+    });
+    // A failed later batch leaves only valid compacted rows. Retrying is safe,
+    // and never redoes the rows already committed by an earlier batch.
+    while (cursor < candidates.length) batch.immediate();
+    return changed;
 }
 
 /**
@@ -1788,6 +2613,7 @@ export function markTagsCompactedByMessageIds(
  *   - Message tags: `messageId == <removed-msg-id>` (text parts).
  *   - File tags: `messageId LIKE <removed-msg-id>:p%` /
  *     `<removed-msg-id>:file%`.
+ *   - Content-derived text tags (Pi): `<removed-msg-id>:mc-text-v1:%`.
  *   - Tool tags owned by the removed message:
  *     `tool_owner_message_id == <removed-msg-id>` (v3.3.1 Layer C).
  *
@@ -1809,8 +2635,9 @@ export function deleteTagsByMessageId(
         const escapedMessageId = escapeLikePattern(messageId);
         const textPartPattern = `${escapedMessageId}:p%`;
         const filePartPattern = `${escapedMessageId}:file%`;
+        const contentDerivedTextPattern = `${escapedMessageId}${escapeLikePattern(TEXT_TAG_IDENTITY_MARKER)}%`;
         const messageScopedTags = getTagNumbersByMessageIdStatement(db)
-            .all(sessionId, messageId, textPartPattern, filePartPattern)
+            .all(sessionId, messageId, textPartPattern, filePartPattern, contentDerivedTextPattern)
             .filter(isTagNumberRow)
             .map((row) => row.tag_number);
 
@@ -1830,6 +2657,7 @@ export function deleteTagsByMessageId(
                 messageId,
                 textPartPattern,
                 filePartPattern,
+                contentDerivedTextPattern,
             );
         }
         if (ownerScopedTagNumbers.length > 0) {
@@ -2128,18 +2956,24 @@ export function getDroppedTagsBySession(
     sessionId: string,
     scope?: { ownerIds: readonly string[]; messageAddresses: readonly string[] },
 ): TagEntry[] {
-    // Filter before hydrating tag rows: a long folded history can dwarf the servable tail.
+    // Query owner and message addresses separately so their indexes bound both
+    // scans to the visible tail. Unary + keeps the status filter but prevents
+    // choosing the session-wide dropped-tag index for these scoped lookups.
     const rows = (
         scope
             ? db
-                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags
-        WHERE session_id = ? AND status = 'dropped'
-          AND ((type = 'tool' AND tool_owner_message_id IN (SELECT value FROM json_each(?)))
-            OR (type != 'tool' AND message_id IN (SELECT value FROM json_each(?))))
+                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+        WHERE session_id = ? AND type = 'tool' AND +status = 'dropped'
+          AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+        UNION ALL
+        SELECT ${TAG_SELECT_COLUMNS} FROM tags INDEXED BY idx_tags_session_message_id
+        WHERE session_id = ? AND type != 'tool' AND +status = 'dropped'
+          AND message_id IN (SELECT value FROM json_each(?))
         ORDER BY tag_number ASC, id ASC`)
                   .all(
                       sessionId,
                       JSON.stringify(scope.ownerIds),
+                      sessionId,
                       JSON.stringify(scope.messageAddresses),
                   )
             : getDroppedTagsBySessionStatement(db).all(sessionId)
@@ -2224,6 +3058,38 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
+const newestToolTagNumberStatements = new WeakMap<Database, PreparedStatement>();
+
+/**
+ * Tag numbers of the session's newest `limit` tool tags, any status, newest
+ * first. Equals filtering a full `getTagsBySession` load to tool tags and
+ * keeping the highest numbers: the row checks mirror `isTagRow`, so a malformed
+ * row is skipped here exactly as that load skips it. The walk runs backwards on
+ * the UNIQUE(session_id, tag_number) index and stops after `limit` rows.
+ */
+export function getNewestToolTagNumbers(db: Database, sessionId: string, limit: number): number[] {
+    if (limit <= 0) return [];
+    let statement = newestToolTagNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT tag_number FROM tags
+              WHERE session_id = ? AND type = 'tool'
+                AND typeof(message_id) = 'text'
+                AND typeof(status) = 'text'
+                AND typeof(byte_size) IN ('integer', 'real')
+                AND typeof(tag_number) IN ('integer', 'real')
+              ORDER BY tag_number DESC
+              LIMIT ?`,
+        );
+        newestToolTagNumberStatements.set(db, statement);
+    }
+    return (statement.all(sessionId, limit) as Array<{ tag_number: number }>).map(
+        (row) => row.tag_number,
+    );
+}
+
+const droppedNumberStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Return only dropped tags whose numbers are visible replay targets. */
 export function getDroppedTagsByNumbers(
     db: Database,
@@ -2240,13 +3106,14 @@ export function getDroppedTagsByNumbers(
         return all;
     }
 
-    const placeholders = tagNumbers.map(() => "?").join(",");
-    const rows = db
-        .prepare(
-            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (${placeholders}) ORDER BY tag_number ASC, id ASC`,
-        )
-        .all(sessionId, ...tagNumbers)
-        .filter(isTagRow);
+    let statement = droppedNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (SELECT value FROM json_each(?)) ORDER BY tag_number ASC, id ASC`,
+        );
+        droppedNumberStatements.set(db, statement);
+    }
+    const rows = statement.all(sessionId, JSON.stringify(tagNumbers)).filter(isTagRow);
 
     return rows.map(toTagEntry);
 }
@@ -2265,10 +3132,17 @@ export function getMaxDroppedTagNumber(db: Database, sessionId: string): number 
     return isMaxTagNumberRow(row) ? row.max_tag_number : 0;
 }
 
+const tagByIdStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getTagById(db: Database, sessionId: string, tagId: number): TagEntry | null {
-    const result = db
-        .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`)
-        .get(sessionId, tagId);
+    let statement = tagByIdStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`,
+        );
+        tagByIdStatements.set(db, statement);
+    }
+    const result = statement.get(sessionId, tagId);
 
     if (!isTagRow(result)) {
         return null;

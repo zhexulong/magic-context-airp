@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parsePluginConfig } from "../../config";
@@ -11,22 +11,16 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { registerTools } from "./tools";
 import type { V2Context } from "./types";
-
-/**
- * The OpenCode 2 lane registered `ctx_note` and `ctx_memory` with no Rust
- * backends at all, so in Rust mode an agent's write went to the host read model
- * and the module — the authority for both — never saw it. This pins the wiring
- * that closes that: the backends reach the tool definitions this host installs.
- */
 
 let dir: string;
 let db: ContextDatabase;
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "mc-v2-tool-backends-"));
+    dir = createTestTempDirFromPath(join(tmpdir(), "mc-v2-tool-backends-"));
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "cortexkit", "magic-context"), { recursive: true });
     const opened = openDatabase();
@@ -61,7 +55,7 @@ function hostContext(registered: RegisteredTool[]): V2Context {
 /** Every module facade call the registered tools made, in order. */
 const calls: string[] = [];
 
-test("Rust tool backends reach the tools this host registers", async () => {
+test("Rust-mode note tools read the shared store without a module facade", async () => {
     calls.length = 0;
     const backends: RustToolBackends = {
         authorityState: async () => "MODULE",
@@ -90,9 +84,7 @@ test("Rust tool backends reach the tools this host registers", async () => {
             progress: () => {},
         },
     );
-    // The module facade ran, which is the whole point: without it this call
-    // would have read only the host's copy.
-    expect(calls).toEqual(["note:read"]);
+    expect(calls).toEqual([]);
 });
 
 test("without backends the same registration keeps the host-only tools", async () => {
@@ -110,7 +102,5 @@ test("without backends the same registration keeps the host-only tools", async (
         { action: "read" },
         { sessionID: "ses-1", messageID: "msg-1", agent: "build", progress: () => {} },
     );
-    // The same call with the argument dropped reaches no module facade, which is
-    // what the OpenCode 2 lane did before this wiring existed.
     expect(calls).toEqual([]);
 });

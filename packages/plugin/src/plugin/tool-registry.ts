@@ -6,7 +6,7 @@ import { getProtectionWindowForSession } from "../features/magic-context/protect
 import {
     getDatabasePersistenceError,
     isDatabasePersisted,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
 } from "../features/magic-context/storage";
 import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
@@ -23,12 +23,15 @@ import {
     createCtxMemoryTools,
 } from "../tools/ctx-memory";
 import { createCtxNoteTools } from "../tools/ctx-note";
+import { withoutSmartNoteText } from "../tools/ctx-note/constants";
 import { createCtxReduceTools } from "../tools/ctx-reduce";
 import { createCtxSearchTools } from "../tools/ctx-search";
+import { CTX_NOTE_LIGHT_DESCRIPTION } from "../tools/light-descriptions";
 import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
+import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
 /**
@@ -64,6 +67,7 @@ export function createToolRegistry(args: {
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     registrationPromptSurface?: PromptSurfaceConfig;
     includeDreamerOnlyTools?: boolean;
+    internalChildSessions?: ReadonlySet<string>;
 }): Record<string, ToolDefinition> {
     const { ctx, pluginConfig, rustToolBackends } = args;
 
@@ -142,6 +146,7 @@ export function createToolRegistry(args: {
             ? {}
             : createCtxReduceTools({
                   db,
+                  protectedTools: pluginConfig.protected_tools,
                   getProtectionWindow: (sessionId) =>
                       getProtectionWindowForSession(
                           db,
@@ -150,10 +155,11 @@ export function createToolRegistry(args: {
                       ),
                   rustToolBackends,
               })),
-        ...createCtxExpandTools({ db }),
+        ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
         ...createCtxNoteTools({
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),
+            smartNotesEnabled: pluginConfig.smart_notes?.enabled,
             resolveProjectPath,
             rustToolBackends,
         }),
@@ -191,7 +197,7 @@ export function createToolRegistry(args: {
         createPromptSurfaceRuntime({
             harness: "opencode",
             directory: ctx.directory,
-            warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
+            warn: (message) => log(`[magic-context] config warning: ${message}`),
         });
     // OpenCode materializes this map once per plugin process. Resolve only the
     // registration owner's default here: model/session routes cannot safely swap
@@ -201,7 +207,11 @@ export function createToolRegistry(args: {
     );
     const surfacedTools = Object.fromEntries(
         Object.entries(allTools).map(([toolId, definition]) => {
-            const parameterDescriptions = parameterDescriptionsFor(toolId, registration.preset);
+            const parameterDescriptions = parameterDescriptionsFor(
+                toolId,
+                registration.preset,
+                pluginConfig.smart_notes?.enabled,
+            );
             const argsWithPresetDescriptions = parameterDescriptions
                 ? Object.fromEntries(
                       Object.entries(definition.args).map(([name, schema]) => [
@@ -221,7 +231,14 @@ export function createToolRegistry(args: {
                 {
                     ...definition,
                     args: argsWithPresetDescriptions,
-                    description: registration.descriptionFor(toolId, definition.description ?? ""),
+                    description:
+                        toolId === "ctx_note" && pluginConfig.smart_notes?.enabled === false
+                            ? withoutSmartNoteText(
+                                  registration.preset === "light"
+                                      ? CTX_NOTE_LIGHT_DESCRIPTION
+                                      : (definition.description ?? ""),
+                              )
+                            : registration.descriptionFor(toolId, definition.description ?? ""),
                 },
             ];
         }),
@@ -233,5 +250,9 @@ export function createToolRegistry(args: {
         normalizeToolArgSchemas(toolDefinition);
     }
 
-    return surfacedTools;
+    return guardSubagentTools(
+        surfacedTools,
+        db,
+        (id) => args.internalChildSessions?.has(id) === true,
+    );
 }

@@ -213,12 +213,42 @@ fn write_config_atomic(
     content: &str,
     project_root: Option<&Path>,
 ) -> Result<(), String> {
+    // A user config is often a symlink into a dotfiles repo (stow, chezmoi,
+    // home-manager). Renaming over the link would replace it with a regular
+    // file and edits would silently stop reaching the repo, so write through
+    // to the file it points at. Project configs never get here as symlinks:
+    // they are untrusted repository content and the project validation
+    // refuses a symlinked target.
+    let path = if project_root.is_none() {
+        resolve_symlinked_config(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let path = path.as_path();
     let parent = path
         .parent()
         .ok_or_else(|| "Config path has no parent directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
-
-    let temp_path = create_temp_config_file(parent, path.file_name(), content)?;
+    ensure_private_config_directory(parent)
+        .map_err(|e| format!("Failed to create directory: {e}"))?;
+    // A user config always ends owner-only, including when replacing a formerly
+    // permissive file. Project config retains its prior mode when one exists.
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if project_root.is_none() {
+            0o600
+        } else {
+            std::fs::metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(0o600)
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = 0o600;
+    // Create the temporary config with its final mode, before content is written.
+    let temp_path = create_temp_config_file(parent, path.file_name(), content, mode)?;
     if let Some(root) = project_root {
         if let Err(e) = validate_project_config_target(root, path) {
             let _ = std::fs::remove_file(&temp_path);
@@ -232,10 +262,48 @@ fn write_config_atomic(
     })
 }
 
+/// The file a config path finally names, following any chain of symlinks.
+/// A path that is not a symlink is returned as is; a dangling link resolves to
+/// the missing file it points at, so the write recreates it there.
+fn resolve_symlinked_config(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)
+                    .map_err(|e| format!("Failed to read config symlink: {e}"))?;
+                current = match current.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(format!("Failed to inspect config path: {e}")),
+        }
+    }
+    Err("Config path has too many levels of symlinks".to_string())
+}
+
+fn ensure_private_config_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 fn create_temp_config_file(
     parent: &Path,
     file_name: Option<&std::ffi::OsStr>,
     content: &str,
+    mode: u32,
 ) -> Result<PathBuf, String> {
     let file_name = file_name
         .and_then(|name| name.to_str())
@@ -258,7 +326,7 @@ fn create_temp_config_file(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
+            options.custom_flags(libc::O_NOFOLLOW).mode(mode);
         }
         match options.open(&temp_path) {
             Ok(mut file) => {
@@ -280,16 +348,11 @@ fn create_temp_config_file(
     Err("Failed to create a unique temporary config path".to_string())
 }
 
-#[cfg(not(windows))]
+/// `std::fs::rename` replaces an existing file on every platform (on Windows
+/// it renames with replace-if-exists semantics), so there is never a moment
+/// with no config on disk. Deleting the target first, as a Windows
+/// workaround, would lose the config if the process died between the two steps.
 fn replace_with_temp(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(temp_path, path)
-}
-
-#[cfg(windows)]
-fn replace_with_temp(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
     std::fs::rename(temp_path, path)
 }
 
@@ -497,6 +560,106 @@ mod tests {
             error.contains("Failed to read config"),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_writes_through_a_symlinked_user_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles/cortexkit");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("magic-context.jsonc");
+        std::fs::write(&real, "{}\n").unwrap();
+        let config_dir = dir.path().join("config/cortexkit");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let link = config_dir.join("magic-context.jsonc");
+        // A relative link, as stow creates them.
+        symlink("../../dotfiles/cortexkit/magic-context.jsonc", &link).unwrap();
+
+        write_config(&link, "{ \"enabled\": false }\n").expect("write through link");
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "{ \"enabled\": false }\n"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&config_dir)
+            .unwrap()
+            .chain(std::fs::read_dir(&dotfiles).unwrap())
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_user_config_is_created_with_owner_only_mode() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join("magic-context").join(format!(
+            "dashboard-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(&root).unwrap();
+        let path = root.join("config/cortexkit/magic-context.jsonc");
+
+        write_config(&path, "{ \"api_key\": \"secret\" }\n").expect("write");
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_keeps_the_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic-context.jsonc");
+        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_config(&path, "{ \"api_key\": \"secret\" }\n").expect("write");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".cortexkit")).unwrap();
+        let canonical_project = project.canonicalize().unwrap();
+        let project_config = canonical_project.join(".cortexkit/magic-context.jsonc");
+        std::fs::write(&project_config, "{}\n").unwrap();
+        std::fs::set_permissions(&project_config, std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        write_project_config(canonical_project.to_str().unwrap(), "{}\n").expect("write");
+        let mode = std::fs::metadata(&project_config)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
     }
 
     #[test]

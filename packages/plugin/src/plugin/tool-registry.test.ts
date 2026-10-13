@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
@@ -20,6 +20,7 @@ import {
     createPromptSurfaceRuntime,
     LIGHT_TOOL_DESCRIPTIONS,
 } from "../shared/prompt-surface-runtime";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import {
     FULL_PARAMETER_DESCRIPTIONS,
     LIGHT_PARAMETER_DESCRIPTIONS,
@@ -50,9 +51,12 @@ afterEach(() => {
 });
 
 function isolateDb(): void {
-    const dir = mkdtempSync(join(tmpdir(), "tool-registry-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "tool-registry-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
+    // The host opens storage asynchronously before registration; this fixture
+    // uses the explicitly synchronous test opener to establish that ready state.
+    expect(openDatabase()).not.toBeNull();
 }
 
 // createToolRegistry only reads ctx.directory; the rest of PluginContext is
@@ -82,7 +86,7 @@ describe("createToolRegistry — memory gating", () => {
         const tools = buildRegistry({});
         const expectedFields: Record<string, string[]> = {
             ctx_reduce: ["drop"],
-            ctx_expand: ["start", "end", "verbose", "message"],
+            ctx_expand: ["start", "end", "verbose", "message", "tag"],
             ctx_note: [
                 "action",
                 "content",
@@ -93,7 +97,9 @@ describe("createToolRegistry — memory gating", () => {
                 "note_ids",
             ],
             ctx_search: ["query", "limit", "from", "to", "sources"],
-            ctx_memory: ["action", "content", "category", "ids", "limit", "reason"],
+            // No `limit`: it only sized the dreamer-only list action, which now
+            // lives on ctx_memory_list (issue 575).
+            ctx_memory: ["action", "content", "category", "ids", "reason"],
         };
 
         for (const [name, fields] of Object.entries(expectedFields)) {

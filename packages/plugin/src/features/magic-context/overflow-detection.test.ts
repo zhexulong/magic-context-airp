@@ -5,6 +5,7 @@ import {
     detectThinkingBindingMismatch,
     extractErrorMessage,
     isPrefixBoundThinkingModel,
+    parseReportedInputTokens,
     parseReportedLimit,
 } from "./overflow-detection";
 
@@ -53,6 +54,12 @@ describe("overflow-detection / detectOverflow", () => {
             "Input token count 1234567 exceeds the maximum number of tokens allowed",
             undefined,
             undefined,
+        ],
+        [
+            "gemini-parenthesized",
+            "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+            100000,
+            "prompt_only",
         ],
         [
             "xai",
@@ -218,33 +225,79 @@ describe("overflow-detection / detectThinkingBindingMismatch", () => {
 });
 
 describe("overflow-detection / isPrefixBoundThinkingModel", () => {
-    test("covers Claude Fable 5.1 and Claude Opus 5.5 on the anthropic provider only", () => {
-        for (const modelID of [
-            "claude-fable-5-1",
-            "fable-5-1-20260831",
-            "claude-opus-5-5",
-            "claude-opus-5.5",
-            "claude-opus-5-5-20260901",
+    test("matches prefix-bound families and route variants independently of provider", () => {
+        for (const providerID of [
+            "anthropic",
+            "ANTHROPIC",
+            "amazon-bedrock",
+            "google-vertex-anthropic",
+            "vertex-eu-anthropic",
+            "custom-route",
+            "openrouter",
+            undefined,
+            null,
+            "",
         ]) {
-            expect(isPrefixBoundThinkingModel("anthropic", modelID)).toBe(true);
+            for (const modelID of [
+                "claude-fable-5-1",
+                "fable-5-1-20260831",
+                "claude-fable-5.1-latest",
+                "claude-opus-5-5",
+                "claude-opus-5.5",
+                "claude-opus-5-5-20260901",
+                "claude-sonnet-5-5",
+                "SONNET_5_5_latest",
+                "claude-sonnet-5.5-20260930",
+                "anthropic.claude-opus-5-5-v1:0",
+                "us.anthropic.claude-sonnet-5-5-v1:0",
+                "anthropic.claude-fable-5-1-v1:0",
+                "claude-sonnet-5-5@20260930",
+                "claude-haiku-5-5",
+                "claude-haiku-5.5-20261001",
+                "us.anthropic.claude-haiku-5-5-v1:0",
+                "claude-haiku-5-5@20261001",
+            ]) {
+                expect(isPrefixBoundThinkingModel(providerID, modelID)).toBe(true);
+            }
+            for (const modelID of [
+                "fable-5-0",
+                "claude-fable-5-5",
+                "claude-opus-5",
+                "claude-opus-5-4",
+                "claude-opus-4-5",
+                "claude-sonnet-5-4",
+                "claude-sonnet-5-50",
+                "claude-sonnet-15-5",
+                "notsonnet-5-5",
+                "claude-haiku-5",
+                "claude-haiku-4-5",
+                "claude-haiku-5-50",
+                "gpt-6-astra",
+                "",
+                null,
+                undefined,
+            ]) {
+                expect(isPrefixBoundThinkingModel(providerID, modelID)).toBe(false);
+            }
         }
-        for (const modelID of [
-            "fable-5-0",
-            "claude-opus-5",
-            "claude-opus-5-4",
-            "claude-opus-4-5",
-        ]) {
-            expect(isPrefixBoundThinkingModel("anthropic", modelID)).toBe(false);
-        }
-        expect(isPrefixBoundThinkingModel("amazon-bedrock", "claude-opus-5-5")).toBe(false);
-        expect(isPrefixBoundThinkingModel("google-vertex-anthropic", "claude-fable-5-1")).toBe(
-            false,
-        );
     });
 });
 
 describe("overflow-detection / parseReportedLimit", () => {
     test("extracts from 'maximum prompt length' (xAI)", () => {
+        expect(
+            parseReportedLimit(
+                "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+            ),
+        ).toEqual({ value: 100000, provenance: "prompt_only" });
+        expect(
+            parseReportedInputTokens(
+                "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+            ),
+        ).toBe(123456);
+        expect(parseReportedInputTokens("Input token count 1234567 exceeds the maximum")).toBe(
+            1234567,
+        );
         expect(parseReportedLimit("the maximum prompt length is 256000 tokens")).toEqual({
             value: 256000,
             provenance: "prompt_only",

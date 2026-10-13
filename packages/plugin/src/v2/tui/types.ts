@@ -57,6 +57,16 @@ export interface V2TuiContext {
     readonly data: {
         readonly listen: (handler: (event: { details: unknown }) => void) => () => void;
         readonly location: { default(): V2TuiLocation };
+        /**
+         * `Context.data.session` on GA 2.0.x. `location.directory` is the
+         * directory whose Magic Context server owns the session. Optional so a
+         * host without it falls back to the startup directory.
+         */
+        readonly session?: {
+            get(
+                sessionID: string,
+            ): { readonly location?: { readonly directory?: string } } | undefined;
+        };
     };
     readonly keymap: {
         readonly layer: (
@@ -109,23 +119,11 @@ export interface V2TuiContext {
     };
 }
 
-/**
- * A slot claim's `render` runs inside the host's component tree; `app` is the
- * always-mounted root slot, which is where `keymap.layer()` can be called from
- * when plugin `setup()` runs outside the keymap provider (see index.ts).
- */
-export type V2SlotClaim =
-    | {
-          readonly append: "sidebar.content";
-          readonly render: (input: { readonly sessionID: string }) => unknown;
-      }
-    | {
-          readonly append: "app";
-          readonly render: (input: Readonly<Record<string, never>>) => unknown;
-      };
-
-/** The layer object `context.keymap.layer()` accepts, derived from the context type. */
-export type V2KeymapLayer = ReturnType<Parameters<V2TuiContext["keymap"]["layer"]>[0]>;
+/** The sidebar slot used by the OpenCode 2 TUI. */
+export type V2SlotClaim = {
+    readonly append: "sidebar.content";
+    readonly render: (input: { readonly sessionID: string }) => unknown;
+};
 
 export interface V2SidebarState {
     snapshots: Record<string, SidebarSnapshot | undefined>;

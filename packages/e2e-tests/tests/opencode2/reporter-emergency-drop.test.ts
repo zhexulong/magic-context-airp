@@ -153,6 +153,24 @@ test("converted 750k session explicit flush exercises reporter emergency drop pa
                 VALUES (?, 1, 0, 1, 'msg_absent_fixture_start', 'msg_absent_fixture_boundary', 'fixture', 'fixture', ?, 'opencode2')`)
                 .run(sessionID, Date.now());
         } finally { contextDb.close(); }
+        // The copied tool row retains its original (pre-warmup) completion time.
+        // The stale-reading guard correctly refuses to record its copied 820k
+        // usage again. Check the provider-proven reading before the restarted
+        // host resets first-pass pressure and prices the converted wire instead.
+        const usageDb = new Database(fixture.contextDbPath, { readonly: true });
+        try {
+            const usage = usageDb.prepare(`SELECT last_input_tokens AS inputTokens,
+                last_usage_context_limit AS contextLimit, last_context_percentage AS percentage
+                FROM session_meta WHERE session_id = ?`).get(sessionID) as {
+                inputTokens: number; contextLimit: number; percentage: number;
+            };
+            expect(usage.inputTokens).toBe(820_000);
+            // The configured window reserves the 1024 output tokens; there is
+            // no declared input cap or overflow-learned limit in this fixture.
+            expect(usage.contextLimit).toBe(748_976);
+            expect(usage.percentage).toBeCloseTo(109.48281386853517, 8);
+            console.log("REPORTER_PROVIDER_USAGE", JSON.stringify(usage));
+        } finally { usageDb.close(); }
         v2 = await spawnOpencode2({ existingIsolation: fixture,
             existingMock: { mock, baseURL: provider.baseURL }, magicContextConfig,
             modelContextLimit: CONTEXT_LIMIT, modelOutputLimit: 1_024, compactionAuto: false });
@@ -185,16 +203,14 @@ test("converted 750k session explicit flush exercises reporter emergency drop pa
             .split("\n").filter((line) => line.startsWith(`PASS ${sessionID} `));
         expect(schemaPasses.length).toBeGreaterThanOrEqual(2);
         const milestones = log.split("\n").filter((line) => /v2 usage:|emergency tiered drop:|heuristic cleanup:|pending ops WILL APPLY|prefix trim:|rematerialized=true/.test(line));
-        expect(milestones.some((line) => /v2 usage: inputTokens=820000 .*percentage=109\./.test(line))).toBe(true);
+        console.log("REPORTER_V2_USAGE", milestones.filter((line) => line.includes("v2 usage:")).join("\n"));
         expect(milestones.some((line) => line.includes("pending ops WILL APPLY — reason=explicit_flush, pendingOps=46"))).toBe(true);
-        // The OpenCode 1 leg omits the agent on chat.message; since 6a7158a407 ("preserve
-        // LKG after host adds empty summaries") the v1 entry still measures the tool
-        // definitions under the "default" agent key. That measured envelope reaches the
-        // OpenCode 2 wire estimate (about 761k tokens, 101.6%, rather than 740k, 98.7%),
-        // which raises the estimated fixed floor, so the planner drops 146 tags, not 143.
+        // The OpenCode 1 leg still measures tool definitions under the default agent.
+        // With the native hidden-run tools, the measured v2 envelope is about 759k
+        // tokens (101.4%); that fixed floor makes this fixture drop 145 tags.
         const v1Log = readFileSync(fixture.logPath("v1-reporter"), "utf8");
         expect(v1Log).toMatch(/final-wire telemetry estimate=\d+ .*toolDefinitions=\d+ /);
-        expect(milestones.some((line) => line.includes("emergency tiered drop: tiered drop: 146 tags"))).toBe(true);
+        expect(milestones.some((line) => line.includes("emergency tiered drop: tiered drop: 145 tags"))).toBe(true);
         expect(milestones.some((line) => /heuristic cleanup: dropped \d+ tool tags, deduplicated \d+ tool calls, dropped 5 system injections/.test(line))).toBe(true);
         expect(milestones.some((line) => /prefix trim: boundary .* absent from current messages; pass=priced; no in-pass trim applied/.test(line))).toBe(true);
         expect(milestones.some((line) => line.includes("rematerialized=true, reason=render_config"))).toBe(true);

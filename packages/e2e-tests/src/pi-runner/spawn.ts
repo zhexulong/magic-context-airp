@@ -1,8 +1,8 @@
+import { createE2ETempDir } from "../temp-dir";
 /** Shared Pi e2e process configuration helpers. */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { __test as subagentRunnerTest } from "../../../pi-plugin/src/subagent-runner";
 import { hostExtractCache } from '../host-extract-cache';
@@ -34,9 +34,11 @@ export function resolvePiPackageJson(host: PiRunnerHost = "pi"): string {
   // Host-version comparisons (for example a control run on an older Pi) pin
   // the host explicitly: either an absolute package.json from a separate
   // install, or an exact version already present in the repository's bun store.
+  const explicitPackageJson = host === "pi"
+    ? process.env.MC_E2E_PI_PACKAGE_JSON
+    : process.env.MC_E2E_OMP_PACKAGE_JSON;
+  if (explicitPackageJson) return explicitPackageJson;
   if (host === "pi") {
-    const explicitPackageJson = process.env.MC_E2E_PI_PACKAGE_JSON;
-    if (explicitPackageJson) return explicitPackageJson;
     const pinnedVersion = process.env.MC_E2E_PI_VERSION;
     if (pinnedVersion) {
       const bunModules = join(REPO_ROOT, "node_modules/.bun");
@@ -120,6 +122,7 @@ export interface PiRunnerOptions {
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
   extensionsBeforeMagicContext?: string[];
+  extensionsAfterMagicContext?: string[];
   /** Compatibility option from the old spawn-per-turn runner. RPC sessions persist naturally. */
   continueSession?: boolean;
 }
@@ -130,8 +133,7 @@ export function createPiIsolatedEnv(
   sharedDataDir?: string,
   host: PiRunnerHost = "pi",
 ): PiIsolatedEnv {
-  const unique = `${host}-e2e-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const baseDirRaw = join(tmpdir(), unique);
+  const baseDirRaw = createE2ETempDir(`${host}-e2e-`);
   mkdirSync(baseDirRaw, { recursive: true });
   const baseDir = realpathSync(baseDirRaw);
   const configDir = join(baseDir, "config");
@@ -269,6 +271,8 @@ export function childEnv(env: PiIsolatedEnv): Record<string, string> {
   result.TMPDIR = hostExtractCache();
   result.PI_CODING_AGENT_DIR = env.agentDir;
   result.HOME = env.baseDir;
+  // macOS Foundation may create an HTTP-cache database independently of XDG.
+  result.CFFIXED_USER_HOME = result.HOME;
   result.XDG_CONFIG_HOME = env.configDir;
   result.XDG_DATA_HOME = env.dataDir;
   result.XDG_CACHE_HOME = env.cacheDir;

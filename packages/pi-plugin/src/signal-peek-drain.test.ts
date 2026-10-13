@@ -142,10 +142,14 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 	const code = stripComments(CONTEXT_HANDLER_SRC);
 
 	test("runPipeline does NOT eager-delete historyRefreshSessions before work", () => {
-		// The eager-delete used to live in the outer pi.on("context") handler
-		// (around line 1052) before runPipeline. Confirm it's gone.
-		// Find the outer ctx-handler lifecycle area, before runPipeline call.
-		const before = code.split("await runPipeline(")[0];
+		// The outer handler must retain the signal until the pipeline succeeds,
+		// whether the pipeline promise is awaited directly or through the pass guard.
+		const pipeline =
+			/await\s+(?:\b(?:guardAwait|budget\.waitMandatory)\(\s*)?runPipeline\(/.exec(
+				code,
+			);
+		expect(pipeline).not.toBeNull();
+		const before = code.slice(0, pipeline?.index);
 		expect(before).not.toContain("historyRefreshSessions.delete(sessionId)");
 	});
 
@@ -224,7 +228,9 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 		// The rolling/sticky reminders were removed in the ctx_reduce nudge
 		// redesign (replaced by Channel 1 tool-result append + Channel 2
 		// sendUserMessage). Note nudges still run after the pipeline completes.
-		const pipelineIdx = code.indexOf("const result = await runPipeline(");
+		const pipelineIdx = code.search(
+			/const\s+result\s*=\s*await\s+(?:\b(?:guardAwait|budget\.waitMandatory)\(\s*)?runPipeline\(/,
+		);
 		const noteIdx = code.indexOf("applyNoteNudges(");
 		expect(pipelineIdx).toBeGreaterThan(0);
 		expect(noteIdx).toBeGreaterThan(pipelineIdx);
@@ -292,6 +298,32 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 		expect(window).toMatch(/if\s*\(\s*isCacheBusting\s*\)/);
 	});
 
+	test("system-prompt injection prefers sections, with a guarded forced fallback for hosts without them", () => {
+		// Pi exposes systemPromptOptions.sections; Oh My Pi's
+		// before_agent_start event has no systemPromptOptions at all
+		// (verified on Oh My Pi 18.2.6 and 18.8.7). Injection must prefer the
+		// shared sections map — an unconditional forced return hides later
+		// extensions' sections on Pi — and fall back to a forced prompt
+		// only when the host has no sections API, because an unconditional
+		// sections assignment throws on Oh My Pi and the handler's catch
+		// would then drop our guidance block entirely.
+		expect(code).toContain("= event.systemPromptOptions;");
+		expect(code).toContain("const hostSections = promptOptions?.sections;");
+		expect(code).toContain("hostSections.magic_context = block");
+		// Exactly two forced fallbacks exist, each on its explicit
+		// no-sections guard: an unguarded forced return adds a third match
+		// or breaks the guard patterns (hiding later Pi sections), and
+		// deleting a fallback drops the count (breaking Oh My Pi).
+		const forcedReturns = [...code.matchAll(/return\s*\{\s*systemPrompt\b/g)];
+		expect(forcedReturns).toHaveLength(2);
+		expect(code).toMatch(
+			/if\s*\(\s*block\s*&&\s*!hostSections\s*\)\s*return\s*\{\s*systemPrompt\b/,
+		);
+		expect(code).toMatch(
+			/if\s*\(\s*hostSections\s*\)\s*\{\s*return;?\s*\}\s*return\s*\{\s*systemPrompt\b/,
+		);
+	});
+
 	test("system-prompt injection supports global disable, skip signatures, and existing prompt dedup", () => {
 		// Council #4 (project-config bleed on /cd): these decisions use
 		// effectiveConfig — the config re-resolved from the CURRENT checkout's
@@ -306,9 +338,14 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 	});
 
 	test("message_end indexes the ended assistant by deferred id lookup", () => {
-		expect(code).toContain("const messageId = endedMsg.id");
-		expect(code).toContain("readPiSessionMessages(ctx)");
-		expect(code).toContain("message.id === messageId");
+		// The lookup itself is exercised in message-end-index-pi.test.ts.
+		expect(code).toContain(
+			"schedulePiAssistantIndexOnMessageEnd(db, sessionId, event.message",
+		);
+		expect(code).toContain("readBranch: () => {");
+		expect(code).not.toContain(
+			"readMessages: () => readPiSessionMessages(ctx)",
+		);
 	});
 
 	test("runtime project identity resolves from ctx.cwd and tracks prompt path sessions", () => {

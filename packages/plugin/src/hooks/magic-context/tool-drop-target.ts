@@ -3,6 +3,7 @@ import { toolPartHasUserAnswer } from "../../shared/user-answer";
 import { droppedInputMarker } from "./dropped-input-guard";
 import { applyEditMarkerToInput } from "./edit-marker";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
+import { neutralizeDroppedReasoningPart } from "./sentinel";
 import { stripTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 import { toolInputStringBytes } from "./tool-input-size";
@@ -247,11 +248,13 @@ export function hasMeaningfulPart(part: unknown): boolean {
     return true;
 }
 
+/**
+ * A drop invalidates the reasoning that led to the dropped call. Take it off
+ * the wire whole (see neutralizeDroppedReasoningPart); never rewrite its text,
+ * which would leave a signature, opaque payload or encrypted content behind.
+ */
 function clearThinkingParts(thinkingParts: ThinkingLikePart[]): void {
-    for (const part of thinkingParts) {
-        if (part.thinking !== undefined) part.thinking = "[cleared]";
-        if (part.text !== undefined) part.text = "[cleared]";
-    }
+    for (const part of thinkingParts) neutralizeDroppedReasoningPart(part);
 }
 
 function messageHasNativeReasoning(message: MessageLike): boolean {
@@ -382,7 +385,8 @@ export class ToolMutationBatch {
 
         const scopedSweep = this.resolveScopedSweep();
         const removed = new Set<MessageLike>();
-        for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+        let writeIndex = 0;
+        for (let i = 0; i < this.messages.length; i += 1) {
             // Tool removal must not delete unrelated reasoning-only turns. Existing
             // sessions switch from the old global scan only on a cache-busting pass,
             // because restoring previously removed messages also changes cached bytes.
@@ -391,9 +395,11 @@ export class ToolMutationBatch {
                 !this.messages[i].parts.some(hasMeaningfulPart)
             ) {
                 removed.add(this.messages[i]);
-                this.messages.splice(i, 1);
+            } else {
+                this.messages[writeIndex++] = this.messages[i];
             }
         }
+        this.messages.length = writeIndex;
         this.pruneServedRows(removed);
 
         this.partsToRemove.clear();
@@ -456,6 +462,8 @@ export function createToolDropTarget(
     batch: ToolMutationBatch,
     tagId: number,
 ): {
+    dropReasoningParts: readonly unknown[];
+    mutationParts: readonly { message: MessageLike; part: unknown }[];
     setContent: (content: string) => boolean;
     drop: () => ToolDropResult;
     truncate: () => ToolDropResult;
@@ -581,6 +589,10 @@ export function createToolDropTarget(
     };
 
     return {
+        dropReasoningParts: thinkingParts,
+        mutationParts:
+            index.get(compositeKey)?.occurrences.map(({ message, part }) => ({ message, part })) ??
+            [],
         measureReclaim: (skeleton) => {
             const entry = index.get(compositeKey);
             const parts = entry?.occurrences.map((occ) => occ.part) ?? [];

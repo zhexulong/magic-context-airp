@@ -14,28 +14,7 @@ export {
     getMaxCompressionDepth,
     incrementCompressionDepth,
 } from "./compression-depth-storage";
-export {
-    AUTHORITY_DOMAINS,
-    type AuthorityDomain,
-    type AuthorityManagedMarker,
-    type AuthorityModuleClient,
-    type AuthorityState,
-    type AuthorityStatus,
-    applyMirrorPage,
-    type ChangefeedPage,
-    type ChangefeedRow,
-    ensureContextStoreUuid,
-    getAuthorityManagedMarker,
-    getContextStoreUuid,
-    getMirrorCursor,
-    installAuthorityManagedMarker,
-    listAuthorityManagedMarkers,
-    type PrepareAuthorityArgs,
-    prepareAuthority,
-    pullAndApplyMirrorPage,
-    reconcileAuthorityMarker,
-    removeAuthorityManagedMarker,
-} from "./context-authority";
+export { ensureContextStoreUuid, getContextStoreUuid } from "./context-store-uuid";
 export {
     clearIndexedMessages,
     deleteIndexedMessage,
@@ -73,6 +52,7 @@ export {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     type OpenDatabaseOptions,
+    openCurrentDatabase,
     openDatabase,
     runSqliteOptimize,
     schemaVersionIsSupported,
@@ -88,6 +68,7 @@ export {
     recordEmbeddingMeasurement,
     type SynapseBatchLedgerInput,
 } from "./storage-embedding-measurements";
+export { countHistorianRuns } from "./storage-historian-runs";
 export {
     deleteIdentityRekeyMap,
     getIdentityRekeyMap,
@@ -314,6 +295,7 @@ export {
     getMaxDroppedTagNumber,
     getMaxTagNumberBySession,
     getMinMessageTagNumberForRawId,
+    getNewestToolTagNumbers,
     getOldestActiveUnprotectedToolTags,
     getPersistedToolTagAccounting,
     getTagById,

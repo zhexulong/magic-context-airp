@@ -33,7 +33,6 @@ import { updateCompactionMarkerAfterPublication } from "./compaction-marker-mana
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import { cleanupHistorianStateFile } from "./compartment-runner-incremental";
 import type { CandidateCompartment, CompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     getReducedRecompTokenBudget,
@@ -41,6 +40,7 @@ import {
     validateStoredCompartments,
 } from "./compartment-runner-validation";
 import { invalidateAutoEmbedSession } from "./embed-session-state";
+import { describeHistorianPromptTrim, fitRecompHistorianPrompt } from "./historian-prompt-fit";
 import { clearInjectionCache } from "./inject-compartments";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -49,9 +49,9 @@ import {
 import {
     getRawSessionMessageCount,
     getRawSessionTagKeysThrough,
+    prepareRawSessionOrdinals,
     readSessionChunk,
 } from "./read-session-chunk";
-import { buildReferenceBlocks } from "./reference-retrieval";
 import { sendStatusNotification } from "./send-session-notification";
 
 function insertRecompCompartmentRows(
@@ -64,7 +64,7 @@ function insertRecompCompartmentRows(
     // promote path. Must match compartment-storage.ts insertCompartmentRows column
     // order. legacy=0 when P1 present, else 1 (flat).
     const stmt = db.prepare(
-        "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, p1, p2, p3, p4, importance, episode_type, legacy, created_at, harness, start_block_index, end_block_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
     for (const c of compartments) {
         const hasTiers = typeof c.p1 === "string" && c.p1.length > 0;
@@ -86,6 +86,8 @@ function insertRecompCompartmentRows(
             hasTiers ? 0 : 1,
             now,
             getHarness(),
+            c.startBlockIndex ?? null,
+            c.endBlockIndex ?? null,
         );
     }
 }
@@ -104,8 +106,8 @@ export function promoteRecompStagingWithM0Mutation(
     }>;
 } | null {
     const now = Date.now();
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
@@ -172,8 +174,36 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         return "## Magic Recomp — Skipped\n\nCould not acquire the compartment-state lease for this session.";
     }
     const leaseHolderId = holderId;
+    if (!(await prepareRawSessionOrdinals(sessionId)))
+        return "## Magic Recomp — Deferred\n\nSession ordinals are warming in the background. Retry shortly; no history was rebuilt.";
+    // Once promotion commits, the rebuilt compartments are the session's history. The
+    // steps after it (depth reset, drop queue, publication signal, embedding, compaction
+    // marker) can each be repaired later. One failing must not report the committed
+    // recomp as failed or skip the steps after it, the publication signal included.
+    const logPostPublishFailure = (step: string, error: unknown): void => {
+        sessionLog(
+            sessionId,
+            `recomp post-publish step=${step} failed; publication stands: ${getErrorMessage(error)}`,
+        );
+    };
+    // Synchronous on purpose: wrapping a step must not add a yield point between
+    // promotion and the publication signal, where a concurrent transform pass could
+    // observe the promoted rows before the drop queue and signal are in place.
+    const afterPublish = (step: string, run: () => void): void => {
+        try {
+            run();
+        } catch (error) {
+            logPostPublishFailure(step, error);
+        }
+    };
+    const afterPublishAsync = async (step: string, run: () => Promise<void>): Promise<void> => {
+        try {
+            await run();
+        } catch (error) {
+            logPostPublishFailure(step, error);
+        }
+    };
     // State file for the current pass — hoisted to be accessible in finally{}
-    let currentStateFilePath: string | undefined;
     updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
     try {
@@ -197,8 +227,9 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         if (rawMessageCount <= 0) {
             return "## Magic Recomp\n\nNo raw history exists, so nothing was rebuilt.";
         }
-        // Intentional: session.get failure is non-fatal — we fall back to deps.directory
-        const parentSessionResponse = await client.session
+        // Intentional: session.get failure is non-fatal — we fall back to deps.directory.
+        // OpenCode 2 hands the runner no SDK client, so the lookup is skipped there.
+        const parentSessionResponse = await client?.session
             .get({ path: { id: sessionId } })
             .catch(() => null);
         const parentSession = normalizeSDKResponse(
@@ -283,7 +314,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // would otherwise skip or wrongly tier the fresh compartments. Wipe
             // per-session depth state so the rebuilt compartments start at depth
             // 0, matching what partial recomp does for its rebuilt range.
-            clearCompressionDepth(db, sessionId);
+            afterPublish("compression-depth", () => clearCompressionDepth(db, sessionId));
 
             if (deps.preserveInjectionCacheUntilConsumed !== true) {
                 clearInjectionCache(sessionId);
@@ -300,7 +331,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // the search substrate (gated only by the embedding provider, not by
             // `memory.enabled`), distinct from fact promotion (which recomp
             // deliberately skips). Fire-and-forget.
-            {
+            await afterPublishAsync("embedding", async () => {
                 const projectIdentity = resolveProjectIdentity(sessionDirectory);
                 // Register the project's embedding provider before embedding;
                 // embedBatchForProject silently no-ops for unregistered projects,
@@ -313,14 +344,16 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                     endMessage: c.endMessage,
                 }));
                 void embedAndStoreCompartmentChunks(db, sessionId, projectIdentity, chunksToEmbed);
-            }
+            });
 
             if (lastCompartmentEnd > 0 && compartmentTagKeys) {
-                queueDropsForCompartmentalizedMessages(
-                    db,
-                    sessionId,
-                    lastCompartmentEnd,
-                    compartmentTagKeys,
+                afterPublish("drop-queue", () =>
+                    queueDropsForCompartmentalizedMessages(
+                        db,
+                        sessionId,
+                        lastCompartmentEnd,
+                        compartmentTagKeys,
+                    ),
                 );
             }
 
@@ -331,7 +364,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // Placed before the embedding await + marker because neither is
             // consumed by those signals, and the await window is exactly where the
             // race fired. Mirrors the incremental path.
-            deps.onCompartmentStatePublished?.(sessionId);
+            afterPublish("publication-signal", () => deps.onCompartmentStatePublished?.(sessionId));
 
             // Update compaction marker after recomp.
             // Recomp is explicit (eagerly clears injection cache), so the marker
@@ -339,23 +372,23 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // marker that a prior in-flight incremental publish may have left
             // behind — recomp now owns the boundary.
             if (lastCompartmentEnd > 0) {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
-                    db,
-                    sessionId,
-                    lastCompartmentEnd,
-                    deps.directory,
-                );
-                // Only CAS-clear a stale pending marker blob when the direct
-                // update actually advanced the boundary. If the update failed
-                // (transient OpenCode DB write error on removal/injection), keep
-                // the pending blob so the deferred drain can still retry —
-                // clearing it would drop the only durable retry path.
-                if (markerUpdated) {
-                    const stalePending = getPendingCompactionMarkerState(db, sessionId);
-                    if (stalePending) {
-                        clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
+                afterPublish("compaction-marker", () => {
+                    const markerUpdated = (
+                        deps.compactionMarkerStrategy?.publish ??
+                        updateCompactionMarkerAfterPublication
+                    )(db, sessionId, lastCompartmentEnd, deps.directory);
+                    // Only CAS-clear a stale pending marker blob when the direct
+                    // update actually advanced the boundary. If the update failed
+                    // (transient OpenCode DB write error on removal/injection), keep
+                    // the pending blob so the deferred drain can still retry —
+                    // clearing it would drop the only durable retry path.
+                    if (markerUpdated) {
+                        const stalePending = getPendingCompactionMarkerState(db, sessionId);
+                        if (stalePending) {
+                            clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
+                        }
                     }
-                }
+                });
             }
 
             sessionLog(
@@ -369,11 +402,54 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         }
 
         while (offset < protectedTailStart) {
+            // Size the chunk to the producer window after the fixed prompt parts;
+            // the reference blocks below come from the same fit.
+            const promptFit = fitRecompHistorianPrompt({
+                model: deps.model,
+                fallbackModelId: deps.fallbackModelId,
+                language: deps.language,
+                requestedChunkTokens: currentTokenBudget,
+                sessionId,
+                chunkStart: offset,
+                lastOrdinal: protectedTailStart - 1,
+                sessionCompartments: candidateCompartments,
+            });
+            if (!promptFit.ok) {
+                recordHistorianRun(db, {
+                    sessionId,
+                    harness: getHarness(),
+                    subagentInvocationId: null,
+                    runKind: "recomp",
+                    status: "failed",
+                    failureReason: promptFit.reason,
+                    chunkStartOrdinal: offset,
+                    chunkEndOrdinal: null,
+                    compartmentsProduced: 0,
+                });
+                sessionLog(
+                    sessionId,
+                    `recomp failed code=${userFacingFailureCode("historian_window_too_small")} reason="${promptFit.reason}"`,
+                );
+                const partial = await promoteAndFinalize(
+                    `the history model's window cannot hold a historian prompt: ${promptFit.reason}`,
+                );
+                if (partial) {
+                    return `## Magic Recomp — Partial\n\n${partial}`;
+                }
+                return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("historian_window_too_small")}`;
+            }
+            if (promptFit.trimmed || promptFit.chunkTokens < currentTokenBudget) {
+                sessionLog(
+                    sessionId,
+                    `recomp prompt fit: ${describeHistorianPromptTrim(promptFit)} requestedChunkTokens=${currentTokenBudget}`,
+                );
+            }
             const chunk = readSessionChunk(
                 sessionId,
-                currentTokenBudget,
+                promptFit.chunkTokens,
                 offset,
                 protectedTailStart,
+                { expandTools: deps.historianExpandTools },
             );
             if (!chunk.text || chunk.messageCount === 0 || chunk.endIndex < offset) {
                 // Remaining messages before the protected tail are too few or all noise.
@@ -402,20 +478,15 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments built so far in THIS recomp run provide
             // continuity). Recomp is a structural rebuild and emits no durable
             // facts (see below), so <project-memory> is omitted — there's
             // nothing to dedup against.
-            const references = buildReferenceBlocks({
-                sessionId,
-                chunkStart: chunk.startIndex,
-                sessionCompartments: candidateCompartments,
-            });
-
             const prompt = buildCompartmentAgentPrompt({
-                seedExamples: references.seedExamples,
-                sessionReferences: references.sessionReferences,
+                seedExamples: promptFit.seedExamples,
+                sessionReferences: promptFit.sessionReferences,
                 projectMemory: "",
                 inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunk.text}`,
                 // Recomp is a structural rebuild only — it must NOT emit facts
@@ -438,6 +509,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
 
             const validatedPass = await runValidatedHistorianPass({
                 client,
+                hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
                 db,
                 parentSessionId: sessionId,
                 sessionDirectory,
@@ -476,13 +548,14 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 },
             });
             if (!validatedPass.ok) {
-                const reducedBudget = getReducedRecompTokenBudget(currentTokenBudget);
+                const reducedBudget = getReducedRecompTokenBudget(promptFit.chunkTokens);
                 if (reducedBudget !== null) {
                     const smallerChunk = readSessionChunk(
                         sessionId,
                         reducedBudget,
                         offset,
                         protectedTailStart,
+                        { expandTools: deps.historianExpandTools },
                     );
                     if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
                         await sendStatusNotification(
@@ -616,7 +689,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         }
         // Full recomp rebuilds every compartment, so all pre-existing depth
         // rows are stale. Matches partial recomp's behavior for rebuilt ranges.
-        clearCompressionDepth(db, sessionId);
+        afterPublish("compression-depth", () => clearCompressionDepth(db, sessionId));
         if (deps.preserveInjectionCacheUntilConsumed !== true) {
             clearInjectionCache(sessionId);
         }
@@ -633,18 +706,20 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         void finalFacts;
 
         if (lastCompartmentEnd > 0 && compartmentTagKeys) {
-            queueDropsForCompartmentalizedMessages(
-                db,
-                sessionId,
-                lastCompartmentEnd,
-                compartmentTagKeys,
+            afterPublish("drop-queue", () =>
+                queueDropsForCompartmentalizedMessages(
+                    db,
+                    sessionId,
+                    lastCompartmentEnd,
+                    compartmentTagKeys,
+                ),
             );
         }
 
         // Signal LAST relative to the drop queue (mirrors the incremental +
         // early-publish paths): a concurrent transform pass consuming the one-shot
         // history/materialize signals must find the drop rows durable.
-        deps.onCompartmentStatePublished?.(sessionId);
+        afterPublish("publication-signal", () => deps.onCompartmentStatePublished?.(sessionId));
 
         // v2: recompute raw chunk embeddings for the rebuilt compartments. This is
         // the NORMAL full-completion path (distinct from promoteAndFinalize, which
@@ -653,7 +728,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // → they vanish from ctx_search semantic results. Gated only by the
         // embedding provider (not `memory.enabled`), distinct from fact
         // promotion (recomp skips).
-        {
+        await afterPublishAsync("embedding", async () => {
             const projectIdentity = resolveProjectIdentity(sessionDirectory);
             // Register the embedding provider first; embedBatchForProject silently
             // no-ops for unregistered projects, leaving no chunk embeddings.
@@ -665,26 +740,25 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 endMessage: c.endMessage,
             }));
             void embedAndStoreCompartmentChunks(db, sessionId, projectIdentity, chunksToEmbed);
-        }
+        });
 
         // v2: advance the compaction marker on the full-completion path too (the
         // promoteAndFinalize early-exit path already does this). Without it, the
         // next incremental run may reprocess already-compartmentalized messages.
         if (lastCompartmentEnd > 0) {
-            const markerUpdated = updateCompactionMarkerAfterPublication(
-                db,
-                sessionId,
-                lastCompartmentEnd,
-                deps.directory,
-            );
-            // Only clear the stale pending blob when the boundary actually
-            // advanced — preserve it for the deferred-drain retry on failure.
-            if (markerUpdated) {
-                const stalePending = getPendingCompactionMarkerState(db, sessionId);
-                if (stalePending) {
-                    clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
+            afterPublish("compaction-marker", () => {
+                const markerUpdated = (
+                    deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication
+                )(db, sessionId, lastCompartmentEnd, deps.directory);
+                // Only clear the stale pending blob when the boundary actually
+                // advanced — preserve it for the deferred-drain retry on failure.
+                if (markerUpdated) {
+                    const stalePending = getPendingCompactionMarkerState(db, sessionId);
+                    if (stalePending) {
+                        clearPendingCompactionMarkerStateIf(db, sessionId, stalePending);
+                    }
                 }
-            }
+            });
         }
 
         // v2: no compressor pass — deterministic decay-tier rendering keeps the
@@ -707,6 +781,5 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
     } finally {
         updateSessionMeta(db, sessionId, { compartmentInProgress: false });
-        cleanupHistorianStateFile(currentStateFilePath);
     }
 }

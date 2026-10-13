@@ -151,7 +151,8 @@ ${candidateList}
 4. Do NOT promote: project-specific preferences, framework choices, one-off moods, task-local frustrations.
 5. If a candidate is semantically equivalent to an existing stable memory, mark it as already covered.
 6. If multiple candidates describe the same trait, merge them into one clean statement.
-7. If an existing stable memory should be updated based on new evidence, include the update.
+7. Phrase every promoted or updated memory as a concise, present-tense verb-first statement without a subject (for example, "Prefers concise explanations" or "Expects changes to be tested").
+8. If an existing stable memory should be updated based on new evidence, include the update and keep the same verb-first, subjectless phrasing.
 
 ### Output Format
 
@@ -310,6 +311,9 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
                 },
             },
             {
+                // Send without holding a request open for the whole run, so the
+                // deadline below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, childSessionId),
                 // The executor owns the per-task deadline (config.timeoutMinutes);
                 // honor the remaining budget, do NOT silently re-cap at 5 minutes.
                 timeoutMs: remainingMs,
@@ -388,7 +392,18 @@ function applyReviewVerdict(
         }))
         .filter((u) => Boolean(u.memoryId) && u.content.length > 0);
     const dismissals = (parsed.dismiss_existing ?? []).filter((d) => Boolean(d.memory_id));
-    const consumeCandidateIds = parsed.consume_candidate_ids ?? [];
+    // A candidate behind a promotion or merge has been used even when the
+    // reviewer forgets to list it for consumption; leaving it in the pool lets
+    // the next review promote the same trait again.
+    const consumeCandidateIds = [
+        ...new Set([
+            ...(parsed.consume_candidate_ids ?? []),
+            ...promotions.flatMap((promotion) => promotion.candidateIds),
+            ...(parsed.update_existing ?? []).flatMap((update) =>
+                update.memory_id && update.content?.trim() ? (update.candidate_ids ?? []) : [],
+            ),
+        ]),
+    ];
 
     // Re-check the lease only after BEGIN IMMEDIATE has serialized writers.
     // A lost lease throws so the executor hot-retries instead of recording

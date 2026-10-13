@@ -143,6 +143,30 @@ fn find_tools_array(value: &Value) -> Option<&Vec<Value>> {
     }
 }
 
+#[test]
+fn legacy_bridge_startup_ctx_reduce_schema_bytes_are_pinned() {
+    // subc-mcp tools/list copies the startup manifest's schema unchanged into
+    // inputSchema. Pin those bytes, not tool.catalog's structural digest: the
+    // Claude Code gateway (thalamus-core tool_surface.rs,
+    // canonical_ctx_reduce_schema) checks this exact shape before it arms
+    // reduction, and refuses a schema it does not recognise. Adding the `drop`
+    // description on 2026-09-22 left Claude Code without reduction for nine
+    // days without any error. Any change here must be coordinated with the
+    // gateway owner first.
+    let startup = serde_json::to_value(manifest(DEFAULT_MODULE_ID)).unwrap();
+    let tools = find_tools_array(&startup["provides"]).unwrap();
+    let reduce = tools
+        .iter()
+        .find(|tool| tool["name"] == "ctx_reduce")
+        .unwrap();
+    let expected = br#"{"additionalProperties":false,"properties":{"drop":{"description":"Tag IDs to drop: \"3-5\", \"1,2,9\", \"1-5,8,12-15\".","type":"string"}},"required":["drop"],"type":"object"}"#;
+    assert_eq!(
+        serde_json::to_vec(&reduce["schema"]).unwrap(),
+        expected,
+        "changing the startup reduce schema can silently disarm Claude Code reduction"
+    );
+}
+
 /// Build one request exactly as Broca's transform plane sends it: the `owned-broca`
 /// profile, the profile folded into `render_config`, and the fields the module does not
 /// read today (`agent_drop_ids`, `cache_ttl_ms`) left in so the test sends the real shape.

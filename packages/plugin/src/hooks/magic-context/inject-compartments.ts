@@ -8,6 +8,7 @@ import {
     escapeXmlContent,
     getCompartments,
     getLastCompartmentEndMessageId,
+    isPartialCompartmentEnd,
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import {
@@ -53,7 +54,10 @@ import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
-import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import {
+    logSlowWriteTransaction,
+    WriteTransactionSteps,
+} from "../../shared/write-transaction-timing";
 import {
     MARKER_SUMMARY_TEXT,
     reconcileForkOrphanedCompactionMarkers,
@@ -63,9 +67,11 @@ import {
     decodeCachedM0UpgradeIdentity,
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
+    readCachedM0MemoryIds,
     renderBudgetIdentityChanged,
     renderedBudgetShrinkReason,
     renderedBudgetSnapshot,
+    withCachedM0MemoryIds,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { historyLocalBudget } from "./decision-calibration";
@@ -75,6 +81,7 @@ import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
+import { renderUserProfileContent } from "./user-profile-render";
 
 export interface PreparedCompartmentInjection {
     block: string;
@@ -207,8 +214,8 @@ function findVisibleReanchorIndex(
 }
 
 /**
- * Return the set of memory ids currently rendered in the cached
- * <session-history> block for this session, if any. Used by ctx_search
+ * Return the set of project-memory ids currently rendered in the cached
+ * m[0]+m[1] prompt pair for this session, if any. Used by ctx_search
  * to hard-filter memories the agent already sees in context — retrieving
  * them from search wastes tokens and pushes high-signal raw-history hits
  * further down the ranking.
@@ -247,6 +254,23 @@ export interface CompartmentInjectionResult {
 
 export function renderMemoryBlock(memories: Memory[]): string | null {
     return renderMemoryBlockV2(memories) || null;
+}
+
+/**
+ * Return the memories `renderHistorianMemoryBlock` renders, in the order it
+ * renders them (by category priority, then input order). Rendering any prefix
+ * of this list reproduces the first lines of the full block, so a caller that
+ * must shrink the block to fit a model window can drop the lowest-priority
+ * lines by taking a shorter prefix.
+ */
+export function orderHistorianMemories(memories: Memory[]): Memory[] {
+    const ordered: Memory[] = [];
+    for (const category of CATEGORY_PRIORITY) {
+        for (const memory of memories) {
+            if (memory.category === category) ordered.push(memory);
+        }
+    }
+    return ordered;
 }
 
 /**
@@ -438,7 +462,16 @@ export function prepareCompartmentInjection(
                     prepared.compartmentEndMessageId,
                 );
                 if (cutoffIndex >= 0) {
-                    const remaining = messages.slice(cutoffIndex + 1);
+                    const remaining = messages.slice(
+                        cutoffIndex +
+                            (isPartialCompartmentEnd(
+                                db,
+                                sessionId,
+                                prepared.compartmentEndMessageId,
+                            )
+                                ? 0
+                                : 1),
+                    );
                     messages.splice(0, messages.length, ...remaining);
                 } else {
                     // Boundary message not in array — covered messages were already
@@ -577,7 +610,9 @@ export function prepareCompartmentInjection(
 
     const lastCompartment = compartments[compartments.length - 1];
     const lastEnd = lastCompartment.endMessage;
-    const lastEndMessageId = lastCompartment.endMessageId;
+    // A newest compartment without an end id cannot be placed; trim at the
+    // newest one that can (see lastCompartmentBoundaryId).
+    const lastEndMessageId = newestCompartmentEndId(compartments) ?? "";
 
     // Modern m0/m1 preparation keeps the persisted baseline boundary. Only final
     // delivery may advance it after prefix preflight, so contention cannot remove
@@ -642,8 +677,9 @@ export function prepareCompartmentInjection(
         // Natural boundary is visible — normal splice, and any degraded-mode
         // bookkeeping from earlier passes is cleared.
         clearDegradedRebuild(sessionId);
-        skippedVisibleMessages = cutoffIndex + 1;
-        const remaining = messages.slice(cutoffIndex + 1);
+        skippedVisibleMessages =
+            cutoffIndex + (isPartialCompartmentEnd(db, sessionId, trimEndMessageId) ? 0 : 1);
+        const remaining = messages.slice(skippedVisibleMessages);
         messages.splice(0, messages.length, ...remaining);
         resultEndMessageId = trimEndMessageId;
     } else {
@@ -675,8 +711,12 @@ export function prepareCompartmentInjection(
                     reAnchorCompartment.endMessageId,
                 );
                 if (reAnchorCutoff >= 0) {
-                    skippedVisibleMessages = reAnchorCutoff + 1;
-                    const remaining = messages.slice(reAnchorCutoff + 1);
+                    skippedVisibleMessages =
+                        reAnchorCutoff +
+                        (isPartialCompartmentEnd(db, sessionId, reAnchorCompartment.endMessageId)
+                            ? 0
+                            : 1);
+                    const remaining = messages.slice(skippedVisibleMessages);
                     messages.splice(0, messages.length, ...remaining);
                     resultEndMessage = reAnchorCompartment.endMessage;
                     resultEndMessageId = reAnchorCompartment.endMessageId;
@@ -966,18 +1006,23 @@ export interface M0M1RenderOptions {
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
     beforePhase3ForTest?: () => void;
+    /** Runs before writer admission, not between m[1] rendering and its writes. */
+    beforeCacheCommitForTest?: () => void;
     /**
-     * Runs inside the transaction that records a HARD fold, just before it
-     * commits (and again on each contention retry, whose earlier attempt rolled
-     * back). Writes that must land only together with an executed fold, such as
-     * converting legacy dropped-tool skeletons, go here. `rendered` carries the
-     * bytes this fold is about to persist, so the caller can tell whether the
-     * fold changes the served prefix or re-renders it byte-identically.
+     * Prepare wire-dependent fold side effects before writer admission, on every
+     * retry. The returned callback receives the locked render, validates its tag
+     * snapshot and persists writes atomically; it must not traverse the wire.
      */
-    onFoldCommit?: (
-        db: Database,
-        rendered: { m0Bytes: Buffer; m1Bytes: Buffer; muralDataUrl: string | null },
-    ) => void;
+    onFoldPrepare?: () =>
+        | ((
+              db: Database,
+              rendered: {
+                  m0Bytes: Buffer;
+                  m1Bytes: Buffer;
+                  muralDataUrl: string | null;
+              },
+          ) => void)
+        | undefined;
 }
 
 export interface MaterializeDecision {
@@ -1076,13 +1121,22 @@ type M0Compartment = Compartment & {
 
 /**
  * The boundary (OpenCode message id) covered by a compartment set rendered into
- * m[0]+m[1] — the highest-sequence compartment's end message id, or null when
- * there are none / the latest has no stored boundary (legacy rows). The input
- * is ordered `sequence ASC`, so the last element is the latest compartment.
+ * m[0]+m[1] — the end message id of the newest compartment that has one, or
+ * null when none does. Newer compartments without an end id (legacy rows, or
+ * rows carried into a forked session) cannot be placed, so the rows after the
+ * boundary stay raw rather than the whole window. The input is ordered
+ * `sequence ASC`.
  */
 function lastCompartmentBoundaryId(compartments: readonly M0Compartment[]): string | null {
-    const last = compartments.at(-1);
-    return last?.endMessageId && last.endMessageId.length > 0 ? last.endMessageId : null;
+    return newestCompartmentEndId(compartments);
+}
+
+function newestCompartmentEndId(compartments: readonly Compartment[]): string | null {
+    for (let index = compartments.length - 1; index >= 0; index -= 1) {
+        const id = compartments[index]?.endMessageId;
+        if (typeof id === "string" && id.length > 0) return id;
+    }
+    return null;
 }
 
 const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
@@ -2228,7 +2282,7 @@ function renderUserProfileBlock(memories: UserMemory[], wrapper = "user-profile"
     if (memories.length === 0) return "";
     const lines = [`<${wrapper}>`];
     for (const memory of memories) {
-        lines.push(`- ${escapeXmlContent(memory.content)}`);
+        lines.push(`- ${escapeXmlContent(renderUserProfileContent(memory.content))}`);
     }
     lines.push(`</${wrapper}>`);
     return lines.join("\n");
@@ -2321,7 +2375,8 @@ function applyMarkersToState(
     state: M0M1State,
     m0Bytes: Buffer,
     markers: M0SnapshotMarkers,
-    m1Bytes?: Buffer,
+    m1Bytes: Buffer,
+    renderedM0Ids: readonly number[],
 ): void {
     state.cachedM0Bytes = m0Bytes;
     if (m1Bytes) {
@@ -2339,13 +2394,16 @@ function applyMarkersToState(
     state.cachedM0ProjectDocsHash = markers.projectDocsHash;
     state.cachedM0MaterializedAt = markers.materializedAt;
     state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
-        markers.upgradeState,
-        markers.compartmentRenderEpoch,
-        markers.muralEnabled,
-        markers.renderBudgetIdentity,
-        markers.memoryRenderEpoch,
-        markers.renderedBudgets ?? null,
+    state.cachedM0UpgradeState = withCachedM0MemoryIds(
+        encodeCachedM0UpgradeIdentity(
+            markers.upgradeState,
+            markers.compartmentRenderEpoch,
+            markers.muralEnabled,
+            markers.renderBudgetIdentity,
+            markers.memoryRenderEpoch,
+            markers.renderedBudgets ?? null,
+        ),
+        renderedM0Ids,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2388,9 +2446,10 @@ function resolveMuralForM0(
     projectPath: string | undefined,
     modelKey: string,
     budgetTokens: number,
+    mode: "persist" | "read-only" = "persist",
 ): MuralWireOptions | undefined {
     if (options.memoryEnabled === false || !options.muralEnabled) return undefined;
-    return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens);
+    return resolveMuralWire(options.db, projectPath, modelKey, true, budgetTokens, mode);
 }
 
 export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
@@ -2563,10 +2622,28 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     const renderedMemoryIds = trimmed.renderOrder.map((m) => m.id);
     options.beforePhase3ForTest?.();
 
+    const steps = new WriteTransactionSteps();
+    const upgradeIdentity = withCachedM0MemoryIds(
+        encodeCachedM0UpgradeIdentity(
+            snapshotMarkers.upgradeState,
+            snapshotMarkers.compartmentRenderEpoch,
+            snapshotMarkers.muralEnabled,
+            snapshotMarkers.renderBudgetIdentity,
+            snapshotMarkers.memoryRenderEpoch,
+            snapshotMarkers.renderedBudgets ?? null,
+        ),
+        renderedMemoryIds,
+    );
+    const baselineEndMessageId = lastCompartmentBoundaryId(compartments);
+    steps.mark("pre_metadata");
+    const commitFold = options.onFoldPrepare?.();
+    steps.mark("pre_onFoldPrepare");
     let m1Text = M1_EMPTY_PLACEHOLDER;
     let m1Bytes = Buffer.from(m1Text, "utf8");
-    const transactionStartedAt = performance.now();
+    options.beforeCacheCommitForTest?.();
     options.db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
+    steps.reset();
     try {
         const currentWorkspace = resolveWorkspaceRenderContext({
             db: options.db,
@@ -2638,7 +2715,10 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             throw new MaterializeContentionError({ reason: "snapshot changed before Phase 3" });
         }
 
-        const m1Render = renderM1WithMetadata(
+        steps.mark("staleCheck");
+        // Keep all delta reads under the writer: selection timestamps, in-place
+        // compartment rewrites and indexed dates are not covered by m[0]'s CAS.
+        const rendered = renderM1WithMetadata(
             {
                 ...options,
                 workspaceIdentitySet: {
@@ -2649,12 +2729,13 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             snapshotMarkers,
             renderedMemoryIds,
         );
-        m1Text = m1Render.text;
+        m1Text = rendered.text;
         m1Bytes = Buffer.from(m1Text, "utf8");
         const visibleMemoryIds = [
-            ...new Set([...renderedMemoryIds, ...m1Render.renderedMemoryIds]),
+            ...new Set([...renderedMemoryIds, ...rendered.renderedMemoryIds]),
         ];
-
+        const visibleIdsJson = JSON.stringify(visibleMemoryIds);
+        steps.mark("m1Render");
         persistCachedM0(options.db, options.sessionId, {
             m0Bytes,
             muralDataUrl: frozenMuralDataUrl,
@@ -2672,20 +2753,14 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectDocsHash: snapshotMarkers.projectDocsHash,
             materializedAt: snapshotMarkers.materializedAt,
             sessionFactsVersion: snapshotMarkers.sessionFactsVersion,
-            upgradeState: encodeCachedM0UpgradeIdentity(
-                snapshotMarkers.upgradeState,
-                snapshotMarkers.compartmentRenderEpoch,
-                snapshotMarkers.muralEnabled,
-                snapshotMarkers.renderBudgetIdentity,
-                snapshotMarkers.memoryRenderEpoch,
-                snapshotMarkers.renderedBudgets ?? null,
-            ),
+            upgradeState: upgradeIdentity,
             systemHash: snapshotMarkers.systemHash,
             toolSetHash: snapshotMarkers.toolSetHash,
             modelKey: snapshotMarkers.modelKey,
             projectIdentity: snapshotMarkers.projectIdentity,
         });
 
+        steps.mark("persistCachedM0");
         // v2 path persists the rendered-memory identity itself. `memory_block_ids`
         // / `memory_block_count` are otherwise written ONLY by the dead legacy v1
         // render path, so without this they stay frozen at whatever the last legacy
@@ -2697,9 +2772,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // bytes and their id manifest never diverge.
         options.db
             .prepare(
-                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
+                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
             )
-            .run(visibleMemoryIds.length, JSON.stringify(visibleMemoryIds), options.sessionId);
+            .run(visibleMemoryIds.length, visibleIdsJson, baselineEndMessageId, options.sessionId);
 
         // Persist the boundary the freshly-rendered m[0]+m[1] cover (the latest
         // compartment's end message id). A cold post-restart pass reads this to
@@ -2707,21 +2782,19 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // so a compartment published after this materialize keeps its raw
         // messages in the tail until an exec pass folds it into m[1]. Same
         // transaction as the m[0] snapshot so bytes and boundary never diverge.
-        const baselineEndMessageId = lastCompartmentBoundaryId(compartments);
-        options.db
-            .prepare(
-                "UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
-            )
-            .run(baselineEndMessageId, options.sessionId);
+        steps.mark("sessionMeta");
+        commitFold?.(options.db, { m0Bytes, m1Bytes, muralDataUrl: frozenMuralDataUrl });
 
-        options.onFoldCommit?.(options.db, {
-            m0Bytes,
-            m1Bytes,
-            muralDataUrl: frozenMuralDataUrl ?? null,
-        });
-
+        steps.mark("onFoldCommit");
         options.db.exec("COMMIT");
-        logSlowWriteTransaction("opencode_materialize_cache", transactionStartedAt);
+        steps.mark("commit");
+        logSlowWriteTransaction(
+            "opencode_materialize_cache",
+            transactionStartedAt,
+            undefined,
+            performance.now(),
+            steps.durations,
+        );
         options.state.cachedM0MuralDataUrl = frozenMuralDataUrl;
         options.state.cachedM0MuralHash = frozenMuralHash;
     } catch (error) {
@@ -2963,9 +3036,7 @@ function renderM1WithMetadata(
     // facts reach the agent as promoted memories via the new-memories block
     // above (maxMemoryId watermark), not via a <session_facts> delta here.
 
-    const renderedNewMemoryIds = newMemoriesBlock
-        ? trimmedNewMemories.map((memory) => memory.id)
-        : [];
+    const renderedNewMemoryIds = newMemoriesBlock ? deltaMemories.map((memory) => memory.id) : [];
     if (blocks.length === 0) {
         return {
             text: M1_EMPTY_PLACEHOLDER,
@@ -3235,8 +3306,11 @@ function m1CoverageAdvanced(options: M0M1RenderOptions): boolean {
 }
 
 function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
-    const transactionStartedAt = performance.now();
+    const steps = new WriteTransactionSteps();
+    options.beforeCacheCommitForTest?.();
     options.db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
+    steps.reset();
     try {
         const row = readCachedM0M1Row(options.db, options.sessionId);
         if (!row || !cachedRowMatchesState(row, options.state)) {
@@ -3259,21 +3333,26 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             };
         }
 
+        steps.mark("staleCheck");
         const markers = markersFromCachedRow(row);
         if (!markers) throw new RenderM1InvalidMarkersError(options.sessionId);
-        const persistedVisibleIds = parseMemoryBlockIds(row.memory_block_ids);
-        // The snapshot watermark separates m[0] ids from post-snapshot m[1] ids,
-        // allowing each soft refresh to replace (rather than accumulate) m[1].
-        const renderedM0Ids = persistedVisibleIds.filter((id) => id <= markers.maxMemoryId);
-        const rendered = renderM1WithMetadata({ ...options }, markers, renderedM0Ids);
+        const renderedM0Ids = readCachedM0MemoryIds(
+            row.cached_m0_upgrade_state,
+            parseMemoryBlockIds(row.memory_block_ids),
+            markers.maxMemoryId,
+        );
+        const rendered = renderM1WithMetadata(options, markers, renderedM0Ids);
         const visibleMemoryIds = [...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds])];
         const m1Bytes = Buffer.from(rendered.text, "utf8");
         const coverage = currentM1Coverage(options, markers);
+        const visibleIdsJson = JSON.stringify(visibleMemoryIds);
         // Advance the persisted baseline boundary too: soft-refresh re-renders
         // m[1] to cover every compartment up to the latest, so the boundary the
         // cached summary covers moves forward with it. Keeping it in sync here is
         // what lets a later cold post-restart defer pass trim correctly.
         const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
+        steps.mark("m1Render");
+
         options.db
             .prepare(
                 `UPDATE session_meta
@@ -3282,7 +3361,8 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                         cached_m1_max_memory_mutation_id = ?,
                         cached_m0_last_baseline_end_message_id = ?,
                         memory_block_count = ?,
-                        memory_block_ids = ?
+                        memory_block_ids = ?,
+                        cached_m0_upgrade_state = ?
                   WHERE session_id = ?`,
             )
             .run(
@@ -3291,14 +3371,27 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                 coverage.maxMemoryMutationId,
                 baselineEndMessageId,
                 visibleMemoryIds.length,
-                JSON.stringify(visibleMemoryIds),
+                visibleIdsJson,
+                withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
                 options.sessionId,
             );
+        steps.mark("sessionMeta");
         options.db.exec("COMMIT");
-        logSlowWriteTransaction("opencode_soft_refresh_cache", transactionStartedAt);
+        steps.mark("commit");
+        logSlowWriteTransaction(
+            "opencode_soft_refresh_cache",
+            transactionStartedAt,
+            undefined,
+            performance.now(),
+            steps.durations,
+        );
         options.state.cachedM1Bytes = m1Bytes;
         options.state.cachedM1MaxMemoryId = coverage.maxMemoryId;
         options.state.cachedM1MaxMemoryMutationId = coverage.maxMemoryMutationId;
+        options.state.cachedM0UpgradeState = withCachedM0MemoryIds(
+            row.cached_m0_upgrade_state,
+            renderedM0Ids,
+        );
         options.state.snapshotMarkers = markers;
         return rendered;
     } catch (error) {
@@ -3459,7 +3552,13 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         options.memoryEnabled === false
             ? undefined
             : (options.mural ??
-              resolveMuralForM0(options, projectPath, snapshotMarkers.modelKey, memoryBudget));
+              resolveMuralForM0(
+                  options,
+                  projectPath,
+                  snapshotMarkers.modelKey,
+                  memoryBudget,
+                  "read-only",
+              ));
     let decayPressureMultiplier = 1;
     let m0Text = renderM0({
         projectDocs: docs.renderedBlock,
@@ -3838,7 +3937,12 @@ function trimToPreparedPrefix(
                             break;
                         }
                         lastSourcePosition = position;
-                        if (position > boundaryPosition) retained.push(message);
+                        if (
+                            position > boundaryPosition ||
+                            (position === boundaryPosition &&
+                                isPartialCompartmentEnd(options.db, options.sessionId, boundary))
+                        )
+                            retained.push(message);
                     }
                     if (liveOrderError) status = refuse(liveOrderError);
                     else {
@@ -3850,7 +3954,11 @@ function trimToPreparedPrefix(
         } else {
             const index = findBoundaryIndex(options.sessionId, options.messages, boundary);
             if (index >= 0) {
-                options.messages.splice(0, index + 1);
+                options.messages.splice(
+                    0,
+                    index +
+                        (isPartialCompartmentEnd(options.db, options.sessionId, boundary) ? 0 : 1),
+                );
                 resetPrefixTrimFallbackState(options.sessionId);
                 status = "applied";
             } else {
@@ -3970,6 +4078,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 materialized.m0Bytes,
                 materialized.snapshotMarkers,
                 materialized.m1Bytes,
+                materialized.renderedMemoryIds,
             );
             m1Render = {
                 text: materialized.m1Text,
@@ -4140,6 +4249,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 refolded.m0Bytes,
                 refolded.snapshotMarkers,
                 refolded.m1Bytes,
+                refolded.renderedMemoryIds,
             );
             rematerialized = true;
             m0Text = decodeM0Bytes(options.state.cachedM0Bytes) ?? M0_EMPTY_BODY;

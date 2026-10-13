@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc } from "comment-json";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { openExistingContextDatabase } from "../lib/database-access";
 import type { PiDiagnosticReport } from "../lib/diagnostics-pi";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
@@ -21,7 +21,7 @@ const originalCacheHome = process.env.XDG_CACHE_HOME;
 const originalConfigHome = process.env.XDG_CONFIG_HOME;
 
 function makeTempRoot(prefix = "mc-pi-doctor-"): string {
-    const path = mkdtempSync(join(tmpdir(), prefix));
+    const path = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempRoots.push(path);
     return path;
 }
@@ -194,6 +194,7 @@ function baseOptions(root: string, cwd: string, prompts: MockPrompts): RunDoctor
                 source: "home",
             }),
             getPiVersion: () => "0.74.0",
+            listPiModels: () => [],
             getLatestNpmVersion: () => "0.1.0",
             openExistingContextDatabase: () => createMockDb(),
             now: () => new Date("2026-04-28T12:34:56Z"),
@@ -282,6 +283,79 @@ describe("Pi doctor", () => {
         expect(output).toContain("PASS SQLite integrity_check: ok");
         expect(output).toContain("Summary: PASS");
         expect(output).toContain("FAIL 0");
+    });
+
+    it("does not fail or run Pi checks when Magic Context is not installed", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(agentDir, "settings.json"),
+            JSON.stringify({ packages: ["npm:other-pi-extension"] }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        if (!options.deps) throw new Error("expected doctor dependencies");
+        options.deps.getPiVersion = () => "0.70.0";
+
+        const code = await runDoctor(options);
+
+        expect(code).toBe(0);
+        expect(prompts.messages).toContain(
+            "info:INFO Pi 0.70.0 found; Magic Context is not installed there (run setup to add it)",
+        );
+        expect(
+            prompts.messages.filter((message) => message.startsWith("info:INFO Pi ")),
+        ).toHaveLength(1);
+        expect(prompts.messages.filter((message) => message.startsWith("error:"))).toHaveLength(0);
+        expect(prompts.messages.join("\n")).toContain("FAIL 0");
+        expect(prompts.messages.join("\n")).not.toContain("older than required 0.74.0");
+    });
+
+    it("still fails when Magic Context is installed on an old Pi version", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        if (!options.deps) throw new Error("expected doctor dependencies");
+        options.deps.getPiVersion = () => "0.70.0";
+
+        const code = await runDoctor(options);
+
+        expect(code).toBe(1);
+        expect(prompts.messages.join("\n")).toContain("Pi 0.70.0 is older than required 0.74.0");
+    });
+
+    it("reports the retired mural.model as one config warning", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        const configHome = process.env.XDG_CONFIG_HOME ?? join(root, ".config");
+        writeFileSync(
+            join(configHome, "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local" },
+                mural: { enabled: true, model: "google/antigravity-gemini-3.8-flash" },
+            }),
+        );
+        const prompts = new MockPrompts();
+
+        await runDoctor(baseOptions(root, cwd, prompts));
+
+        const output = prompts.messages.join("\n");
+        const muralWarnings = output
+            .split("\n")
+            .filter((line) => line.includes("mural.model is deprecated and ignored"));
+        expect(muralWarnings).toHaveLength(1);
+        expect(muralWarnings[0]).toContain("WARN");
+        expect(muralWarnings[0]).toContain(
+            "compress-cues now uses the dreamer model for each harness",
+        );
+        expect(output).not.toContain("PASS Pi Magic Context config loads successfully");
     });
 
     it("names the database and repair command when integrity_check fails", async () => {
@@ -615,9 +689,23 @@ describe("Pi doctor", () => {
             packages?: string[];
         };
         expect(settings.packages).toContain("npm:@cortexkit/pi-magic-context");
-        expect(existsSync(join(root, ".config", "cortexkit", "magic-context.jsonc"))).toBe(true);
+        // Only $schema is written: explicit copies of every schema default would
+        // pin them, so later default changes would never reach this user.
+        expect(
+            parseJsonc(
+                readFileSync(join(root, ".config", "cortexkit", "magic-context.jsonc"), "utf-8"),
+            ),
+        ).toEqual({
+            $schema:
+                "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
+        });
         const output = prompts.messages.join("\n");
-        expect(output).toContain("FAIL npm:@cortexkit/pi-magic-context is missing from packages[]");
+        expect(output).toContain(
+            "INFO Pi 0.74.0 found; Magic Context is not installed there (run setup to add it)",
+        );
+        expect(output).not.toContain(
+            "FAIL npm:@cortexkit/pi-magic-context is missing from packages[]",
+        );
         expect(output).toContain("Added npm:@cortexkit/pi-magic-context");
         expect(output).toContain("Wrote default Magic Context config");
         expect(output).toContain("Repair attempted; 2 item(s) changed");
@@ -651,7 +739,12 @@ describe("Pi doctor", () => {
         expect(existsSync(legacyPath)).toBe(false);
         expect(existsSync(`${legacyPath}.MOVED_READPLEASE`)).toBe(true);
         const output = prompts.messages.join("\n");
-        expect(output).toContain("FAIL npm:@cortexkit/pi-magic-context is missing from packages[]");
+        expect(output).toContain(
+            "INFO Pi 0.74.0 found; Magic Context is not installed there (run setup to add it)",
+        );
+        expect(output).not.toContain(
+            "FAIL npm:@cortexkit/pi-magic-context is missing from packages[]",
+        );
         expect(output).toContain("Migrated Magic Context user config");
         expect(output).not.toContain("Wrote default Magic Context config");
     });
@@ -982,6 +1075,81 @@ describe("Pi doctor", () => {
             'WARN historian.model "github-copilot/gpt-5.4" is a GitHub Copilot reasoning model',
         );
         expect(output).not.toContain('github-copilot/opencode-only" is a GitHub Copilot');
+    });
+
+    it("reports a Pi historian chain with no listed model, naming the closest listed model", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local" },
+                historian: {
+                    pi: {
+                        model: "google/antigravity-gemini-3.8-flash",
+                        fallback_models: ["ollama-cloud/deepseek-v4-flash:0731"],
+                    },
+                },
+                dreamer: {
+                    pi: { model: "google/antigravity-gemini-3.8-flash" },
+                    tasks: { curate: { schedule: "0 4 * * 0" }, verify: { schedule: "" } },
+                },
+            }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        options.deps = {
+            ...options.deps,
+            listPiModels: () => [
+                "google-antigravity/antigravity-gemini-3.8-flash",
+                "ollama-cloud/deepseek-v4.1-flash",
+            ],
+        };
+
+        const code = await runDoctor(options);
+
+        expect(code).toBe(1);
+        const output = prompts.messages.join("\n");
+        expect(output).toContain(
+            "FAIL Pi historian has no model Pi lists, so it will not run: historian: google/antigravity-gemini-3.8-flash (did you mean google-antigravity/antigravity-gemini-3.8-flash?), ollama-cloud/deepseek-v4-flash:0731 (did you mean ollama-cloud/deepseek-v4.1-flash?)",
+        );
+        expect(output).toContain("WARN Pi dreamer task curate has no model Pi lists");
+        // An unscheduled task cannot run, so its chain is not reported.
+        expect(output).not.toContain("dreamer task verify");
+    });
+
+    it("reports the historian chain that resolves in Pi's model list", async () => {
+        const root = makeTempRoot();
+        const cwd = makeTempRoot("mc-pi-doctor-cwd-");
+        const agentDir = setEnv(root, cwd);
+        writeHealthyFiles(agentDir, cwd);
+        writeFileSync(
+            join(root, ".config", "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local" },
+                historian: {
+                    pi: {
+                        model: "google/antigravity-gemini-3.8-flash",
+                        fallback_models: ["google-antigravity/antigravity-gemini-3.8-flash"],
+                    },
+                },
+                dreamer: { disable: true },
+            }),
+        );
+        const prompts = new MockPrompts();
+        const options = baseOptions(root, cwd, prompts);
+        options.deps = {
+            ...options.deps,
+            listPiModels: () => ["google-antigravity/antigravity-gemini-3.8-flash"],
+        };
+
+        await runDoctor(options);
+
+        expect(prompts.messages.join("\n")).toContain(
+            "PASS Pi historian model chain resolves: google-antigravity/antigravity-gemini-3.8-flash",
+        );
     });
 
     it("sanitizes thrown embedding probe errors before printing them", async () => {

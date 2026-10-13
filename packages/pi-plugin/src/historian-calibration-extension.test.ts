@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import { calibrateHistorianProviderPayload } from "./historian-calibration-extension";
 
@@ -115,14 +116,14 @@ describe("historian provider calibration", () => {
 });
 
 it("observes the effective context prompt rather than before-agent input", async () => {
-	const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+	const { writeFileSync, rmSync } = await import("node:fs");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
 	const { spyOn } = await import("bun:test");
 	const { default: extension } = await import(
 		"./historian-calibration-extension"
 	);
-	const root = mkdtempSync(join(tmpdir(), "mc-provenance-test-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-provenance-test-"));
 	const previous = process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
 	const output = spyOn(process.stdout, "write").mockImplementation(() => true);
 	try {
@@ -131,14 +132,14 @@ it("observes the effective context prompt rather than before-agent input", async
 		process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE = file;
 		const handlers = new Map<
 			string,
-			(event: unknown, ctx: { getSystemPrompt(): string }) => unknown
+			(event: unknown, ctx: { getSystemPrompt(): unknown }) => unknown
 		>();
 		extension({
 			on: (
 				name: string,
 				handler: (
 					event: unknown,
-					ctx: { getSystemPrompt(): string },
+					ctx: { getSystemPrompt(): unknown },
 				) => unknown,
 			) => handlers.set(name, handler),
 		} as never);
@@ -153,6 +154,16 @@ it("observes the effective context prompt rather than before-agent input", async
 		expect(event.containsIntended).toBe(true);
 		expect(event.sha256).toHaveLength(64);
 		expect(JSON.stringify(event)).not.toContain("plus extension");
+
+		// Oh My Pi returns one string per prompt segment (issue 618).
+		handlers.get("context")?.(
+			{},
+			{ getSystemPrompt: () => ["intended", "<project-context>"] },
+		);
+		const segmented = JSON.parse(String(output.mock.calls[1]?.[0]));
+		expect(segmented.type).toBe("mc_system_prompt");
+		expect(segmented.bytes).toBe("intended\n\n<project-context>".length);
+		expect(segmented.containsIntended).toBe(true);
 	} finally {
 		output.mockRestore();
 		if (previous === undefined)

@@ -182,6 +182,7 @@ export interface SessionDetail {
   // `getSessionMessages`; cache events by `getSessionCacheEvents`.
   messages_count: number;
   cache_events_count: number;
+  historian_runs: number;
   compartments: Compartment[];
   facts: SessionFact[];
   notes: Note[];
@@ -220,9 +221,9 @@ export interface Compartment {
   title: string;
   content: string;
   created_at: number;
-  /** Resolved from OpenCode DB — epoch ms */
+  /** Epoch milliseconds from the OpenCode message table or matching Pi/OMP JSONL entry. */
   start_time?: number;
-  /** Resolved from OpenCode DB — epoch ms */
+  /** Epoch milliseconds from the OpenCode message table or matching Pi/OMP JSONL entry. */
   end_time?: number;
   /** v2 decay-rate score (1–100). Higher decays into lower tiers slower. */
   importance: number;
@@ -271,7 +272,6 @@ export interface SessionMetaRow {
   is_subagent: boolean;
   last_context_percentage: number;
   last_input_tokens: number;
-  times_execute_threshold_reached: number;
   compartment_in_progress: boolean;
   system_prompt_hash: string;
   memory_block_count: number;
@@ -359,6 +359,7 @@ export interface DreamerProject {
 export type DreamRunFailureClass =
   | "provider_timeout"
   | "provider_error"
+  | "local_refusal"
   | "empty_completion"
   | "no_models"
   | "child_aborted"
@@ -372,12 +373,15 @@ export interface DreamRunFailureDetail {
   provider_error: string | null;
   timeout_ms: number | null;
   child_session_id: string | null;
+  refusal_reason?: string | null;
 }
 
 export interface DreamRunTask {
   name: string;
   durationMs: number;
   resultChars: number;
+  status?: "completed" | "failed" | "skipped";
+  skipReason?: string;
   /** Failure detail only. Missing means no failure was recorded; an empty
    * string is treated as absent by the dashboard. */
   error?: string;
@@ -546,6 +550,8 @@ export type OpencodeInstallState = "cli" | "desktop" | "none";
 
 /** Harness-scoped model catalogs returned together by the Tauri backend. */
 export interface ModelCatalogs {
+  /** Exact variant keys from verbose OpenCode metadata; absence means unknown, [] means none. */
+  opencodeVariants?: Record<string, string[]>;
   opencode: string[];
   pi: string[];
   omp: string[];

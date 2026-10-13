@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,6 +16,7 @@ import {
     inspectProcessesAsync,
 } from "./rpc-utils";
 import { Database } from "./sqlite";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 afterEach(() => {
     __resetSchemaFenceStateForTests();
@@ -116,7 +117,7 @@ test("async Windows inspection bounds CIM and tasklist fallback and caches failu
 });
 
 test("boot storage wait stays responsive with a locked v90 store and slow Windows probes", async () => {
-    const root = mkdtempSync(join(tmpdir(), "async-storage-guard-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "async-storage-guard-"));
     const dbPath = join(root, "context.db");
     const seeded = new Database(dbPath);
     seeded.exec(
@@ -190,6 +191,35 @@ test("boot storage wait stays responsive with a locked v90 store and slow Window
         seeded.close();
         rmSync(root, { recursive: true, force: true });
     }
+});
+
+test("Windows PowerShell 5.1 wrapped creation dates still prove a holder's identity", async () => {
+    __setRpcIdentityTestHooks({ platform: "win32" });
+    __setAsyncProcessProbeForTests(async () =>
+        JSON.stringify([
+            {
+                ProcessId: 10376,
+                ParentProcessId: 1,
+                Name: "opencode.exe",
+                CommandLine: "opencode.exe",
+                CreationDate: {
+                    value: "/Date(1790763300123)/",
+                    DisplayHint: 2,
+                    DateTime: "Wednesday, September 30, 2026 12:15:00 PM",
+                },
+            },
+            {
+                ProcessId: 10377,
+                ParentProcessId: 1,
+                Name: "opencode.exe",
+                CommandLine: "opencode.exe",
+                CreationDate: "2026-09-30T10:15:00.1234567Z",
+            },
+        ]),
+    );
+    const result = await inspectProcessesAsync();
+    expect(result.evidence(10376).startTime).toBe(1790763300123);
+    expect(result.evidence(10377).startTime).toBe(1790763300123);
 });
 
 test("a timed-out refresh retains confirmed blockers until a successful process scan", async () => {

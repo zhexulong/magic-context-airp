@@ -7,6 +7,7 @@ export type CacheBustDivergenceClass =
     | "accounted_hard_pressure_refold"
     | "accounted_hard_marker_drain"
     | "accounted_hard_fold"
+    | "accounted_tag_identity_repair"
     | "accounted_execute_published_history"
     | "accounted_soft_m1_execute"
     | "accounted_ctx_reduce"
@@ -17,6 +18,7 @@ export type CacheBustDivergenceClass =
     | "usage_missing"
     | "provider_full_miss"
     | "provider_short_read_identical_bytes"
+    | "tail_shrink_no_rewrite"
     | "self_inflicted_epoch"
     | "unfaulted_epoch"
     | "unaccounted_defer_pass"
@@ -103,6 +105,8 @@ export interface CacheBustAttributionInput {
     currentModel?: string;
     /** The meter read short while the reusable byte prefix was unchanged. */
     providerShortReadWithIdenticalPrefix?: boolean;
+    /** The only normalized wire change is a shorter tail, not a rewrite. */
+    tailShrink?: boolean;
     /** Current raw OpenCode message count divided by the preceding pass count. */
     ocInputStepRatio?: number;
     decision?: CacheBustDecisionAttribution;
@@ -174,6 +178,11 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         rule: "matched pass records another materialized HARD/m0 fold; tiny mid-history defer/first_render seams are excluded",
     },
     {
+        divergenceClass: "accounted_tag_identity_repair",
+        accounted: true,
+        rule: "matched pass records materialize_reason=tag_identity_repair (Pi kept the newest of two tag numbers for one call or message and rebuilt once)",
+    },
+    {
         divergenceClass: "accounted_ctx_reduce",
         accounted: true,
         rule: "matched pass applies drops at an agent ctx_reduce landing",
@@ -207,6 +216,11 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         divergenceClass: "provider_short_read_identical_bytes",
         accounted: true,
         rule: "provider read fell short while the reusable byte prefix was unchanged; provider-side latency or eviction, not a prompt rewrite",
+    },
+    {
+        divergenceClass: "tail_shrink_no_rewrite",
+        accounted: true,
+        rule: "the tail became shorter and the meter estimates at most 64 rewritten tokens; no meaningful cache write occurred",
     },
     {
         divergenceClass: "self_inflicted_epoch",
@@ -249,6 +263,7 @@ const ACCOUNTED_CLASSES = new Set(
     CACHE_BUST_RULE_TABLE.filter((row) => row.accounted).map((row) => row.divergenceClass),
 );
 const EPOCH_REASONS = new Set(["project_memory_epoch", "epoch_change", "compartment_render_epoch"]);
+const TAIL_SHRINK_REWRITE_NOISE_TOKENS = 64;
 
 export function isUnaccountedCacheBustClass(divergenceClass: string): boolean {
     return !ACCOUNTED_CLASSES.has(divergenceClass as CacheBustDivergenceClass);
@@ -319,6 +334,19 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
         previousTotal !== undefined &&
         previousTotal >= 10_000;
 
+    // A shorter tail can make the meter read below the previous total without
+    // rewriting any reusable prefix. Allow only the provider's 64-token noise
+    // floor here so genuine 1k+ tail rewrites remain actionable.
+    if (
+        !usageMissing &&
+        !providerFullMiss &&
+        input.tailShrink &&
+        input.rewrittenTokens !== undefined &&
+        input.rewrittenTokens <= TAIL_SHRINK_REWRITE_NOISE_TOKENS
+    ) {
+        return "tail_shrink_no_rewrite";
+    }
+
     const decision = input.decision;
     if (!decision) {
         if (usageMissing) return "usage_missing";
@@ -369,6 +397,10 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
         return "accounted_hard_marker_drain";
     }
     if (usageMissing) return "usage_missing";
+    // A declared Pi tag-identity repair rebuilds the array whether or not m[0]
+    // was rematerialized; without this class an unmaterialized repair read as an
+    // m1 refresh and a materialized one as an unnamed fold.
+    if (materializeReason === "tag_identity_repair") return "accounted_tag_identity_repair";
     if (decision.materialized) {
         if (materializeReason === "model_change") return "accounted_hard_model_change";
         if (materializeReason === "system_hash") return "accounted_hard_system_hash";

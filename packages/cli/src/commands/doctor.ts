@@ -36,6 +36,8 @@ export interface RunDoctorOptions extends V22BackfillCommandArgs {
     issue?: boolean;
     report?: string;
     clear?: boolean;
+    /** Print every row of long listings instead of a capped summary. */
+    verbose?: boolean;
     argv?: string[];
 }
 
@@ -134,7 +136,10 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     return anyFailure ? 1 : 0;
 }
 
-async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions): Promise<number> {
+export async function dispatchDoctor(
+    adapter: Pick<HarnessAdapter, "kind">,
+    options: RunDoctorOptions,
+): Promise<number> {
     switch (adapter.kind) {
         // v22 backfill flags are handled once in runDoctor (shared DB), so the
         // per-harness doctors below are NOT forwarded them — that's what
@@ -144,6 +149,8 @@ async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions
                 force: options.force,
                 fix: options.fix,
                 issue: options.issue,
+                report: options.report,
+                verbose: options.verbose,
             });
         }
         case "pi": {
@@ -157,6 +164,7 @@ async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions
             return runOmpDoctor({
                 force: options.force,
                 issue: options.issue,
+                report: options.report,
             });
     }
 }

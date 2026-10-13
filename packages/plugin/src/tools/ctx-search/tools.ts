@@ -15,6 +15,7 @@ import {
     resolveMemoriesByIdsForSearch,
     unifiedSearch,
 } from "../../features/magic-context/search";
+import { searchMessageHistoryOffThread } from "../../hooks/magic-context/auto-search-worker-client";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
@@ -79,7 +80,7 @@ const ctxSearchArgsShape = {
     sources: tool.schema
         .array(tool.schema.enum(["memory", "message", "git_commit", "primer", "note"]))
         .optional()
-        .describe("Restrict to these sources; omit for all. [] searches none."),
+        .describe("Restrict to these sources; omitting it or passing [] searches every source."),
 };
 // The tool definition exposes only the documented argument shape to the model
 // provider, but older callers may still send extra arguments. Parse with
@@ -218,6 +219,10 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     // recall for symbol/command/path lookups. Auto-search hints
                     // (the hot path) leave this off to protect their latency.
                     explicitSearch: true,
+                    // Probe match counts walk the session's FTS rows; run the
+                    // message lane on a worker so the serving thread stays free.
+                    searchMessageHistory: (request) =>
+                        searchMessageHistoryOffThread(deps.db, request),
                     ...dateRange,
                 },
             );

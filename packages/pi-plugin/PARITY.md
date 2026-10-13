@@ -682,6 +682,13 @@ executor; Pi routes through `runPiDreamForProject` → the registered project's
 uses. The dashboard cannot trigger a run on either harness (DB-only, no live
 channel) — it reflects `task_schedule_state` read-only.
 
+Interactive Pi runs `/ctx-dream` detached, for the same reason as recomp (§11b):
+the command handler is the user's turn, so awaiting the run froze the REPL for
+its whole length. The handler returns after the start message; the outcome
+arrives as a later `[ctx-status]` message, and the owner-tracked manual run is
+aborted and drained by `session_shutdown`. Without a UI (print mode) the command
+is the whole invocation, so it still waits for the run.
+
 ---
 
 ## 19b. Processed-image stripping uses harness-specific image shapes
@@ -828,13 +835,23 @@ security boundary unaffected by the main-session activation behavior.
 
 ---
 
-## 25. Pi clone/fork inherits session state; OpenCode `/fork` does not yet
+## 25. Pi clone/fork and OpenCode 2 fork inherit session state; OpenCode 1 `/fork` cannot
 
 Pi preserves JSONL entry ids when cloning a branch, so the clone-start hook can
 copy compartments, tags, reductions, and deferred Pi marker state while filtering
-them to the copied prefix. OpenCode re-mints message ids during `/fork`, making
-entry-id-keyed migration unsafe there. OpenCode fork inheritance therefore needs
-a separate future design based on a stable cross-fork identity.
+them to the copied prefix.
+
+OpenCode 2 records the link (`session_v2.fork_session_id`, `fork_boundary`) and
+copies each parent row with its `seq`, type and creation time, re-minting the id
+as `<id from the fork event>_<seq>`. On the first pass for a fork with no state,
+`v2/fork-inheritance.ts` pairs the rows by `seq` and copies the parent's state up
+to the boundary with the same `copySessionStateForClone` (TypeScript mode only).
+
+OpenCode 1 re-mints every id during `/fork` and records no link to the source
+session (`session.parent_id` is subagent parentage), so there is nothing to pair
+the copy with and no inheritance. A fork there starts empty; the transform's
+over-window check (`unmanaged-over-window.ts`) keeps its first request from going
+out over the model's window.
 
 ---
 
@@ -943,8 +960,10 @@ lookup. Pi does not warm that cache (see §14); when metadata is absent the gate
 never injects the mural image until vision metadata is available; OpenCode warms
 the cache from its SDK at startup.
 
-**Config:** both honor `mural.enabled` (and `mural.model`
-for the compress-cues dreamer task). No intentional per-provider image-part
+**Config:** both honor `mural.enabled`. The compress-cues dreamer task takes its
+model from each harness's own dreamer settings
+(`dreamer.<harness>.tasks.compress-cues.model`, then `dreamer.<harness>.model`);
+the old shared `mural.model` is deprecated and ignored on both. No intentional per-provider image-part
 blacklist today — every Pi serializer path that accepts user image content takes
 raw base64 the same way.
 

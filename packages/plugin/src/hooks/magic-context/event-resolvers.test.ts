@@ -1,8 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -10,6 +9,7 @@ import { recordDetectedContextLimit } from "../../features/magic-context/storage
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
 import {
     historyBudgetPolicyIdentity,
@@ -22,6 +22,7 @@ import {
     resolveSessionId,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { recordOpenCodeProvenInputFloor } from "./opencode-proven-floor";
 
 describe("event-resolvers", () => {
     it("identifies the selected history policy without a live window or unrelated model overrides", () => {
@@ -133,6 +134,7 @@ describe("event-resolvers", () => {
                     lastObservedModelKey: "custom/model",
                     observedSafeInputTokens: 90_000,
                 });
+                recordOpenCodeProvenInputFloor(db, sessionId, "custom/model", 90_000);
 
                 const context = { db, sessionID: sessionId };
                 expect(resolveContextLimit("custom", "model", context)).toBe(90_000);
@@ -151,7 +153,7 @@ describe("event-resolvers", () => {
             initializeDatabase(db);
             runMigrations(db);
             const sessionId = "ses-poisoned-overlay-floor";
-            const dir = mkdtempSync(join(tmpdir(), "mc-floor-overlay-"));
+            const dir = createTestTempDirFromPath(join(tmpdir(), "mc-floor-overlay-"));
             const overlayPath = join(dir, "window-overlay.json");
             try {
                 writeFileSync(
@@ -205,6 +207,7 @@ describe("event-resolvers", () => {
                     observedSafeInputTokens: 593_717,
                     cacheAlertSent: true,
                 });
+                recordOpenCodeProvenInputFloor(db, sessionId, "test-provider/test-model", 593_717);
 
                 const geometry = resolveContextWindowGeometry("test-provider", "test-model", {
                     db,
@@ -270,6 +273,55 @@ describe("event-resolvers", () => {
                 expect(
                     resolveContextLimit("anthropic", "claude", { db, sessionID: sessionId }),
                 ).toBe(167_000);
+            } finally {
+                clearModelsDevCache();
+                closeQuietly(db);
+            }
+        });
+
+        it("bounds a stored prompt-only limit by the declared input cap", async () => {
+            const db = new Database(":memory:");
+            initializeDatabase(db);
+            runMigrations(db);
+            const sessionId = "ses-prompt-only-over-input-cap";
+            try {
+                clearModelsDevCache();
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: "anthropic",
+                                        models: {
+                                            "capped-model": {
+                                                limit: {
+                                                    context: 400_000,
+                                                    input: 272_000,
+                                                    output: 128_000,
+                                                },
+                                            },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+                recordDetectedContextLimit(
+                    db,
+                    sessionId,
+                    1_000_000,
+                    "anthropic/capped-model",
+                    "prompt_only",
+                );
+
+                expect(
+                    resolveContextLimit("anthropic", "capped-model", {
+                        db,
+                        sessionID: sessionId,
+                    }),
+                ).toBe(272_000);
             } finally {
                 clearModelsDevCache();
                 closeQuietly(db);

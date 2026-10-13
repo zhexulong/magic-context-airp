@@ -1,5 +1,6 @@
 import { DREAM_TASK_PROMOTION_DEFAULTS } from "../../../config/schema/magic-context";
-import type { Database } from "../../../shared/sqlite";
+import type { Database, Statement } from "../../../shared/sqlite";
+import { isKnownAutocommit } from "../../../shared/sqlite-helpers";
 import { hasMemoryClassifiedAtColumn } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import {
@@ -106,6 +107,10 @@ export function countProjectSessionsSince(
     projectPath: string,
     since: number | null,
 ): number {
+    // Host events provide precise message timestamps, but SDK bridges may only
+    // maintain the message index. Fall back per session to its indexing time,
+    // not the project binding time (which changes without new messages). Keep
+    // the ledger authoritative so reindexing old Pi history does not reopen work.
     const row =
         since === null
             ? db
@@ -116,9 +121,11 @@ export function countProjectSessionsSince(
             : db
                   .prepare<[string, number], { cnt: number }>(
                       `SELECT COUNT(*) AS cnt FROM session_projects sp
-                        JOIN schema_migrations_meta activity
+                        LEFT JOIN schema_migrations_meta activity
                           ON activity.key = 'retrospective_activity:' || sp.session_id
-                       WHERE sp.project_path = ? AND CAST(activity.value AS INTEGER) > ?`,
+                        LEFT JOIN message_history_index history ON history.session_id = sp.session_id
+                       WHERE sp.project_path = ?
+                         AND COALESCE(CAST(activity.value AS INTEGER), history.updated_at) > ?`,
                   )
                   .get(projectPath, since);
     return row?.cnt ?? 0;
@@ -253,6 +260,145 @@ function countActivePrimers(db: Database, projectPath: string): number {
 }
 
 /**
+ * How far back session activity and new compartments count as "recent" when
+ * deciding whether an identity has anything for the dreamer to do. Older work
+ * no longer seeds schedule rows, and an identity whose only inputs are older
+ * than this (and that has no memories) is pruned from the schedule.
+ */
+export const SCHEDULE_ACTIVITY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Any active or permanent memory, expired or not (the curate gate's pool). */
+export function hasActiveMemories(db: Database, projectPath: string): boolean {
+    return (
+        db
+            .prepare<[string], { one: number }>(
+                "SELECT 1 AS one FROM memories WHERE project_path = ? AND status IN ('active','permanent') LIMIT 1",
+            )
+            .get(projectPath) != null
+    );
+}
+
+/**
+ * Sessions count as recent when they were bound or were active after `since`.
+ * A new binding qualifies before its first message is indexed. Older bindings
+ * need message activity: prefer the host's precise ledger, falling back to the
+ * message index for SDK bridges without host events. This also prevents idle
+ * pruning from removing an actively indexed bridge session's schedule.
+ */
+const RECENT_PROJECT_SESSIONS_SQL = `SELECT sp.session_id FROM session_projects sp
+        LEFT JOIN schema_migrations_meta activity
+          ON activity.key = 'retrospective_activity:' || sp.session_id
+        LEFT JOIN message_history_index history ON history.session_id = sp.session_id
+      WHERE sp.project_path = ?
+        AND (sp.updated_at > ? OR COALESCE(CAST(activity.value AS INTEGER), history.updated_at) > ?)`;
+
+/** Whether a session of this project was bound or was active after `since`. */
+export function hasRecentProjectSession(db: Database, projectPath: string, since: number): boolean {
+    return (
+        db
+            .prepare<[string, number, number], { session_id: string }>(
+                `${RECENT_PROJECT_SESSIONS_SQL} LIMIT 1`,
+            )
+            .get(projectPath, since, since) != null
+    );
+}
+
+/**
+ * Whether a recent session of this project produced a compartment after
+ * `since`. Starting from the few recent sessions keeps this cheap: counting a
+ * large project's compartments by creation time reads every compartment row.
+ */
+function hasRecentProjectCompartment(db: Database, projectPath: string, since: number): boolean {
+    return (
+        db
+            .prepare<[string, number, number, number], { session_id: string }>(
+                `${RECENT_PROJECT_SESSIONS_SQL}
+                    AND EXISTS (SELECT 1 FROM compartments c
+                                 WHERE c.session_id = sp.session_id AND c.created_at > ?)
+                  LIMIT 1`,
+            )
+            .get(projectPath, since, since, since) != null
+    );
+}
+
+/**
+ * The input a task needs before it is worth giving a schedule row at all.
+ *
+ * This is deliberately broader than the per-run activity gate in
+ * `evaluateTaskGate`: the gate asks "is there new work since the last run?",
+ * while this asks "does this identity have the kind of data this task works on?".
+ * A directory that only ever hosted a chat has no memories, so the memory
+ * maintenance tasks get no rows for it; they are seeded later, on the first
+ * scheduler pass after its first memory appears.
+ *
+ * Session-derived inputs only count inside SCHEDULE_ACTIVITY_WINDOW_MS, which
+ * keeps this consistent with the idle-identity pruning: an identity that pruning
+ * removed is never seeded straight back by the next reconcile.
+ */
+export function taskHasSchedulableInput(
+    task: DreamTaskName,
+    db: Database,
+    projectPath: string,
+    now: number,
+): boolean {
+    switch (task) {
+        case "map-memories":
+        case "verify":
+        case "verify-broad":
+        case "curate":
+        case "compress-cues":
+        case "classify-memories":
+            // Raw status, not expiry: curate must still see an expired-only pool
+            // once to transition it.
+            return hasActiveMemories(db, projectPath);
+        case "retrospective":
+            return hasRecentProjectSession(db, projectPath, now - SCHEDULE_ACTIVITY_WINDOW_MS);
+        case "reflect":
+            // The reflection reads the project's own durable memory stream, so any
+            // live memory gives it something to reflect on. Never-run → the pool.
+            return countMemoriesChangedSince(db, projectPath, 0) > 0;
+        case "maintain-docs":
+            return hasRecentProjectCompartment(db, projectPath, now - SCHEDULE_ACTIVITY_WINDOW_MS);
+        case "evaluate-smart-notes":
+            return countPendingSmartNotes(db, projectPath) > 0;
+        case "review-user-memories":
+            // Candidates are global (one cross-project user profile) and any
+            // scheduled identity may review them, so they alone are no reason to
+            // schedule an identity that otherwise has nothing to do.
+            return (
+                countUserMemoryCandidates(db) > 0 && identityHasProjectInput(db, projectPath, now)
+            );
+        case "promote-primers":
+            return countPrimerCandidatesForProject(db, projectPath) > 0;
+        case "refresh-primers":
+            return countActivePrimers(db, projectPath) > 0;
+        default: {
+            const _exhaustive: never = task;
+            return Boolean(_exhaustive);
+        }
+    }
+}
+
+/**
+ * Whether an identity has anything of its own for the dreamer to work on:
+ * active memories, a session in the activity window, or input for any
+ * project-scoped task. The global user-memory review is left out (see
+ * taskHasSchedulableInput). An identity for which this is false is idle and
+ * its schedule rows are pruned.
+ */
+export function identityHasProjectInput(db: Database, projectPath: string, now: number): boolean {
+    // Memories and recent sessions are checked first and by name: they are the
+    // cheapest signals, and "never prune an identity with memories" must hold
+    // even if a memory task's own input rule changes.
+    if (hasActiveMemories(db, projectPath)) return true;
+    if (hasRecentProjectSession(db, projectPath, now - SCHEDULE_ACTIVITY_WINDOW_MS)) return true;
+    return CANONICAL_DREAM_TASKS.some(
+        (task) =>
+            task !== "review-user-memories" && taskHasSchedulableInput(task, db, projectPath, now),
+    );
+}
+
+/**
  * Read-only backlog probe for one task. These probes reuse the task selection
  * predicates and never acquire a lease, materialize a prompt cache, or invoke a model.
  */
@@ -365,6 +511,17 @@ export function getDreamTaskBacklog(
     }
 }
 
+const backlogCaches = new WeakMap<
+    Database,
+    {
+        revisionStatement: Statement;
+        expiryStatement: Statement;
+        revision: string;
+        entries: Map<string, DreamTaskBacklogMap>;
+        eligibleProjects: Map<string, boolean>;
+    }
+>();
+
 /** Read the complete backlog breakdown in the caller's requested registry order. */
 export function getDreamTaskBacklogs(
     db: Database,
@@ -372,8 +529,63 @@ export function getDreamTaskBacklogs(
     tasks: readonly DreamTaskName[] = CANONICAL_DREAM_TASKS,
     options: { lastRunAt?: number | null; retrospectiveWatermarkMs?: number | null } = {},
 ): DreamTaskBacklogMap {
+    if (tasks.length === 0) return {};
+    if (!isKnownAutocommit(db)) {
+        // A rollback leaves every revision counter unchanged, so a backlog read
+        // inside a transaction must never be cached or served from the cache.
+        backlogCaches.delete(db);
+        const result: DreamTaskBacklogMap = {};
+        for (const task of tasks)
+            result[task] = getDreamTaskBacklog(db, projectPath, task, options);
+        return result;
+    }
+    let cache = backlogCaches.get(db);
+    if (!cache) {
+        cache = {
+            revisionStatement: db.prepare(`SELECT total_changes() AS writes,
+                (SELECT data_version FROM pragma_data_version) AS dataVersion,
+                (SELECT schema_version FROM pragma_schema_version) AS schemaVersion`),
+            expiryStatement: db.prepare(`SELECT 1 FROM memories WHERE project_path = ?
+                AND status IN ('active','permanent') AND expires_at IS NOT NULL LIMIT 1`),
+            revision: "",
+            entries: new Map(),
+            eligibleProjects: new Map(),
+        };
+        backlogCaches.set(db, cache);
+    }
+    const revision = JSON.stringify(cache.revisionStatement.get());
+    if (revision !== cache.revision) {
+        cache.entries.clear();
+        cache.eligibleProjects.clear();
+        cache.revision = revision;
+    }
+    let eligible = cache.eligibleProjects.get(projectPath);
+    if (eligible === undefined) {
+        // An expiring pool can change without a write. Never memoize its counts;
+        // all other backlog predicates depend only on rows and caller options.
+        eligible = !cache.expiryStatement.get(projectPath);
+        if (cache.eligibleProjects.size >= 16) cache.eligibleProjects.clear();
+        cache.eligibleProjects.set(projectPath, eligible);
+    }
+    // JSON numbers collapse NaN/Infinity to null; null and omitted watermarks
+    // also have different meanings. Preserve those distinctions in the key.
+    const optionKey = (value: number | null | undefined) =>
+        value === undefined ? "omitted" : value === null ? "null" : `number:${value}`;
+    const key = JSON.stringify([
+        projectPath,
+        tasks,
+        optionKey(options.lastRunAt),
+        optionKey(options.retrospectiveWatermarkMs),
+    ]);
+    const cached = eligible ? cache.entries.get(key) : undefined;
+    if (cached) return structuredClone(cached);
     const result: DreamTaskBacklogMap = {};
     for (const task of tasks) result[task] = getDreamTaskBacklog(db, projectPath, task, options);
+    if (eligible) {
+        if (cache.entries.size >= 16)
+            cache.entries.delete(cache.entries.keys().next().value as string);
+        cache.entries.set(key, structuredClone(result));
+    }
     return result;
 }
 

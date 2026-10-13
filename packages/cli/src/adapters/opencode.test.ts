@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { OpenCodeAdapter } from "./opencode";
 
 // An OpenCode 2 host reads its native `plugins` array and still decodes the legacy
@@ -13,7 +14,7 @@ describe("OpenCodeAdapter registration keys across host generations", () => {
     const originalConfigHome = process.env.XDG_CONFIG_HOME;
 
     beforeEach(() => {
-        root = mkdtempSync(join(tmpdir(), "mc-oc-adapter-"));
+        root = createTestTempDirFromPath(join(tmpdir(), "mc-oc-adapter-"));
         process.env.XDG_CONFIG_HOME = root;
         configPath = join(root, "opencode", "opencode.json");
     });
@@ -96,6 +97,31 @@ describe("OpenCodeAdapter registration keys across host generations", () => {
         expect(read()).toEqual({ plugin: ["@cortexkit/opencode-magic-context@latest"] });
     });
 
+    test("removal keeps comments inside and around the plugin array", async () => {
+        mkdirSync(join(root, "opencode"), { recursive: true });
+        writeFileSync(
+            configPath,
+            `{
+  // plugins I use
+  "plugin": [
+    // theme first
+    "other",
+    "@cortexkit/opencode-magic-context@latest",
+    "third" // keep me
+  ]
+}
+`,
+        );
+        const adapter = new OpenCodeAdapter({ hostGeneration: "v1" });
+        const result = await adapter.removePluginEntry();
+        expect(result.action).toBe("updated");
+        const text = readFileSync(configPath, "utf-8");
+        for (const comment of ["// plugins I use", "// theme first", "// keep me"]) {
+            expect(text).toContain(comment);
+        }
+        expect(text).not.toContain("opencode-magic-context");
+    });
+
     test("removal drops the entry from whichever key holds it", async () => {
         write({ plugins: ["other", "@cortexkit/opencode-magic-context@latest"] });
         const adapter = new OpenCodeAdapter({ hostGeneration: "v2" });
@@ -122,7 +148,7 @@ describe("OpenCodeAdapter plugin cache readers across cache layouts", () => {
     let cache: string;
 
     beforeEach(() => {
-        root = mkdtempSync(join(tmpdir(), "mc-oc-adapter-cache-"));
+        root = createTestTempDirFromPath(join(tmpdir(), "mc-oc-adapter-cache-"));
         for (const key of envKeys) savedEnv[key] = process.env[key];
         cache = join(root, "cache");
         process.env.XDG_CACHE_HOME = cache;

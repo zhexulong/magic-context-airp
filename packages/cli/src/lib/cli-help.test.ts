@@ -1,15 +1,16 @@
 /// <reference types="bun-types" />
 
 import { afterAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import {
     DOCTOR_HELP,
-    DRAIN_AUTHORITY_HELP,
     LIST_HIDDEN_SESSIONS_HELP,
     MERGE_IDENTITY_HELP,
     SETUP_HELP,
+    SINGLE_STORE_HELP,
     subcommandHelp,
 } from "./cli-help";
 
@@ -19,7 +20,7 @@ describe("subcommandHelp", () => {
             [["setup"], SETUP_HELP],
             [["doctor"], DOCTOR_HELP],
             [["doctor", "--fix"], DOCTOR_HELP],
-            [["doctor", "drain-authority"], DRAIN_AUTHORITY_HELP],
+            [["doctor", "single-store", "migrate"], SINGLE_STORE_HELP],
             [["doctor", "merge-identity", "--from", "a"], MERGE_IDENTITY_HELP],
             [["doctor", "list-hidden-sessions"], LIST_HIDDEN_SESSIONS_HELP],
         ];
@@ -43,7 +44,7 @@ describe("subcommandHelp", () => {
 // End-to-end through `main()`: each command must print help and exit 0 without
 // running. Every host path points into a throwaway root so a regression that
 // did run a command could not touch the real OpenCode or Magic Context stores.
-const root = mkdtempSync(join(tmpdir(), "mc-cli-help-"));
+const root = createTestTempDirFromPath(join(tmpdir(), "mc-cli-help-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 const cliEntry = resolve(import.meta.dir, "..", "index.ts");
@@ -78,7 +79,7 @@ describe("CLI --help per subcommand", () => {
     const commands: Array<[string[], string]> = [
         [["setup"], "Usage: magic-context setup"],
         [["doctor"], "Usage: magic-context doctor [options]"],
-        [["doctor", "drain-authority"], "Usage: magic-context doctor drain-authority"],
+        [["doctor", "single-store", "migrate"], "Usage: magic-context doctor single-store migrate"],
         [["doctor", "merge-identities"], "Usage: magic-context doctor merge-identities"],
         [["doctor", "list-hidden-sessions"], "Usage: magic-context doctor list-hidden-sessions"],
         [["doctor", "migrate"], "Magic Context doctor migrate"],

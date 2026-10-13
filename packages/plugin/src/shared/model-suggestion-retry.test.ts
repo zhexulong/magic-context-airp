@@ -1,4 +1,6 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import { withDreamerModelCooldown } from "../features/magic-context/dreamer/provider-output-failure";
+import { recordedGeminiQuotaMessages } from "../features/magic-context/dreamer/provider-output-failure.test-support";
 
 import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
 import {
@@ -406,6 +408,107 @@ describe("promptSyncWithModelSuggestionRetry", () => {
     });
 });
 
+describe("run-scoped primary quota cooldown", () => {
+    test("preserves fallback order, retries the primary after reset, and forgets it in a new run", async () => {
+        let now = 1791425104275;
+        const clock = spyOn(Date, "now").mockImplementation(() => now);
+        const models: string[] = [];
+        const primary = { providerID: "google", modelID: "antigravity-gemini-3.8-flash" };
+        let latestModel = "";
+        let primaryCalls = 0;
+        const client = createClient(
+            mock(async (args: PromptCall) => {
+                latestModel = `${args.body.model?.providerID}/${args.body.model?.modelID}`;
+                models.push(latestModel);
+                if (latestModel.startsWith("google/")) primaryCalls++;
+                if (latestModel === "deepseek/first") throw new Error("fallback unavailable");
+                return {};
+            }),
+        );
+        const run = () =>
+            promptSyncWithValidatedOutputRetry(client, createArgs(primary), {
+                fallbackModels: ["deepseek/first", "deepseek/second"],
+                fetchOutput: async () =>
+                    latestModel.startsWith("google/") && primaryCalls <= 2
+                        ? recordedGeminiQuotaMessages()
+                        : [
+                              {
+                                  info: { role: "assistant" },
+                                  parts: [{ type: "text", text: "valid" }],
+                              },
+                          ],
+                validateOutput: () => "valid",
+            });
+        try {
+            await withDreamerModelCooldown(async () => {
+                await run();
+                await run();
+            });
+            await withDreamerModelCooldown(async () => {
+                await run();
+                await run();
+                now += 5_700_000;
+                await run();
+            });
+            expect(models).toEqual([
+                "google/antigravity-gemini-3.8-flash",
+                "deepseek/first",
+                "deepseek/second",
+                "deepseek/first",
+                "deepseek/second",
+                "google/antigravity-gemini-3.8-flash",
+                "deepseek/first",
+                "deepseek/second",
+                "deepseek/first",
+                "deepseek/second",
+                "google/antigravity-gemini-3.8-flash",
+            ]);
+        } finally {
+            clock.mockRestore();
+        }
+    });
+
+    test("records primary quota exhaustion alongside a failing fallback, not a manifest error", async () => {
+        let model = "";
+        const client = createClient(
+            mock(async (args: PromptCall) => {
+                model = args.body.model?.providerID ?? "";
+                if (model === "deepseek") throw new Error("SessionExecutionFence.Lost");
+                return {};
+            }),
+        );
+        let caught: unknown;
+        await withDreamerModelCooldown(async () => {
+            try {
+                await promptSyncWithValidatedOutputRetry(
+                    client,
+                    createArgs({ providerID: "google", modelID: "antigravity-gemini-3.8-flash" }),
+                    {
+                        fallbackModels: ["deepseek/deepseek-flash"],
+                        fetchOutput: async () => recordedGeminiQuotaMessages(),
+                        validateOutput: () => {
+                            throw new Error("verify manifest missing complete root element");
+                        },
+                    },
+                );
+            } catch (error) {
+                caught = error;
+            }
+        });
+        expect(String(caught)).toContain("primary quota exhausted until");
+        expect(String(caught)).toContain("SessionExecutionFence.Lost");
+        expect(String(caught)).not.toContain("manifest missing");
+        expect(getPromptFailureDetail(caught)).toMatchObject({
+            failureClass: "provider_error",
+            modelAttempted: "deepseek/deepseek-flash",
+            modelsTried: ["google/antigravity-gemini-3.8-flash", "deepseek/deepseek-flash"],
+        });
+        expect(getPromptFailureDetail(caught)?.providerError).toContain(
+            "primary quota exhausted until",
+        );
+    });
+});
+
 describe("promptSyncWithValidatedOutputRetry", () => {
     test("records a step cap as step_limit without a provider error", async () => {
         const prompt = mock(async () => {
@@ -649,4 +752,50 @@ describe("host fetch TimeoutError is a timeout", () => {
         expect(prompt).toHaveBeenCalledTimes(2);
         expect(abort).not.toHaveBeenCalled();
     });
+});
+
+test("empty v1 and v2 replies report the provider finish reason", async () => {
+    for (const output of [
+        [{ info: { role: "assistant", finish: "stop" }, parts: [] }],
+        { text: null, tokenLog: { finish_reason: "stop" } },
+    ]) {
+        const client = createClient(mock(async () => ({})));
+        await expect(
+            promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fetchOutput: async () => output,
+                validateOutput: () => {
+                    throw new Error("map-memories returned no output");
+                },
+            }),
+        ).rejects.toThrow("no output (finish=stop");
+    }
+});
+
+test("DeepSeek unsupported-model 400 preserves provider status and message rather than no output", async () => {
+    const message =
+        "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4-flash";
+    const client = createClient(mock(async () => ({})));
+    let caught: unknown;
+    try {
+        await promptSyncWithValidatedOutputRetry(client, createArgs(), {
+            fetchOutput: async () => [
+                {
+                    info: {
+                        role: "assistant",
+                        error: { name: "APIError", data: { statusCode: 400, message } },
+                    },
+                    parts: [],
+                },
+            ],
+            validateOutput: () => {
+                throw new Error("map-memories returned no output");
+            },
+        });
+    } catch (error) {
+        caught = error;
+    }
+    expect((caught as Error).message).toContain(message);
+    expect((caught as Error).message).toContain("status=400");
+    expect((caught as Error).message).not.toContain("no output");
+    expect(getPromptFailureDetail(caught)).toMatchObject({ failureClass: "provider_error" });
 });

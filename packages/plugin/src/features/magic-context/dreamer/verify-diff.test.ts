@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 
 import { buildVerifyDiffEvidence, VERIFY_DIFF_BUDGET_TOKENS } from "./verify-diff";
 import { buildVerifyPrompt, type VerifyPromptMemory } from "./verify-prompt";
@@ -14,7 +15,7 @@ afterEach(() => {
 const git = (dir: string, ...args: string[]) =>
     execFileSync("git", args, { cwd: dir, encoding: "utf8", windowsHide: true }).trim();
 function repo() {
-    const dir = mkdtempSync(path.join(tmpdir(), "verify-diff-"));
+    const dir = createTestTempDirFromPath(path.join(tmpdir(), "verify-diff-"));
     dirs.push(dir);
     git(dir, "init", "-q");
     git(dir, "config", "user.email", "verify@example.invalid");
@@ -33,6 +34,22 @@ function memory(id: number, file: string, at: number, commit?: string): VerifyPr
 }
 
 describe("incremental verify evidence", () => {
+    it("shared timestamp bases produce byte-identical ordered evidence to explicit commit bases", async () => {
+        const dir = repo();
+        for (const file of ["a.ts", "b.ts"]) writeFileSync(path.join(dir, file), "old\n");
+        git(dir, "add", ".");
+        git(dir, "commit", "-qm", "base");
+        const base = git(dir, "rev-parse", "HEAD");
+        const at = Number(git(dir, "show", "-s", "--format=%ct")) * 1000 + 1000;
+        writeFileSync(path.join(dir, "a.ts"), "new\n");
+        const memories = [memory(1, "b.ts", at), memory(2, "a.ts", at), memory(3, "b.ts", at)];
+        expect(await buildVerifyDiffEvidence(dir, memories)).toEqual(
+            await buildVerifyDiffEvidence(
+                dir,
+                memories.map((m) => ({ ...m, verifiedCommit: base })),
+            ),
+        );
+    });
     it("captures changed hunks once per shared file, untouched hunks, rename, deletion and pending edits", async () => {
         const dir = repo();
         writeFileSync(path.join(dir, "a.ts"), "old\nkeep\n");

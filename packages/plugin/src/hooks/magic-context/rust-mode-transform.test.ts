@@ -1,20 +1,16 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
-import {
-    type AuthorityStatus,
-    ensureContextStoreUuid,
-    getAuthorityManagedMarker,
-    resetAuthorityRoutingObservationsForTest,
-    TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET,
-} from "../../features/magic-context/context-authority";
+import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
+import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
+import * as embeddingDrain from "../../features/magic-context/memory/single-store-embedding-drain";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { ensureMuralRendered } from "../../features/magic-context/mural/render-trigger";
 import {
@@ -38,14 +34,23 @@ import {
     getEmergencyRecoveryArmedAt,
     getMergedReasoningStrippedIds,
     getOverflowState,
+    getPendingCompactionMarkerState,
+    getPersistedCompactionMarkerState,
     getPersistedNoteNudge,
     getThinkingBindingRecoveryTarget,
+    getTrailingBlankDecisions,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
+    setPendingCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
+import {
+    isRustMarkerAdmissionFenced,
+    setRustMarkerAdmissionFence,
+} from "../../features/magic-context/storage-replay-document";
+import { createTagger } from "../../features/magic-context/tagger";
 import {
     __resetToolDefinitionMeasurements,
     recordToolDefinition,
@@ -60,17 +65,38 @@ import * as logger from "../../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { promptSurfaceConfigIdentity } from "../../shared/prompt-surface";
 import { createPromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
-import { Database, withAsyncPrivilegedWriter, withPrivilegedWriter } from "../../shared/sqlite";
+import {
+    Database,
+    withAsyncPrivilegedWriter,
+    withPrivilegedWriter,
+    withSqliteTransformPass,
+} from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { deriveWindowGeometry } from "../../shared/window-geometry";
+import {
+    type SqliteWriteLocker,
+    startSqliteWriteLocker,
+} from "../../shared/sqlite-write-locker-test-support";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { applyProvenInputFloor, deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
+import {
+    applyDeferredCompactionMarker,
+    type MarkerUpdateOutcome,
+} from "./compaction-marker-manager";
 import { primeCtxReduceSpawnPermission } from "./ctx-reduce-availability";
+import { autoEmbedAttemptedBySession } from "./embed-session-state";
 import {
     EmergencyFailClosedError,
     ENGINE_RECONNECTING_USER_MESSAGE,
 } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
-import { createDbLkgPersistence } from "./lkg-persist";
+import {
+    beginV2LkgRequest,
+    clearLkgMeasuredRequest,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
+import { createDbLkgPersistence, loadPersistedLkgSlot } from "./lkg-persist";
+import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { MODULE_ORDINAL_PAGE_SIZE, MODULE_PAGE_MAX_BYTES } from "./module-wire";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
@@ -87,9 +113,12 @@ import {
     RUST_PARK_RETRY_INTERVAL,
     type RustModeModuleClient,
 } from "./rust-mode-transform";
+import { StorageBusyRefusalError } from "./storage-busy-refusal";
+import { buildSyntheticTodoPart } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
+import { reconcileMarkerRepresentation } from "./transform-postprocess-phase";
 
 const createRustModeTransform = (
     deps: TransformDeps,
@@ -97,7 +126,6 @@ const createRustModeTransform = (
 ) =>
     createRustModeTransformImpl(deps, {
         ...options,
-        allowAuthorityProtocolBypassForTests: true,
         modulePageMaxBytes: 512 * 1024,
         scheduleLkgCapture: options.scheduleLkgCapture ?? ((capture) => capture()),
     });
@@ -186,7 +214,7 @@ function makeDb(): ContextDatabase {
 }
 
 function makeFileDb(): ContextDatabase {
-    const directory = mkdtempSync(join(tmpdir(), "rust-mode-context-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "rust-mode-context-"));
     availabilityDataHomes.push(directory);
     const db = openDatabase(join(directory, "context.db")) as ContextDatabase | null;
     if (!db) throw new Error("file-backed test database did not open");
@@ -256,7 +284,6 @@ function makeDeps(db: ContextDatabase, moduleClient: RustModeModuleClient): Tran
         sessionDirectoryBySession: new Map(),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         // These fixtures assert the exact module calls a pass makes for the
         // authority protocol. Naming Broca keeps the historian pull loop, which an
         // unset runner builds on OpenCode, out of those call lists; the loop has
@@ -285,7 +312,7 @@ function makeMeta(
 }
 
 function installAvailabilityDb(sessionId: string, firstUserTools?: Record<string, unknown>): void {
-    const dataHome = mkdtempSync(join(tmpdir(), "rust-mode-availability-"));
+    const dataHome = createTestTempDirFromPath(join(tmpdir(), "rust-mode-availability-"));
     availabilityDataHomes.push(dataHome);
     const dbPath = join(dataHome, "opencode", "opencode.db");
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -330,88 +357,1194 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
-    it("uses the resolved session directory instead of the plugin launch directory for authority routes", async () => {
-        const sessionId = "ses-directory-root";
-        installRawProvider(sessionId);
-        const db = makeDb();
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed me', 'seed-hash', 0, 0, 0, 0)",
-            ).run("git:identity");
-        });
-        const authorityRoots: string[] = [];
-        const statuses = new Map<string, AuthorityStatus>();
-        const module: RustModeModuleClient = {
-            call: async () => {
-                throw new Error("stop after authority preparation");
+    it("transports accepted provider floors unchanged to Rust geometry", () => {
+        const base = deriveWindowGeometry("cursor", "grok-4.7", { context: 256_000 });
+        expect(base).toBeDefined();
+        for (const measured of [757_872, 1_328_370]) {
+            const geometry = applyProvenInputFloor(base!, measured).geometry;
+            const wire = __rustModeTransformTest.transformGeometryForWire(geometry);
+            expect(wire?.usable_soft).toBe(measured);
+            expect(wire?.usable_hard).toBe(measured);
+            expect(wire?.absolute_wall).toBe(measured);
+        }
+    });
+    function markerFaultFixture(
+        fault:
+            | "fence"
+            | "after-marker"
+            | "capture"
+            | "bookkeeping"
+            | "host-lock-capture"
+            | "mirror"
+            | "final-fit"
+            | "os-cut",
+        queueOldCapture = false,
+        noCutOutcome?: MarkerUpdateOutcome,
+        admissionEstimator?: Parameters<
+            typeof createRustModeTransform
+        >[1]["rawFallbackEstimatorForTests"],
+        schedulerDecision = "execute",
+        historianState = "idle",
+    ) {
+        const sid = `marker-admission-${fault}-${Date.now()}`;
+        sessions.push(sid);
+        installRawProvider(sid);
+        installAvailabilityDb(sid);
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(sid, '{"role":"user"}');
+        oc.close();
+        // Prime the host's WAL connection before taking its writer lock, so the
+        // reverse-order probe fails at BEGIN, not during cold journal setup.
+        if (fault === "host-lock-capture") listSessionCompactionMarkers(sid);
+        let db = makeFileDb();
+        const path = (
+            db.prepare("PRAGMA database_list").all() as Array<{ name: string; file: string }>
+        ).find((row) => row.name === "main")!.file;
+        appendCompartments(db, sid, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "indexed",
             },
-            authorityStatus: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return { authority: statuses.get(args.domain) ?? null };
-            },
-            authorityPrepare: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                const domain = String(args.domain) as "memories" | "notes";
-                const phase = String(args.phase);
-                const base = {
-                    context_store_uuid: String(args.context_store_uuid),
-                    project: String(args.project),
-                    domain,
-                    generation: 1,
-                };
-                if (phase === "begin") {
-                    const authority = { ...base, state: "PREPARING" as const };
-                    statuses.set(domain, authority);
-                    return { authority };
+        ]);
+        registerLkgPersistence(createDbLkgPersistence(db));
+        let step = 0;
+        let fail = true;
+        let captureCompleted = false;
+        let deferRebuild = false;
+        let hostLocker: SqliteWriteLocker | undefined;
+        const markerOutcomes: MarkerUpdateOutcome[] = [];
+        const queuedCaptures: Array<() => void> = [];
+        const calls: string[] = [];
+        const transformRequests: Record<string, unknown>[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                calls.push(method);
+                if (method !== "transform") return { ok: true };
+                transformRequests.push(body as Record<string, unknown>);
+                step++;
+                if (fault === "host-lock-capture" && fail && step === 2) {
+                    hostLocker = await startSqliteWriteLocker(
+                        join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"),
+                        7_000,
+                    );
                 }
-                if (phase === "complete") {
-                    const checksum = String(args.checksum_expected);
-                    const authority = {
-                        ...base,
-                        state: "PREPARING" as const,
-                        checksum_expected: checksum,
-                        checksum_actual: checksum,
-                        checksum_ok: true,
-                    };
-                    statuses.set(domain, authority);
-                    return { authority };
-                }
-                if (phase === "ack") {
-                    const authority = { ...base, state: "MODULE" as const };
-                    statuses.set(domain, authority);
-                    return { authority };
-                }
-                const authority = { ...base, state: "TS" as const };
-                statuses.set(domain, authority);
-                return { authority };
-            },
-            authoritySeed: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                const rows = Array.isArray(args.rows) ? args.rows : [];
-                return { seeded: rows.length, module_row_ids: rows.map((_, index) => index + 1) };
-            },
-            mirrorPull: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
+                captureCompleted = false;
+                const oldRepresentation = step === 1 || (queueOldCapture && step === 2);
                 return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor,
-                        has_more: false,
-                        rows: [],
-                    },
+                    decision: deferRebuild || (queueOldCapture && step === 2) ? "SOFT+" : "HARD",
+                    prefix_bust_permitted: !deferRebuild && !(queueOldCapture && step === 2),
+                    scheduler_decision: queueOldCapture && step === 2 ? "defer" : schedulerDecision,
+                    historian: { state: historianState },
+                    row_version: step,
+                    native_messages: oldRepresentation
+                        ? makeMessages(sid)
+                        : [
+                              {
+                                  info: { role: "user", sessionID: sid },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>new admitted prefix</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sid),
+                          ],
+                    ...(!oldRepresentation
+                        ? { committed: true, coverage_ordinal: 1, boundary_id: "m1#0" }
+                        : {}),
                 };
             },
         };
-        const deps = makeDeps(db, module);
-        deps.directory = "/launch/root-a";
-        deps.projectPath = "git:identity";
-        deps.sessionDirectoryBySession?.set(sessionId, "/session/root-b");
-        const runner = createRustModeTransformImpl(deps, { moduleClient: module });
-        const messages = makeMessages(sessionId);
-        resetAuthorityRoutingObservationsForTest();
-        const logSpy = spyOn(logger, "log").mockImplementation(() => {});
+        let prepareSpy: ReturnType<typeof spyOn> | undefined;
+        const build = () => {
+            const originalPrepare = db.prepare.bind(db);
+            prepareSpy = spyOn(db, "prepare").mockImplementation((sql) => {
+                if (
+                    fault === "fence" &&
+                    fail &&
+                    step >= 2 &&
+                    String(sql).startsWith("UPDATE session_meta SET trailing_blank_decisions = ?")
+                )
+                    throw new Error("injected durable marker admission fence failure");
+                if (
+                    fault === "bookkeeping" &&
+                    fail &&
+                    step >= 2 &&
+                    captureCompleted &&
+                    String(sql).startsWith(
+                        "SELECT detected_context_limit, detected_context_limit_model_key",
+                    )
+                ) {
+                    if (noCutOutcome) fail = false;
+                    throw new Error("injected late overflow bookkeeping failure");
+                }
+                if (
+                    fault === "mirror" &&
+                    fail &&
+                    step >= 2 &&
+                    String(sql).startsWith("UPDATE session_meta SET compaction_marker_state")
+                ) {
+                    throw new Error("injected post-cut context mirror failure");
+                }
+                return originalPrepare(sql);
+            });
+            const deps = makeDeps(db, moduleClient);
+            deps.tagger = createTagger();
+            deps.compactionMarkerStrategy = {
+                applyDeferred: (...args) => {
+                    expect(isRustMarkerAdmissionFenced(db, sid)).toBe(true);
+                    const outcome = noCutOutcome ?? applyDeferredCompactionMarker(...args);
+                    markerOutcomes.push(outcome);
+                    if (fault === "os-cut" && fail && outcome.kind === "applied") {
+                        const record = process.env.MC_RUST_MARKER_OS_CUT_RECORD;
+                        if (!record) throw new Error("missing isolated crash record path");
+                        writeFileSync(
+                            record,
+                            JSON.stringify({ sid, path, dataHome: process.env.XDG_DATA_HOME }),
+                        );
+                        process.kill(process.pid, "SIGKILL");
+                    }
+                    if (fault === "after-marker" && fail && outcome.kind === "applied")
+                        throw new Error("injected after irreversible marker write");
+                    return outcome;
+                },
+                reconcile: (...args) => {
+                    reconcileMarkerRepresentation(...args);
+                    if (fault === "final-fit" && fail && step >= 2) {
+                        args[0].push({
+                            info: { id: "over-limit", role: "user", sessionID: sid },
+                            parts: [{ type: "text", text: "x".repeat(2_000_000) }],
+                        } as MessageLike);
+                    }
+                },
+            };
+            return createRustModeTransform(deps, {
+                moduleClient,
+                rawFallbackEstimatorForTests: admissionEstimator,
+                ...(queueOldCapture
+                    ? {
+                          scheduleLkgCapture: (capture: () => void) => {
+                              queuedCaptures.push(capture);
+                          },
+                      }
+                    : {}),
+                onLkgCaptureForTests: () => {
+                    if ((fault === "capture" || fault === "host-lock-capture") && fail && step >= 2)
+                        throw new Error("injected priced LKG capture failure");
+                    captureCompleted = true;
+                },
+            });
+        };
+        let transform = build();
+        const invoke = async (output: { messages: unknown[] }) => {
+            const input = makeMessages(sid);
+            await transform.run(sid, input, output, makeMeta(db, sid));
+        };
+        const serve = async () => {
+            const output = { messages: [...makeMessages(sid)] as unknown[] };
+            await invoke(output);
+            return JSON.stringify(output.messages);
+        };
+        return {
+            sid,
+            get db() {
+                return db;
+            },
+            calls,
+            transformRequests,
+            markerOutcomes,
+            serve,
+            serveAliased: async () => {
+                const input = makeMessages(sid);
+                const output = { messages: input as unknown[] };
+                await transform.run(sid, input, output, makeMeta(db, sid));
+                return JSON.stringify(output.messages);
+            },
+            waitForHostLock: async () => {
+                if (hostLocker) expect(await hostLocker.exited).toBe(0);
+            },
+            invoke,
+            queuedCaptures,
+            stopFault: () => {
+                fail = false;
+            },
+            setDeferredRebuild: (deferred: boolean) => {
+                deferRebuild = deferred;
+            },
+            restart: () => {
+                transform.dispose();
+                prepareSpy?.mockRestore();
+                closeQuietly(db);
+                resetLkgSlotsForTest();
+                db = new Database(path) as ContextDatabase;
+                databases.push(db);
+                registerLkgPersistence(createDbLkgPersistence(db));
+                transform = build();
+            },
+            dispose: () => {
+                transform.dispose();
+                prepareSpy?.mockRestore();
+            },
+        };
+    }
+
+    it("one shared rebuild drains while the historian is running", async () => {
+        const fixture = markerFaultFixture(
+            "capture",
+            false,
+            undefined,
+            undefined,
+            "defer",
+            "running",
+        );
         try {
+            fixture.stopFault();
+            await fixture.serve();
+            const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+            setPendingCompactionMarkerState(fixture.db, fixture.sid, pending);
+            fixture.setDeferredRebuild(true);
+            await fixture.serve();
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(fixture.calls).not.toContain("session.flush");
+            fixture.setDeferredRebuild(false);
+            await fixture.serve();
+            expect(
+                getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+            ).toBe(1);
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("an error response cannot grant host authority even with true permission and native messages", async () => {
+        const sessionId = `rust-error-permission-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          status: "error",
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 7,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: sessionId },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>invalid response</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sessionId),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        await expect(
+            transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(writes).toBe(0);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+        transform.dispose();
+    });
+
+    it("a SOFT+ response that also claims prefix-bust permission is rejected before any host edit", async () => {
+        // A defer (SOFT+) replays the provider's cached prefix byte for byte, so a
+        // response that pairs it with permission to bust that prefix contradicts
+        // itself. The host must treat it as a broken wire and grant nothing: no
+        // compaction marker cut, and the queued marker target stays as it was.
+        const sessionId = `rust-softplus-permission-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 7,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: sessionId },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>contradictory response</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sessionId),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        const output = { messages: [...input] as unknown[] };
+        let refusal: unknown;
+        try {
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+        } catch (error) {
+            refusal = error;
+        }
+        expect(writes).toBe(0);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+        expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+        expect(JSON.stringify(output.messages)).not.toContain("contradictory response");
+        expect(refusal).toBeInstanceOf(EmergencyFailClosedError);
+        expect(String((refusal as { cause?: unknown }).cause)).toContain(
+            "SOFT+ cannot permit a prefix bust",
+        );
+        transform.dispose();
+    });
+
+    it("supported false wire permission captures newest-tail replay while unsupported wire permission holds", async () => {
+        for (const permission of [false, undefined, null, 1, "true", {}]) {
+            const sessionId = `rust-wire-tail-${String(permission)}-${Date.now()}`;
+            sessions.push(sessionId);
+            installRawProvider(sessionId);
+            const db = makeDb();
+            const input = [
+                ...makeMessages(sessionId),
+                {
+                    info: { id: "newest", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "already served tail" }],
+                },
+            ] as MessageLike[];
+            input[0]!.info.model = { providerID: "anthropic", modelID: "mock-sonnet" };
+            input[1]!.info.providerID = "anthropic";
+            input[1]!.info.modelID = "mock-sonnet";
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) =>
+                    method === "transform"
+                        ? {
+                              decision: "SOFT+",
+                              ...(permission === undefined
+                                  ? {}
+                                  : { prefix_bust_permitted: permission }),
+                              row_version: 1,
+                              native_messages: structuredClone(input),
+                          }
+                        : { ok: true },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.liveModelBySession?.set(sessionId, {
+                providerID: "anthropic",
+                modelID: "mock-sonnet",
+            });
+            deps.getModelKey = () => "anthropic/mock-sonnet";
+            const transform = createRustModeTransform(deps, { moduleClient });
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            expect(getTrailingBlankDecisions(db, sessionId).get("newest")).toBe(
+                permission === false ? "strip" : undefined,
+            );
+            expect(output.messages).toEqual(input);
+            transform.dispose();
+        }
+    });
+
+    it("all host first applications hold without an actual boolean permission", async () => {
+        for (const wireValue of [undefined, null, false, 1, "true", "false", {}]) {
+            const sessionId = `rust-permission-${String(wireValue)}-${Date.now()}`;
+            sessions.push(sessionId);
+            installRawProvider(sessionId);
+            const db = makeDb();
+            const pending = {
+                ordinal: 1,
+                endMessageId: "m1",
+                publishedAt: 1,
+                injectAttempts: 3,
+                lastInjectError: "locked",
+                firstInjectFailedAt: 1,
+            };
+            setPendingCompactionMarkerState(db, sessionId, pending);
+            let writes = 0;
+            const calls: string[] = [];
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) => {
+                    calls.push(method);
+                    if (method !== "transform") return { ok: true };
+                    return {
+                        decision: "HARD",
+                        scheduler_decision: "execute",
+                        committed: true,
+                        ...(wireValue === undefined ? {} : { prefix_bust_permitted: wireValue }),
+                        row_version: 7,
+                        coverage_ordinal: 1,
+                        boundary_id: "m1#0",
+                        native_messages: [
+                            {
+                                info: { role: "user", sessionID: sessionId },
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text: "<session-history>stable</session-history>",
+                                        synthetic: true,
+                                    },
+                                ],
+                            },
+                            ...makeMessages(sessionId),
+                        ],
+                    };
+                },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.tagger = createTagger();
+            deps.compactionMarkerStrategy = {
+                applyDeferred: () => {
+                    writes++;
+                    return { kind: "applied", markerOrdinal: 1 };
+                },
+                reconcile: reconcileMarkerRepresentation,
+            };
+            const transform = createRustModeTransform(deps, { moduleClient });
+            const input = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            expect(writes).toBe(0);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            expect(calls).not.toContain("session.flush");
+            expect(getSlot(sessionId)).toBeDefined();
+            setRustMarkerAdmissionFence(db, sessionId, true);
+            await expect(
+                transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(db, sessionId)).toBe(true);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            transform.dispose();
+        }
+    });
+
+    it.skipIf(process.env.MC_RUST_MARKER_OS_CUT_CHILD !== "1")("marker OS cut child", async () => {
+        const fixture = markerFaultFixture("os-cut", false, undefined, undefined, "defer");
+        await fixture.serve();
+        await fixture.serve();
+        throw new Error("the crash probe did not reach the committed host cut");
+    });
+
+    it("defer HARD failed admission remains fenced across restart", async () => {
+        for (const fault of [
+            "after-marker",
+            "capture",
+            "bookkeeping",
+            "mirror",
+            "final-fit",
+        ] as const) {
+            const fixture = markerFaultFixture(fault, false, undefined, undefined, "defer");
+            try {
+                await fixture.serve();
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+                if (fault === "mirror")
+                    expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+                else
+                    expect(
+                        getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+                    ).toBe(1);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+                fixture.restart();
+                expect(getSlot(fixture.sid)).toBeUndefined();
+                fixture.setDeferredRebuild(true);
+                fixture.stopFault();
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                fixture.setDeferredRebuild(false);
+                expect(await fixture.serve()).toContain("new admitted prefix");
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            } finally {
+                fixture.dispose();
+            }
+        }
+        const home = createTestTempDirFromPath(join(tmpdir(), "marker-os-cut-"));
+        const recordPath = join(home, "crash.json");
+        const child = spawnSync(
+            process.execPath,
+            ["test", import.meta.path, "-t", "marker OS cut child"],
+            {
+                env: {
+                    ...process.env,
+                    MC_RUST_MARKER_OS_CUT_CHILD: "1",
+                    MC_RUST_MARKER_OS_CUT_RECORD: recordPath,
+                },
+                encoding: "utf8",
+                timeout: 30_000,
+                windowsHide: true,
+            },
+        );
+        expect(child.signal).toBe("SIGKILL");
+        const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+            sid: string;
+            path: string;
+            dataHome: string;
+        };
+        sessions.push(record.sid);
+        availabilityDataHomes.push(record.dataHome, home, dirname(record.path));
+        process.env.XDG_DATA_HOME = record.dataHome;
+        installRawProvider(record.sid);
+        const recoveredDb = new Database(record.path) as ContextDatabase;
+        databases.push(recoveredDb);
+        registerLkgPersistence(createDbLkgPersistence(recoveredDb));
+        expect(listSessionCompactionMarkers(record.sid)).toHaveLength(1);
+        expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(true);
+        expect(loadPersistedLkgSlot(recoveredDb, record.sid)).toBeUndefined();
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 3,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: record.sid },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>new admitted prefix</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(record.sid),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(recoveredDb, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        try {
+            const input = makeMessages(record.sid);
+            await transform.run(
+                record.sid,
+                input,
+                { messages: [...input] },
+                makeMeta(recoveredDb, record.sid),
+            );
+            expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(recoveredDb, record.sid)?.jsonPrefix).toContain(
+                "new admitted prefix",
+            );
+        } finally {
+            transform.dispose();
+        }
+    });
+
+    // Allow time for the separate process's seven-second SQLite write lock to release.
+    it("a busy host cut followed by priced capture failure retains still-safe LKG across restart", async () => {
+        const fixture = markerFaultFixture(
+            "host-lock-capture",
+            false,
+            undefined,
+            undefined,
+            "defer",
+        );
+        try {
+            const old = await fixture.serve();
+            expect(await fixture.serveAliased()).toBe(old);
+            expect(fixture.markerOutcomes.at(-1)).toMatchObject({
+                kind: "retryable-failure",
+                cut: "definitely-no-cut",
+            });
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            await fixture.waitForHostLock();
+            fixture.restart();
+            expect(getSlot(fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            await fixture.waitForHostLock();
+            fixture.dispose();
+        }
+    }, 30_000);
+
+    for (const outcome of [
+        { kind: "already-current" },
+        { kind: "stale-skip", reason: "partial-message-boundary" },
+    ] as const) {
+        it(`a definitely unchanged ${outcome.kind} cut preserves old LKG after later capture failure`, async () => {
+            const fixture = markerFaultFixture("capture", false, outcome);
+            try {
+                const old = await fixture.serve();
+                expect(await fixture.serve()).toBe(old);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
+
+    it("a proven no-cut bookkeeping fault restores the old durable slot after a newer capture persisted", async () => {
+        const fixture = markerFaultFixture("bookkeeping", false, { kind: "already-current" });
+        try {
+            const old = await fixture.serve();
+            expect(await fixture.serve()).toBe(old);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.restart();
+            expect(getSlot(fixture.sid)?.jsonPrefix).toBe(old);
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("an uncertain strategy failure never revives quarantined LKG even without a visible marker", async () => {
+        const fixture = markerFaultFixture("capture", false, {
+            kind: "retryable-failure",
+            error: new Error("strategy cannot prove its commit outcome"),
+        });
+        try {
+            await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            fixture.restart();
+            expect(getSlot(fixture.sid)).toBeUndefined();
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    for (const fault of ["after-marker", "capture", "bookkeeping"] as const) {
+        it(`post-cut ${fault} fault refuses instead of old replay, then recomposes successfully`, async () => {
+            const fixture = markerFaultFixture(fault);
+            try {
+                const old = await fixture.serve();
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeDefined();
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(
+                    getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+                ).toBe(1);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+                fixture.stopFault();
+                const rebuilt = await fixture.serve();
+                expect(rebuilt).not.toBe(old);
+                expect(rebuilt).toContain("new admitted prefix");
+                expect(fixture.calls).toContain("session.flush");
+                expect(fixture.transformRequests.at(-1)?.tail_delta).toBeUndefined();
+                expect(fixture.transformRequests.at(-1)?.native_messages).toEqual(
+                    makeMessages(fixture.sid),
+                );
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(rebuilt);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
+
+    it("a failed durable admission fence prevents the host cut and preserves restart-safe old LKG", async () => {
+        const fixture = markerFaultFixture("fence");
+        try {
+            const old = await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.restart();
+            expect(getSlot(fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("a post-cut SOFT+ response cannot release the refusal fence even with committed execute metadata", async () => {
+        const fixture = markerFaultFixture("capture");
+        try {
+            await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.stopFault();
+            fixture.setDeferredRebuild(true);
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            fixture.setDeferredRebuild(false);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("persistent post-cut capture faults refuse every rebuilding pass without old LKG or raw fallback", async () => {
+        const fixture = markerFaultFixture("capture");
+        try {
+            await fixture.serve();
+            for (let pass = 0; pass < 4; pass++) {
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            }
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("post-cut outer storage-busy wrapper cannot replay old bytes and re-arms rebuilding admission", async () => {
+        const fixture = markerFaultFixture("after-marker");
+        try {
+            await fixture.serve();
+            fixture.stopFault();
+            const replayed = mock(() => {});
+            const wrapper = createMessagesTransformHandler({
+                magicContext: {
+                    "experimental.chat.messages.transform": async (_input, output) => {
+                        await fixture.invoke(output);
+                        throw Object.assign(new Error("outer post-cut storage failure"), {
+                            code: "SQLITE_BUSY",
+                        });
+                    },
+                },
+                onLkgReplay: replayed,
+            });
+            const output = { messages: makeMessages(fixture.sid) };
+            await expect(wrapper({}, output)).rejects.toBeInstanceOf(StorageBusyRefusalError);
+            expect(replayed).not.toHaveBeenCalled();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("post-cut refusal fence survives a new adapter and file connection without hydrating old LKG", async () => {
+        const fixture = markerFaultFixture("capture");
+        try {
+            await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.restart();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(getSlot(fixture.sid)).toBeUndefined();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("a queued pre-cut defer capture cannot resurrect old LKG after a marker fault", async () => {
+        const fixture = markerFaultFixture("after-marker", true);
+        try {
+            const old = await fixture.serve();
+            expect(await fixture.serve()).toBe(old);
+            expect(fixture.queuedCaptures).toHaveLength(1);
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.queuedCaptures[0]!();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(
+                (
+                    fixture.db
+                        .prepare("SELECT count(*) AS n FROM lkg_slots WHERE session_id=?")
+                        .get(fixture.sid) as { n: number }
+                ).n,
+            ).toBe(0);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+    it("r2 proof: a rejected HARD output cannot move the host marker before LKG replay", async () => {
+        const sid = `r2-rejected-hard-${Date.now()}`;
+        sessions.push(sid);
+        installRawProvider(sid);
+        installAvailabilityDb(sid);
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(sid, '{"role":"user"}');
+        oc.close();
+        const db = makeDb();
+        appendCompartments(db, sid, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "indexed",
+            },
+        ]);
+        let step = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                step++;
+                return {
+                    decision: "HARD",
+                    scheduler_decision: "execute",
+                    prefix_bust_permitted: true,
+                    row_version: step,
+                    native_messages: makeMessages(sid),
+                    ...(step === 2
+                        ? { committed: true, coverage_ordinal: 1, boundary_id: "m1#0" }
+                        : {}),
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const serve = async () => {
+            const input = makeMessages(sid);
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sid, input, output, makeMeta(db, sid));
+            return JSON.stringify(output.messages);
+        };
+        // Each call recreates raw input, output and session metadata to compare the
+        // last-known-good request (LKG) without reusing messages edited by the previous pass.
+        const first = await serve();
+        expect(await serve()).toBe(first);
+        expect(transform.getState(sid).lkgRepresentationFrozen).toBe(true);
+        expect(getPersistedCompactionMarkerState(db, sid)).toBeNull();
+        expect(listSessionCompactionMarkers(sid)).toHaveLength(0);
+        expect(isRustMarkerAdmissionFenced(db, sid)).toBe(false);
+    });
+
+    it("serves a rebuilding output above the fixed prompt floor without cutting, then cuts when room returns", async () => {
+        const fixture = markerFaultFixture("capture");
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            fixture.stopFault();
+            await fixture.serve();
+            updateSessionMeta(fixture.db, fixture.sid, { systemPromptTokens: 1_000 });
+            recordDetectedContextLimit(fixture.db, fixture.sid, 1_000, "test-provider/test-model");
+            recordToolDefinition(
+                "test-provider",
+                "test-model",
+                undefined,
+                "large-tool",
+                "schema ".repeat(1_000),
+                {
+                    type: "object",
+                },
+            );
+
+            // The fixed system/tool floor exceeds this window even after the engine folds.
+            // Failure to admit an optional host cut must not reject the fresh engine output.
+            const served = await fixture.serve();
+            expect(served).toContain("new admitted prefix");
+            expect(fixture.markerOutcomes).toHaveLength(0);
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(served);
+            const pending = getPendingCompactionMarkerState(fixture.db, fixture.sid);
+            expect(pending).toMatchObject({ ordinal: 1, endMessageId: "m1" });
+            const deferrals = log.mock.calls.filter((call) =>
+                String(call[1]).startsWith("rust compaction-marker admission deferred:"),
+            );
+            expect(deferrals).toHaveLength(1);
+            expect(deferrals[0]?.[1]).toContain("fit=over");
+            expect(deferrals[0]?.[1]).toContain("limit=1000");
+            expect(deferrals[0]?.[1]).toMatch(/estimated=\d+ trusted=true proxy_tokens=\d+/);
+
+            fixture.setDeferredRebuild(true);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toEqual(pending);
+            expect(fixture.markerOutcomes).toHaveLength(0);
+
+            recordDetectedContextLimit(
+                fixture.db,
+                fixture.sid,
+                200_000,
+                "test-provider/test-model",
+            );
+            fixture.setDeferredRebuild(false);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(fixture.markerOutcomes.at(-1)?.kind).toBe("applied");
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            log.mockRestore();
+            fixture.dispose();
+        }
+    });
+    for (const unavailable of ["untrusted", "throwing"] as const) {
+        it(`serves fresh output and retains the pending cut with an ${unavailable} admission estimate`, async () => {
+            const fixture = markerFaultFixture("capture", false, undefined, () => {
+                if (unavailable === "throwing") throw new Error("tokenizer unavailable");
+                return {
+                    tokens: 1,
+                    trusted: false,
+                    messageTokens: { conversation: 1, toolCall: 0 },
+                    systemTokens: 0,
+                };
+            });
+            try {
+                fixture.stopFault();
+                await fixture.serve();
+                expect(await fixture.serve()).toContain("new admitted prefix");
+                expect(fixture.markerOutcomes).toHaveLength(0);
+                expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)?.ordinal).toBe(1);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
+    it("retains pending indexed markers while a healthy SOFT+ serves the frozen representation", async () => {
+        const sessionId = `rust-frozen-marker-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        installAvailabilityDb(sessionId);
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(
+            sessionId,
+            '{"role":"user"}',
+        );
+        oc.close();
+        const db = makeDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "indexed",
+            },
+        ]);
+        let step = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                step++;
+                if (step === 2) throw new Error("module temporarily unavailable");
+                return {
+                    decision: step === 1 || step === 5 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: step === 1 || step === 5,
+                    scheduler_decision: step === 1 || step === 5 ? "execute" : "defer",
+                    row_version: step,
+                    ...(step === 5 ? { coverage_ordinal: 1, boundary_id: "m1#0" } : {}),
+                    native_messages: [
+                        ...(step === 5
+                            ? [
+                                  {
+                                      info: { role: "user", sessionID: sessionId },
+                                      parts: [
+                                          {
+                                              type: "text",
+                                              text: "<session-history>indexed</session-history>",
+                                              synthetic: true,
+                                          },
+                                      ],
+                                  },
+                              ]
+                            : []),
+                        ...makeMessages(sessionId),
+                    ],
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const serve = async () => {
+            const input = makeMessages(sessionId);
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return JSON.stringify(output.messages);
+        };
+        const first = await serve();
+        await serve();
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        for (let pass = 0; pass < 2; pass++) {
+            expect(await serve()).toBe(first);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+        }
+        await serve();
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+        expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(1);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+    });
+    it("frozen SOFT+ holds retained markers beyond the former bounded release", async () => {
+        const sessionId = `rust-local-release-marker-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        installAvailabilityDb(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        const native = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>stable</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            ...makeMessages(sessionId),
+        ];
+        let step = 0;
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (++step === 2) throw new Error("module temporarily unavailable");
+                return {
+                    decision: step === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: step === 1,
+                    row_version: 1,
+                    coverage_ordinal: 1,
+                    boundary_id: "m1#0",
+                    native_messages: structuredClone(native),
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const serve = async () => {
+            const input = makeMessages(sessionId);
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return JSON.stringify(output.messages);
+        };
+        const first = await serve();
+        await serve();
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        for (let pass = 0; pass < 8; pass++) {
+            expect(await serve()).toBe(first);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(writes).toBe(0);
+        }
+        // Healthy-pass counts no longer release a frozen prefix without a rebuild.
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        transform.dispose();
+    });
+
+    it("unprovable shared boundaries fail by name without replay or parking", async () => {
+        const sessionId = "ses-unprovable-shared-boundaries";
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "missing-start",
+                endMessageId: "missing-end",
+                title: "missing coverage",
+                content: "cannot infer both boundaries",
+            },
+        ]);
+        const methods: string[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                methods.push(method);
+                return { ok: true };
+            },
+        };
+        const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        for (let pass = 0; pass < 4; pass++) {
+            const messages = makeMessages(sessionId);
             await expect(
                 runner.run(
                     sessionId,
@@ -419,30 +1552,87 @@ describe("Rust mode authority adapter", () => {
                     { messages: [...messages] },
                     makeMeta(db, sessionId),
                 ),
-            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
-
-            expect(authorityRoots.length).toBeGreaterThan(0);
-            expect(authorityRoots.every((root) => root === "/session/root-b")).toBe(true);
-            expect(
-                db
-                    .prepare(
-                        "SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode'",
-                    )
-                    .get(sessionId),
-            ).toEqual({
-                project_path: resolveProjectIdentityForSession("/session/root-b", false),
-            });
-            expect(
-                logSpy.mock.calls.filter(([message]) =>
-                    String(message).includes("authority → MODULE: host backends → MODULE"),
+            ).rejects.toThrow("context_compartment_boundary_unresolved");
+        }
+        expect(methods).not.toContain("transform");
+        expect(runner.getState(sessionId).parked).toBe(false);
+    });
+    it("shared-store embedding drain does not inherit foreground SQLite retries", async () => {
+        const sessionId = "ses-shared-store-background-drain";
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const probe = new Database(":memory:");
+        const busy = Object.assign(new Error("drain busy"), { code: "SQLITE_BUSY" });
+        const exec = spyOn(probe, "exec").mockImplementation(() => {
+            throw busy;
+        });
+        const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+        const drain = spyOn(
+            embeddingDrain,
+            "drainSingleStoreEmbeddingWatermarks",
+        ).mockImplementation(async () => {
+            expect(() => withPrivilegedWriter(probe, () => {})).toThrow("drain busy");
+            expect(exec).toHaveBeenCalledTimes(1);
+            expect(wait).not.toHaveBeenCalled();
+            return 0;
+        });
+        try {
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) =>
+                    method === "transform"
+                        ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
+                        : { ok: true },
+            };
+            const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const messages = makeMessages(sessionId);
+            await withSqliteTransformPass(() =>
+                runner.run(
+                    sessionId,
+                    messages,
+                    { messages: [...messages] },
+                    makeMeta(db, sessionId),
                 ),
-            ).toHaveLength(1);
+            );
+            expect(drain).toHaveBeenCalledTimes(1);
+            expect(exec).toHaveBeenCalledTimes(1);
         } finally {
-            logSpy.mockRestore();
-            resetAuthorityRoutingObservationsForTest();
+            drain.mockRestore();
+            exec.mockRestore();
+            wait.mockRestore();
+            probe.close();
         }
     });
-
+    it("routes shared-store requests through the resolved session directory", async () => {
+        const sessionId = "ses-shared-store-directory-root";
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const roots: string[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async (args) => {
+                roots.push(args.projectRoot);
+                throw new Error("stop after routing");
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.directory = "/launch/root-a";
+        deps.sessionDirectoryBySession?.set(sessionId, "/session/root-b");
+        const runner = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        await expect(
+            runner.run(sessionId, messages, { messages: [...messages] }, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(roots.length).toBeGreaterThan(0);
+        expect(roots.every((root) => root === "/session/root-b")).toBe(true);
+        expect(
+            db
+                .prepare(
+                    "SELECT project_path FROM session_projects WHERE session_id=? AND harness='opencode'",
+                )
+                .get(sessionId),
+        ).toEqual({ project_path: resolveProjectIdentityForSession("/session/root-b", false) });
+    });
     it("transports the host-resolved output_reserve as Rust usable_soft", () => {
         const resolved = deriveWindowGeometry(
             "openai-codex",
@@ -576,49 +1766,8 @@ describe("Rust mode authority adapter", () => {
         });
     });
 
-    it("copies the resolved history budget onto the authority wire", () => {
-        const body = __rustModeTransformTest.buildTransformBody({
-            sessionId: "budget-wire",
-            input: [],
-            nativeMessages: [],
-            passInputs: { history_budget_tokens: 42_000 },
-            usage: {},
-            modelKey: null,
-            providerId: null,
-        });
-        expect(body.history_budget_tokens).toBe(42_000);
-    });
-
-    it("copies the profile-resolved historian chain onto the authority wire", () => {
-        const historianModelChain = __rustModeTransformTest.resolvedHistorianModelChain({
-            historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
-            fallbackModels: [
-                { model: "openai/profile-fallback", qualifier: "low" },
-                "anthropic/profile-historian",
-            ],
-        });
-        const body = __rustModeTransformTest.buildTransformBody({
-            sessionId: "profile-model-wire",
-            input: [],
-            nativeMessages: [],
-            passInputs: { historian_model_chain: historianModelChain },
-            usage: {},
-            modelKey: null,
-            providerId: null,
-        });
-
-        expect(body.historian_model_chain).toEqual([
-            "anthropic/profile-historian",
-            "openai/profile-fallback",
-        ]);
-        const limits = __rustModeTransformTest.resolvedHistorianModelLimits(historianModelChain);
-        expect(Object.keys(limits)).toEqual(body.historian_model_chain);
-        expect(limits["anthropic/profile-historian"]).toBeDefined();
-        expect(limits["openai/profile-fallback"]).toBeDefined();
-    });
-
     it("sends each historian chain model's resolved window and output ceiling", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-historian-model-limits-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-historian-model-limits-"));
         const previous = process.env.XDG_DATA_HOME;
         try {
             process.env.XDG_DATA_HOME = root;
@@ -747,7 +1896,7 @@ describe("Rust mode authority adapter", () => {
         });
     });
 
-    it("sends the frozen known-model TTL to the Rust module", async () => {
+    it("sends the frozen built-in known-model TTL to the Rust module", async () => {
         const sessionId = "rust-known-model-ttl";
         sessions.push(sessionId);
         const db = makeDb();
@@ -762,12 +1911,17 @@ describe("Rust mode authority adapter", () => {
                     ]);
                 }
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
         const deps = makeDeps(db, moduleClient);
         deps.cacheTtlConfig = "5m";
+        deps.cacheTtlConfigured = false;
         const transform = createRustModeTransform(deps, { moduleClient });
         const messages = makeMessages(sessionId);
         messages[0].info.model = { providerID: "openai", modelID: "gpt-6" };
@@ -791,18 +1945,48 @@ describe("Rust mode authority adapter", () => {
         expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("30m");
     });
 
-    it("copies caveman settings onto the authority wire", () => {
-        const body = __rustModeTransformTest.buildTransformBody({
-            sessionId: "caveman-wire",
-            input: [],
-            nativeMessages: [],
-            passInputs: { caveman_enabled: true, caveman_min_chars: 240 },
-            usage: {},
-            modelKey: null,
-            providerId: null,
-        });
-        expect(body.caveman_enabled).toBe(true);
-        expect(body.caveman_min_chars).toBe(240);
+    it("sends the live user TTL to both Rust module scheduling inputs on the next pass", async () => {
+        const sessionId = "rust-live-user-ttl";
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const ttls: unknown[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform")
+                    ttls.push([
+                        body?.cache_ttl,
+                        (body?.pass_inputs as Record<string, unknown>)?.cache_ttl,
+                    ]);
+                return method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
+                    : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        let ttl = "1h";
+        deps.sampleCacheTtlConfig = () => ({ cache_ttl: ttl, cacheTtlConfigured: true });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0].info.model = { providerID: "anthropic", modelID: "opus" };
+        for (const next of ["1h", "13h"]) {
+            ttl = next;
+            await transform.run(
+                sessionId,
+                messages,
+                { messages: [...messages] },
+                makeMeta(db, sessionId),
+            );
+        }
+        expect(ttls).toEqual([
+            ["1h", "1h"],
+            ["13h", "13h"],
+        ]);
+        expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("13h");
     });
 
     it("serves 2048-message SOFT+, SOFT and HARD native wires with the original SHA256", async () => {
@@ -827,10 +2011,32 @@ describe("Rust mode authority adapter", () => {
                 call: async ({ method }) =>
                     method === "transform" ? { decision, native_messages: native } : { ok: true },
             };
-            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            installAvailabilityDb(sessionId);
+            clearModelsDevCache();
+            await refreshModelLimitsFromApi({
+                config: {
+                    providers: async () => ({
+                        data: {
+                            providers: [
+                                {
+                                    id: "test-provider",
+                                    models: { "test-model": { limit: { context: 4_000_000 } } },
+                                },
+                            ],
+                        },
+                    }),
+                },
+            });
+            const deps = makeDeps(db, moduleClient);
+            deps.getModelKey = () => "test-provider/test-model";
+            const transform = createRustModeTransform(deps, { moduleClient });
             const messages = makeMessages(sessionId);
             const output: { messages: unknown[] } = { messages: [...messages] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+            const meta = makeMeta(db, sessionId);
+            // This test checks byte-for-byte preservation, not whether the large
+            // request can be sent. Give its 2048-message fixture a fitting limit.
+            recordDetectedContextLimit(db, sessionId, 4_000_000, "test-provider/test-model");
+            await transform.run(sessionId, messages, output, meta);
             expect(output.messages).toHaveLength(2048);
             const beforeHash = sha(serializedBefore);
             const afterHash = sha(JSON.stringify(output.messages));
@@ -839,6 +2045,7 @@ describe("Rust mode authority adapter", () => {
             );
             expect(afterHash).toBe(beforeHash);
             expect(JSON.stringify(native)).toBe(serializedBefore);
+            clearModelsDevCache();
         }
     });
 
@@ -851,6 +2058,7 @@ describe("Rust mode authority adapter", () => {
             {
                 decision: "HARD",
                 materialize_reason: "first_render",
+                prefix_bust_permitted: true,
                 scheduler_decision: "execute",
                 historian: {
                     fired: false,
@@ -954,6 +2162,7 @@ describe("Rust mode authority adapter", () => {
             {
                 decision: "HARD",
                 scheduler_decision: "execute",
+                prefix_bust_permitted: true,
                 row_version: 1,
                 native_messages: stableNative,
             },
@@ -1099,6 +2308,7 @@ describe("Rust mode authority adapter", () => {
                 if (transformPass === 1) {
                     return {
                         decision: "HARD",
+                        prefix_bust_permitted: true,
                         row_version: 1,
                         native_messages: structuredClone(representationA),
                     };
@@ -1106,6 +2316,7 @@ describe("Rust mode authority adapter", () => {
                 const priced = transformPass === 5;
                 return {
                     decision: priced ? "SOFT" : "SOFT+",
+                    prefix_bust_permitted: priced,
                     scheduler_decision: priced ? "execute" : "defer",
                     row_version: transformPass,
                     first_divergence: {
@@ -1183,10 +2394,20 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 transformPass += 1;
                 if (transformPass === 1) {
-                    return { decision: "HARD", row_version: 1, native_messages: stable };
+                    return {
+                        decision: "HARD",
+                        prefix_bust_permitted: true,
+                        row_version: 1,
+                        native_messages: stable,
+                    };
                 }
                 if (externalEpochObserved) {
-                    return { decision: "HARD", row_version: 3, native_messages: drained };
+                    return {
+                        decision: "HARD",
+                        prefix_bust_permitted: true,
+                        row_version: 3,
+                        native_messages: drained,
+                    };
                 }
                 return {
                     decision: "SOFT+",
@@ -1320,31 +2541,108 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render identity_delta=mur served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=identity_resolve:0.0 prompt_surface:0.0 mural_resolve:0.0 prefix_guard:0.0 ordinal_resolve:0.0 ordinal_rebuild:0.0 ordinal_rows:0 ordinal_mode:memo state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 mirror_pull:0.0 compartment_mirror:0.0 other:12.3 transport_lane:0.0 transport_route:0.0 transport_encode:0.0 transport_issue:0.0 transport_response_wait_decode:0.0 transport_settle:0.0 transport_wrapper:0.0 preflight:0.0 todo_verdict:0.0 todo_probe:0.0 todo_persist:0.0 todo_probe_required:0 todo_probe_reason:none todo_unprobed_bust:0 session_directory:0.0 paging:0.0 output_clone:0.0 delivery:0.0 bookkeeping:0.0",
+            "rust pass: decision=HARD reason=first_render prefix_bust_permitted=unsupported identity_delta=mur served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=identity_resolve:0.0 prompt_surface:0.0 mural_resolve:0.0 prefix_guard:0.0 ordinal_resolve:0.0 ordinal_rebuild:0.0 ordinal_rows:0 ordinal_mode:memo state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 mirror_pull:0.0 compartment_mirror:0.0 other:12.3 transport_lane:0.0 transport_route:0.0 transport_encode:0.0 transport_issue:0.0 transport_response_wait_decode:0.0 transport_settle:0.0 transport_wrapper:0.0 preflight:0.0 todo_verdict:0.0 todo_probe:0.0 todo_persist:0.0 todo_probe_required:0 todo_probe_reason:none todo_unprobed_bust:0 session_directory:0.0 paging:0.0 output_clone:0.0 delivery:0.0 bookkeeping:0.0",
         );
     });
 
-    it("accepts materialized boundaries only from a committed non-defer response", () => {
+    it("accepts materialized boundaries from a committed rebuild regardless of scheduler", () => {
         expect(
-            __rustModeTransformTest.materializedCompactionBoundary({
-                decision: "HARD",
-                scheduler_decision: "execute",
-                committed: true,
-                row_version: 12,
-                coverage_ordinal: 9_590,
-                boundary_id: "msg_boundary#3",
-            }),
+            __rustModeTransformTest.materializedCompactionBoundary(
+                {
+                    decision: "HARD",
+                    scheduler_decision: "defer",
+                    committed: true,
+                    row_version: 12,
+                    coverage_ordinal: 9_590,
+                    boundary_id: "msg_boundary#3",
+                },
+                true,
+            ),
         ).toEqual({ rowVersion: 12, ordinal: 9_590, endMessageId: "msg_boundary" });
         expect(
-            __rustModeTransformTest.materializedCompactionBoundary({
-                decision: "SOFT+",
-                scheduler_decision: "defer",
-                committed: true,
-                row_version: 12,
-                coverage_ordinal: 9_590,
-                boundary_id: "msg_boundary#3",
-            }),
+            __rustModeTransformTest.materializedCompactionBoundary(
+                {
+                    decision: "SOFT+",
+                    scheduler_decision: "defer",
+                    committed: true,
+                    row_version: 12,
+                    coverage_ordinal: 9_590,
+                    boundary_id: "msg_boundary#3",
+                },
+                false,
+            ),
         ).toBeUndefined();
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary(
+                {
+                    decision: "SOFT+",
+                    scheduler_decision: "execute",
+                    committed: true,
+                    row_version: 12,
+                    coverage_ordinal: 9_590,
+                    boundary_id: "msg_boundary#3",
+                },
+                false,
+            ),
+        ).toBeUndefined();
+    });
+
+    it("deferred rebuilding extraction preserves every durable coordinate guard", () => {
+        const valid = {
+            committed: true,
+            scheduler_decision: "defer",
+            row_version: 12,
+            coverage_ordinal: 9590,
+            boundary_id: "msg_boundary#3",
+        };
+        expect(__rustModeTransformTest.materializedCompactionBoundary(valid, true)).toEqual({
+            rowVersion: 12,
+            ordinal: 9590,
+            endMessageId: "msg_boundary",
+        });
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary(valid, false),
+        ).toBeUndefined();
+        for (const patch of [
+            ...[undefined, false, 1, "true"].map((committed) => ({ committed })),
+            ...[
+                undefined,
+                0,
+                -1,
+                1.5,
+                Number.POSITIVE_INFINITY,
+                Number.NaN,
+                Number.MAX_SAFE_INTEGER + 1,
+                "12",
+            ].map((row_version) => ({ row_version })),
+            ...[
+                undefined,
+                -1,
+                1.5,
+                Number.POSITIVE_INFINITY,
+                Number.NaN,
+                Number.MAX_SAFE_INTEGER + 1,
+                "9590",
+            ].map((coverage_ordinal) => ({ coverage_ordinal })),
+            ...[
+                undefined,
+                null,
+                "",
+                "missing-hash",
+                "#0",
+                "msg#",
+                "msg#-1",
+                "msg#abc",
+                "msg#1.5",
+                "msg# 1",
+            ].map((boundary_id) => ({ boundary_id })),
+        ])
+            expect(
+                __rustModeTransformTest.materializedCompactionBoundary(
+                    { ...valid, ...patch },
+                    true,
+                ),
+            ).toBeUndefined();
     });
 
     it("arms the deferred-note nudge only when a module fold advances the published sequence", async () => {
@@ -1369,6 +2667,7 @@ describe("Rust mode authority adapter", () => {
                     ? {
                           decision: "HARD",
                           scheduler_decision: "execute",
+                          prefix_bust_permitted: true,
                           committed: true,
                           row_version: 4,
                           coverage_ordinal: coverageOrdinal,
@@ -1417,6 +2716,7 @@ describe("Rust mode authority adapter", () => {
                     ? {
                           decision: "HARD",
                           scheduler_decision: "execute",
+                          prefix_bust_permitted: true,
                           committed: true,
                           row_version: 4,
                           coverage_ordinal: 12,
@@ -1461,7 +2761,11 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method !== "transform") return { ok: true };
                 transformBody = body;
-                return { decision: "HARD", native_messages: makeMessages(sessionId) };
+                return {
+                    decision: "HARD",
+                    prefix_bust_permitted: true,
+                    native_messages: makeMessages(sessionId),
+                };
             },
         };
         const deps = makeDeps(db, moduleClient);
@@ -1719,7 +3023,7 @@ describe("Rust mode authority adapter", () => {
                     throw authoritySeqMismatch(5);
                 }
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true };
             },
         };
@@ -1785,33 +3089,6 @@ describe("Rust mode authority adapter", () => {
         expect(transform.getState(sessionId).seedPassPending).toBe(false);
     });
 
-    it("fails after the second authority mismatch in one transform pass", async () => {
-        const sessionId = `rust-adopt-once-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const messages = makeMessages(sessionId);
-        const methods: string[] = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) => {
-                methods.push(method);
-                if (method === "state_sync") throw authoritySeqMismatch(4);
-                return { decision: "SOFT+", native_messages: [] };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const output = { messages: messages as unknown[] };
-
-        await expect(
-            transform.run(sessionId, messages, output, makeMeta(db, sessionId)),
-        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
-
-        expect(methods).toEqual(["state_sync", "state_sync"]);
-        expect(transform.getState(sessionId).lastAckedSeq).toBe(4);
-        expect(transform.getState(sessionId).lastAckedWatermarks).toBeNull();
-        expect(output.messages).toBe(messages);
-    });
-
     it("gates the transform before any TypeScript mutation", async () => {
         const sessionId = `rust-gate-${Date.now()}`;
         sessions.push(sessionId);
@@ -1822,7 +3099,7 @@ describe("Rust mode authority adapter", () => {
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) =>
                 method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true },
         };
         const deps = makeDeps(db, moduleClient);
@@ -1831,6 +3108,33 @@ describe("Rust mode authority adapter", () => {
         await transform({}, output);
         expect(output.messages).toEqual(native);
         expect(input).toEqual(native);
+    });
+
+    it("skips TypeScript entry projection in Rust mode", async () => {
+        const sessionId = `rust-no-entry-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const native = [{ role: "user", parts: [{ type: "text", text: "unchanged" }] }];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
+                    : { ok: true },
+        };
+        const fullDigest = spyOn(lkgSlot, "lkgContentDigest");
+        const fields = spyOn(lkgSlot, "lkgContentFields");
+        try {
+            const transform = createTransform(makeDeps(db, moduleClient));
+            const output = { messages: makeMessages(sessionId) as unknown[] };
+            await transform({}, output);
+            expect(output.messages).toEqual(native);
+            expect(fullDigest).not.toHaveBeenCalled();
+            expect(fields).not.toHaveBeenCalled();
+        } finally {
+            fullDigest.mockRestore();
+            fields.mockRestore();
+        }
     });
 
     it("applies module output through the OpenCode hook array reference", async () => {
@@ -1922,7 +3226,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -1966,7 +3270,7 @@ describe("Rust mode authority adapter", () => {
                 methods.push(method);
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true };
             },
         };
@@ -2011,7 +3315,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requests.push(body as Record<string, unknown>);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -2070,7 +3374,11 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
@@ -2209,6 +3517,53 @@ describe("Rust mode authority adapter", () => {
         expect(watermarkReads).toBeGreaterThan(readsAfterMeta);
     });
 
+    it("re-arms auto-embed when the module publishes compartments into context.db", async () => {
+        const sessionId = `rust-auto-embed-rearm-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let rowVersion = 1;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          row_version: rowVersion,
+                          native_messages: makeMessages(sessionId),
+                      }
+                    : { ok: true },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const run = async () => {
+            const messages = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                messages,
+                { messages: [...messages] as unknown[] },
+                makeMeta(db, sessionId),
+            );
+            // The compartment check runs in a background task; let it settle.
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        };
+
+        await run();
+        autoEmbedAttemptedBySession.add(sessionId);
+        await run();
+        expect(autoEmbedAttemptedBySession.has(sessionId)).toBe(true);
+
+        // What the module does on a historian publish: a new shared row plus a new
+        // row_version on the next transform response.
+        db.prepare(
+            `INSERT INTO compartments (session_id, sequence, start_message, end_message,
+                start_message_id, end_message_id, title, content, created_at)
+             VALUES (?, 0, 1, 2, 'm1', 'm2', 'published', 'published by the module', ?)`,
+        ).run(sessionId, Date.now());
+        rowVersion = 2;
+        await run();
+        expect(autoEmbedAttemptedBySession.has(sessionId)).toBe(false);
+        autoEmbedAttemptedBySession.delete(sessionId);
+    });
+
     it("forwards the model-routed prompt preset and description overrides", async () => {
         const sessionId = `rust-prompt-surface-${Date.now()}`;
         sessions.push(sessionId);
@@ -2221,7 +3576,11 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
@@ -2279,611 +3638,6 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
-    it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
-        const sessionId = `rust-memory-visibility-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const memory = insertMemory(db, {
-            projectPath: "/tmp/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "The rust-rendered memory must not be returned twice.",
-        });
-        const meta = makeMeta(db, sessionId);
-        db.exec(`
-            CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
-            INSERT INTO memory_manifest_updates (count) VALUES (0);
-            CREATE TRIGGER count_memory_manifest_updates
-            AFTER UPDATE OF memory_block_ids, memory_block_count ON session_meta
-            BEGIN
-                UPDATE memory_manifest_updates SET count = count + 1;
-            END;
-        `);
-        let renderedMemoryIds = [memory.id];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          native_messages: makeMessages(sessionId),
-                          rendered_memory_ids: renderedMemoryIds,
-                      }
-                    : { ok: true },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(sessionId, messages, { messages: [...messages] }, meta);
-        };
-
-        await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
-        const tools = createCtxSearchTools({
-            db,
-            resolveProjectPath: () => "/tmp/project",
-            memoryEnabled: true,
-            embeddingEnabled: false,
-            readMessages: () => [],
-        });
-        const search = await tools.ctx_search.execute(
-            { query: `#${memory.id}`, sources: ["memory"] },
-            { sessionID: sessionId, directory: "/tmp/project" } as never,
-        );
-        expect(search).toContain(
-            `Memories: 1 match found, all already visible in your project-memory block (ids ${memory.id}).`,
-        );
-
-        await run();
-        expect(
-            db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
-        ).toEqual({ count: 1 });
-
-        renderedMemoryIds = [memory.id + 1];
-        await run();
-        expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
-        expect(
-            db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
-        ).toEqual({ count: 2 });
-    });
-
-    it("preserves the receiver for a class-backed compartment mirror client", async () => {
-        const sessionId = `rust-class-compartments-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-
-        class ClassBackedModuleClient {
-            private readonly title = "receiver-bound compartment";
-
-            async call({ method }: Parameters<RustModeModuleClient["call"]>[0]) {
-                return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
-                    : { ok: true };
-            }
-
-            async getCompartmentsAfter(_sessionId: string, _afterSequence: number) {
-                if (this.title !== "receiver-bound compartment") {
-                    throw new Error("class receiver was detached");
-                }
-                return {
-                    max_sequence: 1,
-                    compartments: [
-                        {
-                            sequence: 1,
-                            start_message: 0,
-                            end_message: 0,
-                            start_message_id: "m1",
-                            end_message_id: "m1",
-                            title: this.title,
-                            content: "summary",
-                        },
-                    ],
-                };
-            }
-        }
-
-        const moduleClient: RustModeModuleClient = new ClassBackedModuleClient();
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const messages = makeMessages(sessionId);
-        await transform.run(
-            sessionId,
-            messages,
-            { messages: [...messages] },
-            makeMeta(db, sessionId),
-        );
-
-        expect(
-            db.prepare("SELECT title FROM compartments WHERE session_id = ?").get(sessionId),
-        ).toEqual({ title: "receiver-bound compartment" });
-    });
-
-    it("does not block transform completion on a compartment mirror backlog", async () => {
-        const sessionId = `rust-compartment-backlog-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let releaseMirror!: () => void;
-        const mirrorBacklog = new Promise<void>((resolve) => {
-            releaseMirror = resolve;
-        });
-        let mirrorCompleted = false;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform" ? { decision: "HARD", native_messages: [] } : { ok: true },
-            getCompartmentsAfter: async () => {
-                await mirrorBacklog;
-                mirrorCompleted = true;
-                return { max_sequence: 0, compartments: [] };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const messages = makeMessages(sessionId);
-        const run = transform.run(
-            sessionId,
-            messages,
-            { messages: [...messages] },
-            makeMeta(db, sessionId),
-        );
-
-        const disposition = await Promise.race([
-            run.then(() => "served" as const),
-            Bun.sleep(500).then(() => "blocked" as const),
-        ]);
-        expect(disposition).toBe("served");
-        expect(mirrorCompleted).toBe(false);
-        releaseMirror();
-        await run;
-        await Bun.sleep(20);
-        expect(mirrorCompleted).toBe(true);
-    });
-
-    it("drains every memory mirror page before stamping the transform projection", async () => {
-        const sessionId = `rust-memory-mirror-drain-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let memoryPulls = 0;
-        let transform!: ReturnType<typeof createRustModeTransform>;
-        const projectionKeysDuringPull: Array<string | null> = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 7,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                projectionKeysDuringPull.push(
-                    transform.getState(sessionId).memoryMirrorProjectionKey,
-                );
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor + 1,
-                        has_more: memoryPulls < 4,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const messages = makeMessages(sessionId);
-
-        await transform.run(
-            sessionId,
-            messages,
-            { messages: [...messages] },
-            makeMeta(db, sessionId),
-        );
-        await Bun.sleep(20);
-
-        expect(memoryPulls).toBe(4);
-        expect(projectionKeysDuringPull).toEqual([null, null, null, null]);
-        expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBe(
-            JSON.stringify([7, null, null, []]),
-        );
-    });
-
-    it("leaves a budget-exhausted memory mirror projection unstamped for the next pass", async () => {
-        const sessionId = `rust-memory-mirror-budget-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const mirrorPageBudget = TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET;
-        let memoryPulls = 0;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 8,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor + 1,
-                        has_more: true,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-            await Bun.sleep(20);
-        };
-
-        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
-        try {
-            await run();
-            expect(memoryPulls).toBe(mirrorPageBudget);
-            expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBeNull();
-
-            await run();
-            expect(memoryPulls).toBe(mirrorPageBudget * 2);
-            expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBeNull();
-            const backlogLogs = logSpy.mock.calls.filter(
-                ([loggedSession, message]) =>
-                    loggedSession === sessionId &&
-                    message.includes("rows_applied=0 backlog_remaining=true pages=20"),
-            );
-            expect(backlogLogs).toHaveLength(2);
-        } finally {
-            logSpy.mockRestore();
-        }
-    });
-
-    it("does not repoll a completely drained memory mirror on stable passes", async () => {
-        const sessionId = `rust-memory-mirror-stable-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let memoryPulls = 0;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 9,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-            await Bun.sleep(20);
-        };
-
-        await run();
-        await run();
-        await run();
-        await run();
-
-        expect(memoryPulls).toBe(1);
-        expect(transform.getState(sessionId).memoryMirrorProjectionKey).toBe(
-            JSON.stringify([9, null, null, []]),
-        );
-    });
-
-    it("resumes an interrupted multi-page mirror on later transform passes", async () => {
-        const sessionId = `rust-memory-mirror-interrupted-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const feedHead = 2_500;
-        let failSecondPage = true;
-        const cursorSamples: Array<{ cursor: number; updated_at: number }> = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 10,
-                          memory_mirror_head: feedHead,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                if (failSecondPage && args.cursor === 1_000) {
-                    failSecondPage = false;
-                    throw new Error("injected mirror page interruption");
-                }
-                const nextCursor = Math.min(feedHead, args.cursor + args.limit);
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: nextCursor,
-                        has_more: nextCursor < feedHead,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            await transform.run(
-                sessionId,
-                messages,
-                { messages: [...messages] },
-                makeMeta(db, sessionId),
-            );
-            await Bun.sleep(20);
-            cursorSamples.push(
-                db
-                    .prepare(
-                        "SELECT cursor, updated_at FROM mirror_cursors WHERE domain = 'memories'",
-                    )
-                    .get() as { cursor: number; updated_at: number },
-            );
-        };
-
-        await run();
-        await run();
-        await run();
-        await run();
-
-        expect(cursorSamples[0]?.cursor).toBe(1_000);
-        expect(cursorSamples.slice(1).map((sample) => sample.cursor)).toEqual([
-            feedHead,
-            feedHead,
-            feedHead,
-        ]);
-        expect(cursorSamples[1]?.updated_at).toBeGreaterThan(cursorSamples[0]?.updated_at ?? 0);
-        expect(cursorSamples[2]?.updated_at).toBe(cursorSamples[1]?.updated_at);
-        expect(cursorSamples[3]?.updated_at).toBe(cursorSamples[2]?.updated_at);
-    });
-
-    it("uses the module feed frontier to resume without polling a caught-up mirror", async () => {
-        const sessionId = `rust-memory-mirror-frontier-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let feedHead = 1;
-        let memoryPulls = 0;
-        const servedBytes: string[] = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 11,
-                          memory_mirror_head: feedHead,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: feedHead,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            const output = { messages: [...messages] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-            await Bun.sleep(20);
-            servedBytes.push(JSON.stringify(output.messages));
-        };
-
-        await run();
-        await run();
-        await run();
-        expect(memoryPulls).toBe(1);
-        expect(new Set(servedBytes).size).toBe(1);
-
-        feedHead = 2;
-        await run();
-        expect(memoryPulls).toBe(2);
-        expect(
-            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
-        ).toEqual({ cursor: 2 });
-        expect(new Set(servedBytes).size).toBe(1);
-
-        await run();
-        expect(memoryPulls).toBe(2);
-    });
-
-    it("keeps defer bytes stable while one bounded memory mirror pull is in flight", async () => {
-        const sessionId = `rust-memory-mirror-cache-neutral-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let releasePull!: () => void;
-        const pullGate = new Promise<void>((resolve) => {
-            releasePull = resolve;
-        });
-        let mirrorPullCalls = 0;
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) =>
-                method === "transform"
-                    ? {
-                          decision: "SOFT+",
-                          row_version: 4,
-                          memory_mirror_head: 7,
-                          rendered_memory_ids: [],
-                          native_messages: makeMessages(sessionId),
-                      }
-                    : { ok: true },
-            mirrorPull: async (args) => {
-                mirrorPullCalls += 1;
-                await pullGate;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: 7,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
-        const hashes: string[] = [];
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            const output = { messages: [...messages] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-            hashes.push(createHash("sha256").update(JSON.stringify(output.messages)).digest("hex"));
-        };
-
-        await run();
-        await run();
-        await run();
-        await run();
-        expect(mirrorPullCalls).toBe(1);
-        expect(new Set(hashes).size).toBe(1);
-
-        releasePull();
-        await Bun.sleep(20);
-        expect(
-            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
-        ).toEqual({ cursor: 7 });
-    });
-
-    it("caches mural bytes and pulls mirrors only when the module projection moves", async () => {
-        const sessionId = `rust-mural-mirror-generation-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        let rowVersion = 1;
-        let muralResolves = 0;
-        let memoryPulls = 0;
-        let compartmentPulls = 0;
-        let memoryCursor = 0;
-        const transformMuralHashes: string[] = [];
-        const moduleClient: RustModeModuleClient = {
-            call: async ({ method, body }) => {
-                if (method !== "transform") return { ok: true };
-                const mural = (body as { mural?: { content_hash?: string } }).mural;
-                transformMuralHashes.push(mural?.content_hash ?? "none");
-                return {
-                    decision: "SOFT+",
-                    row_version: rowVersion,
-                    rendered_memory_ids: [],
-                    native_messages: makeMessages(sessionId),
-                };
-            },
-            mirrorPull: async (args) => {
-                memoryPulls += 1;
-                const nextCursor = memoryPulls >= 2 ? 1 : memoryCursor;
-                memoryCursor = nextCursor;
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: nextCursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-            getCompartmentsAfter: async () => {
-                compartmentPulls += 1;
-                return { max_sequence: -1, compartment_count: 0, compartments: [] };
-            },
-        };
-        const deps = makeDeps(db, moduleClient);
-        deps.muralEnabled = true;
-        const transform = createRustModeTransform(deps, {
-            moduleClient,
-            muralResolverForTests: () => {
-                muralResolves += 1;
-                return {
-                    enabled: true,
-                    supportsVision: true,
-                    dataUrl: `data:image/png;base64,mural-${muralResolves}`,
-                    contentHash: `mural-${muralResolves}`,
-                };
-            },
-        });
-        const servedDigests: string[] = [];
-        const run = async () => {
-            const messages = makeMessages(sessionId);
-            const output = { messages: [...messages] as unknown[] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
-            servedDigests.push(
-                createHash("sha256").update(JSON.stringify(output.messages)).digest("hex"),
-            );
-            await Bun.sleep(20);
-        };
-
-        await run();
-        await run();
-        expect(muralResolves).toBe(1);
-        expect(memoryPulls).toBe(1);
-        expect(compartmentPulls).toBe(1);
-
-        rowVersion = 2;
-        await run();
-        expect(memoryPulls).toBe(2);
-        expect(compartmentPulls).toBe(2);
-        await run();
-        await run();
-
-        expect(muralResolves).toBe(2);
-        expect(memoryPulls).toBe(2);
-        expect(compartmentPulls).toBe(2);
-        expect(transformMuralHashes).toEqual([
-            "mural-1",
-            "mural-1",
-            "mural-1",
-            "mural-2",
-            "mural-2",
-        ]);
-        expect(new Set(servedDigests)).toEqual(new Set([servedDigests[0]]));
-    });
-
     it("sends the resolved historian timeout and default on the transform request", async () => {
         for (const [configured, expected] of [
             [720_000, 720_000],
@@ -2898,7 +3652,7 @@ describe("Rust mode authority adapter", () => {
                 call: async ({ method, body }) => {
                     if (method === "transform") requestBody = body as Record<string, unknown>;
                     return method === "transform"
-                        ? { decision: "SOFT+", native_messages: [] }
+                        ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                         : { ok: true };
                 },
             };
@@ -2927,7 +3681,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBodies.push(body as Record<string, unknown>);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -2966,7 +3720,7 @@ describe("Rust mode authority adapter", () => {
                 call: async ({ method, body }) => {
                     if (method === "transform") requestBody = body as Record<string, unknown>;
                     return method === "transform"
-                        ? { decision: "SOFT+", native_messages: [] }
+                        ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                         : { ok: true };
                 },
             };
@@ -2994,7 +3748,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBody = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -3019,6 +3773,9 @@ describe("Rust mode authority adapter", () => {
         const db = makeDb();
         installRawProvider(sessionId);
         const bodies: Record<string, unknown>[] = [];
+        updateSessionMeta(db, sessionId, {
+            lastTodoState: '[{"content":"pending work","status":"pending","priority":"medium"}]',
+        });
         let decision = "HARD";
         let materializeReason = "first_render";
         const moduleClient: RustModeModuleClient = {
@@ -3027,6 +3784,7 @@ describe("Rust mode authority adapter", () => {
                 bodies.push(body as Record<string, unknown>);
                 return {
                     decision,
+                    prefix_bust_permitted: decision === "HARD",
                     materialize_reason: materializeReason,
                     native_messages: makeMessages(sessionId),
                 };
@@ -3112,7 +3870,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBody = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -3140,6 +3898,83 @@ describe("Rust mode authority adapter", () => {
 
         expect(agents).toHaveBeenCalledTimes(1);
         expect(requestBody?.todo_tool_present).toBe(false);
+    });
+
+    it("probes changed todowrites and agent identity, not full-wire retries or unrelated refreshes", async () => {
+        const sessionId = "rust-todo-related-only";
+        sessions.push(sessionId);
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const bodies: Record<string, unknown>[] = [];
+        let needFull = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                bodies.push(body as Record<string, unknown>);
+                if (needFull) {
+                    needFull = false;
+                    return { need_full_sync: true };
+                }
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const agents = mock(async () => ({ data: [{ name: "build", permission: {} }] }));
+        const get = mock(async () => ({ data: { agent: "build" } }));
+        deps.client = { app: { agents }, session: { get } } as never;
+        deps.sessionDirectoryBySession!.set(sessionId, "/tmp/project");
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        (input[0].info as { agent?: string }).agent = "build";
+        const run = async () => {
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+        };
+        await run();
+        expect(agents).toHaveBeenCalledTimes(1);
+        agents.mockClear();
+        get.mockClear();
+        for (let pass = 0; pass < 12; pass++) {
+            transform.invalidateWireState(sessionId);
+            deps.historyRefreshSessions.add(sessionId);
+            deps.contextUsageMap.set(sessionId, {
+                usage: { inputTokens: 100_000, percentage: 90 },
+                updatedAt: Date.now(),
+            });
+            input[0].parts = [{ type: "text", text: `unrelated edit ${pass}` }];
+            await run();
+        }
+        needFull = true;
+        await run();
+        expect(agents).toHaveBeenCalledTimes(0);
+        expect(get).toHaveBeenCalledTimes(0);
+        expect(bodies.at(-1)?.todo_verdict_probed).toBe(false);
+        input[0].parts.push({
+            type: "tool",
+            tool: "todowrite",
+            callID: "new-todo",
+            state: {
+                status: "completed",
+                input: { todos: [] },
+                output: "[]",
+            },
+        });
+        await run();
+        expect(agents).toHaveBeenCalledTimes(1);
+        await run();
+        expect(agents).toHaveBeenCalledTimes(1);
+        // A late completion on an older message is a todo change even on a full wire.
+        (input[0].parts.at(-1)!.state as { output: string }).output = "updated";
+        await run();
+        expect(agents).toHaveBeenCalledTimes(2);
+        (input[0].info as { agent?: string }).agent = "plan";
+        await run();
+        expect(agents).toHaveBeenCalledTimes(3);
     });
 
     it("defers a repeated module directive until the terminal boundary", async () => {
@@ -3272,7 +4107,7 @@ describe("Rust mode authority adapter", () => {
                     retryStarted = true;
                     return { status: "need_full_sync" };
                 }
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -3300,6 +4135,45 @@ describe("Rust mode authority adapter", () => {
         expect(output.messages).toEqual(native);
     });
 
+    it("forwards the served response clock and adopted system identity without hiding an omitted bootstrap hash", async () => {
+        const sessionId = `rust-idle-system-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const bodies: Array<Record<string, unknown>> = [];
+        const moduleClient: RustModeModuleClient = {
+            invalidateStateSyncCapabilities: () => undefined,
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                bodies.push(body as Record<string, unknown>);
+                return {
+                    decision: "SOFT+",
+                    prefix_bust_permitted: false,
+                    native_messages: [
+                        { role: "assistant", parts: [{ type: "text", text: "stable" }] },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        for (const hash of ["", "oct02", "oct03"]) {
+            const meta = makeMeta(db, sessionId);
+            meta.systemPromptHash = hash;
+            meta.cachedM0SystemHash = hash;
+            meta.lastResponseTime = 123;
+            const messages = makeMessages(sessionId);
+            await transform.run(sessionId, messages, { messages: messages as unknown[] }, meta);
+        }
+        expect(bodies.map((body) => body.system_prompt_hash)).toEqual(["", "oct02", "oct03"]);
+        expect(bodies.map((body) => body.adopted_system_prompt_hash)).toEqual([
+            undefined,
+            "oct02",
+            "oct03",
+        ]);
+        expect(bodies.map((body) => body.prev_response_completed_at_ms)).toEqual([123, 123, 123]);
+    });
+
     it("sends the same render identity on the need_full_sync full-array retry", async () => {
         // The module HARD-renders whenever the render identity changes. A retry that
         // drops a field (the reasoning variant) records a different identity, and the
@@ -3320,7 +4194,7 @@ describe("Rust mode authority adapter", () => {
                 transforms += 1;
                 // Pass two sends a tail delta that the restarted module cannot apply.
                 if (transforms === 2) return { status: "need_full_sync" };
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const deps = makeDeps(db, moduleClient);
@@ -3348,6 +4222,7 @@ describe("Rust mode authority adapter", () => {
                 "model_key",
                 "provider_id",
                 "system_prompt_hash",
+                "adopted_system_prompt_hash",
                 "upgrade_state",
             ]) {
                 expect(body?.[field]).toEqual(steady?.[field]);
@@ -3372,7 +4247,11 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 transforms += 1;
                 if (transforms === 2) return { status: "need_full_sync" };
-                return { decision: transforms === 3 ? "HARD" : "SOFT+", native_messages: native };
+                return {
+                    decision: transforms === 3 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: transforms === 3,
+                    native_messages: native,
+                };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -3450,7 +4329,7 @@ describe("Rust mode authority adapter", () => {
                     };
                 if (transforms === 4 || transforms === 5)
                     throw new Error("rust module transform timed out");
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
@@ -3549,7 +4428,12 @@ describe("Rust mode authority adapter", () => {
                     );
                 }
                 return page.transform_page_complete === true
-                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          served_from: "transform",
+                          native_messages: native,
+                      }
                     : { staged: true };
             },
         };
@@ -3606,7 +4490,12 @@ describe("Rust mode authority adapter", () => {
                     };
                 }
                 return page.transform_page_complete === true
-                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          served_from: "transform",
+                          native_messages: native,
+                      }
                     : { staged: true };
             },
         };
@@ -3986,7 +4875,7 @@ describe("Rust mode authority adapter", () => {
             const sessionId = "rust-hotpath-measure-session";
             sessions.push(sessionId);
             const db = makeDb();
-            const projectRoot = mkdtempSync(join(tmpdir(), `rust-hotpath-${label}-`));
+            const projectRoot = createTestTempDirFromPath(join(tmpdir(), `rust-hotpath-${label}-`));
             availabilityDataHomes.push(projectRoot);
             mkdirSync(join(projectRoot, ".git"), { recursive: true });
             const guidance = `## Magic Context\n\n${"Measured guidance. ".repeat(2_000)}`;
@@ -4160,8 +5049,8 @@ describe("Rust mode authority adapter", () => {
             const before = await measure("before", true);
             const after = await measure("after", false);
             expect(after.hash).toBe(before.hash);
-            expect(after.memoryPulls).toBeLessThan(before.memoryPulls);
-            expect(after.compartmentPulls).toBeLessThan(before.compartmentPulls);
+            expect(after.memoryPulls).toBe(0);
+            expect(after.compartmentPulls).toBe(0);
             if (process.env.MAGIC_CONTEXT_HOTPATH_MEASURE === "1") {
                 console.log(`HOTPATH_MEASUREMENT ${JSON.stringify({ before, after })}`);
             }
@@ -4169,6 +5058,236 @@ describe("Rust mode authority adapter", () => {
             logSpy.mockRestore();
         }
     });
+
+    it("keeps all served bytes identical across 64 todo and mural cache passes", async () => {
+        const baselinePath = process.env.MAGIC_CONTEXT_RUST_STAGE_BASELINE;
+        const baselineFactory: typeof createRustModeTransformImpl = baselinePath
+            ? (await import(baselinePath)).createRustModeTransform
+            : createRustModeTransformImpl;
+        const sessionId = "rust-stage-differential";
+        const projectPath = "/tmp/rust-stage-fixture";
+        const todoJson = '[{"content":"review changes","status":"pending","priority":"high"}]';
+        const rows = Array.from({ length: 2_000 }, (_, index) => ({
+            id: `fixture-${index}`,
+            timeCreated: index + 1,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+            ordinal: index + 1,
+            role: index % 2 ? "assistant" : "user",
+            parts: [],
+        }));
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        const runArm = async (factory: typeof createRustModeTransformImpl, baseline: boolean) => {
+            sessions.push(sessionId);
+            installAvailabilityDb(sessionId, {});
+            const db = makeDb();
+            unregisters.push(
+                setRawMessageProvider(sessionId, {
+                    readMessages: () => rows,
+                    getStoredMessageCount: () => rows.length,
+                }),
+            );
+            const memories = Array.from({ length: 400 }, (_, index) => {
+                const content = `Memory ${index}: ${"architectural constraint ".repeat(30)}`;
+                const memory = insertMemory(db, { projectPath, category: "CONSTRAINTS", content });
+                setMuralCue(
+                    db,
+                    projectPath,
+                    memory.id,
+                    `Stable cue ${index}`,
+                    computeCueContentHash(content),
+                );
+                return memory;
+            });
+            const input = rows.map((row, index) => ({
+                info: {
+                    id: row.id,
+                    sessionID: sessionId,
+                    role: index % 2 ? "assistant" : "user",
+                    ...(index % 2
+                        ? { providerID: "test-provider", modelID: "test-model" }
+                        : { agent: "build" }),
+                },
+                parts: [
+                    { type: "text", text: `message ${index}: ${"fixture ballast ".repeat(12)}` },
+                ],
+            })) as MessageLike[];
+            input[999].parts = [
+                {
+                    type: "tool",
+                    tool: "todowrite",
+                    callID: "origin-todo",
+                    state: {
+                        status: "completed",
+                        input: { todos: JSON.parse(todoJson) },
+                        output: todoJson,
+                    },
+                },
+            ];
+            updateSessionMeta(db, sessionId, { lastTodoState: todoJson });
+            let pass = 0;
+            let denied = false;
+            const seenInputs: unknown[] = [];
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method, body }) => {
+                    if (method !== "transform") return { ok: true };
+                    const request = body as Record<string, unknown>;
+                    seenInputs.push([request.todo_tool_present, request.mural]);
+                    // A deterministic materializer consumes the adapter's actual candidates,
+                    // rather than echoing a fixed native array regardless of their values.
+                    const native: unknown[] = structuredClone(input);
+                    if (pass >= 16) {
+                        (native[999] as MessageLike).parts = [];
+                        if (request.todo_tool_present)
+                            native.unshift(
+                                {
+                                    info: { id: "__magic_context_todo_head__", role: "user" },
+                                    parts: [{ type: "text", text: "Todo state" }],
+                                },
+                                {
+                                    info: { id: "synthetic-todo", role: "assistant" },
+                                    parts: [buildSyntheticTodoPart(todoJson)],
+                                },
+                            );
+                    }
+                    if (request.mural)
+                        native.unshift({
+                            info: { id: "mural", role: "user" },
+                            parts: [request.mural],
+                        });
+                    return {
+                        decision: "HARD",
+                        prefix_bust_permitted: true,
+                        native_messages: native,
+                    };
+                },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.projectPath = projectPath;
+            deps.muralEnabled = true;
+            deps.memoryConfig!.injectionBudgetTokens = 1;
+            let probes = 0;
+            let resolutions = 0;
+            deps.client = {
+                app: {
+                    agents: async () => {
+                        probes++;
+                        return {
+                            data: [
+                                {
+                                    name: "build",
+                                    permission: { todowrite: denied ? "deny" : "allow" },
+                                },
+                            ],
+                        };
+                    },
+                },
+                session: { get: async () => ({ data: { agent: "build" } }) },
+            } as never;
+            deps.sessionDirectoryBySession!.set(sessionId, projectPath);
+            const transform = factory(deps, {
+                moduleClient,
+                scheduleLkgCapture: (capture) => capture(),
+                disableHotPathIoCachesForTests: baseline && !baselinePath,
+                muralResolverForTests: (muralDb, project, _model, _enabled, budget) => {
+                    resolutions++;
+                    const result = ensureMuralRendered(muralDb, project!, budget);
+                    return {
+                        enabled: true,
+                        supportsVision: true,
+                        dataUrl: result.dataUrl,
+                        contentHash: result.contentHash,
+                    };
+                },
+            });
+            const outputs: string[] = [];
+            const start = logSpy.mock.calls.length;
+            for (pass = 0; pass < 64; pass++) {
+                // Full sends and unrelated edits do not imply a permission change.
+                if (pass % 3 === 0) transform.invalidateWireState(sessionId);
+                input[1200].parts = [{ type: "text", text: `late edit ${pass}` }];
+                deps.contextUsageMap.set(sessionId, {
+                    usage: {
+                        inputTokens: pass >= 16 && pass < 24 ? 180_000 : 100,
+                        percentage: pass >= 16 && pass < 24 ? 90 : 1,
+                    },
+                    updatedAt: Date.now(),
+                });
+                if (pass === 20 || pass === 22) denied = !denied;
+                if (pass === 32) {
+                    setMuralCue(
+                        db,
+                        projectPath,
+                        memories[0].id,
+                        "Changed cue",
+                        computeCueContentHash(memories[0].content),
+                    );
+                    deps.pendingMaterializationSessions.add(sessionId);
+                }
+                if (pass === 48) {
+                    (input[999].parts[0].state as { output: string }).output += " completed";
+                }
+                const output = { messages: [...input] as unknown[] };
+                await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+                outputs.push(JSON.stringify(output.messages));
+                deps.pendingMaterializationSessions.delete(sessionId);
+            }
+            const stages = ["todo_probe", "todo_verdict", "mural_resolve"];
+            const samples = Object.fromEntries(
+                stages.map((stage) => [
+                    stage,
+                    logSpy.mock.calls
+                        .slice(start)
+                        .filter(([, message]) => message.startsWith("rust pass:"))
+                        .map(([, message]) =>
+                            Number(
+                                message.match(new RegExp(`(?:stages=| )${stage}:([\\d.]+)`))?.[1] ??
+                                    0,
+                            ),
+                        ),
+                ]),
+            );
+            transform.dispose();
+            return { outputs, seenInputs, probes, resolutions, samples };
+        };
+        try {
+            const before = await runArm(baselineFactory, true);
+            const after = await runArm(createRustModeTransformImpl, false);
+            expect(after.outputs).toEqual(before.outputs);
+            expect(after.seenInputs).toEqual(before.seenInputs);
+            expect(after.outputs[16]).not.toContain('"callID":"origin-todo"');
+            expect(after.outputs[16]).toContain('"syntheticTodoMarker":true');
+            expect(after.outputs[20]).not.toContain('"syntheticTodoMarker":true');
+            expect(after.outputs[22]).toContain('"syntheticTodoMarker":true');
+            expect(after.resolutions).toBe(2);
+            if (baselinePath) expect(after.probes).toBeLessThan(before.probes);
+            if (process.env.MAGIC_CONTEXT_HOTPATH_MEASURE === "1") {
+                const summary = (arm: typeof after) => ({
+                    probes: arm.probes,
+                    resolutions: arm.resolutions,
+                    stages: Object.fromEntries(
+                        Object.entries(arm.samples).map(([stage, values]) => {
+                            const sorted = values.sort((a, b) => a - b);
+                            return [
+                                stage,
+                                {
+                                    passes: sorted.length,
+                                    median: sorted[Math.floor(sorted.length / 2)],
+                                    p90: sorted[Math.floor(sorted.length * 0.9)],
+                                    max: sorted.at(-1),
+                                },
+                            ];
+                        }),
+                    ),
+                });
+                console.log(
+                    `RUST_STAGE_DIFFERENTIAL ${JSON.stringify({ baseline: baselinePath ?? "uncached", passes: 64, before: summary(before), after: summary(after) })}`,
+                );
+            }
+        } finally {
+            logSpy.mockRestore();
+        }
+    }, 120_000);
 
     it("keeps a 1,000-message steady-state pass under the adapter budget", async () => {
         const sessionId = `rust-wire-delta-${Date.now()}`;
@@ -4206,6 +5325,7 @@ describe("Rust mode authority adapter", () => {
                 return method === "transform"
                     ? {
                           decision: transformPass === 1 ? "HARD" : "SOFT+",
+                          prefix_bust_permitted: transformPass === 1,
                           row_version: transformPass,
                           native_messages: [],
                       }
@@ -4366,6 +5486,7 @@ describe("Rust mode authority adapter", () => {
                 if (failTransform) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -4407,6 +5528,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             role: "assistant",
@@ -4436,13 +5558,40 @@ describe("Rust mode authority adapter", () => {
 
         const secondInput = makeMessages(sessionId);
         const secondOutput = { messages: [...secondInput] as unknown[] };
+        const startedAt = performance.now();
         await expect(
             transform.run(sessionId, secondInput, secondOutput, makeMeta(db, sessionId)),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        const elapsedMs = performance.now() - startedAt;
+        console.log(`oversized priced snapshot refusal: ${elapsedMs.toFixed(1)}ms`);
+        expect(elapsedMs).toBeLessThan(1000);
 
         // Refusal can follow an in-place managed edit, but no sendable result is returned.
         expect(getSlot(sessionId)).toBeUndefined();
         expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const input = makeMessages(sessionId);
+            await expect(
+                transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        }
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(3);
+        expect(transform.getState(sessionId).parked).toBe(true);
+        expect(pass).toBe(4);
+        const parkedInput = makeMessages(sessionId);
+        await expect(
+            transform.run(
+                sessionId,
+                parkedInput,
+                { messages: [...parkedInput] },
+                makeMeta(db, sessionId),
+            ),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        // The fifth live pass is the one retry allowed while parked. Another invalid
+        // response must refuse and increment the existing failure count.
+        expect(pass).toBe(5);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(4);
+        expect(transform.getState(sessionId).parkCount).toBe(1);
     });
 
     it("reuses only the exact accepted prefix after an older stable-id mutation", async () => {
@@ -4462,6 +5611,7 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 return {
                     decision: ++pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     row_version: pass,
                     native_messages: structuredClone(input),
                 };
@@ -4533,6 +5683,7 @@ describe("Rust mode authority adapter", () => {
                 if (unavailable) throw new Error("module unavailable");
                 return {
                     decision: ++pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     row_version: pass,
                     native_messages: [
                         {
@@ -4573,6 +5724,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4607,6 +5759,51 @@ describe("Rust mode authority adapter", () => {
         expect(secondSlot?.inputContentDigests).not.toEqual(firstSlot?.inputContentDigests);
     });
 
+    it("replays byte-identical LKG after transform_transport_interrupted without retrying", async () => {
+        const sessionId = `rust-interrupted-lkg-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let interrupted = false;
+        let calls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                calls++;
+                if (interrupted)
+                    throw Object.assign(
+                        new Error("Transform transport interrupted; abandon this pass"),
+                        {
+                            code: "transform_transport_interrupted",
+                            cause: new Error("subc closed the connection"),
+                        },
+                    );
+                return {
+                    decision: "HARD",
+                    prefix_bust_permitted: true,
+                    native_messages: [
+                        {
+                            info: { id: "served", role: "assistant", sessionID: sessionId },
+                            parts: [{ type: "text", text: "last good module bytes" }],
+                        },
+                    ],
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const input = makeMessages(sessionId);
+        const firstOutput = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, firstOutput, makeMeta(db, sessionId));
+        const firstBytes = JSON.stringify(firstOutput.messages);
+        expect(firstBytes).not.toBe(JSON.stringify(input));
+        interrupted = true;
+        const failedOutput = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, failedOutput, makeMeta(db, sessionId));
+        expect(JSON.stringify(failedOutput.messages)).toBe(firstBytes);
+        expect(calls).toBe(2);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+    });
+
     it("replays byte-identical LKG on a typed mc-store transform failure", async () => {
         const sessionId = `rust-module-store-busy-${Date.now()}`;
         sessions.push(sessionId);
@@ -4623,6 +5820,7 @@ describe("Rust mode authority adapter", () => {
                 }
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4660,6 +5858,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4686,10 +5885,15 @@ describe("Rust mode authority adapter", () => {
             await transform.run(sessionId, input, secondOutput, makeMeta(db, sessionId));
             expect(JSON.stringify(secondOutput.messages)).toContain("module output 2");
             expect(getSlot(sessionId)?.jsonPrefix).toContain("module output 2");
-            const persisted = db
-                .prepare("SELECT json_prefix FROM lkg_slots WHERE session_id = ?")
-                .get(sessionId) as { json_prefix: string };
-            expect(persisted.json_prefix).toContain("module output 1");
+            // The durable prefix is stored as ordered slices.
+            const persisted = (
+                db
+                    .prepare("SELECT body FROM lkg_slot_chunks WHERE session_id = ? ORDER BY chunk")
+                    .all(sessionId) as Array<{ body: string }>
+            )
+                .map((row) => row.body)
+                .join("");
+            expect(persisted).toContain("module output 1");
         } finally {
             if (blocker.inTransaction) blocker.exec("ROLLBACK");
             closeQuietly(blocker);
@@ -4723,6 +5927,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: pass === 1 ? "HARD" : "SOFT",
+                    prefix_bust_permitted: true,
                     row_version: pass,
                     native_messages: [
                         {
@@ -4787,6 +5992,10 @@ describe("Rust mode authority adapter", () => {
                     { type: "text", text: "answer" },
                 ],
             },
+            {
+                info: { id: "next-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Next turn" }],
+            },
         ] as unknown as MessageLike[];
         recordDetectedContextLimit(db, sessionId, 200_000, "anthropic/fable-5-1");
         recordToolDefinition("anthropic", "fable-5-1", undefined, "read", "read fixture", {
@@ -4803,6 +6012,7 @@ describe("Rust mode authority adapter", () => {
                 // baseline would already strip it proactively.
                 return {
                     decision: rowVersion === 1 ? "SOFT+" : "HARD",
+                    prefix_bust_permitted: rowVersion !== 1,
                     row_version: rowVersion,
                     native_messages: nativeMessages(),
                 };
@@ -4869,6 +6079,7 @@ describe("Rust mode authority adapter", () => {
                 return {
                     decision: "SOFT+",
                     row_version: pass,
+                    prefix_bust_permitted: false,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -5025,6 +6236,7 @@ describe("Rust mode authority adapter", () => {
                     throw Object.assign(new Error("request deadline"), { code: "ETIMEDOUT" });
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -5045,6 +6257,113 @@ describe("Rust mode authority adapter", () => {
         expect(JSON.stringify(output.messages)).toContain("managed fold");
         expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
         expect(transform.getState(sessionId).parked).toBe(false);
+    });
+
+    it("refuses transform_transport_interrupted without LKG instead of serving unmanaged history", async () => {
+        const sessionId = `rust-interrupted-no-lkg-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let calls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                calls++;
+                throw Object.assign(
+                    new Error("Transform transport interrupted; abandon this pass"),
+                    {
+                        code: "transform_transport_interrupted",
+                        cause: new Error("subc closed the connection"),
+                    },
+                );
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const output = { messages: [] as unknown[] };
+        await expect(
+            transform.run(sessionId, makeMessages(sessionId), output, makeMeta(db, sessionId)),
+        ).rejects.toThrow("Magic Context's engine is reconnecting");
+        expect(output.messages).toEqual([]);
+        expect(calls).toBe(1);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+    });
+
+    it("refuses instead of rebuilding forever when every state sync loses the module connection", async () => {
+        const sessionId = `rust-state-sync-reconnect-loop-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let stateSyncs = 0;
+        let transforms = 0;
+        const moduleClient: RustModeModuleClient = {
+            stateSyncCapabilities: async () => ({ state_sync_deltas: true }),
+            call: async ({ method }) => {
+                if (method === "state_sync") {
+                    stateSyncs += 1;
+                    // Bounded so a client that never gives up still finishes and the
+                    // assertions below report the retry count instead of hanging.
+                    if (stateSyncs <= 50) {
+                        return {
+                            transport_status: "connection_generation_changed",
+                            previous_generation: stateSyncs,
+                            current_generation: stateSyncs + 1,
+                        };
+                    }
+                    return { ok: true };
+                }
+                if (method === "transform") {
+                    transforms += 1;
+                    return { decision: "PASSTHROUGH", native_messages: makeMessages(sessionId) };
+                }
+                return { ok: true };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const output = { messages: [] as unknown[] };
+        await expect(
+            transform.run(sessionId, makeMessages(sessionId), output, makeMeta(db, sessionId)),
+        ).rejects.toThrow("Magic Context's engine is reconnecting");
+        expect(output.messages).toEqual([]);
+        expect(stateSyncs).toBe(3);
+        expect(transforms).toBe(0);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+    });
+
+    it("refuses transform_transport_interrupted with compaction disabled instead of serving unmanaged history", async () => {
+        const sessionId = `rust-interrupted-compaction-off-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        recordDetectedContextLimit(db, sessionId, 20_000, "test-provider/test-model");
+        let calls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                calls++;
+                throw Object.assign(
+                    new Error("Transform transport interrupted; abandon this pass"),
+                    { code: "transform_transport_interrupted" },
+                );
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.compactionOff = true;
+        const transform = createRustModeTransform(deps, {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => ({
+                tokens: 1,
+                trusted: true,
+                messageTokens: { conversation: 1, toolCall: 0 },
+                systemTokens: 0,
+                toolDefinitionTokens: 0,
+            }),
+        });
+        const output = { messages: [] as unknown[] };
+        await expect(
+            transform.run(sessionId, makeMessages(sessionId), output, makeMeta(db, sessionId)),
+        ).rejects.toThrow("Magic Context's engine is reconnecting");
+        expect(output.messages).toEqual([]);
+        expect(calls).toBe(1);
     });
 
     it("refuses a module timeout without LKG instead of serving raw", async () => {
@@ -5264,7 +6583,9 @@ describe("Rust mode authority adapter", () => {
                     .filter(([loggedSession]) => loggedSession === sessionId)
                     .map(([, message]) => message)
                     .find((message) => message.startsWith("rust pass:")),
-            ).toContain("decision=error reason=state_sync_non_retryable served_from=refused");
+            ).toContain(
+                "decision=error reason=state_sync_non_retryable prefix_bust_permitted=unsupported served_from=refused",
+            );
 
             for (let pass = 0; pass < 2; pass += 1) {
                 const parked = makeMessages(sessionId);
@@ -5353,6 +6674,75 @@ describe("Rust mode authority adapter", () => {
         }
     });
 
+    it("refuses migration-required turns without LKG replay or parking", async () => {
+        const sessionId = `rust-single-store-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let moduleCalls = 0;
+        let toastCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async () => {
+                moduleCalls += 1;
+                throw Object.assign(new Error("storage open refused"), {
+                    code: "single_store_migration_required",
+                    detail: {
+                        reason_code: "single_store_migration_required",
+                    },
+                });
+            },
+        };
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+                moduleClient,
+                notifyParked: () => {
+                    toastCalls += 1;
+                },
+            });
+            // Four passes is more than RUST_FAILURE_PARK_THRESHOLD, the number of consecutive
+            // failures that would park an ordinary failing session into fallback serving. A
+            // refused store must keep failing visibly instead.
+            for (let pass = 0; pass < 4; pass += 1) {
+                const input = makeMessages(sessionId);
+                const callsBefore = moduleCalls;
+                const failure = transform
+                    .run(
+                        sessionId,
+                        input,
+                        { messages: input as unknown[] },
+                        makeMeta(db, sessionId),
+                    )
+                    .then(
+                        () => null,
+                        (error: unknown) => error,
+                    );
+                const error = await failure;
+                expect(error).toBeInstanceOf(EmergencyFailClosedError);
+                expect((error as Error).message).toBe(
+                    "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+                );
+                expect(moduleCalls).toBeGreaterThan(callsBefore);
+            }
+            expect(transform.getState(sessionId).parked).toBe(false);
+            expect(toastCalls).toBe(0);
+            const messages = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => String(message));
+            expect(
+                messages.some((message) =>
+                    message.startsWith(
+                        "mc_rust_single_store_refusal reason=single_store_migration_required",
+                    ),
+                ),
+            ).toBe(true);
+            expect(messages.some((message) => message.includes("lkg_replay_served"))).toBe(false);
+            expect(messages.some((message) => message.includes("served_from=raw"))).toBe(false);
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
     it("parked without LKG retries the recovered module on the next pass even when raw exceeds the limit", async () => {
         const sessionId = `rust-failure-${Date.now()}`;
         sessions.push(sessionId);
@@ -5366,7 +6756,11 @@ describe("Rust mode authority adapter", () => {
                 if (method === "transform") transformCalls += 1;
                 if (shouldFail) throw new Error("daemon unavailable");
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [{ role: "assistant", parts: [] }] }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: [{ role: "assistant", parts: [] }],
+                      }
                     : { ok: true };
             },
         };
@@ -5544,6 +6938,7 @@ describe("Rust mode authority adapter", () => {
                 if (failTransform) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         { role: "assistant", parts: [{ type: "text", text: "lkg" }] },
                     ],
@@ -5657,6 +7052,7 @@ describe("Rust mode authority adapter", () => {
                 if (failTransform) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -5704,472 +7100,6 @@ describe("Rust mode authority adapter", () => {
         ).rejects.toBeInstanceOf(RawFallbackContextLimitError);
 
         expect(output.messages).toEqual([]);
-    });
-});
-
-describe("prepareRustMemoryAuthority mixed restore", () => {
-    it("resumes a schema-57 DRAINING restart through the real prepare path", async () => {
-        const db = makeDb();
-        const projectPath = "git:schema-57-restart";
-        const projectRoot = "/worktrees/schema-57-restart";
-        db.exec(`
-            DROP TABLE mirror_live_staging;
-            DROP TABLE mirror_resnapshot_state;
-            DROP TABLE mirror_live_memory_rows;
-            DELETE FROM schema_migrations WHERE version >= 58;
-        `);
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                "INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (9395, ?, 'CONFIG_VALUES', 'drive model', 'same-hash', 0, 0, 0, 0)",
-            ).run(projectPath);
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', '/legacy', 100, 9395)",
-            ).run();
-            db.prepare(
-                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 20, 0)",
-            ).run();
-        });
-        runMigrations(db);
-        db.prepare(
-            "UPDATE mirror_resnapshot_state SET status = 'resnapshotting' WHERE domain = 'memories'",
-        ).run();
-        db.prepare(
-            "INSERT INTO mirror_live_staging VALUES ('abandoned', '/stale', 1, 'CONSTRAINTS', 'stale', NULL)",
-        ).run();
-
-        const calls: Array<{ liveOnly?: boolean; cursor: number }> = [];
-        const statuses = new Map<string, AuthorityStatus | null>([
-            [
-                "memories",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "memories",
-                    state: "DRAINING",
-                    generation: 3,
-                    captured_upper_bound: 21,
-                    coordinator_token: "restart-token",
-                },
-            ],
-            [
-                "notes",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "notes",
-                    state: "TS",
-                    generation: 1,
-                },
-            ],
-        ]);
-        const memoryRow = (id: number, sourceProject: string) => ({
-            id,
-            project_path: sourceProject,
-            category: "CONFIG_VALUES",
-            content: "drive model",
-            normalized_hash: "same-hash",
-            status: "active",
-        });
-        const module: RustModeModuleClient = {
-            call: async () => ({ ok: true }),
-            authorityStatus: async (args) => ({ authority: statuses.get(args.domain) ?? null }),
-            authorityPrepare: async () => {
-                throw new Error("prepare should not run during DRAINING recovery");
-            },
-            authoritySeed: async () => ({ seeded: 0 }),
-            authorityDrain: async (args) => {
-                if (args.action === "finish") {
-                    statuses.set("memories", {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "TS",
-                        generation: 4,
-                    });
-                }
-                return {
-                    authority: {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: args.action === "finish" ? "TS" : "DRAINING",
-                        generation: args.action === "finish" ? 4 : 3,
-                        captured_upper_bound: 21,
-                        coordinator_token: "restart-token",
-                    },
-                };
-            },
-            mirrorPull: async (args) => {
-                calls.push({ liveOnly: args.live_only, cursor: args.cursor });
-                return args.live_only
-                    ? {
-                          page: {
-                              domain: "memories",
-                              cursor: 0,
-                              next_cursor: 200,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 0,
-                                      domain: "memories",
-                                      op: "insert",
-                                      module_row_id: 200,
-                                      full_row_snapshot: memoryRow(200, projectPath),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      }
-                    : {
-                          page: {
-                              domain: "memories",
-                              cursor: args.cursor,
-                              next_cursor: 21,
-                              has_more: false,
-                              rows: [
-                                  {
-                                      feed_seq: 21,
-                                      domain: "memories",
-                                      op: "tombstone",
-                                      module_row_id: 100,
-                                      full_row_snapshot: memoryRow(100, "/legacy"),
-                                      content_hash: "same-hash",
-                                  },
-                              ],
-                          },
-                      };
-            },
-        };
-        const state = {
-            initialized: false,
-            consecutiveFailures: 0,
-            passCount: 0,
-            parked: false,
-            passesSincePark: 0,
-            warningSent: false,
-            ordinalMemoAnchor: null,
-            ordinalMemoStoredCount: null,
-            ordinalMemoCanonicalCount: 0,
-            seedPassPending: true,
-            failureCount: 0,
-            parkCount: 0,
-            moduleGeneration: 0,
-            lastAckedSeq: 0,
-            lastAckedWatermarks: null,
-            idOrdinalMemoGeneration: 0,
-            idOrdinalMemo: new Map(),
-            syntheticTurnCount: 0,
-            lastObservedUserMessageId: null,
-            syntheticLoopBreakerLogged: false,
-            memoryAuthorityProject: null as string | null,
-            memoryAuthorityRoot: null as string | null,
-            memoryAuthorityReady: false,
-        };
-
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot,
-            state,
-        });
-
-        expect(calls.map((call) => call.liveOnly)).toEqual([true, undefined]);
-        expect(
-            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
-        ).toEqual({
-            cursor: 21,
-        });
-        expect(db.prepare("SELECT id FROM memories WHERE id = 9395").get()).toEqual({ id: 9395 });
-        expect(db.prepare("SELECT status FROM mirror_resnapshot_state").get()).toEqual({
-            status: "complete",
-        });
-        expect(db.prepare("SELECT COUNT(*) AS count FROM mirror_live_staging").get()).toEqual({
-            count: 0,
-        });
-        expect(state.memoryAuthorityReady).toBe(true);
-    });
-
-    it("reconciles remaining MODULE domains after a DRAINING resume before tools open", async () => {
-        const db = makeDb();
-        const projectPath = "git:mixed-restore";
-        const projectRoot = "/worktrees/mixed-restore";
-        const authorityRoots: string[] = [];
-        const statuses = new Map<string, AuthorityStatus | null>([
-            [
-                "memories",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "memories",
-                    state: "DRAINING",
-                    generation: 3,
-                    coordinator_token: "tok-a",
-                    captured_upper_bound: 0,
-                },
-            ],
-            [
-                "notes",
-                {
-                    context_store_uuid: "store",
-                    project: projectPath,
-                    domain: "notes",
-                    state: "MODULE",
-                    generation: 2,
-                },
-            ],
-        ]);
-        const module: RustModeModuleClient = {
-            call: async () => ({ ok: true }),
-            authorityStatus: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return { authority: statuses.get(args.domain) ?? null };
-            },
-            authorityPrepare: async () => {
-                throw new Error("prepare should not run on mixed DRAINING resume");
-            },
-            authoritySeed: async () => ({ seeded: 0 }),
-            authorityDrain: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                if (args.action === "begin") {
-                    return {
-                        authority: {
-                            context_store_uuid: "store",
-                            project: projectPath,
-                            domain: "memories",
-                            state: "DRAINING",
-                            generation: 3,
-                            coordinator_token: "tok-a",
-                            captured_upper_bound: 0,
-                        },
-                    };
-                }
-                if (args.action === "finish") {
-                    statuses.set("memories", {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "TS",
-                        generation: 4,
-                    });
-                    return {
-                        authority: {
-                            context_store_uuid: "store",
-                            project: projectPath,
-                            domain: "memories",
-                            state: "TS",
-                            generation: 4,
-                            coordinator_token: "tok-a",
-                        },
-                    };
-                }
-                return {
-                    authority: {
-                        context_store_uuid: "store",
-                        project: projectPath,
-                        domain: "memories",
-                        state: "DRAINING",
-                        generation: 3,
-                        coordinator_token: "tok-a",
-                    },
-                };
-            },
-            mirrorPull: async (args) => {
-                authorityRoots.push(String(args.projectRoot));
-                return {
-                    page: {
-                        domain: args.domain,
-                        cursor: args.cursor,
-                        next_cursor: args.cursor,
-                        has_more: false,
-                        rows: [],
-                    },
-                };
-            },
-        };
-        const state = {
-            initialized: false,
-            consecutiveFailures: 0,
-            passCount: 0,
-            parked: false,
-            passesSincePark: 0,
-            warningSent: false,
-            ordinalMemoAnchor: null,
-            ordinalMemoStoredCount: null,
-            ordinalMemoCanonicalCount: 0,
-            seedPassPending: true,
-            failureCount: 0,
-            parkCount: 0,
-            moduleGeneration: 0,
-            lastAckedSeq: 0,
-            lastAckedWatermarks: null,
-            idOrdinalMemoGeneration: 0,
-            idOrdinalMemo: new Map(),
-            syntheticTurnCount: 0,
-            lastObservedUserMessageId: null,
-            syntheticLoopBreakerLogged: false,
-            memoryAuthorityProject: null as string | null,
-            memoryAuthorityRoot: null as string | null,
-            memoryAuthorityReady: false,
-        };
-        const preparedProjects: string[] = [];
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot,
-            state,
-            onProjectPrepared: (prepared) => preparedProjects.push(prepared),
-        });
-        expect(state.memoryAuthorityReady).toBe(true);
-        // Hosts hang per-project services (the smart-note evaluator bridge) off this
-        // callback, so it must fire with the RESOLVED project — a session that resolves
-        // a project other than the plugin's launch directory still gets its bridge.
-        expect(preparedProjects).toEqual([projectPath]);
-        expect(authorityRoots.length).toBeGreaterThan(0);
-        expect(authorityRoots.every((root) => root === projectRoot)).toBe(true);
-        expect(getAuthorityManagedMarker(db, projectPath)).not.toBeNull();
-        statuses.set("memories", {
-            context_store_uuid: "store",
-            project: projectPath,
-            domain: "memories",
-            state: "MODULE",
-            generation: 4,
-        });
-        const secondRoot = "/worktrees/mixed-restore-two";
-        await __rustModeTransformTest.prepareRustMemoryAuthority({
-            db,
-            module,
-            projectPath,
-            projectRoot: secondRoot,
-            state,
-        });
-        expect(authorityRoots).toContain(secondRoot);
-        expect(state.memoryAuthorityRoot).toBe(secondRoot);
-
-        expect(() =>
-            db
-                .prepare(
-                    "INSERT INTO notes(type, status, content, project_path, session_id, created_at, updated_at) VALUES ('plain', 'active', 'blocked', ?, 's', 0, 0)",
-                )
-                .run(projectPath),
-        ).toThrow("managed by the Rust module");
-    });
-
-    it("keeps MODULE memory and note values over conflicting TS rows during delta-cache recovery", async () => {
-        const sessionId = `rust-authority-conflict-${Date.now()}`;
-        sessions.push(sessionId);
-        const db = makeDb();
-        installRawProvider(sessionId);
-        const projectPath = "/tmp/project";
-        const contextStoreUuid = ensureContextStoreUuid(db);
-        withPrivilegedWriter(db, () => {
-            db.prepare(
-                `INSERT INTO memories (
-                    id, project_path, category, content, normalized_hash,
-                    first_seen_at, created_at, updated_at, last_seen_at
-                ) VALUES (501, ?, 'CONSTRAINTS', 'stale TS memory', 'ts-memory', 0, 0, 0, 0)`,
-            ).run(projectPath);
-            db.prepare(
-                `INSERT INTO notes (
-                    id, type, status, content, project_path, session_id, created_at, updated_at
-                ) VALUES (601, 'smart', 'active', 'stale TS note', ?, ?, 0, 0)`,
-            ).run(projectPath, sessionId);
-        });
-        const stateSyncBodies: unknown[] = [];
-        let transformCalls = 0;
-        const moduleClient: RustModeModuleClient = {
-            authorityStatus: async (args) => ({
-                authority: {
-                    context_store_uuid: contextStoreUuid,
-                    project: projectPath,
-                    domain: args.domain,
-                    state: "MODULE",
-                    generation: 1,
-                },
-            }),
-            authorityPrepare: async () => {
-                throw new Error("MODULE authority must not prepare from TS");
-            },
-            authoritySeed: async () => ({ seeded: 0 }),
-            mirrorPull: async (args) => ({
-                page: {
-                    domain: args.domain,
-                    cursor: args.cursor,
-                    next_cursor: 1,
-                    has_more: false,
-                    rows:
-                        args.domain === "memories"
-                            ? [
-                                  {
-                                      feed_seq: 1,
-                                      domain: "memories",
-                                      op: "update",
-                                      module_row_id: 51,
-                                      full_row_snapshot: {
-                                          context_store_uuid: contextStoreUuid,
-                                          context_row_id: 501,
-                                          project_path: projectPath,
-                                          category: "CONSTRAINTS",
-                                          content: "MODULE memory wins",
-                                          normalized_hash: "module-memory",
-                                          status: "active",
-                                          created_at_ms: 0,
-                                          updated_at_ms: 1,
-                                      },
-                                      content_hash: "module-memory",
-                                  },
-                              ]
-                            : [
-                                  {
-                                      feed_seq: 1,
-                                      domain: "notes",
-                                      op: "update",
-                                      module_row_id: 61,
-                                      full_row_snapshot: {
-                                          context_store_uuid: contextStoreUuid,
-                                          context_row_id: 601,
-                                          type: "smart",
-                                          project_path: projectPath,
-                                          session_id: sessionId,
-                                          content: "MODULE note wins",
-                                          status: "active",
-                                          created_at_ms: 0,
-                                          updated_at_ms: 1,
-                                      },
-                                      content_hash: null,
-                                  },
-                              ],
-                },
-            }),
-            call: async ({ method, body }) => {
-                if (method === "state_sync") {
-                    stateSyncBodies.push(structuredClone(body));
-                    return { ok: true };
-                }
-                if (method !== "transform") return { ok: true };
-                transformCalls += 1;
-                if (transformCalls === 1) return { status: "need_full_sync" };
-                return {
-                    decision: "HARD",
-                    row_version: 2,
-                    native_messages: makeMessages(sessionId),
-                };
-            },
-        };
-        const transform = createRustModeTransformImpl(makeDeps(db, moduleClient), { moduleClient });
-        const input = makeMessages(sessionId);
-        await transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId));
-
-        expect(stateSyncBodies).toHaveLength(1);
-        expect(JSON.stringify(stateSyncBodies)).not.toContain("stale TS memory");
-        expect(JSON.stringify(stateSyncBodies)).not.toContain("stale TS note");
-        expect(db.prepare("SELECT content FROM memories WHERE id = 501").get()).toEqual({
-            content: "MODULE memory wins",
-        });
-        expect(db.prepare("SELECT content FROM notes WHERE id = 601").get()).toEqual({
-            content: "MODULE note wins",
-        });
     });
 });
 
@@ -6268,11 +7198,16 @@ describe("native output delta", () => {
                 if (transformBodies.length === 1) {
                     return {
                         decision: "SOFT+",
+                        prefix_bust_permitted: false,
                         native_messages: structuredClone(request.native_messages),
                     };
                 }
                 if (request.tail_delta) return { status: "ok", served_from: "transform" };
-                return { decision: "SOFT+", native_messages: structuredClone(healedNative) };
+                return {
+                    decision: "SOFT+",
+                    prefix_bust_permitted: false,
+                    native_messages: structuredClone(healedNative),
+                };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -6392,6 +7327,7 @@ describe("delta prefix-mutation guard", () => {
                 }
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: structuredClone(moduleNativeSnapshot),
                 };
             },
@@ -6483,7 +7419,7 @@ describe("delta prefix-mutation guard", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBodies.push(body as Record<string, unknown>);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -6696,6 +7632,7 @@ describe("delta prefix-mutation guard", () => {
                 }
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -6811,6 +7748,7 @@ describe("Rust stalled transform probe", () => {
                 }
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: [
                         { role: "assistant", parts: [{ type: "text", text: "scoped result" }] },
                     ],
@@ -6860,7 +7798,7 @@ describe("Rust stalled transform probe", () => {
                 }
                 if (calls.length === 3)
                     await new Promise((resolve) => clock.setTimeout(resolve, 20000));
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), {
@@ -7003,6 +7941,7 @@ describe("Rust stalled transform probe", () => {
                 await new Promise((resolve) => clock.setTimeout(resolve, 5000));
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -7247,7 +8186,11 @@ describe("LKG durability across restarts", () => {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 if (fail()) throw new Error("daemon unavailable");
-                return { decision: "HARD", native_messages: structuredClone(native) };
+                return {
+                    decision: "HARD",
+                    prefix_bust_permitted: true,
+                    native_messages: structuredClone(native),
+                };
             },
         };
         return { moduleClient, servedNative: () => structuredClone(native) };
@@ -7301,6 +8244,115 @@ describe("LKG durability across restarts", () => {
             resetLkgSlotsForTest();
         }
     });
+
+    it("releases an over-context frozen replay to fitting module output on a healthy defer", async () => {
+        const sessionId = `rust-lkg-context-escape-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeRestartInput(sessionId);
+        const largePrefix = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "x".repeat(20_000) }],
+            },
+        ];
+        const fittingOutput = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "§123§ fitting fresh prefix" }],
+            },
+        ];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                if (pass === 2) throw new Error("daemon unavailable");
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    row_version: pass,
+                    native_messages: structuredClone(pass === 1 ? largePrefix : fittingOutput),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            const fallback = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, fallback, makeMeta(db, sessionId));
+            expect(fallback.messages).toEqual(largePrefix);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+            recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+            const healthy = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, healthy, makeMeta(db, sessionId));
+            expect(healthy.messages).toEqual(fittingOutput);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+            expect(getSlot(sessionId)?.jsonPrefix).toBe(JSON.stringify(fittingOutput));
+            expect(
+                logSpy.mock.calls.filter(([sid]) => sid === sessionId).map(([, line]) => line),
+            ).toContain("lkg_frozen_replay_released reason=frozen_over_context_limit");
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    for (const invalidation of ["model", "anchor"] as const) {
+        it(`releases a frozen replay on ${invalidation} validation failure on a healthy defer`, async () => {
+            const sessionId = `rust-lkg-validation-${invalidation}-${Date.now()}`;
+            sessions.push(sessionId);
+            const db = makeDb();
+            installRawProvider(sessionId);
+            const input = makeRestartInput(sessionId);
+            let pass = 0;
+            const fresh = [
+                {
+                    info: { id: "fresh", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "§123§ fresh validated output" }],
+                },
+            ];
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) => {
+                    if (method !== "transform") return { ok: true };
+                    pass += 1;
+                    if (pass === 2) throw new Error("daemon unavailable");
+                    return {
+                        decision: pass === 1 ? "HARD" : "SOFT+",
+                        row_version: pass,
+                        native_messages: structuredClone(pass === 1 ? input : fresh),
+                    };
+                },
+            };
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+            const changed = structuredClone(input);
+            if (invalidation === "model")
+                changed[0]!.info.model = { providerID: "test-provider", modelID: "other-model" };
+            else changed[0]!.info.id = "replacement-anchor";
+            const healthy = { messages: [...changed] as unknown[] };
+            await transform.run(sessionId, changed, healthy, makeMeta(db, sessionId));
+            expect(healthy.messages).toEqual(fresh);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+        });
+    }
 
     it("releases an invalid frozen replay to priced module output without raw refusal", async () => {
         const sessionId = `rust-lkg-frozen-invalid-${Date.now()}`;
@@ -7364,7 +8416,289 @@ describe("LKG durability across restarts", () => {
         }
     });
 
-    it("releases a valid frozen replay on the eighth consecutive healthy defer", async () => {
+    for (const alias of [true, false]) {
+        for (const replayPath of [
+            "failure ladder",
+            "parked shortcut",
+            "parked health probe",
+            "outer wrapper",
+        ] as const) {
+            it(`preserves the frozen replay after one new raw message with ${alias ? "aliased" : "separate"} arrays (${replayPath})`, async () => {
+                const sessionId = `rust-lkg-ingress-${alias}-${replayPath}-${Date.now()}`;
+                sessions.push(sessionId);
+                const db = makeDb();
+                installRawProvider(sessionId);
+                const raw = Array.from({ length: 40 }, (_, index) => ({
+                    info: {
+                        id: index === 0 ? "m1" : `raw-${index}`,
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "test-model" },
+                    },
+                    parts: [{ type: "text", text: `raw message ${index}` }],
+                })) as MessageLike[];
+                const representation = [
+                    {
+                        info: { id: "m1", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "frozen prefix" }],
+                    },
+                ];
+                let fail = false;
+                let transformCalls = 0;
+                let statusCalls = 0;
+                const moduleClient: RustModeModuleClient = {
+                    call: async ({ method }) => {
+                        if (method === "session.status") {
+                            statusCalls += 1;
+                            if (fail) throw new Error("daemon unavailable");
+                        }
+                        if (method !== "transform") return { ok: true };
+                        transformCalls += 1;
+                        if (fail) throw new Error("daemon unavailable");
+                        return {
+                            decision: transformCalls === 1 ? "HARD" : "SOFT+",
+                            scheduler_decision: transformCalls === 1 ? "execute" : "defer",
+                            row_version: transformCalls,
+                            native_messages: structuredClone(
+                                transformCalls === 1
+                                    ? representation
+                                    : [
+                                          {
+                                              ...representation[0],
+                                              parts: [
+                                                  {
+                                                      type: "text",
+                                                      text: "§123§ fresh module prefix",
+                                                  },
+                                              ],
+                                          },
+                                      ],
+                            ),
+                        };
+                    },
+                };
+                const deps = makeDeps(db, moduleClient);
+                const transform = createRustModeTransform(deps, { moduleClient });
+                await transform.run(
+                    sessionId,
+                    raw,
+                    { messages: [...raw] },
+                    makeMeta(db, sessionId),
+                );
+                const saved = getSlot(sessionId)!;
+                fail = true;
+                if (replayPath.startsWith("parked")) {
+                    // Park without a replay, so the chosen parked caller must create
+                    // the first freeze rather than keep an earlier baseline.
+                    lkgSlot.dropSlot(sessionId);
+                    for (let pass = 0; pass < RUST_FAILURE_PARK_THRESHOLD; pass += 1) {
+                        await expect(
+                            transform.run(
+                                sessionId,
+                                raw,
+                                { messages: [...raw] },
+                                makeMeta(db, sessionId),
+                            ),
+                        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                    }
+                    if (replayPath === "parked shortcut") {
+                        // Pass five is a health probe; pass six is the shortcut.
+                        await expect(
+                            transform.run(
+                                sessionId,
+                                raw,
+                                { messages: [...raw] },
+                                makeMeta(db, sessionId),
+                            ),
+                        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                    }
+                    expect(transform.getState(sessionId).parked).toBe(true);
+                    expect(transform.getState(sessionId).lkgFrozenAtInputCount).toBeNull();
+                    expect(lkgSlot.captureSlot(sessionId, saved)).toBe(true);
+                }
+                const ingress = [...raw];
+                const fallback = { messages: alias ? ingress : ([...ingress] as unknown[]) };
+                const beforeTransform = transformCalls;
+                const beforeStatus = statusCalls;
+                if (replayPath === "outer wrapper") {
+                    const wrapper = createMessagesTransformHandler({
+                        magicContext: {
+                            "experimental.chat.messages.transform": async () => {
+                                throw new Error("hook unavailable");
+                            },
+                        },
+                    });
+                    await wrapper({}, fallback as never);
+                } else {
+                    await transform.run(sessionId, ingress, fallback, makeMeta(db, sessionId));
+                }
+                expect(transformCalls - beforeTransform).toBe(
+                    replayPath === "failure ladder" ? 1 : 0,
+                );
+                expect(statusCalls - beforeStatus).toBe(
+                    replayPath === "parked health probe" ? 1 : 0,
+                );
+                expect(fallback.messages).toEqual(representation);
+                expect(fallback.messages === ingress).toBe(alias);
+                const frozenBytes = JSON.stringify(fallback.messages);
+                const baseline = transform.getState(sessionId).lkgFrozenAtInputCount;
+
+                fail = false;
+                // Bypass the parked shortcut to exercise an actual healthy defer.
+                if (replayPath.startsWith("parked"))
+                    deps.contextUsageMap.set(sessionId, {
+                        usage: {
+                            inputTokens: 90_000,
+                            percentage: RUST_PARK_PROBE_PRESSURE_BYPASS_PCT,
+                        },
+                        updatedAt: Date.now(),
+                    });
+                const nextRaw = [
+                    ...raw,
+                    {
+                        info: {
+                            id: "next",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: { providerID: "test-provider", modelID: "test-model" },
+                        },
+                        parts: [{ type: "text", text: "one new raw message" }],
+                    } as MessageLike,
+                ];
+                const deferred = { messages: alias ? [...nextRaw] : ([...nextRaw] as unknown[]) };
+                const nextInput = alias ? (deferred.messages as MessageLike[]) : nextRaw;
+                await transform.run(sessionId, nextInput, deferred, makeMeta(db, sessionId));
+                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+                expect(JSON.stringify(deferred.messages.slice(0, fallback.messages.length))).toBe(
+                    frozenBytes,
+                );
+                expect(deferred.messages.at(-1)).toEqual(nextRaw.at(-1));
+                expect(baseline).toBe(40);
+                expect(transformCalls).toBe(
+                    beforeTransform + (replayPath === "failure ladder" ? 2 : 1),
+                );
+            });
+        }
+    }
+
+    for (const alias of [true, false]) {
+        it(`keeps frozen bytes through twenty new raw messages and ten healthy defers with ${alias ? "aliased" : "separate"} arrays until a genuine rebuild`, async () => {
+            const sessionId = `rust-lkg-debt-${alias}-${Date.now()}`;
+            sessions.push(sessionId);
+            const db = makeDb();
+            installRawProvider(sessionId);
+            const raw = makeRestartInput(sessionId);
+            let pass = 0;
+            let rebuild = false;
+            let lastRaw = raw;
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) => {
+                    if (method !== "transform") return { ok: true };
+                    pass += 1;
+                    if (pass === 2) throw new Error("daemon unavailable");
+                    return {
+                        decision: pass === 1 || rebuild ? "HARD" : "SOFT+",
+                        prefix_bust_permitted: pass === 1 || rebuild,
+                        scheduler_decision: pass === 1 || rebuild ? "execute" : "defer",
+                        row_version: pass,
+                        native_messages: structuredClone(lastRaw).map((message) => ({
+                            ...message,
+                            parts: [{ type: "text", text: `§123§ tagged ${message.info.id}` }],
+                        })),
+                    };
+                },
+            };
+            let transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const serve = async (input: MessageLike[]) => {
+                lastRaw = input;
+                const ingress = structuredClone(input);
+                const output = { messages: alias ? ingress : ([...ingress] as unknown[]) };
+                await transform.run(sessionId, ingress, output, makeMeta(db, sessionId));
+                return output.messages;
+            };
+            const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+            try {
+                await serve(raw);
+                const outageTail = [
+                    {
+                        info: { id: "outage-assistant", role: "assistant", sessionID: sessionId },
+                        parts: [
+                            { type: "text", text: "already served without a tag" },
+                            {
+                                type: "tool",
+                                callID: "outage-read",
+                                tool: "read",
+                                state: {
+                                    status: "completed",
+                                    input: { path: "fixture.txt" },
+                                    output: "already served tool result",
+                                    title: "read fixture",
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        info: {
+                            id: "outage-user",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: { providerID: "test-provider", modelID: "test-model" },
+                        },
+                        parts: [{ type: "text", text: "already served user tail" }],
+                    },
+                ] as MessageLike[];
+                raw.push(...outageTail);
+                const fallback = await serve(raw);
+                const frozenBytes = JSON.stringify(fallback);
+                const appended = Array.from({ length: 20 }, (_, index) => ({
+                    info: {
+                        id: `new-${index}`,
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "test-model" },
+                    },
+                    parts: [{ type: "text", text: `new raw message ${index}` }],
+                })) as MessageLike[];
+                raw.push(...appended);
+                const expectedBytes = JSON.stringify([...fallback, ...appended]);
+                for (let healthyPass = 1; healthyPass <= 10; healthyPass += 1) {
+                    const served = await serve(raw);
+                    expect(JSON.stringify(served)).toBe(expectedBytes);
+                    expect(JSON.stringify(served.slice(0, fallback.length))).toBe(frozenBytes);
+                    expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+                    expect(transform.getState(sessionId).lkgFrozenHealthyPasses).toBe(healthyPass);
+                }
+                const lines = logSpy.mock.calls
+                    .filter(([sid]) => sid === sessionId)
+                    .map(([, line]) => String(line));
+                expect(lines).toContain("lkg_frozen_replay_debt healthy_passes=10 raw_messages=20");
+                expect(lines.some((line) => line.startsWith("lkg_frozen_replay_released"))).toBe(
+                    false,
+                );
+                // Restarting must not turn pending tags into permission to rewrite
+                // the raw-served tail recorded in the durable snapshot.
+                transform.dispose();
+                resetLkgSlotsForTest();
+                registerLkgPersistence(createDbLkgPersistence(db));
+                transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+                expect(JSON.stringify(await serve(raw))).toBe(expectedBytes);
+                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+                rebuild = true;
+                const adopted = await serve(raw);
+                expect(JSON.stringify(adopted)).not.toBe(expectedBytes);
+                expect((adopted[1] as MessageLike).parts).toEqual([
+                    { type: "text", text: "§123§ tagged outage-assistant" },
+                ]);
+                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+                expect(transform.getState(sessionId).lkgFrozenHealthyPasses).toBe(0);
+                expect(transform.getState(sessionId).lkgFrozenAtInputCount).toBeNull();
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
+    }
+
+    it("keeps a valid frozen replay past the eighth healthy defer until a module rebuild", async () => {
         const sessionId = `rust-lkg-frozen-bounded-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -7383,13 +8717,15 @@ describe("LKG durability across restarts", () => {
             },
         ];
         let pass = 0;
+        let rebuild = false;
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 pass += 1;
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
-                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    decision: pass === 1 || rebuild ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1 || rebuild,
                     served_from: "transform",
                     row_version: pass,
                     native_messages: structuredClone(
@@ -7406,21 +8742,20 @@ describe("LKG durability across restarts", () => {
         expect(fallback.messages).toEqual(representationA);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
 
-        const healthyDeferLimit = 8;
-        for (let healthyPass = 1; healthyPass <= healthyDeferLimit; healthyPass += 1) {
+        for (let healthyPass = 1; healthyPass <= 10; healthyPass += 1) {
             const output = { messages: [...input] as unknown[] };
             await transform.run(sessionId, input, output, makeMeta(db, sessionId));
-            if (healthyPass < healthyDeferLimit) {
-                expect(output.messages).toEqual(representationA);
-                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
-            } else {
-                expect(output.messages).toEqual(representationB);
-                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
-            }
+            expect(output.messages).toEqual(representationA);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
         }
+        rebuild = true;
+        const rebuilt = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, rebuilt, makeMeta(db, sessionId));
+        expect(rebuilt.messages).toEqual(representationB);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
     });
 
-    it("releases a valid frozen replay when the raw tail grows by sixteen messages", async () => {
+    it("keeps a valid frozen replay after sixteen new raw messages until a module rebuild", async () => {
         const sessionId = `rust-lkg-frozen-tail-bound-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -7439,13 +8774,15 @@ describe("LKG durability across restarts", () => {
             },
         ];
         let pass = 0;
+        let rebuild = false;
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 pass += 1;
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
-                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    decision: pass === 1 || rebuild ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1 || rebuild,
                     served_from: "transform",
                     row_version: pass,
                     native_messages: structuredClone(
@@ -7473,6 +8810,10 @@ describe("LKG durability across restarts", () => {
         const released = { messages: [...grownInput] as unknown[] };
         await transform.run(sessionId, grownInput, released, makeMeta(db, sessionId));
 
+        expect(released.messages).toEqual([...frozenRepresentation, ...grownInput.slice(1)]);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        rebuild = true;
+        await transform.run(sessionId, grownInput, released, makeMeta(db, sessionId));
         expect(released.messages).toEqual(moduleRepresentation);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
     });
@@ -7512,6 +8853,7 @@ describe("LKG durability across restarts", () => {
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
                     decision: pass === 4 ? "HARD" : pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 4 || pass === 1,
                     native_messages: structuredClone(
                         pass === 1
                             ? representationA
@@ -7541,8 +8883,10 @@ describe("LKG durability across restarts", () => {
         await transform.run(sessionId, input, busted, makeMeta(db, sessionId));
         expect(busted.messages).toEqual(representationB);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+        // The first recovery re-primes the native basis; later frozen passes may
+        // use it for transport without changing the provider-visible representation.
         expect(transformBodies[2]?.tail_delta).toBeUndefined();
-        expect(transformBodies[3]?.tail_delta).toBeUndefined();
+        expect(transformBodies[3]?.tail_delta).toBeDefined();
 
         const resumedInput = [
             ...input,
@@ -7582,6 +8926,7 @@ describe("LKG durability across restarts", () => {
                 if (calls > 1) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: structuredClone(frozenRepresentation),
                 };
             },
@@ -7773,6 +9118,9 @@ describe("raw fallback refusal copy and early abort", () => {
                 }) as MessageLike,
         );
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        // A module-mocked logger can retain earlier transforms' calls when Bun
+        // reuses it for spyOn. Only this refusal pass belongs in the assertions.
+        logSpy.mockClear();
         try {
             const output = { messages: [] as unknown[] };
             await expect(
@@ -7869,94 +9217,6 @@ describe("raw fallback refusal copy and early abort", () => {
     });
 });
 
-describe("authoritySeedRows — supersede pointer resolution (issue #377)", () => {
-    // The store records a pending memory reference for any seeded row whose
-    // superseded_by_memory_id it cannot resolve, and authority_finish_prepare
-    // rejects the memories-domain handoff while any pending references exist.
-    // A target outside the seed set can never resolve, so the pending survives
-    // the resolution sweep and blocks rust mode permanently.
-    function seedDb(): ContextDatabase {
-        const db = new Database(":memory:") as ContextDatabase;
-        initializeDatabase(db);
-        return db;
-    }
-
-    function insert(db: ContextDatabase, project: string, content: string, status: string): number {
-        const now = Date.now();
-        db.prepare(
-            `INSERT INTO memories
-               (project_path, category, content, normalized_hash, source_type,
-                seen_count, retrieval_count, first_seen_at, created_at, updated_at,
-                last_seen_at, status)
-             VALUES (?, 'ARCHITECTURE', ?, ?, 'agent', 1, 0, ?, ?, ?, ?, ?)`,
-        ).run(project, content, `hash-${content}`, now, now, now, now, status);
-        return Number((db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
-    }
-
-    it("drops a supersede pointer whose target is absent from the seed set", () => {
-        const db = seedDb();
-        try {
-            const project = "git:seed-test";
-            const survivor = insert(db, project, "survivor", "active");
-            const superseded = insert(db, project, "superseded", "archived");
-            const orphaned = insert(db, project, "orphaned", "archived");
-
-            // Resolvable: target is in the same seed set.
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                survivor,
-                superseded,
-            );
-            // Unresolvable: target id never existed in this project.
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                999_999,
-                orphaned,
-            );
-
-            const rows = __rustModeTransformTest.authoritySeedRows(db, project, "memories");
-            const byId = new Map(
-                rows.map((row) => [
-                    Number((row as { source_row_id: unknown }).source_row_id),
-                    (row as { snapshot: Record<string, unknown> }).snapshot,
-                ]),
-            );
-
-            // The dead link is dropped so the module never records a pending reference.
-            expect(byId.get(orphaned)?.superseded_by_memory_id).toBeNull();
-            // The resolvable pointer is preserved verbatim — this must stay surgical,
-            // not a blanket null of the column.
-            expect(byId.get(superseded)?.superseded_by_memory_id).toBe(survivor);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    it("drops a supersede pointer whose target belongs to another project", () => {
-        const db = seedDb();
-        try {
-            const project = "git:seed-a";
-            const foreign = insert(db, "git:seed-b", "foreign-target", "active");
-            const local = insert(db, project, "local", "archived");
-            db.prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?").run(
-                foreign,
-                local,
-            );
-
-            const rows = __rustModeTransformTest.authoritySeedRows(db, project, "memories");
-            const snapshot = (
-                rows.find(
-                    (row) => Number((row as { source_row_id: unknown }).source_row_id) === local,
-                ) as { snapshot: Record<string, unknown> }
-            ).snapshot;
-
-            // The seed set is project-scoped, so a cross-project target is
-            // equally unresolvable module-side.
-            expect(snapshot.superseded_by_memory_id).toBeNull();
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
 describe("rust-mode wire transport (protected_tokens_effective)", () => {
     it("transports resolved floor scalar protected_tokens_effective on the wire alongside effective_execute_threshold and never sends protected_tags", async () => {
         const sessionId = `rust-floor-wire-${Date.now()}`;
@@ -8015,6 +9275,81 @@ describe("rust-mode wire transport (protected_tokens_effective)", () => {
         expect(transformBodies[0]?.protected_tokens_effective).toBe(10_240);
     });
 });
+
+for (const host of ["v1", "v2"] as const) {
+    it(`${host} Rust failure serves measured 633258 LKG plus a small tail instead of inflated 912733`, async () => {
+        const sessionId = `measured-rust-replay-${host}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const modelKey = "test-provider/test-model";
+        if (host === "v1")
+            noteLkgProviderResponse({ sessionId, modelKey, responseId: "reply", inputTokens: 0 });
+        else beginV2LkgRequest(sessionId, modelKey, "previous-reply");
+        let failing = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (failing) throw new Error("rust module request timed out");
+                return {
+                    decision: "HARD",
+                    row_version: 1,
+                    native_messages: structuredClone(input),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => ({
+                tokens: 912_733,
+                trusted: true,
+                messageTokens: { conversation: 900_000, toolCall: 0 },
+                systemTokens: 100,
+                toolDefinitionTokens: 12_633,
+            }),
+        });
+        const meta = makeMeta(db, sessionId);
+        recordDetectedContextLimit(db, sessionId, 872_000, modelKey);
+        await transform.run(sessionId, input, { messages: [...input] }, meta);
+        const saved = getSlot(sessionId)!;
+        expect(saved).toBeDefined();
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey,
+            responseId: "reply",
+            inputTokens: 633_258,
+            finish: "stop",
+            completedAt: Date.now() + 1,
+            ...(host === "v2" ? { v2: true, createdAt: Date.now() + 1 } : {}),
+        });
+        const next: MessageLike[] = [
+            ...input,
+            {
+                info: { id: "reply", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "small reply" }],
+            } as MessageLike,
+            {
+                info: {
+                    id: "next",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "continue" }],
+            } as MessageLike,
+        ];
+        failing = true;
+        const output = { messages: structuredClone(next) as unknown[] };
+        await transform.run(sessionId, next, output, meta);
+        expect(output.messages).toEqual([
+            ...JSON.parse(saved.jsonPrefix),
+            ...next.slice(input.length),
+        ]);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        clearLkgMeasuredRequest(sessionId);
+    });
+}
 
 it("refuses a tiny untrusted fallback estimate instead of treating the byte proxy as fit proof", async () => {
     const sessionId = "fit-incomplete-fallback";
@@ -8196,6 +9531,7 @@ describe("proactive thinking strip on a released frozen replay", () => {
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
                     decision: pass === 1 ? "HARD" : decision,
+                    prefix_bust_permitted: pass === 1 || decision === "HARD" || decision === "SOFT",
                     served_from: "transform",
                     row_version: pass,
                     native_messages: moduleOutput(lastInput),
@@ -8245,20 +9581,20 @@ describe("proactive thinking strip on a released frozen replay", () => {
             .map(([, message]) => String(message));
     }
 
-    it("serves byte-identical bytes when a healthy_pass_limit release changes nothing", async () => {
+    it("serves byte-identical bytes past eight healthy defers without granting strip authority", async () => {
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             const session = await frozenSession("healthy");
-            // The pass above was the first healthy frozen defer; the eighth releases.
+            // Healthy defers accumulate debt but do not authorize any representation change.
             let served: unknown[] = session.frozenServed;
             for (let healthyPass = 2; healthyPass <= 8; healthyPass += 1) {
                 served = await session.run(session.frozenInput);
             }
             expect(session.transform.getState(session.sessionId).lkgRepresentationFrozen).toBe(
-                false,
+                true,
             );
             const lines = sessionLines(logSpy, session.sessionId);
-            expect(lines).toContain("lkg_frozen_replay_released reason=healthy_pass_limit");
+            expect(lines).toContain("lkg_frozen_replay_debt healthy_passes=8 raw_messages=0");
             expect(JSON.stringify(served)).toBe(JSON.stringify(session.frozenServed));
             expect(lines.some((line) => line.includes("proactive thinking strip"))).toBe(false);
 
@@ -8332,5 +9668,395 @@ describe("proactive thinking strip on a released frozen replay", () => {
         } finally {
             logSpy.mockRestore();
         }
+    });
+});
+
+it("copies the resolved history budget onto the authority wire", () => {
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "budget-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: { history_budget_tokens: 42_000 },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+    expect(body.history_budget_tokens).toBe(42_000);
+});
+
+it("copies the profile-resolved historian chain onto the authority wire", () => {
+    const historianModelChain = __rustModeTransformTest.resolvedHistorianModelChain({
+        historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
+        fallbackModels: [
+            { model: "openai/profile-fallback", qualifier: "low" },
+            "anthropic/profile-historian",
+        ],
+    });
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "profile-model-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: { historian_model_chain: historianModelChain },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+
+    expect(body.historian_model_chain).toEqual([
+        "anthropic/profile-historian",
+        "openai/profile-fallback",
+    ]);
+    const limits = __rustModeTransformTest.resolvedHistorianModelLimits(historianModelChain);
+    expect(Object.keys(limits)).toEqual(body.historian_model_chain);
+    expect(limits["anthropic/profile-historian"]).toBeDefined();
+    expect(limits["openai/profile-fallback"]).toBeDefined();
+});
+
+it("copies each historian chain model's configured variant onto the authority wire", () => {
+    const models = {
+        historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
+        fallbackModels: [
+            { model: "openai/profile-fallback", qualifier: "low" },
+            "google/plain-fallback",
+            // A repeated model keeps the first entry's slot, so its variant stays `high`.
+            { model: "anthropic/profile-historian", qualifier: "max" },
+        ],
+    };
+    const variants = __rustModeTransformTest.resolvedHistorianModelVariants(models);
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "profile-variant-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: {
+            historian_model_chain: __rustModeTransformTest.resolvedHistorianModelChain(models),
+            historian_model_variants: variants,
+        },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+
+    expect(body.historian_model_variants).toEqual({
+        "anthropic/profile-historian": "high",
+        "openai/profile-fallback": "low",
+    });
+    expect(
+        __rustModeTransformTest.resolvedHistorianModelVariants({
+            historianModel: "anthropic/plain",
+            fallbackModels: [],
+        }),
+    ).toEqual({});
+});
+
+it("copies caveman settings onto the authority wire", () => {
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "caveman-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: { caveman_enabled: true, caveman_min_chars: 240 },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+    expect(body.caveman_enabled).toBe(true);
+    expect(body.caveman_min_chars).toBe(240);
+});
+
+it("fails after the second authority mismatch in one transform pass", async () => {
+    const sessionId = `rust-adopt-once-${Date.now()}`;
+    sessions.push(sessionId);
+    const db = makeDb();
+    installRawProvider(sessionId);
+    const messages = makeMessages(sessionId);
+    const methods: string[] = [];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) => {
+            methods.push(method);
+            if (method === "state_sync") throw authoritySeqMismatch(4);
+            return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] };
+        },
+    };
+    const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const output = { messages: messages as unknown[] };
+
+    await expect(
+        transform.run(sessionId, messages, output, makeMeta(db, sessionId)),
+    ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+
+    expect(methods).toEqual(["state_sync", "state_sync"]);
+    expect(transform.getState(sessionId).lastAckedSeq).toBe(4);
+    expect(transform.getState(sessionId).lastAckedWatermarks).toBeNull();
+    expect(output.messages).toBe(messages);
+});
+
+it("mirrors rendered memory ids for ctx_search without rewriting a stable manifest", async () => {
+    const sessionId = `rust-memory-visibility-${Date.now()}`;
+    sessions.push(sessionId);
+    const db = makeDb();
+    installRawProvider(sessionId);
+    const memory = insertMemory(db, {
+        projectPath: "/tmp/project",
+        category: "ARCHITECTURE_DECISIONS",
+        content: "The rust-rendered memory must not be returned twice.",
+    });
+    const meta = makeMeta(db, sessionId);
+    db.exec(`
+            CREATE TABLE memory_manifest_updates (count INTEGER NOT NULL);
+            INSERT INTO memory_manifest_updates (count) VALUES (0);
+            CREATE TRIGGER count_memory_manifest_updates
+            AFTER UPDATE OF memory_block_ids, memory_block_count ON session_meta
+            BEGIN
+                UPDATE memory_manifest_updates SET count = count + 1;
+            END;
+        `);
+    let renderedMemoryIds = [memory.id];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) =>
+            method === "transform"
+                ? {
+                      decision: "SOFT+",
+                      native_messages: makeMessages(sessionId),
+                      rendered_memory_ids: renderedMemoryIds,
+                  }
+                : { ok: true },
+    };
+    const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const run = async () => {
+        const messages = makeMessages(sessionId);
+        await transform.run(sessionId, messages, { messages: [...messages] }, meta);
+    };
+
+    await run();
+    expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id]));
+    const tools = createCtxSearchTools({
+        db,
+        resolveProjectPath: () => "/tmp/project",
+        memoryEnabled: true,
+        embeddingEnabled: false,
+        readMessages: () => [],
+    });
+    const search = await tools.ctx_search.execute({ query: `#${memory.id}`, sources: ["memory"] }, {
+        sessionID: sessionId,
+        directory: "/tmp/project",
+    } as never);
+    expect(search).toContain(
+        `Memories: 1 match found, all already visible in your project-memory block (ids ${memory.id}).`,
+    );
+
+    await run();
+    expect(
+        db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
+    ).toEqual({ count: 1 });
+
+    renderedMemoryIds = [memory.id + 1];
+    await run();
+    expect(getVisibleMemoryIds(db, sessionId)).toEqual(new Set([memory.id + 1]));
+    expect(
+        db.prepare("SELECT count FROM memory_manifest_updates").get() as { count: number },
+    ).toEqual({ count: 2 });
+});
+
+it("rechecks mural candidates on bootstrap, pressure and flush but not ordinary defers", async () => {
+    const sessionId = `mural-opportunities-${Date.now()}`;
+    sessions.push(sessionId);
+    const db = makeDb();
+    installRawProvider(sessionId);
+    const muralHashes: unknown[] = [];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method, body }) => {
+            if (method !== "transform") return { ok: true };
+            muralHashes.push((body.mural as { content_hash?: string } | undefined)?.content_hash);
+            return { decision: "PASSTHROUGH", native_messages: makeMessages(sessionId) };
+        },
+    };
+    const deps = makeDeps(db, moduleClient);
+    deps.muralEnabled = true;
+    let resolutions = 0;
+    let cue = "a";
+    const transform = createRustModeTransform(deps, {
+        moduleClient,
+        muralResolverForTests: () => {
+            resolutions++;
+            return {
+                enabled: true,
+                supportsVision: true,
+                dataUrl: `data:image/png;base64,${cue}`,
+                contentHash: cue,
+            };
+        },
+    });
+    const run = async () => {
+        const input = makeMessages(sessionId);
+        await transform.run(sessionId, input, { messages: input }, makeMeta(db, sessionId));
+    };
+    await run();
+    expect(resolutions).toBe(1);
+    cue = "b";
+    await run();
+    expect(resolutions).toBe(1);
+    expect(muralHashes.at(-1)).toBe("a");
+    deps.contextUsageMap.set(sessionId, {
+        usage: { inputTokens: 100_000, percentage: 90 },
+        updatedAt: Date.now(),
+    });
+    // A refresh opportunity is not itself a new mural revision.
+    await run();
+    expect(resolutions).toBe(1);
+    insertMemory(db, { projectPath: deps.projectPath!, category: "CONSTRAINTS", content: "b" });
+    await run();
+    expect(resolutions).toBe(2);
+    expect(muralHashes.at(-1)).toBe("b");
+    deps.contextUsageMap.set(sessionId, {
+        usage: { inputTokens: 100, percentage: 1 },
+        updatedAt: Date.now(),
+    });
+    cue = "c";
+    insertMemory(db, { projectPath: deps.projectPath!, category: "CONSTRAINTS", content: "c" });
+    await run();
+    expect(resolutions).toBe(2);
+    deps.pendingMaterializationSessions.add(sessionId);
+    await run();
+    expect(resolutions).toBe(3);
+    expect(muralHashes.at(-1)).toBe("c");
+});
+it("Rust-mode final outgoing wire preserves successful no-op reclaim with no protected mass", async () => {
+    const sid = "rust-mode-final-over-limit";
+    sessions.push(sid);
+    installRawProvider(sid);
+    installAvailabilityDb(sid);
+    const db = makeDb();
+    const messages = makeMessages(sid);
+    messages[0].parts = [{ type: "text", text: "word ".repeat(12000) }];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method, body }) => {
+            if (method === "transform") {
+                return {
+                    decision: "SOFT+",
+                    scheduler_decision: "execute",
+                    row_version: 1,
+                    native_messages: structuredClone(messages),
+                };
+            }
+            return { ok: true };
+        },
+    };
+    const deps = makeDeps(db, moduleClient);
+    const model = { providerID: "anthropic", modelID: "claude-fable-5-1" };
+    messages[0].info.model = model;
+    deps.liveModelBySession?.set(sid, model);
+    const runner = createRustModeTransform(deps, { moduleClient });
+    const meta = makeMeta(db, sid);
+    recordToolDefinition(model.providerID, model.modelID, undefined, "read", "read fixture", {});
+    recordDetectedContextLimit(db, sid, 16000, "anthropic/claude-fable-5-1");
+    const output = { messages: [...messages] };
+    await runner.run(sid, messages, output, meta);
+    expect(output.messages).toEqual(messages);
+});
+
+it("Rust-mode final outgoing wire admits an uncalibrated healthy request despite a complete upper envelope", async () => {
+    const sid = "rust-mode-uncalibrated-admission";
+    sessions.push(sid);
+    installRawProvider(sid);
+    installAvailabilityDb(sid);
+    const db = makeDb();
+    const messages = makeMessages(sid);
+    messages[0].parts = [{ type: "text", text: "word ".repeat(8000) }];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method, body }) => {
+            if (method === "transform") {
+                return {
+                    decision: "SOFT+",
+                    scheduler_decision: "execute",
+                    row_version: 1,
+                    native_messages: structuredClone(messages),
+                };
+            }
+            return { ok: true };
+        },
+    };
+    const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const meta = makeMeta(db, sid);
+    recordDetectedContextLimit(db, sid, 16000, "test-provider/test-model");
+    const output = { messages: [...messages] };
+    await runner.run(sid, messages, output, meta);
+    expect(output.messages[0].parts).toEqual(messages[0].parts);
+});
+
+for (const measured of [false, true])
+    it(`Rust-mode native refusal trust requires measured calibration (${measured ? "measured" : "unknown"} route)`, async () => {
+        const sid = `rust-native-refusal-grade-${measured}`;
+        sessions.push(sid);
+        installRawProvider(sid);
+        installAvailabilityDb(sid);
+        const db = makeDb();
+        const model = measured
+            ? { providerID: "anthropic", modelID: "claude-fable-5-1" }
+            : { providerID: "test-provider", modelID: "test-model" };
+        const messages = makeMessages(sid);
+        messages[0].info.model = model;
+        const observations: unknown[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform") {
+                    observations.push(
+                        (body as { usage: { final_wire_trusted: unknown } }).usage
+                            .final_wire_trusted,
+                    );
+                    return {
+                        decision: "SOFT+",
+                        scheduler_decision: "execute",
+                        row_version: 1,
+                        native_messages: structuredClone(messages),
+                    };
+                }
+                return { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.liveModelBySession?.set(sid, model);
+        const runner = createRustModeTransform(deps, { moduleClient });
+        const meta = makeMeta(db, sid);
+        recordToolDefinition(
+            model.providerID,
+            model.modelID,
+            undefined,
+            "read",
+            "read fixture",
+            {},
+        );
+        // Only overflow recovery measures and sends this request-specific evidence
+        // to the native transform.
+        recordOverflowDetected(db, sid, 16000, `${model.providerID}/${model.modelID}`);
+        try {
+            await runner.run(sid, messages, { messages: [...messages] }, meta);
+        } catch {
+            /* Recovery may refuse when the measured request still exceeds its provider limit. */
+        }
+        expect(observations).toEqual([measured]);
+    });
+
+it("Rust-mode typed protected overflow cannot become passthrough or LKG replay", async () => {
+    const sid = "rust-mode-native-protected-refusal";
+    sessions.push(sid);
+    installRawProvider(sid);
+    installAvailabilityDb(sid);
+    const db = makeDb();
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) => {
+            if (method === "transform")
+                throw Object.assign(new Error("module refusal"), {
+                    code: "protected_tool_results_over_limit",
+                });
+            return { ok: true };
+        },
+    };
+    const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const messages = makeMessages(sid);
+    await expect(
+        runner.run(sid, messages, { messages: [...messages] }, makeMeta(db, sid)),
+    ).rejects.toMatchObject({
+        code: "protected_tool_results_over_limit",
+        message:
+            "The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.",
     });
 });

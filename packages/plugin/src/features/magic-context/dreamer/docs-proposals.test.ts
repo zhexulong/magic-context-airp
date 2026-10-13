@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     docsBaseHashes,
     docsChangeSet,
@@ -18,7 +19,7 @@ afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 function fixture() {
-    const dir = mkdtempSync(join(tmpdir(), "mc-proposal-test-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-proposal-test-"));
     dirs.push(dir);
     writeFileSync(
         join(dir, "ARCHITECTURE.md"),
@@ -157,4 +158,56 @@ describe("docs proposals", () => {
         expect(changes?.text).toContain("rename from old.ts");
         expect(changes?.text).toContain("rename to new.ts");
     });
+
+    function anchoredRepo(architecture: string) {
+        const dir = fixture();
+        const git = (...args: string[]) =>
+            execFileSync("git", args, { cwd: dir, encoding: "utf8", windowsHide: true }).trim();
+        git("init", "-q");
+        git("config", "user.email", "test@example.com");
+        git("config", "user.name", "Test");
+        writeFileSync(join(dir, "ARCHITECTURE.md"), architecture);
+        git("add", ".");
+        git("-c", "commit.gpgsign=false", "commit", "-qm", "base");
+        const anchor = git("rev-parse", "HEAD");
+        const commitAll = () => {
+            git("add", ".");
+            git("-c", "commit.gpgsign=false", "commit", "-qm", "change");
+        };
+        return { dir, anchor, commitAll };
+    }
+
+    test("summarises a patch larger than the git output buffer instead of throwing", () => {
+        const { dir, anchor, commitAll } = anchoredRepo("# Architecture\n\n## Core\nsrc/big.txt\n");
+        mkdirSync(join(dir, "src"));
+        // About 3.3 MB of added lines: past the 2 MB buffer the diff is read into.
+        writeFileSync(
+            join(dir, "src/big.txt"),
+            "a line long enough to fill the patch\n".repeat(90_000),
+        );
+        commitAll();
+
+        const changes = docsChangeSet(dir, anchor);
+
+        expect(changes?.relevant).toBe(true);
+        expect(changes?.text).toStartWith("Changed files and ranges (diff exceeds prompt budget):");
+        expect(changes?.text).toContain("src/big.txt");
+    });
+
+    test("lists changed files without passing thousands of pathspecs to git", () => {
+        const deep = `src/${"nested-directory-name-".repeat(7)}`;
+        const { dir, anchor, commitAll } = anchoredRepo(`# Architecture\n\n## Core\n${deep}\n`);
+        mkdirSync(join(dir, deep), { recursive: true });
+        // About 1,400 paths of roughly 200 bytes: over the pathspec byte cap.
+        for (let index = 0; index < 1_400; index++) {
+            writeFileSync(join(dir, deep, `file-${index}-${"x".repeat(25)}.txt`), `${index}\n`);
+        }
+        commitAll();
+
+        const changes = docsChangeSet(dir, anchor);
+
+        expect(changes?.relevant).toBe(true);
+        expect(changes?.text).toStartWith("Changed files (too many to include a diff):");
+        expect(changes?.text).toContain(`${deep}/file-0-`);
+    }, 60_000);
 });

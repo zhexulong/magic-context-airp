@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type {
@@ -30,12 +31,34 @@ type PerfLane =
 
 interface RunnerOptions {
 	fixture?: string;
+	database?: string;
+	wireOutput?: string;
 	messages: number;
 	step: number;
 	points?: number[];
 	repeatFinal: number;
 	output?: string;
 	lane: PerfLane;
+	/**
+	 * Commit an unrelated write from a second connection before every pass.
+	 * Production shares context.db with other OpenCode and Pi processes, so
+	 * PRAGMA data_version almost always advances between passes; a single
+	 * connection never shows that.
+	 */
+	externalWrites: boolean;
+	/**
+	 * Mirror Pi 0.87: the branch persists a system message entry, and
+	 * emitContext withholds system messages from `context` handlers.
+	 */
+	pi087: boolean;
+	/** Seed one `pi-msg-*` fallback message tag whose fingerprint matches no live message. */
+	lingeringFallback: boolean;
+	/**
+	 * Seed this many tags with status 'compacted' for old messages that Pi no
+	 * longer sends, as a long-lived session accumulates them.
+	 */
+	historicalTags: number;
+	toolResultRepeat?: number;
 }
 
 export interface PerfPassReport {
@@ -47,11 +70,13 @@ export interface PerfPassReport {
 	outputHash: string;
 	tagRows: number;
 	tagRowsHash: string;
+	stages: ReturnType<ReturnType<typeof createTimingCollector>["samples"]>;
 	phases: PhaseTotals;
 	db: DatabaseTiming;
 	serializationMs: number;
 	deferredDrainMs: number;
 	deferredDb: DatabaseTiming;
+	dbQueries: ReturnType<ReturnType<typeof createDatabaseTimer>["queries"]>;
 }
 
 export interface PerfRunReport {
@@ -68,7 +93,11 @@ async function main(): Promise<void> {
 	const options = parseOptions(process.argv.slice(2));
 	const fixture = options.fixture
 		? loadFixture(options.fixture)
-		: generateSyntheticFixture({ messages: options.messages });
+		: generateSyntheticFixture({
+				messages: options.messages,
+				systemEntry: options.pi087,
+				toolResultRepeat: options.toolResultRepeat,
+			});
 	const points =
 		options.points ??
 		buildPoints(
@@ -118,9 +147,51 @@ async function main(): Promise<void> {
 
 	setHarness("pi");
 	const dbPath = join(dataDir, "context.db");
+	if (options.database) {
+		const seed = resolve(options.database);
+		for (const suffix of ["", "-wal", "-shm"]) {
+			if (existsSync(`${seed}${suffix}`))
+				execFileSync("cp", ["-c", `${seed}${suffix}`, `${dbPath}${suffix}`]);
+		}
+	}
 	const rawDb = new Database(dbPath);
 	initializeDatabase(rawDb);
 	runMigrations(rawDb);
+	const externalDb = options.externalWrites ? new Database(dbPath) : null;
+	externalDb?.exec("PRAGMA busy_timeout = 5000");
+	externalDb?.exec(
+		"CREATE TABLE IF NOT EXISTS perf_external_writes (pass INTEGER NOT NULL)",
+	);
+	if (options.lingeringFallback) {
+		// A fallback row whose fingerprint matches no live message, as left by an
+		// in-flight message that was edited before Pi persisted it.
+		rawDb
+			.prepare(
+				`INSERT INTO tags (session_id, message_id, type, byte_size, reasoning_byte_size,
+				   tag_number, harness, entry_fingerprint, status)
+				 VALUES (?, 'pi-msg-0-1-user:p0', 'message', 10, 0, 1, 'pi', ?, 'compacted')`,
+			)
+			.run(
+				fixture.sessionId,
+				JSON.stringify([null, 1, "user", null, "0".repeat(64)]),
+			);
+	}
+	if (options.historicalTags > 0) {
+		const insert = rawDb.prepare(
+			`INSERT INTO tags (session_id, message_id, type, byte_size, reasoning_byte_size,
+			   tag_number, harness, status, token_count)
+			 VALUES (?, ?, 'message', 400, 0, ?, 'pi', 'compacted', 100)`,
+		);
+		rawDb.exec("BEGIN");
+		for (let index = 0; index < options.historicalTags; index += 1) {
+			insert.run(
+				fixture.sessionId,
+				`historical-entry-${index}:p0`,
+				2 + index,
+			);
+		}
+		rawDb.exec("COMMIT");
+	}
 	const dbTimer = createDatabaseTimer(rawDb);
 	const timings = createTimingCollector();
 	const restoreObserver = setPiTransformTimingObserver((sample) =>
@@ -162,7 +233,11 @@ async function main(): Promise<void> {
 			: undefined,
 		autoSearch:
 			options.lane === "auto-search-sticky"
-				? { enabled: true, minPromptChars: Number.MAX_SAFE_INTEGER }
+				? {
+						enabled: true,
+						minPromptChars: Number.MAX_SAFE_INTEGER,
+						scoreThreshold: 0.55,
+					}
 				: undefined,
 	});
 	const handler = handlers.get("context");
@@ -176,6 +251,9 @@ async function main(): Promise<void> {
 		for (let index = 0; index < passes.length; index += 1) {
 			const pass = passes[index];
 			if (!pass) continue;
+			externalDb
+				?.prepare("INSERT INTO perf_external_writes (pass) VALUES (?)")
+				.run(index);
 			timings.reset();
 			dbTimer.reset();
 			if (options.lane === "execute-compacted" && index > 0) {
@@ -198,16 +276,30 @@ async function main(): Promise<void> {
 							: 0.25;
 			const context = fakeContext(
 				fixture.sessionId,
-				fixture.cwd,
+				options.database ? dataDir : fixture.cwd,
 				pass.branchEntries,
 				usagePercentage,
 			);
-			const event = { messages: pass.messages };
+			const event = {
+				messages: structuredClone(
+					options.pi087
+						? pass.messages.filter(
+								(message) =>
+									(message as { role?: unknown }).role !== "system",
+							)
+						: pass.messages,
+				),
+			};
 			const inputMessageCount = event.messages.length;
 			const result = (await handler(event, context)) as
 				| { messages?: unknown[] }
 				| undefined;
 			const output = result?.messages ?? event.messages;
+			if (options.wireOutput)
+				writeFileSync(
+					`${resolve(options.wireOutput)}-${index + 1}.json`,
+					JSON.stringify(output),
+				);
 			const transformError = rawDb
 				.prepare(
 					"SELECT last_transform_error AS error FROM session_meta WHERE session_id = ?",
@@ -238,17 +330,20 @@ async function main(): Promise<void> {
 				outputHash: canonicalHash(output),
 				tagRows: tagRows.length,
 				tagRowsHash: canonicalHash(tagRows),
+				stages: timings.samples(),
 				phases: summarizePhases(timings.samples(), dbSnapshot),
 				db: dbSnapshot,
 				serializationMs,
 				deferredDrainMs,
 				deferredDb,
+				dbQueries: dbTimer.queries(),
 			});
 		}
 	} finally {
 		restoreObserver();
 		clearContextHandlerSession(fixture.sessionId);
-		rawDb.close(false);
+		externalDb?.close();
+		rawDb.close();
 		rmSync(dataDir, { recursive: true, force: true });
 	}
 
@@ -345,12 +440,22 @@ function parseOptions(args: readonly string[]): RunnerOptions {
 		step: 500,
 		repeatFinal: 0,
 		lane: "default",
+		externalWrites: false,
+		pi087: false,
+		lingeringFallback: false,
+		historicalTags: 0,
 	};
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		const value = args[index + 1];
 		if (arg === "--fixture" && value) {
 			options.fixture = value;
+			index += 1;
+		} else if (arg === "--database" && value) {
+			options.database = value;
+			index += 1;
+		} else if (arg === "--wire-output" && value) {
+			options.wireOutput = value;
 			index += 1;
 		} else if (arg === "--messages" && value) {
 			options.messages = positiveInteger(value, arg);
@@ -369,6 +474,18 @@ function parseOptions(args: readonly string[]): RunnerOptions {
 		} else if (arg === "--output" && value) {
 			options.output = value;
 			index += 1;
+		} else if (arg === "--pi087") {
+			options.pi087 = true;
+		} else if (arg === "--lingering-fallback") {
+			options.lingeringFallback = true;
+		} else if (arg === "--historical-tags" && value) {
+			options.historicalTags = positiveInteger(value, arg);
+			index += 1;
+		} else if (arg === "--tool-result-repeat" && value) {
+			options.toolResultRepeat = positiveInteger(value, arg);
+			index += 1;
+		} else if (arg === "--external-writes") {
+			options.externalWrites = true;
 		} else if (arg === "--lane" && value) {
 			if (!isPerfLane(value)) throw new Error(`Unknown perf lane: ${value}`);
 			options.lane = value;

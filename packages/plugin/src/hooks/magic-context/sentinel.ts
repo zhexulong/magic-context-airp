@@ -39,6 +39,96 @@ export function modelAcceptsEmptyContent(providerID?: string): boolean {
 }
 
 /**
+ * True when the route serializes reasoning as Anthropic signed thinking, where
+ * removing the tool-result separator between two reasoning-bearing assistant
+ * steps lets the adapter merge them into one signed turn (issue 423). Covers
+ * canonical Anthropic, Vertex and other custom Anthropic ids, and Claude
+ * models behind any other provider (Bedrock, Copilot, OpenRouter
+ * `anthropic/*`). Non-Claude Bedrock models (Nova, Llama, DeepSeek) do not
+ * produce signed Anthropic thinking and are excluded. The forced call
+ * skeleton beside reasoning exists only for these routes.
+ */
+export function isAnthropicFamilyRoute(providerID?: string, modelID?: string): boolean {
+    const provider = (providerID ?? "").toLowerCase();
+    const model = (modelID ?? "").toLowerCase();
+    return (
+        provider.includes("anthropic") || model.includes("claude") || model.includes("anthropic")
+    );
+}
+
+const REMOVED_REASONING_MARK = Symbol.for("magic-context.removed-reasoning");
+/** The fields a neutralized part had, so a route that keeps it can restore it. */
+const NEUTRALIZED_ORIGINALS = new WeakMap<object, Record<string, unknown>>();
+
+/**
+ * Take a reasoning part that a tool or text drop invalidated off the wire,
+ * without ever writing placeholder text into it.
+ *
+ * The part object is rewritten in place to the exact `makeSentinel(part)`
+ * shape (an empty text part keeping any cache marker), so indices stay stable
+ * for every lane that runs later in the pass. Canonical Anthropic's adapter
+ * drops that empty part, which is the output the older `[cleared]` plus
+ * sentinel conversion produced. On every other route the part also carries a
+ * hidden mark, and final representation splices it out together with all of
+ * its provider metadata (signatures, OpenAI encrypted content).
+ *
+ * Parts without `thinking` or `text` (redacted blocks) are left alone, as
+ * before.
+ */
+export function neutralizeDroppedReasoningPart(part: unknown): void {
+    if (!isRecord(part)) return;
+    if (part.thinking === undefined && part.text === undefined) return;
+    if (part.type === "text") return;
+    NEUTRALIZED_ORIGINALS.set(part, { ...part });
+    const cacheControl = part.cache_control;
+    const cacheControlCamel = part.cacheControl;
+    for (const key of Object.keys(part)) delete part[key];
+    part.type = "text";
+    part.text = "";
+    if (cacheControl !== undefined) part.cache_control = cacheControl;
+    if (cacheControlCamel !== undefined) part.cacheControl = cacheControlCamel;
+    Object.defineProperty(part, REMOVED_REASONING_MARK, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+    });
+}
+
+/**
+ * Put a neutralized part back exactly as it was (same object, same key order).
+ * With `legacyCleared`, write `[cleared]` into its `thinking`/`text` the way
+ * drops did before parts were neutralized, reproducing those bytes.
+ */
+export function restoreNeutralizedReasoningPart(part: unknown, legacyCleared: boolean): boolean {
+    if (!isRecord(part)) return false;
+    const original = NEUTRALIZED_ORIGINALS.get(part);
+    if (!original) return false;
+    for (const key of Object.keys(part)) delete part[key];
+    Object.assign(part, original);
+    if (legacyCleared) {
+        if (part.thinking !== undefined) part.thinking = "[cleared]";
+        if (part.text !== undefined) part.text = "[cleared]";
+    }
+    NEUTRALIZED_ORIGINALS.delete(part);
+    delete (part as Record<PropertyKey, unknown>)[REMOVED_REASONING_MARK];
+    return true;
+}
+
+/** True for a part rewritten by `neutralizeDroppedReasoningPart`. */
+export function isNeutralizedReasoningPart(part: unknown): boolean {
+    return (
+        isRecord(part) && (part as Record<PropertyKey, unknown>)[REMOVED_REASONING_MARK] === true
+    );
+}
+
+/** A non-Anthropic drop restores this payload at final representation; cost it
+ * without changing the working part or invalidating the index-addressed lanes.
+ */
+export function neutralizedReasoningSource(part: unknown): unknown {
+    return isRecord(part) ? (NEUTRALIZED_ORIGINALS.get(part) ?? part) : part;
+}
+
+/**
  * Provider-cache facts for model identities whose effort can change without
  * invalidating cached prompt bytes: Anthropic Fable 5.1 was observed on
  * 2026-09-02, OpenAI GPT-6 Astra on 2026-09-05, and Anthropic Opus 5.5 on
@@ -150,6 +240,49 @@ export function makeWholeMessageSentinel(
 }
 
 /**
+ * True when neutralizing this whole message must leave it with no parts at all
+ * instead of a sentinel part.
+ *
+ * OpenCode 2 hands host system updates (instruction changes, other plugins'
+ * reminders) to the transform as `system` rows; OpenCode 1 and Pi never do.
+ * OpenCode 2's Anthropic adapter drops empty text in user and assistant
+ * messages, but sends a `system` row as an in-conversation system message
+ * (Claude models with native system updates: Opus 4.8 and every Claude 5)
+ * with its text blocks as they are, and Anthropic rejects an empty text block
+ * with HTTP 400 `text content blocks must be non-empty`. On older Claude
+ * models the host instead appends the row to the user turn as a
+ * `<system-update>` text block; with the row removed, that block goes too.
+ *
+ * A message left with no parts is omitted when the payload goes back to the
+ * host (`adaptPayload().commit()` in v2/hooks/payload.ts), the same rule the
+ * Rust module applies to a rendered message with no content. Other providers
+ * keep the `[dropped]` row: it is valid there and already served.
+ */
+export function wholeMessageNeutralizationRemoves(
+    message: { info: { role?: unknown } },
+    providerID?: string,
+): boolean {
+    return message.info.role === "system" && modelAcceptsEmptyContent(providerID);
+}
+
+/**
+ * Neutralize a whole message in place: replace its parts with one
+ * `makeWholeMessageSentinel` part, or with no parts at all when
+ * `wholeMessageNeutralizationRemoves` says the row must leave the request.
+ * The message object stays in the array either way, so index-addressed lanes
+ * later in the pass still line up.
+ */
+export function neutralizeWholeMessage(
+    message: { info: { role?: unknown }; parts: unknown[] },
+    providerID?: string,
+): void {
+    message.parts.length = 0;
+    if (!wholeMessageNeutralizationRemoves(message, providerID)) {
+        message.parts.push(makeWholeMessageSentinel(providerID));
+    }
+}
+
+/**
  * Detect whether a part is already a sentinel produced by `makeSentinel`
  * or `makeWholeMessageSentinel`. Used by strip functions to stay
  * idempotent — don't re-count or re-mutate a sentinel we already
@@ -167,12 +300,14 @@ export function isSentinel(part: unknown): boolean {
 
 /**
  * Replay persisted whole-message decisions onto a fresh host projection.
- * Canonical Anthropic keeps empty sentinels because its adapter filters them.
+ * Canonical Anthropic keeps empty sentinels because its adapter filters them,
+ * except on OpenCode 2 `system` rows, which are left with no parts (see
+ * `wholeMessageNeutralizationRemoves`).
  * For non-empty-sentinel providers, hidden seam rows are removed instead: they
  * were absent on the fold pass, so removal is the only byte-identical replay.
  */
 export function replaySentinelByMessageIds(
-    messages: Array<{ info: { id?: string }; parts: unknown[] }>,
+    messages: Array<{ info: { id?: string; role?: unknown }; parts: unknown[] }>,
     ids: Set<string>,
     providerID?: string,
     hiddenSeamIds: ReadonlySet<string> = new Set(),
@@ -191,8 +326,8 @@ export function replaySentinelByMessageIds(
             continue;
         }
         if (msg.parts.length === 1 && isSentinel(msg.parts[0])) continue;
-        msg.parts.length = 0;
-        msg.parts.push(makeWholeMessageSentinel(providerID));
+        if (wholeMessageNeutralizationRemoves(msg, providerID) && msg.parts.length === 0) continue;
+        neutralizeWholeMessage(msg, providerID);
         replayed += 1;
     }
     const missingIds: string[] = [];

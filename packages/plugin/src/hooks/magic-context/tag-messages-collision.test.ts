@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
  * v3.3.1 Layer C: tag-messages.ts FIFO pairing + composite-key
@@ -12,7 +13,7 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,6 +22,7 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
+import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { type MessageLike, tagMessages } from "./transform-operations";
@@ -44,7 +46,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -112,6 +114,35 @@ function createOpenCodeMessageDb(
 }
 
 describe("tag-messages composite-key collision handling (v3.3.1 Layer C)", () => {
+    it.failing("OpenCode result-only unavailable message times must not expose a second tag (separate known hazard)", () => {
+        useTempDataHome("oc-owner-unavailable-");
+        const original = process.env.OPENCODE_DB;
+        process.env.OPENCODE_DB = join(process.env.XDG_DATA_HOME!, "missing.db");
+        closeReadOnlySessionDb();
+        resetOpenCodeDbPathStateForTesting();
+        try {
+            const db = openDatabase();
+            const tagger = createTagger();
+            const served = tagger.assignToolTag("ses-1", "call", "assistant-owner", 100, db);
+            const messages: MessageLike[] = [
+                {
+                    info: { id: "result", role: "tool", sessionID: "ses-1" },
+                    parts: [{ type: "tool", callID: "call", state: { output: "result" } }],
+                },
+            ];
+            tagMessages("ses-1", messages, tagger, db);
+            // With OpenCode's message database unavailable, this result cannot
+            // be linked to its assistant call by creation time. The current
+            // tagger uses the result message id and emits another number; this
+            // expected failure records that separate, still-unfixed behavior.
+            expect(toolOutput(messages[0])).toBe(`§${served}§ result`);
+        } finally {
+            if (original === undefined) delete process.env.OPENCODE_DB;
+            else process.env.OPENCODE_DB = original;
+            closeReadOnlySessionDb();
+            resetOpenCodeDbPathStateForTesting();
+        }
+    });
     it("two assistant turns reusing the same callId get distinct tags", () => {
         //#given — two assistant turns, both invoking `read:32`. Pre-fix
         // these would have shared one tag; dropping the first would

@@ -11,7 +11,6 @@ import { EventEmitter } from "node:events";
 import {
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -32,9 +31,14 @@ import {
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
-import { __test, PiSubagentRunner } from "./subagent-runner";
+import {
+	__test,
+	configurePiSubagentHostTools,
+	PiSubagentRunner,
+} from "./subagent-runner";
 
 const baseOptions: SubagentRunOptions = {
 	agent: "historian",
@@ -66,6 +70,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	__setPiHarnessKindForTesting(undefined);
+	__test.resetHostToolState();
 	closeDatabase();
 	__resetSchemaFenceStateForTests();
 });
@@ -161,6 +166,7 @@ function runnerWith(
 		platform,
 		extraArgs,
 		subagentExtensions,
+		getHostToolNames,
 	}: {
 		piBinary?: string;
 		invocation?: {
@@ -172,6 +178,7 @@ function runnerWith(
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
 		subagentExtensions?: readonly string[];
+		getHostToolNames?: () => readonly string[] | undefined;
 	} = {},
 ) {
 	const remainingChildren = Array.isArray(childOrChildren)
@@ -189,6 +196,7 @@ function runnerWith(
 		platform,
 		extraArgs,
 		subagentExtensions,
+		getHostToolNames,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
@@ -219,7 +227,7 @@ function nextTick() {
 }
 
 function writePiCliFixture(bin: string, useBinShim = false) {
-	const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-layout-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-cli-layout-"));
 	const packageRoot = join(
 		root,
 		"node_modules",
@@ -250,7 +258,7 @@ function writePiCliFixture(bin: string, useBinShim = false) {
 // without a standalone `pi` on PATH still spawns its own CLI instead of the
 // bare `pi` fallback (which ENOENTs).
 function writeOmpCliFixture(bin: string, useBinShim = false) {
-	const root = mkdtempSync(join(tmpdir(), "mc-omp-cli-layout-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-omp-cli-layout-"));
 	const packageRoot = join(
 		root,
 		"node_modules",
@@ -452,7 +460,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("still resolves a string bin (no object map)", () => {
-		const root = mkdtempSync(join(tmpdir(), "mc-pi-string-bin-"));
+		const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-string-bin-"));
 		const packageRoot = join(
 			root,
 			"node_modules",
@@ -486,7 +494,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("falls through to the bare pi fallback when the manifest has neither bin.pi nor bin.omp", () => {
-		const root = mkdtempSync(join(tmpdir(), "mc-pi-no-bin-"));
+		const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-no-bin-"));
 		const packageRoot = join(
 			root,
 			"node_modules",
@@ -592,8 +600,7 @@ describe("subagent-runner pure helpers", () => {
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
-			"--tools",
-			"read,grep,find,ls,aft_search",
+			"--no-tools",
 			"--system-prompt",
 			TEST_SYSTEM_PROMPT_PATH,
 			"--model",
@@ -715,7 +722,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("uses PI_CODING_AGENT_DIR only for a positively identified OMP host", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-host-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-host-test-"),
+		);
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const previousPackageDir = process.env.PI_PACKAGE_DIR;
 		writeFileSync(
@@ -746,7 +755,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("uses the OMP default agent dir when PI_CODING_AGENT_DIR is unset", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-default-host-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-default-host-test-"),
+		);
 		const previous = {
 			agentDir: process.env.PI_CODING_AGENT_DIR,
 			packageDir: process.env.PI_PACKAGE_DIR,
@@ -790,7 +801,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("gives a named OMP profile precedence over a stale agent-dir override", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-profile-host-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-profile-host-test-"),
+		);
 		const previous = {
 			agentDir: process.env.PI_CODING_AGENT_DIR,
 			packageDir: process.env.PI_PACKAGE_DIR,
@@ -850,13 +863,15 @@ describe("subagent-runner pure helpers", () => {
 
 		expect(args).toContain("--no-context-files");
 		expect(args.indexOf("--no-context-files")).toBeLessThan(
-			args.indexOf("--tools"),
+			args.indexOf("--no-tools"),
 		);
 	});
 
 	it("emits only OMP-supported startup flags and tool names on an OMP host", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-argv-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-argv-test-"),
+		);
 		const previousPackageDir = process.env.PI_PACKAGE_DIR;
 		writeFileSync(
 			join(root, "package.json"),
@@ -871,9 +886,7 @@ describe("subagent-runner pure helpers", () => {
 			expect(historianArgs).toContain("--no-rules");
 			expect(historianArgs).not.toContain("--no-prompt-templates");
 			expect(historianArgs).not.toContain("--no-context-files");
-			expect(historianArgs).toEqual(
-				expect.arrayContaining(["--tools", "read,grep,glob"]),
-			);
+			expect(historianArgs).toEqual(expect.arrayContaining(["--no-tools"]));
 
 			const dreamerArgs = buildArgsForTest({
 				...baseOptions,
@@ -966,14 +979,19 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--no-tools");
 	});
 
-	it("locks historian to an explicit read-only allow-list", () => {
-		const historianArgs = buildArgsForTest({
-			...baseOptions,
-			agent: "historian",
-		});
-		expect(historianArgs).toEqual(
-			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
-		);
+	it("locks every historian variant to zero tools even with discovered extensions", () => {
+		for (const agent of [
+			"magic-context-historian",
+			"historian",
+			"historian-recomp",
+			"historian-editor",
+		]) {
+			const args = buildArgsForTest({ ...baseOptions, agent });
+			expect(args).toContain("--no-tools");
+			expect(args).not.toContain("--tools");
+			expect(args).not.toContain("--no-extensions");
+			expect(__test.STRICT_TOOL_ALLOWLIST.get(agent)).toEqual([]);
+		}
 	});
 
 	it("translates every strict Pi allow-list into valid OMP built-ins", () => {
@@ -1000,6 +1018,33 @@ describe("subagent-runner pure helpers", () => {
 			}
 			expect(new Set(resolved).size, agent).toBe(resolved.length);
 		}
+	});
+
+	it("intersects OMP built-ins with the host registry when grep or glob is disabled", () => {
+		const readOnlyTools = ["read", "grep", "find", "ls"];
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, true, ["read", "glob"]),
+		).toEqual(["read", "glob"]);
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, true, ["read", "grep"]),
+		).toEqual(["read", "grep"]);
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, false, [
+				"read",
+				"find",
+				"ls",
+			]),
+		).toEqual(["read", "find", "ls"]);
+		expect(__test.resolveHostToolAllowlist(readOnlyTools, true, [])).toEqual(
+			[],
+		);
+
+		const args = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer-memory-mapper" },
+			{ targetHarness: "omp", hostToolNames: [] },
+		);
+		expect(args).toContain("--no-tools");
+		expect(args).not.toContain("--tools");
 	});
 
 	it("locks base dreamer (curate) to the two memory tools, stripping all built-ins", () => {
@@ -1151,9 +1196,7 @@ describe("subagent-runner pure helpers", () => {
 			"historian-editor",
 		]) {
 			const tools = toolListFor(agent);
-			expect(tools).toContain("aft_search");
-			expect(tools).not.toContain("aft_outline");
-			expect(tools).not.toContain("aft_zoom");
+			expect(tools).toEqual([]);
 		}
 
 		for (const agent of [
@@ -1260,13 +1303,15 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
-	it("records OMP message_end usage in subagent_invocations", async () => {
+	it("records OMP usage and message provider for an unqualified model ref", async () => {
 		__setPiHarnessKindForTesting("omp");
 		const child = createMockChild();
 		const { runner } = runnerWith(child, {
 			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
 		});
-		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-"));
+		const testDataDir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-accounting-"),
+		);
 		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 		const previousXdgDataHome = process.env.XDG_DATA_HOME;
 		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
@@ -1275,7 +1320,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		try {
 			const resultPromise = runner.run({
 				...baseOptions,
-				model: "anthropic/claude-sonnet",
+				model: "gpt-6.1-sol",
 				accountingSessionId: "omp-accounting-session",
 				accountingSubagent: "historian",
 			});
@@ -1302,6 +1347,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				type: "message_end",
 				message: {
 					role: "assistant",
+					providerID: "openai",
+					modelID: "gpt-6.1-sol",
 					content: [{ type: "text", text: "done" }],
 					stopReason: "stop",
 					usage: {
@@ -1326,6 +1373,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			const [row] = getSubagentInvocations(db, "omp-accounting-session");
 			expect(row).toMatchObject({
 				harness: "omp",
+				providerId: "openai",
+				modelId: "gpt-6.1-sol",
 				inputTokens: 1_600,
 				outputTokens: 110,
 				cacheReadTokens: 400,
@@ -1347,7 +1396,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const { runner } = runnerWith(child, {
 			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
 		});
-		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-empty-"));
+		const testDataDir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-accounting-empty-"),
+		);
 		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 		const previousXdgDataHome = process.env.XDG_DATA_HOME;
 		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
@@ -1468,6 +1519,244 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			meta: { stderr: undefined },
 		});
 	});
+
+	it.each([
+		"pi",
+		"omp",
+	] as const)("preserves %s stop text without agent_end through drain SIGTERM and two aborted events", async (targetHarness) => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: targetHarness, prefixArgs: [], targetHarness },
+		});
+		const text = "s".repeat(6103);
+		const timeline: string[] = [];
+		const terminals: Array<{ stopReason?: string; textLength: number }> = [];
+		// The shutdown events must come from the runner's actual drain signal,
+		// not an independently scheduled close that could bypass the timer.
+		child.kill.mockImplementation((signal) => {
+			timeline.push(String(signal));
+			for (let i = 0; i < 2; i++) {
+				child.writeStdoutLine({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [],
+						stopReason: "aborted",
+						errorMessage: "Cloud Code Assist API error (400)",
+					},
+				});
+			}
+			child.emitClose(null, "SIGTERM");
+			return true;
+		});
+		const resultPromise = runner.run({
+			...baseOptions,
+			timeoutMs: 10_000,
+			onProgress: (event) => {
+				if (event.type === "terminal") terminals.push(event);
+				if (event.type === "raw_event" && event.eventType === "message_end") {
+					const message = (event.event as { message: { stopReason: string } })
+						.message;
+					timeline.push(message.stopReason);
+				}
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text }],
+				stopReason: "stop",
+			},
+		});
+
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: text,
+		});
+		expect(timeline).toEqual(["stop", "SIGTERM", "aborted", "aborted"]);
+		expect(terminals).toEqual([
+			expect.objectContaining({ stopReason: "stop", textLength: 6103 }),
+		]);
+	}, 15_000);
+
+	it.each([
+		"message_end",
+		"agent_end",
+	] as const)("preserves a drained stop result against a later aborted %s", async (eventType) => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "completed summary" }],
+				stopReason: "stop",
+			},
+		});
+		const aborted = {
+			role: "assistant",
+			content: [{ type: "text", text: "shutdown partial" }],
+			stopReason: "aborted",
+			errorMessage: "stale error",
+		};
+		child.writeStdoutLine(
+			eventType === "agent_end"
+				? agentEnd([aborted])
+				: { type: "message_end", message: aborted },
+		);
+		child.emitClose(null, "SIGTERM");
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: "completed summary",
+		});
+	});
+
+	it("drains a standalone agent_end and preserves its terminal text", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		child.kill.mockImplementation((signal) => {
+			expect(signal).toBe("SIGTERM");
+			child.writeStdoutLine(
+				agentEnd([{ role: "assistant", content: [], stopReason: "aborted" }]),
+			);
+			child.emitClose(null, "SIGTERM");
+			return true;
+		});
+		const resultPromise = runner.run({ ...baseOptions, timeoutMs: 10_000 });
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "agent_end summary" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: "agent_end summary",
+		});
+	}, 15_000);
+
+	it.each([
+		"auto_retry_start",
+		"agent_end",
+	] as const)("allows a new successful attempt after %s resets terminal capture", async (retryType) => {
+		for (const stopReason of ["error", "stop"]) {
+			const child = createMockChild();
+			const { runner } = runnerWith(child);
+			const resultPromise = runner.run(baseOptions);
+			const first = {
+				role: "assistant",
+				content: [{ type: "text", text: "first attempt" }],
+				stopReason,
+			};
+			child.writeStdoutLine({ type: "message_end", message: first });
+			child.writeStdoutLine(
+				retryType === "agent_end"
+					? { ...agentEnd([first]), willRetry: true }
+					: { type: "auto_retry_start" },
+			);
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "second attempt" }],
+					stopReason: "stop",
+				},
+			});
+			child.emitClose(0);
+			expect(await resultPromise).toMatchObject({
+				ok: true,
+				assistantText: "second attempt",
+			});
+		}
+	});
+
+	it("preserves length as truncated rather than a shutdown abort", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "partial summary" }],
+				stopReason: "length",
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: { role: "assistant", content: [], stopReason: "aborted" },
+		});
+		child.emitClose(null, "SIGTERM");
+		expect(await resultPromise).toMatchObject({
+			ok: false,
+			reason: "truncated",
+			error: expect.stringContaining(
+				'pi assistant stopped with reason "length"',
+			),
+		});
+	});
+
+	it.each([
+		"error",
+		"aborted",
+	] as const)("still fails when the first terminal is an empty %s", async (stopReason) => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [],
+				stopReason,
+				errorMessage: "provider failed",
+			},
+		});
+		child.emitClose(0);
+		expect(await resultPromise).toMatchObject({
+			ok: false,
+			reason: "no_assistant",
+			error:
+				"pi assistant produced empty text (provider error: provider failed)",
+		});
+	});
+
+	it("does not preserve agent_end text with a pending tool call", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const resultPromise = runner.run(baseOptions);
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "still investigating" },
+						{ type: "toolCall", id: "read-1", name: "read", arguments: {} },
+					],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "provider failure" }],
+				stopReason: "error",
+			},
+		});
+		child.emitClose(0);
+		expect(await resultPromise).toMatchObject({
+			ok: false,
+			reason: "model_failed",
+		});
+	});
+
 	it("counts toolCall content parts from assistant message_end into toolCallCount (grounding gate)", async () => {
 		// The grounding gate (refresh-primers) treats toolCallCount === 0 as a
 		// closed-book paraphrase and refuses to commit. The count is derived from
@@ -1655,6 +1944,30 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("keeps a multibyte stderr character intact when it spans two chunks", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const progressChunks: string[] = [];
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			onProgress: (event) => {
+				if (event.type === "stderr") progressChunks.push(event.chunk);
+			},
+		});
+		// "é" is 0xC3 0xA9 in UTF-8; a pipe may deliver the two bytes apart.
+		const bytes = Buffer.from("café — failed\n", "utf8");
+		child.stderr.write(bytes.subarray(0, 4));
+		child.stderr.write(bytes.subarray(4));
+		child.emitClose(1);
+
+		const result = await resultPromise;
+
+		expect(result.ok).toBe(false);
+		expect(result.meta?.stderr).toBe("café — failed\n");
+		expect(progressChunks.join("")).toBe("café — failed\n");
+	});
+
 	it("preserves an explicit zero historian temperature in the child environment", async () => {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
@@ -1729,7 +2042,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		// Default resolution must NOT spawn a bare "pi" (which ENOENTs on Windows
 		// because npm installs a pi.cmd shim, not a literal pi). It re-invokes the
 		// exact host CLI: process.execPath + process.argv[1], with no shell.
-		const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-"));
+		const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-cli-"));
 		const distDir = join(
 			root,
 			"node_modules",
@@ -3028,8 +3341,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
-			"--tools",
-			"read,grep,find,ls,aft_search",
+			"--no-tools",
 			"--system-prompt",
 			expect.stringMatching(/system-prompt\.txt$/),
 			"--model",
@@ -3163,6 +3475,127 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		);
 	});
 
+	it("plain Pi never reads a loading-phase host tool registry", async () => {
+		const getTools = mock(() => {
+			throw new Error(
+				"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+			);
+		});
+		configurePiSubagentHostTools(getTools);
+		for (const agent of [
+			"historian",
+			"historian-recomp",
+			"dreamer-memory-mapper",
+		]) {
+			const child = createMockChild();
+			const { runner, spawnImpl } = runnerWith(child, {
+				invocation: { command: "pi-test", prefixArgs: [], targetHarness: "pi" },
+				getHostToolNames: getTools,
+			});
+			const result = runner.run({ ...baseOptions, agent });
+			child.writeStdoutLine(
+				agentEnd([
+					{ role: "assistant", content: [{ type: "text", text: "done" }] },
+				]),
+			);
+			child.emitClose(0);
+			expect((await result).ok).toBe(true);
+			expect(spawnImpl).toHaveBeenCalledTimes(1);
+			if (agent === "dreamer-memory-mapper") {
+				const args = spawnImpl.mock.calls[0]?.[1] as string[];
+				expect(args[args.indexOf("--tools") + 1]).toBe(
+					"read,grep,find,ls,aft_outline,aft_zoom,aft_search",
+				);
+			}
+		}
+		expect(getTools).not.toHaveBeenCalled();
+	});
+
+	it("OMP launches with its normal tools when the host registry is not initialized", async () => {
+		configurePiSubagentHostTools(() => {
+			throw new Error(
+				"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+			);
+		});
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "omp-test", prefixArgs: [], targetHarness: "omp" },
+		});
+		const result = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+		});
+		child.writeStdoutLine(
+			agentEnd([
+				{ role: "assistant", content: [{ type: "text", text: "done" }] },
+			]),
+		);
+		child.emitClose(0);
+		expect((await result).ok).toBe(true);
+		const args = spawnImpl.mock.calls[0]?.[1] as string[];
+		expect(args[args.indexOf("--tools") + 1]).toBe("read,grep,glob");
+	});
+
+	it("applies the host tool intersection to fallback child invocations", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		let spawnCount = 0;
+		const spawnImpl = mock(() => {
+			spawnCount += 1;
+			return (spawnCount === 1 ? first : second) as never;
+		});
+		const runner = new PiSubagentRunner({
+			invocation: {
+				command: "omp-test",
+				prefixArgs: [],
+				targetHarness: "omp",
+			},
+			getHostToolNames: () => ["read", "glob"],
+			spawnImpl: spawnImpl as never,
+		});
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			model: "anthropic/primary",
+			fallbackModels: ["openai/fallback"],
+		});
+		first.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "primary failed" }],
+					stopReason: "error",
+				},
+			]),
+		);
+		first.emitClose(0);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback succeeded" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: "fallback succeeded",
+		});
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		for (const [, argv] of spawnImpl.mock.calls) {
+			const args = argv as string[];
+			const toolsIndex = args.indexOf("--tools");
+			expect(toolsIndex).toBeGreaterThanOrEqual(0);
+			expect(args[toolsIndex + 1]).toBe("read,glob");
+			expect(args[toolsIndex + 1]).not.toContain("grep");
+		}
+	});
+
 	it("retries fallback models after empty assistant text", async () => {
 		const first = createMockChild();
 		const second = createMockChild();
@@ -3292,7 +3725,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 
 describe("Pi subagent schema-fence probe", () => {
 	it("does not spawn a Pi child when the shared database is newer than this build", async () => {
-		const dataHome = mkdtempSync(join(tmpdir(), "mc-pi-fence-probe-"));
+		const dataHome = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-fence-probe-"),
+		);
 		try {
 			process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataHome;
 			process.env.XDG_DATA_HOME = dataHome;
@@ -3519,7 +3954,7 @@ describe("Pi dreamer prompt-token budget", () => {
 		prefixArgs: [],
 		targetHarness: "pi" as const,
 	};
-	async function started() {
+	async function started(tokenBudget = 100) {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child, {
 			invocation,
@@ -3528,7 +3963,7 @@ describe("Pi dreamer prompt-token budget", () => {
 		const run = runner.run({
 			...baseOptions,
 			agent: "dreamer-memory-mapper",
-			tokenBudget: 100,
+			tokenBudget,
 		});
 		for (
 			let i = 0;
@@ -3540,6 +3975,39 @@ describe("Pi dreamer prompt-token budget", () => {
 		expect(spawnImpl.mock.calls[0]?.[1]).toContain("rpc");
 		return { child, run, spawnImpl };
 	}
+
+	it("finalizes the mapper before its step cap and retains a partial manifest below token budget", async () => {
+		const { child, run } = await started(3_000_000);
+		for (let step = 1; step <= 58; step++)
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					usage: { input: 1 },
+					stopReason: "toolUse",
+					content: [{ type: "toolCall", id: `read-${step}`, name: "read" }],
+				},
+			});
+		const steered = child.stdinText.includes("dreamer-finalize");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 1 },
+				stopReason: "stop",
+				content: [
+					{ type: "text", text: '<verify><verified id="1"/></verify>' },
+				],
+			},
+		});
+		child.emitClose();
+		expect(await run).toMatchObject({
+			ok: true,
+			meta: { tokenBudget: { spent: 59, finalizeFired: true } },
+		});
+		expect(steered).toBe(true);
+		expect(child.stdinText.match(/dreamer-finalize/g)).toHaveLength(1);
+	});
 
 	it("does not steer a completed under-budget child", async () => {
 		const { child, run } = await started();

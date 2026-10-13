@@ -18,6 +18,10 @@ import {
     type HiddenRunHandle,
 } from "../../../hooks/magic-context/compartment-runner-types";
 import type { RawMessageProvider } from "../../../hooks/magic-context/read-session-chunk";
+import {
+    projectNeedsSingleStoreMigration,
+    renderSingleStoreMigrationRequiredRefusal,
+} from "../../../hooks/magic-context/single-store-refusal";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -36,7 +40,6 @@ import {
 import type { Database } from "../../../shared/sqlite";
 import { dreamFailureCode, userFacingFailureCode } from "../../../shared/user-facing-codes";
 import { getCompartmentEvents } from "../compartment-events";
-import { getAuthorityManagedMarker } from "../context-authority";
 import {
     getMemoriesByProject,
     getMemoryCountsByStatus,
@@ -139,6 +142,15 @@ export interface DreamTaskExecutorDeps {
     hiddenCompletionExecutor?: HiddenCompletionExecutor;
     /** Existing user session used by a completion-only host. */
     parentSessionId?: string;
+    /**
+     * Finds a parent session when none was handed in. OpenCode 2's schedule
+     * timer uses it: a timer run has no triggering session, and a hidden child
+     * created without a parent would show up as a top-level session in the
+     * user's session list. When this is set and finds nothing, every task that
+     * needs a child session is skipped (not failed); database-only tasks and
+     * smart-note evaluation still run.
+     */
+    findParentSessionId?: () => Promise<string | undefined> | string | undefined;
     /** Filesystem directory of the project this drain owns (NOT the identity). */
     sessionDirectory: string;
     /** Opens the OpenCode DB read-only (for the key-files candidate scan). The
@@ -172,9 +184,10 @@ export interface DreamTaskExecutorDeps {
     /** Resolved project transform mode; an explicit TS mode always stays on TS. */
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
-    mural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
+    smartNotesEnabled?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     /** Pi's process runner reports usage after each child exits rather than through session.messages. */
@@ -206,6 +219,7 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
             provider_error: prompt.providerError,
             timeout_ms: prompt.timeoutMs,
             child_session_id: prompt.childSessionId,
+            ...(prompt.refusalReason ? { refusal_reason: prompt.refusalReason } : {}),
         };
     }
 
@@ -231,20 +245,27 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
             child_session_id: null,
         };
     }
+    const localRefusal = error instanceof HiddenCompletionRefusal;
     const providerFailure =
-        error instanceof HiddenCompletionRefusal ||
-        (error instanceof Error && error.name === "DreamerProviderOutputFailureError");
+        error instanceof Error && error.name === "DreamerProviderOutputFailureError";
     return {
-        failure_class: providerFailure
-            ? "provider_error"
-            : /no models?|model chain is empty/i.test(message)
-              ? "no_models"
-              : "unknown",
+        failure_class: localRefusal
+            ? "local_refusal"
+            : providerFailure
+              ? "provider_error"
+              : /no models?|model chain is empty/i.test(message)
+                ? "no_models"
+                : "unknown",
         model_attempted: null,
         models_tried: [],
         provider_error: providerFailure ? sanitizeDiagnosticText(message).slice(0, 500) : null,
         timeout_ms: null,
         child_session_id: null,
+        ...(localRefusal
+            ? {
+                  refusal_reason: sanitizeDiagnosticText(error.message).slice(0, 500),
+              }
+            : {}),
     };
 }
 
@@ -330,7 +351,7 @@ interface CurateValidatedOutput {
     memoryOperations: CurateMemoryOperationSummary;
 }
 
-function inspectCurateMemoryOperations(messages: unknown): CurateMemoryOperationSummary {
+export function inspectCurateMemoryOperations(messages: unknown): CurateMemoryOperationSummary {
     const summary: CurateMemoryOperationSummary = { totalCalls: 0, completedActions: [] };
     if (!Array.isArray(messages)) return summary;
 
@@ -408,6 +429,12 @@ function requireDreamTransport(deps: DreamTaskExecutorDeps): {
  * if the lease is lost, and writes one per-task dream_runs telemetry row.
  */
 export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecutor {
+    const backgroundSessionsAreHidden =
+        (
+            deps.client as
+                | (PluginContext["client"] & { backgroundSessionsAreHidden?: boolean })
+                | undefined
+        )?.backgroundSessionsAreHidden === true;
     // Memoize the PROMISE, not a flag+value. Domain groups run concurrently
     // (task-scheduler runs them under Promise.all), so several tasks call this at
     // once. A flag-then-await memo set the "resolved" flag BEFORE the session.list
@@ -418,24 +445,76 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
     // single shared promise makes every caller await the same populated result.
     let parentSessionIdPromise: Promise<string | undefined> | undefined;
 
-    const resolveParentSessionId = (): Promise<string | undefined> => {
-        if (deps.hiddenCompletionExecutor) return Promise.resolve(deps.parentSessionId);
+    const resolveParentSessionId = (deadline: number): Promise<string | undefined> => {
+        if (deps.parentSessionId) return Promise.resolve(deps.parentSessionId);
+        const findParentSessionId = deps.findParentSessionId;
+        if (findParentSessionId) {
+            parentSessionIdPromise ??= (async () => {
+                try {
+                    return await findParentSessionId();
+                } catch (error) {
+                    log(
+                        `[dreamer] parent lookup failed for ${deps.sessionDirectory}: ${describeError(error).brief}`,
+                    );
+                    return undefined;
+                }
+            })().then((parent) => {
+                // A session can be opened in this directory after the lookup.
+                if (!parent) parentSessionIdPromise = undefined;
+                return parent;
+            });
+            return parentSessionIdPromise;
+        }
+        if (deps.hiddenCompletionExecutor || backgroundSessionsAreHidden)
+            return Promise.resolve(deps.parentSessionId);
         if (!parentSessionIdPromise) {
             parentSessionIdPromise = (async () => {
                 try {
-                    const listResponse = await requireDreamClient(deps.client).session.list({
-                        query: { directory: deps.sessionDirectory },
-                    });
-                    const sessions = shared.normalizeSDKResponse(
-                        listResponse,
-                        [] as { id?: string }[],
-                        { preferResponseOnMissingData: true },
+                    // OpenCode limits session.list to the 100 most recent rows.
+                    // Filter children on the host, before that limit, and search
+                    // the project: a timer's checkout may have no conversations
+                    // while a sibling worktree has the project's ordinary root.
+                    // Older leaked Magic Context roots still need client-side
+                    // filtering. Grow the prefix until it includes a real parent
+                    // or exhausts the roots; /session has no cursor pagination.
+                    for (let limit = 100; Date.now() < deadline; limit *= 2) {
+                        const query = {
+                            directory: deps.sessionDirectory,
+                            scope: "project",
+                            roots: true,
+                            limit,
+                        };
+                        const listResponse = await requireDreamClient(deps.client).session.list({
+                            query,
+                        });
+                        const sessions = shared.normalizeSDKResponse(
+                            listResponse,
+                            null as { id?: string; title?: string; parentID?: string }[] | null,
+                        );
+                        if (!Array.isArray(sessions)) {
+                            throw new Error("session.list did not return a session array");
+                        }
+                        const parent = sessions.find(
+                            (s) =>
+                                typeof s?.id === "string" &&
+                                !s.parentID &&
+                                !s.title?.startsWith("magic-context-"),
+                        )?.id;
+                        if (parent || sessions.length < limit) return parent;
+                    }
+                    log(`[dreamer] parent lookup timed out for ${deps.sessionDirectory}`);
+                    return undefined;
+                } catch (error) {
+                    log(
+                        `[dreamer] parent lookup failed for ${deps.sessionDirectory}: ${describeError(error).brief}`,
                     );
-                    return sessions?.find((s) => typeof s?.id === "string")?.id;
-                } catch {
                     return undefined;
                 }
-            })();
+            })().then((parent) => {
+                // A project can acquire its first ordinary session after boot.
+                if (!parent) parentSessionIdPromise = undefined;
+                return parent;
+            });
         }
         return parentSessionIdPromise;
     };
@@ -470,26 +549,23 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             });
         };
         reportProgress(0);
-        if (config.modelChainUnavailable) {
-            return {
-                status: "completed",
-                detail: "skipped: Pi model chain is empty (no configured model resolves in Pi)",
-            };
-        }
         const incompleteMessage = (remaining: number): string => {
             const processed = processedDreamTaskItems(backlogAtStart.pending, remaining);
             return `${config.task} incomplete: ${remaining} remain (was ${backlogAtStart.pending} at run start; processed ${processed} this run)`;
         };
+        const migrationRequired = projectNeedsSingleStoreMigration(db, projectIdentity);
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
         if (
-            config.task === "curate" ||
-            config.task === "map-memories" ||
-            config.task === "compress-cues" ||
-            config.task === "classify-memories" ||
-            config.task === "verify" ||
-            config.task === "verify-broad" ||
-            config.task === "retrospective" ||
-            config.task === "reflect"
+            !migrationRequired &&
+            !config.modelChainUnavailable &&
+            (config.task === "curate" ||
+                config.task === "map-memories" ||
+                config.task === "compress-cues" ||
+                config.task === "classify-memories" ||
+                config.task === "verify" ||
+                config.task === "verify-broad" ||
+                config.task === "retrospective" ||
+                config.task === "reflect")
         ) {
             try {
                 moduleRoute = await resolveDreamerModuleRoute({
@@ -501,12 +577,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     commandId: `${startedAt}:${holderId}:${config.task}`,
                 });
             } catch (error) {
-                throw new DreamerModuleFailureError("authority.status", error);
+                throw new DreamerModuleFailureError("store admission", error);
             }
         }
         if (
             !moduleRoute &&
-            getAuthorityManagedMarker(db, projectIdentity) &&
+            migrationRequired &&
             (
                 [
                     "curate",
@@ -523,7 +599,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             logDreamerNotOwnerOnce(projectIdentity);
             return { status: "completed", detail: "skipped: module-managed memory; not owner" };
         }
-        const parent = await resolveParentSessionId();
+        const parent =
+            migrationRequired || config.modelChainUnavailable
+                ? deps.parentSessionId
+                : await resolveParentSessionId(deadline);
         if (!leaseOwnershipMatches(db, holderId, leaseAcquisition.generation, leaseKey)) {
             throw new Error("Dream lease lost during executor setup");
         }
@@ -544,7 +623,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             budgetFinalized ||= state.finalizeFired;
         };
         const recordRun = (
-            status: "completed" | "failed",
+            status: "completed" | "failed" | "skipped",
             error: string | null,
             extra?: {
                 memoryChanges?: ReturnType<typeof computeMemoryDelta>;
@@ -583,6 +662,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                             name: config.task,
                             durationMs: Date.now() - startedAt,
                             resultChars: 0,
+                            status,
+                            ...(status === "skipped" && error ? { skipReason: error } : {}),
                             ...(status === "failed" && error ? { error } : {}),
                             ...(status === "failed"
                                 ? {
@@ -673,6 +754,39 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         }
 
         try {
+            const skip = (reason: string): TaskExecOutcome => {
+                log(`[dreamer] ${config.task}: skipped (${reason})`);
+                recordRun("skipped", reason);
+                return { status: "skipped", detail: reason };
+            };
+            if (config.modelChainUnavailable)
+                return skip("Pi model chain is empty (no configured model resolves in Pi)");
+            if (migrationRequired) return skip(renderSingleStoreMigrationRequiredRefusal());
+            // A visible host must not create a background root. Skip the whole
+            // scheduled task before opening batches or advancing task cursors;
+            // the scheduler moves skipped work to its next cron without retries.
+            // Hidden carriers and Pi's process-local sessions need no parent.
+            // Tasks that may finish without any child session keep running:
+            // host-only database work, and smart-note evaluation, whose compiled
+            // checks run in the local sandbox (or defer to the wake plane).
+            // A host that supplies its own parent lookup (OpenCode 2's timer)
+            // needs that parent for the same reason, carrier or not.
+            const parentRequired =
+                deps.findParentSessionId !== undefined ||
+                (deps.client !== undefined &&
+                    !deps.hiddenCompletionExecutor &&
+                    !backgroundSessionsAreHidden);
+            if (
+                parentRequired &&
+                !parent &&
+                DREAM_TASK_CAPABILITIES[config.task].transport !== "host-only" &&
+                config.task !== "evaluate-smart-notes"
+            )
+                return skip(
+                    deps.findParentSessionId
+                        ? "no session in this directory to hold the run's child session; it runs once one exists"
+                        : "no ordinary parent session is available on this host",
+                );
             if (
                 deps.hiddenCompletionExecutor?.capabilities.tools === false &&
                 DREAM_TASK_CAPABILITIES[config.task].requiresTools
@@ -691,16 +805,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             }
             if (config.task === "compress-cues") {
                 if (deps.mural?.enabled !== true) {
-                    // Config-gated no-op, but say so: a silent "completed" here
-                    // reads as a successful run in /ctx-dream summaries and would
-                    // otherwise mask a wiring gap.
-                    log("[dreamer] compress-cues: skipped (mural is not enabled)");
-                    recordRun("completed", null);
-                    return { status: "completed" };
+                    return skip("mural is not enabled");
                 }
-                // `config.model` is already resolved by task-config using the
-                // executing harness's task-specific, mural/project-level,
-                // then default model settings.
+                // `config.model` is already resolved by task-config from the
+                // executing harness's task-specific, then default model settings.
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
@@ -884,8 +992,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                           | "moduleClient"
                           | "moduleSessionId"
                           | "moduleProjectRoot"
-                          | "moduleContextStoreUuid"
-                          | "moduleAuthorityGeneration"
                           | "moduleCommandId"
                       >
                     | undefined;
@@ -894,8 +1000,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         moduleClient: moduleRoute.moduleClient,
                         moduleSessionId: moduleRoute.moduleSessionId,
                         moduleProjectRoot: moduleRoute.moduleProjectRoot,
-                        moduleContextStoreUuid: moduleRoute.moduleContextStoreUuid,
-                        moduleAuthorityGeneration: moduleRoute.moduleAuthorityGeneration,
                         moduleCommandId: moduleRoute.moduleCommandId,
                     };
                 }
@@ -995,6 +1099,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     retinaHandoff: deps.retinaHandoff,
+                    smartNotesEnabled: deps.smartNotesEnabled,
                 });
                 recordRun("completed", null, {
                     smartNotesSurfaced: result.surfaced,
@@ -1013,6 +1118,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     invocationStartedAt: startedAt,
                     moduleRoute,
                 });
+                if (retro.skipReason) return skip(retro.skipReason);
                 recordRun("completed", null, {
                     memoryChanges: computeMemoryDelta(memoryBefore),
                     backlogAfter:
@@ -1345,13 +1451,16 @@ async function runRetrospectiveTask(
 ): Promise<{
     retrospectiveWatermarkMs: number | null;
     taskStateJson?: string;
+    skipReason?: string;
 }> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
     const { deps, deadline, parent, onBudgetUpdate } = helpers;
     const provider = resolveRetrospectiveProvider(deps, db, projectIdentity);
     if (!provider) {
-        log("[dreamer] retrospective: no raw provider available — clean no-op");
-        return { retrospectiveWatermarkMs: null };
+        return {
+            retrospectiveWatermarkMs: null,
+            skipReason: "no raw-history provider is available",
+        };
     }
 
     // Content watermark (max message ts actually scanned) — NOT lastRunAt, which
@@ -1385,7 +1494,9 @@ async function runRetrospectiveTask(
         ...(clearedTaskStateJson ? { taskStateJson: clearedTaskStateJson } : {}),
     });
     const messages = withGlobalOrdinals(scan.messages);
-    const userMessages = messages.filter((message) => message.role === "user");
+    const userMessages = messages.filter(
+        (message) => message.role === "user" && message.text.trim().length > 0,
+    );
     if (userMessages.length === 0) {
         log("[dreamer] retrospective: no user messages in window");
         return completedWindow(scan.maxScannedTs);

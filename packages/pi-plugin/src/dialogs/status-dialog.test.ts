@@ -12,10 +12,11 @@ import {
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
-	buildStatusView,
+	buildStatusViewFor,
 	STATUS_COLUMN_GAP,
 	statusColumnsFor,
 } from "@magic-context/core/shared/status-view";
+import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
 import {
 	clearPiChannel1State,
 	setPiChannel1Baseline,
@@ -273,11 +274,13 @@ describe("Pi status dialog", () => {
 					"80-100": 1,
 				},
 			});
-			// The distribution is data the status surfaces no longer draw: the
-			// single view dropped the Importance histogram row.
-			expect(
-				renderPiStatusOverlay(detail, plainTheme(), 74).join("\n"),
-			).not.toContain("Importance");
+			expect(detail.historianRuns).toBe(0);
+			const overlay = renderPiStatusOverlay(detail, plainTheme(), 74).join(
+				"\n",
+			);
+			expect(overlay).toContain("Historian runs");
+			expect(overlay).toMatch(/Historian runs\s+0/);
+			expect(overlay).not.toContain("Importance");
 		} finally {
 			closeQuietly(db);
 		}
@@ -332,19 +335,16 @@ describe("Pi status dialog", () => {
 			const summary = formatPiStatusSummary(statusFixture);
 			expect(summary).toBe(`Magic Context Status
 Context: 1.0% of usable context (1,000 / 100,000 tokens)
-Cache lifetime: 1h (config for anthropic/claude-opus-5)
+Cache lifetime: 1h (your config)
 Automatic compression: at 65.0% of usable context
 History compression: Waiting for enough conversation history
 Reclaimable: 3 spent tool outputs (~14k tokens)
 Memory: 0 memories · 0 notes
 Search indexing: Off
 Warning: The last context update did not finish. Send another message to retry. (MC-S02)
-Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)`);
-			for (const value of [
-				"1.0%",
-				"65.0%",
-				"1h (config for anthropic/claude-opus-5)",
-			]) {
+Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)
+Window source: catalog; denominator: 100000 tokens`);
+			for (const value of ["1.0%", "65.0%", "1h (your config)"]) {
 				expect(summary).toContain(value);
 			}
 			for (const forbidden of [
@@ -456,7 +456,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 						) => unknown,
 					) {
 						const component = factory(
-							{ requestRender() {} },
+							{ terminal: { rows: 100 }, requestRender() {} },
 							{
 								fg: (_name: string, text: string) => text,
 								bold: (text: string) => text,
@@ -521,7 +521,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 				ui: {
 					async custom(factory: unknown) {
 						const makeComponent = factory as (
-							tui: { requestRender: () => void },
+							tui: { terminal: { rows: number }; requestRender: () => void },
 							theme: {
 								fg: (_name: string, text: string) => string;
 								bold: (text: string) => string;
@@ -530,7 +530,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 							done: (value: undefined) => void,
 						) => { render: (width: number) => string[]; dispose?: () => void };
 						const component = makeComponent(
-							{ requestRender: () => undefined },
+							{ terminal: { rows: 100 }, requestRender: () => undefined },
 							{ fg: (_name, text) => text, bold: (text) => text },
 							undefined,
 							() => undefined,
@@ -574,7 +574,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 				ui: {
 					async custom(factory: unknown) {
 						const makeComponent = factory as (
-							tui: { requestRender: () => void },
+							tui: { terminal: { rows: number }; requestRender: () => void },
 							theme: {
 								fg: (_name: string, text: string) => string;
 								bold: (text: string) => string;
@@ -583,7 +583,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 							done: (value: undefined) => void,
 						) => { render: (width: number) => string[]; dispose?: () => void };
 						const component = makeComponent(
-							{ requestRender: () => undefined },
+							{ terminal: { rows: 100 }, requestRender: () => undefined },
 							{ fg: (_name, text) => text, bold: (text) => text },
 							undefined,
 							() => undefined,
@@ -799,7 +799,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 				ui: {
 					async custom(factory: unknown) {
 						const makeComponent = factory as (
-							tui: { requestRender: () => void },
+							tui: { terminal: { rows: number }; requestRender: () => void },
 							theme: {
 								fg: (_name: string, text: string) => string;
 								bold: (text: string) => string;
@@ -808,7 +808,7 @@ Warning: History compression could not finish this turn. It will retry automatic
 							done: (value: undefined) => void,
 						) => { render: (width: number) => string[]; dispose?: () => void };
 						const component = makeComponent(
-							{ requestRender: () => undefined },
+							{ terminal: { rows: 100 }, requestRender: () => undefined },
 							{ fg: (_name, text) => text, bold: (text) => text },
 							undefined,
 							() => undefined,
@@ -948,9 +948,12 @@ Warning: History compression could not finish this turn. It will retry automatic
 				{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
 				sessionId,
 			);
-			const view = buildStatusView(statusViewSourceFromPiDetail(detail), {
-				version: "0.0.0",
-			});
+			const view = buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "0.0.0",
+				},
+			);
 			const lines = renderPiStatusOverlay(detail, plainTheme(), 74);
 
 			// Section titles appear in the model's order, and every row label the
@@ -1002,9 +1005,12 @@ Warning: History compression could not finish this turn. It will retry automatic
 		try {
 			const innerWidth = 96;
 			const lines = renderPiStatusOverlay(detail, plainTheme(), innerWidth);
-			const view = buildStatusView(statusViewSourceFromPiDetail(detail), {
-				version: "0.0.0",
-			});
+			const view = buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "0.0.0",
+				},
+			);
 			// The shared model decides the layout and sizes each column from its own
 			// widest section, so a value never wraps inside its column.
 			const layout = statusColumnsFor(view.sections, innerWidth);
@@ -1065,9 +1071,12 @@ Warning: History compression could not finish this turn. It will retry automatic
 		try {
 			const innerWidth = 60;
 			const lines = renderPiStatusOverlay(detail, plainTheme(), innerWidth);
-			const view = buildStatusView(statusViewSourceFromPiDetail(detail), {
-				version: "0.0.0",
-			});
+			const view = buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "0.0.0",
+				},
+			);
 
 			// Walk the sections in model order: each title is alone on its own
 			// line, followed by its rows, each padded to the full inner width.
@@ -1178,10 +1187,34 @@ it("Pi status includes config generation and last reload warning", () => {
 			"Config reload failed /tmp/magic-context.jsonc: malformed",
 		);
 		expect(
-			buildStatusView(statusViewSourceFromPiDetail(detail), {
-				version: "test",
-			}).sections.some((section) => section.title === "Config"),
+			buildStatusViewFor(
+				checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
+				{
+					version: "test",
+				},
+			).sections.some((section) => section.title === "Config"),
 		).toBe(true);
+	} finally {
+		closeQuietly(db);
+	}
+});
+
+it("a Pi snapshot the status model cannot draw renders the unavailable view instead of throwing", () => {
+	const db = createTestDb();
+	try {
+		const detail = buildPiStatusDetail(
+			{ getAllTools: () => [] } as never,
+			fakeContext("ses-status-malformed") as never,
+			{ db, projectIdentity: resolveProjectIdentity(process.cwd()) },
+			"ses-status-malformed",
+		);
+		// The shared model formats usagePercentage with toFixed; a snapshot
+		// without it used to throw out of the overlay's render.
+		const broken = { ...detail, usagePercentage: undefined } as never;
+		const text = renderPiStatusOverlay(broken, plainTheme(), 74).join("\n");
+		expect(text).toContain("Status unavailable");
+		expect(text).toContain("incomplete status data");
+		expect(text).toContain("usagePercentage");
 	} finally {
 		closeQuietly(db);
 	}

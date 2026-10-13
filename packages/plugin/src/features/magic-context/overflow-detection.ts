@@ -90,6 +90,12 @@ const LIMIT_EXTRACTION_PATTERNS: ReadonlyArray<LimitExtractionPattern> = [
         pattern: />\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b/i,
         provenance: "prompt_only",
     }, // Anthropic reports the accepted input ceiling, not input plus output.
+    // Gemini puts both numbers in parentheses: "input token count (N) exceeds the
+    // maximum number of tokens allowed (M)". M is the input ceiling.
+    {
+        pattern: /maximum number of tokens allowed\s*\(?\s*(\d+)/i,
+        provenance: "prompt_only",
+    }, // Google Gemini
     { pattern: /prepared prompt exceeds engine max_context\s+(\d+)/i, provenance: "unknown" }, // This format reports the engine's max_context limit after the message.
     { pattern: /prompt exceeds (?:the )?.{0,32}\bmax_context\s+(\d+)/i, provenance: "unknown" }, // Other local engines
     { pattern: /max(?:imum)?.*context.*?(\d+)/i, provenance: "unknown" }, // generic fallback
@@ -224,27 +230,62 @@ export function detectThinkingBindingMismatch(error: unknown): ThinkingBindingMi
     };
 }
 
-/**
- * True for the models whose signed thinking blocks Anthropic binds to the
- * request prefix: Claude Fable 5.1 and Claude Opus 5.5. Accounts created on or
- * after 2026-08-31 get a 400 on these models when anything before a replayed
- * thinking block changed. Only the first-party `anthropic` provider is covered;
- * Bedrock and Vertex enforce the same rule but are not handled here.
- */
-export function isPrefixBoundThinkingModel(
-    providerID: string | null | undefined,
-    modelID: string | null | undefined,
-): boolean {
-    if (providerID?.toLowerCase() !== "anthropic" || !modelID) return false;
+/** Distinct from prefix binding: the provider rejected edits to its active turn. */
+export function detectLatestTurnThinkingMismatch(error: unknown): boolean {
+    const status = extractExplicitHttpStatus(error);
     return (
-        isFable51ThinkingBindingModel(providerID, modelID) ||
-        /(?:^|[-_.])opus[-_.]?5[-_.]5(?:$|[-_.])/i.test(modelID)
+        (status === undefined || status === 400) &&
+        /(?:thinking|redacted_thinking)[\s\S]*latest assistant (?:message|turn)[\s\S]*cannot be modified/i.test(
+            extractErrorMessage(error),
+        )
     );
 }
 
 /**
+ * Claude models whose signed thinking blocks Anthropic binds to the request
+ * prefix, as `[family, major, minor]`. The source of truth is Anthropic's
+ * preserved-thinking page
+ * (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking,
+ * "Keeping the prefix unchanged"); add a row when it names a new model.
+ */
+export const PREFIX_BOUND_THINKING_MODELS: ReadonlyArray<readonly [string, number, number]> = [
+    ["fable", 5, 1],
+    ["opus", 5, 5],
+    ["sonnet", 5, 5],
+    ["haiku", 5, 5],
+];
+
+// One pattern built from the list: the family, then the version with `-`, `_`
+// or `.` between parts, bounded so `sonnet-5-50` or `notsonnet-5-5` never match.
+// The trailing boundary also accepts Vertex `@date` and Bedrock `:0` suffixes.
+const PREFIX_BOUND_THINKING_PATTERN = new RegExp(
+    `(?:^|[-_.:/])(?:${PREFIX_BOUND_THINKING_MODELS.map(
+        ([family, major, minor]) => `${family}[-_.]?${major}[-_.]${minor}`,
+    ).join("|")})(?:$|[-_.:/@])`,
+    "i",
+);
+
+/**
+ * True for a model in PREFIX_BOUND_THINKING_MODELS on any route. Accounts
+ * created on or after 2026-08-31 enforce the binding on the Claude API, Vertex
+ * and Bedrock, so the provider is deliberately ignored. Proactive stripping
+ * runs only when a pass already rebuilds the cached prefix: a false positive
+ * costs reasoning on those passes, a false negative risks a binding 400.
+ */
+export function isPrefixBoundThinkingModel(
+    _providerID: string | null | undefined,
+    modelID: string | null | undefined,
+): boolean {
+    if (!modelID) return false;
+    return PREFIX_BOUND_THINKING_PATTERN.test(modelID);
+}
+
+/**
  * True only for canonical Anthropic Fable 5.1 model identifiers. Binding
- * recovery uses isPrefixBoundThinkingModel instead, which also covers Opus 5.5.
+ * recovery uses isPrefixBoundThinkingModel instead, which also covers Opus 5.5,
+ * Sonnet 5.5 and cloud routes. The variant-cache policy uses this narrower
+ * check to recognize Fable 5.1, whose cached prefix survives effort changes;
+ * that measured cache behavior is separate from prefix binding.
  */
 export function isFable51ThinkingBindingModel(
     providerID: string | null | undefined,
@@ -302,7 +343,7 @@ export function parseReportedInputTokens(message: string): number | undefined {
     if (!message) return undefined;
     const patterns = [
         /prompt is too long:\s*(\d+)/i,
-        /input token count\s*(\d+)/i,
+        /input token count\s*\(?\s*(\d+)/i,
         /input length\s*(\d+)/i,
         /prompt was\s*(\d+)/i,
         /messages resulted in\s*(\d+)\s*tokens?/i,

@@ -1,8 +1,10 @@
+import { promptAsyncAndWaitForIdle } from "../../shared/prompt-async-transport";
 import { drainNotifications } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
@@ -99,7 +101,7 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -200,6 +202,55 @@ function providersClient(limit: number, prompt?: ReturnType<typeof mock>) {
     };
 }
 
+describe("provider-measured proven floor", () => {
+    it("keeps accepted 757872 and 1328370 inputs unscaled and excludes failed usage", async () => {
+        useTempDataHome("context-event-measured-floor-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        const sessionID = "ses-measured-floor";
+        for (const [ordinal, input] of [757_872, 1_328_370].entries()) {
+            await handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id: `measured-${ordinal}`,
+                            role: "assistant",
+                            sessionID,
+                            providerID: "cursor",
+                            modelID: "grok-4.7",
+                            finish: "stop",
+                            tokens: { input, cache: { read: 0, write: 0 } },
+                        },
+                    },
+                },
+            });
+            const meta = getOrCreateSessionMeta(deps.db, sessionID);
+            expect(meta.observedSafeInputTokens).toBe(input);
+            expect(meta.lastUsageContextLimit).toBe(input);
+            expect(meta.lastContextPercentage).toBe(100);
+        }
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "measured-2",
+                        role: "assistant",
+                        sessionID,
+                        providerID: "cursor",
+                        modelID: "grok-4.7",
+                        finish: "error",
+                        error: { message: "quota exhausted" },
+                        tokens: { input: 8_732_692, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+        expect(getOrCreateSessionMeta(deps.db, sessionID).observedSafeInputTokens).toBe(1_328_370);
+    });
+});
+
 // Captured 400 body for Claude Fable 5.1 and Claude Opus 5.5 (identical on both),
 // from docs/reports/anthropic-thinking-binding.md section 2.
 const LIVE_BINDING_400_BODY = {
@@ -213,6 +264,39 @@ const LIVE_BINDING_400_BODY = {
 };
 
 describe("createEventHandler", () => {
+    for (const [providerID, modelID] of [
+        ["google-vertex-anthropic", "claude-sonnet-5-5@20260930"],
+        ["amazon-bedrock", "anthropic.claude-opus-5-5-v1:0"],
+        ["vertex-eu-anthropic", "claude-fable-5-1"],
+    ]) {
+        it(`arms binding recovery via ${providerID}/${modelID}`, async () => {
+            useTempDataHome("context-event-cloud-binding-");
+            const deps = createDeps(new Map());
+            const handler = createEventHandler(deps);
+            await handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id: "failed-shell",
+                            role: "assistant",
+                            sessionID: "ses-cloud-binding",
+                            providerID,
+                            modelID,
+                            error: {
+                                status: 400,
+                                data: { message: JSON.stringify(LIVE_BINDING_400_BODY) },
+                            },
+                        },
+                    },
+                },
+            });
+            expect(getThinkingBindingRecoveryTarget(deps.db, "ses-cloud-binding")).toBe(
+                "all_reasoning_bearing_assistants",
+            );
+        });
+    }
+
     it("observes both user and assistant message events without a transform pass", async () => {
         useTempDataHome("context-event-activity-");
         const deps = createDeps(new Map());
@@ -615,7 +699,7 @@ describe("createEventHandler", () => {
     it("binds host-created children without a transform and does not bind directoryless events", async () => {
         useTempDataHome("context-event-binding-");
         const handler = createEventHandler(createDeps(new Map()));
-        const directory = mkdtempSync(join(tmpdir(), "context-child-project-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "context-child-project-"));
         tempDirs.push(directory);
         for (const [id, parentID] of [
             ["ses-parent", ""],
@@ -1150,6 +1234,85 @@ describe("createEventHandler", () => {
         });
 
         expect(getOrCreateSessionMeta(openDatabase(), "ses-idle").lastResponseTime).toBe(5_000);
+    });
+
+    it("expires once after switching to usage-less completed replies, but not on shells or failures", async () => {
+        useTempDataHome("context-event-no-usage-completion-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        const sessionID = "ses-no-usage-switch";
+        const now = Date.now();
+        const previous = now - 2 * 3_600_000;
+        const emit = (info: Record<string, unknown>) =>
+            handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            sessionID,
+                            providerID: "test-provider",
+                            modelID: "usage-less",
+                            ...info,
+                        },
+                    },
+                },
+            });
+        await emit({
+            id: "msg_01",
+            modelID: "usage-bearing",
+            finish: "stop",
+            time: { completed: previous },
+            tokens: { input: 1_000 },
+        });
+        // Age the persisted response clock, as a resumed session's idle gap would.
+        updateSessionMeta(deps.db, sessionID, { cacheTtl: "1h", lastResponseTime: previous });
+        deps.contextUsageMap.clear();
+        for (const info of [
+            { id: "msg_02", tokens: { input: 0 }, time: { created: now } },
+            {
+                id: "msg_03",
+                finish: "error",
+                time: { completed: now },
+                error: { name: "APIError" },
+            },
+            {
+                id: "msg_04",
+                finish: "stop",
+                time: { completed: now },
+                error: { name: "MessageAbortedError" },
+            },
+        ])
+            await emit(info);
+        const scheduler = createScheduler({ executeThresholdPercentage: 90 });
+        const usage = { inputTokens: 1_000, percentage: 1 };
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(previous);
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now),
+        ).toBe("execute");
+        await emit({ id: "msg_05", finish: "stop", time: { completed: now } });
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(now);
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastInputTokens).toBe(1_000);
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now + 1_000),
+        ).toBe("defer");
+        await emit({
+            id: "msg_06",
+            finish: "stop",
+            time: { completed: now + 2_000 },
+            tokens: { input: 0 },
+        });
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now + 3_000),
+        ).toBe("defer");
+        await emit({
+            id: "msg_01",
+            modelID: "usage-bearing",
+            finish: "stop",
+            time: { completed: previous },
+            tokens: { input: 1_000 },
+        });
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(now + 2_000);
     });
 
     it("ignores tokenless assistant updates when no prior usage exists", async () => {
@@ -2405,4 +2568,39 @@ describe("createEventHandler — usage is recorded before the model-limit refres
         expect(contextUsageMap.get(SESSION)?.usage.inputTokens).toBe(95_000);
         expect(getOrCreateSessionMeta(deps.db, SESSION).lastInputTokens).toBe(95_000);
     });
+});
+
+it("forwards an early dreamer model error into its active asynchronous wait", async () => {
+    useTempDataHome("context-dreamer-provider-error-");
+    const handler = createEventHandler(createDeps(new Map()));
+    const message =
+        "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4-flash";
+    const client = {
+        session: {
+            messages: async () => ({ data: [] }),
+            status: async () => ({ data: {} }),
+            promptAsync: async () => {
+                await handler({
+                    event: {
+                        type: "session.error",
+                        properties: {
+                            sessionID: "ses-dreamer-error",
+                            error: { name: "APIError", data: { statusCode: 400, message } },
+                        },
+                    },
+                });
+                return {};
+            },
+        },
+    } as never;
+    await expect(
+        promptAsyncAndWaitForIdle(
+            client,
+            {
+                path: { id: "ses-dreamer-error" },
+                body: { parts: [{ type: "text", text: "map" }] },
+            },
+            { pollIntervalMs: 1, startGraceMs: 20 },
+        ),
+    ).rejects.toThrow(`${message} (status=400)`);
 });

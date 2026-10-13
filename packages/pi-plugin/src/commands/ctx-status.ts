@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import type { MagicContextConfig } from "@magic-context/core/config/schema/magic-context";
 import type { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -20,7 +23,9 @@ import { createCtxStatusSender, resolveSessionId } from "./pi-command-utils";
 export interface RegisterCtxStatusDeps {
 	db: ContextDatabase;
 	projectIdentity: string;
-	resolveStatusDeps?: (ctx: { cwd: string }) => CtxStatusRuntimeDeps;
+	resolveStatusDeps?: (
+		ctx: Pick<ExtensionCommandContext, "cwd" | "sessionManager">,
+	) => CtxStatusRuntimeDeps;
 	resolveProject?: (ctx: { cwd: string }) => {
 		projectDir: string;
 		projectIdentity: string;
@@ -48,6 +53,7 @@ export interface RegisterCtxStatusDeps {
 	configParseFailures?: ConfigParseFailure[];
 	hasDeprecatedProtectedTags?: boolean;
 	compactionEnabled?: boolean;
+	smartNotesEnabled?: boolean;
 }
 
 export type CtxStatusRuntimeDeps = Omit<
@@ -62,7 +68,6 @@ export interface CtxStatusDetails {
 	droppedTags: number;
 	totalBytes: number;
 	pendingOps: number;
-	lastExecuteThreshold: number;
 	compartmentCount: number;
 	lastCompartmentRange: string | null;
 	memoryCount: number;
@@ -75,7 +80,7 @@ export interface CtxStatusDetails {
 		backlog?: ReturnType<typeof getDreamTaskBacklogs>;
 	};
 	historian: {
-		lastFireCount: number;
+		runs: number;
 		inProgress: boolean;
 		lastFailureAt: number | null;
 		lastError: string | null;
@@ -169,14 +174,13 @@ function buildStatusDetails(
 		droppedTags: status.droppedTags,
 		totalBytes: status.activeBytes,
 		pendingOps: status.pendingOpsCount,
-		lastExecuteThreshold: status.timesExecuteThresholdReached,
 		compartmentCount: status.compartmentCount,
 		lastCompartmentRange: status.lastCompartmentRange,
 		memoryCount: status.memoryCount,
 		noteCount: status.sessionNoteCount + status.readySmartNoteCount,
 		dreamer: status.dreamer,
 		historian: {
-			lastFireCount: status.timesExecuteThresholdReached,
+			runs: status.historianRuns,
 			inProgress: status.historianRunning,
 			lastFailureAt: status.historianLastFailureAt,
 			lastError: status.historianLastError,

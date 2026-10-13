@@ -7,7 +7,7 @@ import {
 	setSystemTime,
 	spyOn,
 } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -18,6 +18,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
 	__test as contextHandlerInternals,
@@ -75,7 +76,7 @@ function setup(
 			logs.push(parts.map(String).join(" "));
 		},
 	);
-	const root = mkdtempSync(join(tmpdir(), "mc-idle-ttl-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-idle-ttl-"));
 	const db = createTestDb();
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, {
@@ -227,7 +228,7 @@ describe("Pi idle past the cache TTL applies queued drops (issue 545)", () => {
 		}
 	});
 
-	it("advances last_response_time only for an assistant message that carries provider usage", async () => {
+	it("advances last_response_time for served assistants, never user/tool/error events", async () => {
 		const sessionId = "ses-545-stamp";
 		const ctx = setup(sessionId);
 		try {
@@ -265,6 +266,58 @@ describe("Pi idle past the cache TTL applies queued drops (issue 545)", () => {
 			);
 			expect(getOrCreateSessionMeta(ctx.db, sessionId).lastResponseTime).toBe(
 				T0 + 41 * MINUTE,
+			);
+		} finally {
+			ctx.cleanup();
+		}
+	});
+
+	it("expires once after a switch to usage-less completed replies, never on aborted replies", async () => {
+		const sessionId = "ses-pi-no-usage-switch";
+		const ctx = setup(sessionId);
+		try {
+			await turnBeforePause(ctx, sessionId);
+			setSystemTime(new Date(T0 + 102 * MINUTE));
+			await ctx.messageEnd(
+				assistantMessage("", 3, {
+					stopReason: "aborted",
+					errorMessage: "Request was aborted",
+				}),
+			);
+			expect(getOrCreateSessionMeta(ctx.db, sessionId).lastResponseTime).toBe(
+				T0,
+			);
+			await ctx.runPass([user1, assistant1, userMessage("new model", 4)], 20);
+			await ctx.messageEnd(
+				assistantMessage("usage-less answer", 5, {
+					provider: MODEL.provider,
+					model: "usage-less",
+					stopReason: "stop",
+					usage: {},
+				}),
+			);
+			expect(getOrCreateSessionMeta(ctx.db, sessionId).lastResponseTime).toBe(
+				T0 + 102 * MINUTE,
+			);
+			ctx.logs.length = 0;
+			setSystemTime(new Date(T0 + 103 * MINUTE));
+			await ctx.runPass([user1, assistant1, userMessage("warm", 6)], 20);
+			expect(ctx.logs.some((line) => line.includes("decision=defer"))).toBe(
+				true,
+			);
+			await ctx.messageEnd(
+				assistantMessage("still usage-less", 7, {
+					provider: MODEL.provider,
+					model: "usage-less",
+					stopReason: "stop",
+					usage: {},
+				}),
+			);
+			ctx.logs.length = 0;
+			setSystemTime(new Date(T0 + 104 * MINUTE));
+			await ctx.runPass([user1, assistant1, userMessage("warm again", 8)], 20);
+			expect(ctx.logs.some((line) => line.includes("decision=defer"))).toBe(
+				true,
 			);
 		} finally {
 			ctx.cleanup();

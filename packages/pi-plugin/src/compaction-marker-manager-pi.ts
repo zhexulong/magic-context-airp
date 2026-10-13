@@ -1,15 +1,26 @@
-import { getCompartmentsByEndMessageId } from "@magic-context/core/features/magic-context/compartment-storage";
+import {
+	getCompartmentsByEndMessageId,
+	getUncoveredCompartmentEndThrough,
+} from "@magic-context/core/features/magic-context/compartment-storage";
 import type { PendingPiCompactionMarker } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { findFirstKeptEntryId } from "./pi-historian-runner";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
 
 export type PiMarkerUpdateOutcome =
 	| { kind: "applied"; firstKeptEntryId: string; compactionId: string }
 	| { kind: "already-current"; firstKeptEntryId: string; compactionId: string }
 	| {
 			kind: "stale-skip";
-			reason: "compartment-removed" | "target-superseded" | "entry-removed";
+			reason:
+				| "compartment-removed"
+				| "target-superseded"
+				| "entry-removed"
+				| "partial-message-boundary";
 	  }
 	| { kind: "waiting-for-entry" }
 	| { kind: "retryable-failure"; error: Error };
@@ -50,10 +61,38 @@ export function applyDeferredPiCompactionMarker(
 			return { kind: "stale-skip", reason: "target-superseded" };
 		}
 
+		// Pi keeps the first entry after the summarized range, not OpenCode's
+		// earlier user turn. A summary ending within a message could hide its
+		// remaining parts. Require the next summary to continue it at a later block
+		// or start at the next message ordinal, even if publication already chose
+		// which entry to keep.
+		if (
+			getUncoveredCompartmentEndThrough(deps.db, sessionId, pending.ordinal)
+		) {
+			return { kind: "stale-skip", reason: "partial-message-boundary" };
+		}
+
 		const branchEntries = deps.readBranchEntries();
-		const firstKeptEntryId =
-			pending.firstKeptEntryId ??
-			findFirstKeptEntryId(branchEntries, pending.ordinal);
+		let firstKeptEntryId: string | null | undefined = pending.firstKeptEntryId;
+		if (!firstKeptEntryId) {
+			// The pending ordinal is a stored coordinate. Place it on this branch
+			// the same way every raw reader does, and keep the marker waiting while
+			// the stored coordinates cannot be placed at all: trimming the branch
+			// at a guessed position could hide content no summary covers.
+			const alignment = resolvePiOrdinalAlignment(
+				deps.db,
+				sessionId,
+				branchEntries,
+			);
+			if (isPiOrdinalAlignmentUnanchored(alignment)) {
+				return { kind: "waiting-for-entry" };
+			}
+			firstKeptEntryId = findFirstKeptEntryId(
+				branchEntries,
+				pending.ordinal,
+				alignment.offset,
+			);
+		}
 		if (!firstKeptEntryId) {
 			sessionLog(
 				sessionId,

@@ -11,6 +11,7 @@
 //! frame   := [len u32 LE][ver u8][seq u64 LE][fence u64 LE][digest 32][payload: len bytes]
 //! record  := ver 1, seq >= 1, payload = one record as JSON
 //! lineage := ver 2, seq 0, fence 0, payload = 16 opaque identity bytes
+//! gated   := ver 3, seq >= 1, payload = {"requires": [feature names], "record": record}
 //! digest  := SHA-256 over (ver ‖ seq LE ‖ fence LE ‖ payload)
 //! ```
 //!
@@ -21,8 +22,10 @@
 //! - a short final frame, or a complete final frame that fails its digest or
 //!   JSON decode, is a torn tail (Broca is mid-append): stop before it, and
 //!   look again on the next poll;
-//! - a bad frame anywhere else, an unknown frame version, or a record
-//!   sequence gap makes the whole file unreadable: nothing is guessed past it,
+//! - unknown features or framing versions stop projection at that frame and
+//!   retain the verified prefix with a compatibility note; nothing is skipped;
+//! - a bad frame anywhere else or a record sequence gap makes the whole file
+//!   unreadable: nothing is guessed past it,
 //!   and the caller falls back to `run-index.db` run totals;
 //! - lineage frames recur anywhere in a file and are verified then skipped;
 //! - record types this reader does not use are skipped (Broca keeps adding
@@ -40,12 +43,35 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 const HEADER_LEN: usize = 4 + 1 + 8 + 8 + 32;
 const RECORD_VERSION: u8 = 1;
 const LINEAGE_VERSION: u8 = 2;
+const GATED_VERSION: u8 = 3;
+/// Broca's own table (`KNOWN_FEATURES` in broca-wal's framing.rs). A name
+/// missing here stops the session at the first frame that requires it: a
+/// missing `restart-pause/v1` cut every mason run Broca paused for a daemon
+/// restart at the pause, hiding every step after the resume. Each name below
+/// only adds a field or a record type this reader does not use.
+const KNOWN_FEATURES: &[&str] = &[
+    "flow-scopes/v1",
+    "plan-manifest/v1",
+    "restart-pause/v1",
+    "scope/v1",
+    "steer-queue/v1",
+    "archive-index/v2",
+    "dispatch-module/v1",
+];
+
+#[derive(serde::Deserialize)]
+struct GatedRequires {
+    requires: Vec<String>,
+    #[allow(dead_code)]
+    record: serde::de::IgnoredAny,
+}
 const LINEAGE_PAYLOAD_LEN: usize = 16;
 const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
 
@@ -60,6 +86,11 @@ const MAX_ARCHIVED_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 /// Live files whose read position is remembered. Past this the memory is
 /// dropped and files are re-read from the start when next asked for.
 const MAX_REMEMBERED_FILES: usize = 512;
+
+/// Decoded archived members kept in memory. Each holds a session's whole run
+/// history, so fewer are kept than live cursors; past this they are dropped
+/// and re-read from their container when next asked for.
+const MAX_REMEMBERED_ARCHIVED: usize = 64;
 
 const ARCHIVE_MEMBER_PREFIX: &[u8; 8] = b"WALM\x01\x00\x00\x00";
 const ARCHIVE_TRAILER_MAGIC: &[u8; 4] = b"WALK";
@@ -139,6 +170,10 @@ pub(crate) struct WalRun {
     pub ts_ms: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The context window the run was admitted with
+    /// (`run_started.config.context_limit`: the caller's override, else the
+    /// catalog's window for the model), frozen for the whole run.
+    pub context_limit: Option<i64>,
     pub steps: Vec<WalStep>,
     /// True once the run's `run_finished` record has been read.
     pub finished: bool,
@@ -146,11 +181,34 @@ pub(crate) struct WalRun {
 
 /// The session's runs as far as its WAL has been read, or `None` when the WAL
 /// is missing, unreadable, or corrupt and the caller must use run totals.
-pub(crate) fn session_runs(state_root: &Path, identity: &SessionIdentity) -> Option<Vec<WalRun>> {
+pub(crate) fn session_runs(
+    state_root: &Path,
+    identity: &SessionIdentity,
+) -> Option<(Vec<WalRun>, Option<String>)> {
+    session_snapshot(state_root, identity).map(|fold| (fold.runs, fold.activity_note))
+}
+
+/// The session's compatibility note as of the last time its WAL was read in
+/// this process, without reading it now. The Cache tab's session list calls
+/// this for every listed Broca session on every poll; decoding each of those
+/// WALs (and archived ones out of their containers) just for the note cost far
+/// more than the list. A session's WAL is read when its events are fetched,
+/// which the tab does for the sessions it shows, so their notes appear by the
+/// next poll.
+pub(crate) fn session_activity_note(identity: &SessionIdentity) -> Option<String> {
+    shared_cache().lock().ok()?.known_note(identity)
+}
+
+fn shared_cache() -> &'static Mutex<WalCache> {
     static CACHE: OnceLock<Mutex<WalCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(WalCache::default()));
-    let mut cache = cache.lock().ok()?;
-    cache.session_runs(state_root, identity)
+    CACHE.get_or_init(|| Mutex::new(WalCache::default()))
+}
+
+fn session_snapshot(state_root: &Path, identity: &SessionIdentity) -> Option<Fold> {
+    shared_cache()
+        .lock()
+        .ok()?
+        .session_snapshot(state_root, identity)
 }
 
 // ── Frame decoding ─────────────────────────────────────────────────────────
@@ -173,7 +231,9 @@ enum Corruption {
 }
 
 enum Next<'a> {
+    NewerWriter(String),
     Record {
+        gated: bool,
         seq: u64,
         payload: &'a [u8],
         consumed: usize,
@@ -197,10 +257,8 @@ fn decode_next(buf: &[u8]) -> Next<'_> {
     let version = buf[4];
     let seq = u64::from_le_bytes(buf[5..13].try_into().expect("8 bytes"));
     let fence = u64::from_le_bytes(buf[13..21].try_into().expect("8 bytes"));
-    if version != RECORD_VERSION && version != LINEAGE_VERSION {
-        return Next::Corrupt(Corruption::Other(format!(
-            "unsupported frame version {version}"
-        )));
+    if version != RECORD_VERSION && version != LINEAGE_VERSION && version != GATED_VERSION {
+        return Next::NewerWriter(format!("frame version {version}"));
     }
     if len > MAX_PAYLOAD_LEN {
         return Next::Corrupt(Corruption::Other(format!(
@@ -224,6 +282,7 @@ fn decode_next(buf: &[u8]) -> Next<'_> {
         return Next::Lineage { consumed: total };
     }
     Next::Record {
+        gated: version == GATED_VERSION,
         seq,
         payload,
         consumed: total,
@@ -237,9 +296,12 @@ enum ScanStop {
     End,
     /// The buffer ends inside a frame but the file continues; read at least
     /// `needed` bytes from the stop point to decode it.
-    NeedMore { needed: usize },
+    NeedMore {
+        needed: usize,
+    },
     /// The file ends in a torn frame, left for a later poll.
     TornTail,
+    NewerWriter(String),
 }
 
 /// Decodes frames from `buf` into `fold`, returning how many bytes were
@@ -276,14 +338,34 @@ fn scan(
             Next::Corrupt(Corruption::Other(reason)) => {
                 return Err(format!("{reason} at byte {pos}"));
             }
+            Next::NewerWriter(reason) => return Ok((pos, ScanStop::NewerWriter(reason))),
             Next::Lineage { consumed } => pos += consumed,
             Next::Record {
+                gated,
                 seq,
                 payload,
                 consumed,
             } => {
                 if seq != *expected_seq {
                     return Err(format!("expected sequence {expected_seq}, found {seq}"));
+                }
+                if gated {
+                    let requires = match serde_json::from_slice::<GatedRequires>(payload) {
+                        Ok(envelope) => envelope.requires,
+                        Err(_) if at_eof && pos + consumed == buf.len() => {
+                            return Ok((pos, ScanStop::TornTail));
+                        }
+                        Err(error) => return Err(format!("frame {seq}: {error}")),
+                    };
+                    let mut missing: Vec<_> = requires
+                        .into_iter()
+                        .filter(|name| !KNOWN_FEATURES.contains(&name.as_str()))
+                        .collect();
+                    missing.sort_unstable();
+                    missing.dedup();
+                    if !missing.is_empty() {
+                        return Ok((pos, ScanStop::NewerWriter(missing.join(", "))));
+                    }
                 }
                 let envelope = match serde_json::from_slice::<Value>(payload) {
                     Ok(value) => value,
@@ -317,7 +399,10 @@ fn open_envelope(envelope: &Value) -> Result<(Option<i64>, &Map<String, Value>),
     let object = envelope
         .as_object()
         .ok_or_else(|| "payload is not an object".to_owned())?;
-    let ts_ms = match object.get("ts_ms") {
+    let ts_ms = match object
+        .get("ts_ms")
+        .or_else(|| object.get("record").and_then(|r| r.get("ts_ms")))
+    {
         None | Some(Value::Null) => None,
         Some(value) => {
             Some(non_negative_int(value).ok_or_else(|| format!("invalid ts_ms {value}"))?)
@@ -366,6 +451,8 @@ struct Fold {
     runs: Vec<WalRun>,
     step_started_ts: HashMap<u64, i64>,
     attempt_ts: HashMap<u64, i64>,
+    last_ts_ms: Option<i64>,
+    activity_note: Option<String>,
 }
 
 impl Fold {
@@ -374,6 +461,9 @@ impl Fold {
         envelope_ts: Option<i64>,
         record: &Map<String, Value>,
     ) -> Result<(), String> {
+        if let Some(ts) = envelope_ts {
+            self.last_ts_ms = Some(ts);
+        }
         let kind = record
             .get("type")
             .and_then(Value::as_str)
@@ -391,6 +481,11 @@ impl Fold {
             let model_id = model.and_then(|model| {
                 string_field(model, "model_id").or_else(|| string_field(model, "model"))
             });
+            let context_limit = record
+                .get("config")
+                .and_then(|config| config.get("context_limit"))
+                .and_then(non_negative_int)
+                .filter(|limit| *limit > 0);
             self.step_started_ts.clear();
             self.attempt_ts.clear();
             self.runs.push(WalRun {
@@ -398,6 +493,7 @@ impl Fold {
                 ts_ms: envelope_ts,
                 provider,
                 model: model_id,
+                context_limit,
                 steps: Vec::new(),
                 finished: false,
             });
@@ -468,8 +564,13 @@ struct WalCursor {
     expected_seq: u64,
     fold: Fold,
     /// Set once the file proved unreadable; it stays unreadable until it
-    /// shrinks (Broca rewrote it), since corruption does not heal.
+    /// shrinks or is replaced (Broca rewrote it), since corruption does not
+    /// heal.
     failed: Option<String>,
+    /// The (device, inode) of the file this cursor read, when known. A
+    /// different file at the same path (replaced, not appended to) is read
+    /// again from the start even when it is not shorter.
+    file_key: Option<(u64, u64)>,
 }
 
 impl Default for WalCursor {
@@ -480,6 +581,7 @@ impl Default for WalCursor {
             expected_seq: 1,
             fold: Fold::default(),
             failed: None,
+            file_key: None,
         }
     }
 }
@@ -489,9 +591,16 @@ impl WalCursor {
     /// (or one frame, when a single frame is bigger).
     fn advance<R: Read + Seek>(&mut self, reader: &mut R, len: u64, budget: usize) {
         if len < self.offset {
-            *self = Self::default();
+            *self = Self {
+                file_key: self.file_key,
+                ..Self::default()
+            };
         }
-        if self.failed.is_some() || len == self.offset || len == self.seen_len {
+        if self.failed.is_some()
+            || self.fold.activity_note.is_some()
+            || len == self.offset
+            || len == self.seen_len
+        {
             return;
         }
         let available = len - self.offset;
@@ -516,6 +625,20 @@ impl WalCursor {
                         ScanStop::NeedMore { needed } if consumed == 0 && needed as u64 > want => {
                             want = available.min(needed as u64);
                         }
+                        ScanStop::NewerWriter(reason) => {
+                            let through = self
+                                .fold
+                                .last_ts_ms
+                                .and_then(chrono::DateTime::from_timestamp_millis)
+                                .map(|time| time.to_rfc3339())
+                                .unwrap_or_else(|| {
+                                    "the beginning of the WAL (no timestamp read)".to_owned()
+                                });
+                            self.fold.activity_note = Some(format!(
+                                "Broca recorded features this dashboard doesn't understand ({reason}); showing data up to {through}."
+                            ));
+                            return;
+                        }
                         _ => return,
                     }
                 }
@@ -528,6 +651,30 @@ impl WalCursor {
     }
 }
 
+/// Bytes this process has read from Broca WAL files and archive containers,
+/// for measuring what a Cache tab refresh costs (`bench_cache_poll`).
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+pub fn bytes_read_total() -> u64 {
+    BYTES_READ.load(Ordering::Relaxed)
+}
+
+/// The (device, inode) pair naming the file behind `metadata`, so a reader can
+/// tell a file replaced at the same path from the one it already read. `None`
+/// where the platform does not expose it; callers then rely on length alone.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 fn read_exact_at<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -536,6 +683,7 @@ fn read_exact_at<R: Read + Seek>(
     reader.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0; len as usize];
     reader.read_exact(&mut buf)?;
+    BYTES_READ.fetch_add(len, Ordering::Relaxed);
     Ok(buf)
 }
 
@@ -585,10 +733,21 @@ fn read_member_header<R: Read + Seek>(
     }
     let address = hex_address(&raw[8..24])?;
     let size = u64::from_le_bytes(raw[24..32].try_into().expect("8 bytes"));
-    if offset + ARCHIVE_MEMBER_HEADER_LEN + size > end {
-        return Err("archive member exceeds container bounds".to_owned());
+    // `size` is file data: checked, so a huge value is refused rather than
+    // overflowing (a panic in debug builds, a wrapped bound check in release).
+    match member_end(offset, size) {
+        Some(member_end) if member_end <= end => {}
+        _ => return Err("archive member exceeds container bounds".to_owned()),
     }
     Ok((address, size, raw[32..64].try_into().expect("32 bytes")))
+}
+
+/// The offset just past a member whose header starts at `offset`, or `None`
+/// when that overflows.
+fn member_end(offset: u64, size: u64) -> Option<u64> {
+    offset
+        .checked_add(ARCHIVE_MEMBER_HEADER_LEN)?
+        .checked_add(size)
 }
 
 /// Parses a container's trailer and index, rebuilding the index from the
@@ -638,7 +797,10 @@ fn read_stored_index<R: Read + Seek>(
         if offset != next_offset || members.contains_key(&address) {
             return Err("invalid archive index coverage".to_owned());
         }
-        next_offset = offset + ARCHIVE_MEMBER_HEADER_LEN + size;
+        next_offset = match member_end(offset, size) {
+            Some(member_end) => member_end,
+            None => return Err("archive index member exceeds bounds".to_owned()),
+        };
         if next_offset > start {
             return Err("archive index member exceeds bounds".to_owned());
         }
@@ -720,44 +882,86 @@ fn fold_stamp(name: &str) -> Option<u64> {
 #[derive(Debug, Default)]
 pub(crate) struct WalCache {
     live: HashMap<PathBuf, WalCursor>,
+    /// Each session's compatibility note from its last read, by address.
+    notes: HashMap<String, Option<String>>,
     containers: HashMap<PathBuf, CachedContainer>,
     /// Decoded archived members by (container, member offset, container length).
-    archived: HashMap<(PathBuf, u64, u64), Result<Vec<WalRun>, String>>,
+    archived: HashMap<(PathBuf, u64, u64), Result<Fold, String>>,
 }
 
 impl WalCache {
+    #[cfg(test)]
     pub(crate) fn session_runs(
         &mut self,
         state_root: &Path,
         identity: &SessionIdentity,
     ) -> Option<Vec<WalRun>> {
+        self.session_snapshot(state_root, identity)
+            .map(|fold| fold.runs)
+    }
+
+    fn known_note(&self, identity: &SessionIdentity) -> Option<String> {
+        self.notes.get(&identity.addr()).cloned().flatten()
+    }
+
+    fn session_snapshot(&mut self, state_root: &Path, identity: &SessionIdentity) -> Option<Fold> {
         let address = identity.addr();
+        let fold = self.read_session(state_root, &address);
+        if self.notes.len() >= MAX_REMEMBERED_FILES && !self.notes.contains_key(&address) {
+            self.notes.clear();
+        }
+        self.notes.insert(
+            address,
+            fold.as_ref().and_then(|fold| fold.activity_note.clone()),
+        );
+        fold
+    }
+
+    fn read_session(&mut self, state_root: &Path, address: &str) -> Option<Fold> {
         let live_path = state_root.join("wal").join(format!("{address}.wal"));
         match File::open(&live_path) {
             Ok(mut file) => {
-                let len = file.metadata().ok()?.len();
+                let metadata = file.metadata().ok()?;
+                let (len, file_key) = (metadata.len(), file_identity(&metadata));
                 if !self.live.contains_key(&live_path) && self.live.len() >= MAX_REMEMBERED_FILES {
                     self.live.clear();
                 }
                 let cursor = self.live.entry(live_path).or_default();
+                if cursor.file_key != file_key {
+                    *cursor = WalCursor {
+                        file_key,
+                        ..WalCursor::default()
+                    };
+                }
                 cursor.advance(&mut file, len, READ_BUDGET_BYTES);
                 if cursor.failed.is_some() {
                     return None;
                 }
-                Some(cursor.fold.runs.clone())
+                Some(cursor.fold.clone())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.live.remove(&live_path);
-                self.archived_runs(&state_root.join("wal-archive"), &address)
+                self.archived_runs(&state_root.join("wal-archive"), address)
             }
             Err(_) => None,
         }
     }
 
+    /// Caches a decoded member. Entries for an older length of the same
+    /// container (it was rewritten) can never be hit again and are dropped.
+    fn remember_archived(&mut self, key: (PathBuf, u64, u64), runs: Result<Fold, String>) {
+        self.archived
+            .retain(|(path, _, len), _| *path != key.0 || *len == key.2);
+        if self.archived.len() >= MAX_REMEMBERED_ARCHIVED {
+            self.archived.clear();
+        }
+        self.archived.insert(key, runs);
+    }
+
     /// The session's runs from the newest container holding it. `None` when
     /// no container holds it, or when a container that might hold a newer
     /// copy cannot be read.
-    fn archived_runs(&mut self, archive_dir: &Path, address: &str) -> Option<Vec<WalRun>> {
+    fn archived_runs(&mut self, archive_dir: &Path, address: &str) -> Option<Fold> {
         let mut containers = Vec::new();
         for entry in std::fs::read_dir(archive_dir).ok()? {
             let path = entry.ok()?.path();
@@ -799,10 +1003,12 @@ impl WalCache {
                 continue;
             };
             let key = (path, member.offset, len);
-            let runs = self.archived.entry(key).or_insert_with(|| {
-                read_archived_member(&mut file, len, address, member).map(|fold| fold.runs)
-            });
-            return runs.clone().ok();
+            if let Some(runs) = self.archived.get(&key) {
+                return runs.clone().ok();
+            }
+            let runs = read_archived_member(&mut file, len, address, member);
+            self.remember_archived(key, runs.clone());
+            return runs.ok();
         }
         None
     }
@@ -1004,6 +1210,99 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn broca_encoder_golden_gated_frames_decode() {
+        let bytes = include_bytes!("../tests/fixtures/broca-gated/frames.wal");
+        let mut fold = Fold::default();
+        let mut seq = 1;
+        assert_eq!(
+            scan(bytes, true, &mut seq, &mut fold).unwrap(),
+            (bytes.len(), ScanStop::End)
+        );
+        assert_eq!(seq, 3);
+        assert!(fold.activity_note.is_none());
+        assert!(matches!(
+            decode_next(bytes),
+            Next::Record {
+                gated: false,
+                seq: 1,
+                ..
+            }
+        ));
+        let first_len = HEADER_LEN + u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert!(matches!(
+            decode_next(&bytes[first_len..]),
+            Next::Record {
+                gated: true,
+                seq: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a copied Broca state root and independently extracted run facts"]
+    fn copied_broca_sessions_match_export_facts() {
+        let root = PathBuf::from(std::env::var("BROCA_WAL_COPY_ROOT").expect("copy root"));
+        let facts: Value =
+            serde_json::from_slice(&std::fs::read(root.join("expected.json")).unwrap()).unwrap();
+        let mut cache = WalCache::default();
+        let sessions = facts.as_array().unwrap();
+        assert!(sessions.len() >= 3);
+        for fact in sessions {
+            let identity = SessionIdentity::from_json(&fact["session"].to_string()).unwrap();
+            assert!(root
+                .join("wal")
+                .join(format!("{}.wal", identity.addr()))
+                .is_file());
+            let fold = cache.session_snapshot(&root, &identity).unwrap();
+            assert!(fold.activity_note.is_none());
+            let mut checked = 0;
+            for expected in fact["runs"].as_array().unwrap() {
+                let run = fold
+                    .runs
+                    .iter()
+                    .find(|run| run.run_id == expected["run_id"].as_str().unwrap())
+                    .unwrap();
+                assert!(!run.steps.is_empty());
+                for (key, count) in [
+                    ("input_tokens", 0),
+                    ("cached_input_tokens", 1),
+                    ("cache_write_tokens", 2),
+                    ("output_tokens", 3),
+                ] {
+                    let sum: i64 = run
+                        .steps
+                        .iter()
+                        .map(|step| {
+                            match count {
+                                0 => step.usage.input_tokens,
+                                1 => step.usage.cached_input_tokens,
+                                2 => step.usage.cache_write_tokens,
+                                _ => step.usage.output_tokens,
+                            }
+                            .unwrap_or(0)
+                        })
+                        .sum();
+                    assert_eq!(
+                        sum,
+                        expected["usage"][key].as_i64().unwrap(),
+                        "{} {} {key}",
+                        identity.addr(),
+                        run.run_id
+                    );
+                }
+                checked += 1;
+            }
+            assert!(checked > 0);
+            println!(
+                "address={} runs={checked} steps={}",
+                identity.addr(),
+                fold.runs.iter().map(|run| run.steps.len()).sum::<usize>()
+            );
+        }
+    }
+
+    #[test]
     fn multi_step_runs_decode_with_usage_model_and_times() {
         let runs = decode(&two_runs().bytes).unwrap();
         assert_eq!(
@@ -1100,16 +1399,114 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unknown_frame_version_makes_the_file_unreadable() {
-        let mut wal = two_runs();
-        wal.bytes.extend(frame(3, 0, 0, b"future"));
-        let error = decode(&wal.bytes).unwrap_err();
-        assert!(error.contains("version 3"), "{error}");
-        // Even with valid frames after it.
+    fn unknown_frame_versions_keep_the_prefix_and_stop_with_a_note() {
+        for version in [4, 9, 255] {
+            let mut wal = two_runs();
+            let stop = wal.bytes.len();
+            wal.bytes.extend(frame(version, wal.seq + 1, 0, b"future"));
+            wal.push(step_finished(2, usage(999, 999, 999, 999)));
+            let mut cursor = WalCursor::default();
+            cursor.advance(
+                &mut std::io::Cursor::new(&wal.bytes),
+                wal.bytes.len() as u64,
+                READ_BUDGET_BYTES,
+            );
+            assert!(cursor.failed.is_none());
+            assert_eq!(cursor.offset, stop as u64);
+            assert_eq!(step_ids(&cursor.fold.runs).len(), 3);
+            let note = cursor.fold.activity_note.as_deref().unwrap();
+            assert!(note.contains(&format!("frame version {version}")), "{note}");
+            assert!(note.contains("1970-01-01T00:00:02.010"), "{note}");
+            wal.push(step_finished(3, usage(999, 999, 999, 999)));
+            cursor.advance(
+                &mut std::io::Cursor::new(&wal.bytes),
+                wal.bytes.len() as u64,
+                READ_BUDGET_BYTES,
+            );
+            assert_eq!(cursor.offset, stop as u64);
+            assert_eq!(step_ids(&cursor.fold.runs).len(), 3);
+        }
+    }
+
+    #[test]
+    fn gated_known_features_decode_usage_and_inner_timestamps() {
         let mut wal = Wal::new();
-        wal.bytes.extend(frame(9, 1, 0, b"{}"));
-        wal.push(run_started("r1", 1));
-        assert!(decode(&wal.bytes).is_err());
+        for record in [
+            run_started("gated", 400),
+            step_finished(1, usage(10, 20, 30, 40)),
+        ] {
+            wal.seq += 1;
+            wal.bytes.extend(frame(
+                3,
+                wal.seq,
+                3,
+                json!({"requires": KNOWN_FEATURES, "record": record})
+                    .to_string()
+                    .as_bytes(),
+            ));
+        }
+        let runs = decode(&wal.bytes).unwrap();
+        assert_eq!(runs[0].ts_ms, Some(400));
+        assert_eq!(
+            runs[0].steps[0].usage,
+            StepUsage {
+                input_tokens: Some(10),
+                cached_input_tokens: Some(20),
+                cache_write_tokens: Some(30),
+                output_tokens: Some(40)
+            }
+        );
+    }
+
+    #[test]
+    fn gated_unknown_features_keep_steps_and_do_not_interpret_the_record() {
+        let mut wal = two_runs();
+        let stop = wal.bytes.len();
+        wal.seq += 1;
+        wal.bytes.extend(frame(
+            3,
+            wal.seq,
+            3,
+            br#"{"requires":["future/v1"],"record":42}"#,
+        ));
+        wal.push(step_finished(2, usage(999, 999, 999, 999)));
+        let mut cursor = WalCursor::default();
+        cursor.advance(
+            &mut std::io::Cursor::new(&wal.bytes),
+            wal.bytes.len() as u64,
+            READ_BUDGET_BYTES,
+        );
+        assert!(cursor.failed.is_none());
+        assert_eq!(cursor.offset, stop as u64);
+        assert_eq!(step_ids(&cursor.fold.runs).len(), 3);
+        let note = cursor.fold.activity_note.unwrap();
+        assert!(note.contains("future/v1"), "{note}");
+        assert!(
+            note.contains("showing data up to 1970-01-01T00:00:02.010"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn gated_frames_preserve_digest_sequence_and_torn_tail_rules() {
+        let original = two_runs();
+        let payload = br#"{"requires":["scope/v1"],"record":{"type":"turn_finished","step_id":1}}"#;
+        let tail = frame(3, original.seq + 1, 3, payload);
+        for cut in [3, HEADER_LEN - 1, tail.len() - 1] {
+            let mut bytes = original.bytes.clone();
+            bytes.extend(&tail[..cut]);
+            assert_eq!(step_ids(&decode(&bytes).unwrap()).len(), 3);
+        }
+        let mut bad = tail.clone();
+        bad[21] ^= 1;
+        let mut bytes = original.bytes.clone();
+        bytes.extend(&bad);
+        assert_eq!(step_ids(&decode(&bytes).unwrap()).len(), 3);
+        bytes.extend(lineage());
+        assert!(decode(&bytes).unwrap_err().contains("digest"));
+        let mut bytes = original.bytes.clone();
+        bytes.extend(frame(3, original.seq + 2, 3, payload));
+        assert!(decode(&bytes).unwrap_err().contains("sequence"));
     }
 
     #[test]
@@ -1234,6 +1631,117 @@ pub(crate) mod tests {
             push(json!({"type": "step_started", "step_id": steps.len() as u64 + 1}));
         }
         bytes
+    }
+
+    /// WAL bytes holding `payloads` in order: a payload with a `requires` key
+    /// is written as a gated (version 3) frame, any other as a plain record.
+    pub(crate) fn wal_bytes(payloads: &[Value]) -> Vec<u8> {
+        let mut bytes = lineage();
+        for (index, payload) in payloads.iter().enumerate() {
+            let version = if payload.get("requires").is_some() {
+                3
+            } else {
+                1
+            };
+            bytes.extend(frame(
+                version,
+                index as u64 + 1,
+                1,
+                payload.to_string().as_bytes(),
+            ));
+        }
+        bytes
+    }
+
+    /// A mason run cut by a daemon restart, shaped like the live one: Broca
+    /// pauses the run in a gated `run_paused` frame (`restart-pause/v1`),
+    /// then resumes the same run id without a new `run_started`, and step ids
+    /// carry on from where they stopped.
+    pub(crate) fn restart_resumed_wal() -> Vec<u8> {
+        let run = "run-sid-restart";
+        wal_bytes(&[
+            json!({"type": "run_started", "run_id": run, "ts_ms": 1_000,
+                   "session": {"project_root": "/work", "harness": "broca", "session": "alfonso:bg_mason"},
+                   "config": {"model": {"provider_module_id": "openai", "model_id": "gpt-6.1-sol"},
+                              "context_limit": 1_050_000},
+                   "input": [], "origin": {"kind": "fresh"}}),
+            step_started(1),
+            attempt(1, 1_100),
+            step_finished(
+                1,
+                json!({"input_tokens": 3_928, "cached_input_tokens": 13_056,
+                                    "cache_write_tokens": 0, "output_tokens": 89}),
+            ),
+            step_started(2),
+            attempt(2, 1_200),
+            step_finished(
+                2,
+                json!({"input_tokens": 260, "cached_input_tokens": 16_896,
+                                    "cache_write_tokens": 0, "output_tokens": 135}),
+            ),
+            json!({"requires": ["restart-pause/v1"],
+                   "record": {"type": "run_paused", "run_id": run, "ts_ms": 1_300, "reason": "restart"}}),
+            json!({"type": "resume_started", "episode": run, "resumed_from_seq": 8,
+                   "replayed": {"messages": 4, "model_steps": 2, "tool_results": 0},
+                   "redone": [], "indeterminate": []}),
+            step_started(3),
+            attempt(3, 2_000),
+            step_finished(
+                3,
+                json!({"input_tokens": 485, "cached_input_tokens": 89_600,
+                                    "cache_write_tokens": 0, "output_tokens": 780}),
+            ),
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 2_100,
+                   "usage": {"input_tokens": 4_673, "cached_input_tokens": 119_552,
+                             "cache_write_tokens": 0, "output_tokens": 1_004}}),
+        ])
+    }
+
+    #[test]
+    fn a_run_resumed_after_a_restart_pause_keeps_every_step() {
+        let mut cursor = WalCursor::default();
+        let bytes = restart_resumed_wal();
+        cursor.advance(
+            &mut std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            bytes.len(),
+        );
+        assert_eq!(cursor.failed, None);
+        assert_eq!(cursor.fold.activity_note, None);
+        let runs = cursor.fold.runs;
+        assert_eq!(
+            step_ids(&runs),
+            [
+                ("run-sid-restart".to_string(), 1),
+                ("run-sid-restart".to_string(), 2),
+                ("run-sid-restart".to_string(), 3)
+            ]
+        );
+        assert!(runs[0].finished);
+    }
+
+    /// Every feature name Broca 0.3.189 writes (`KNOWN_FEATURES` in
+    /// broca-wal's framing.rs), spelled out rather than taken from this
+    /// reader's own list, so a name Broca adds and this reader lacks shows up
+    /// here instead of silently truncating sessions.
+    #[test]
+    fn every_feature_broca_writes_is_understood() {
+        for feature in [
+            "flow-scopes/v1",
+            "plan-manifest/v1",
+            "restart-pause/v1",
+            "scope/v1",
+            "steer-queue/v1",
+            "archive-index/v2",
+            "dispatch-module/v1",
+        ] {
+            let bytes = wal_bytes(&[
+                json!({"requires": [feature], "record": run_started("r1", 1)}),
+                step_finished(1, usage(1, 2, 3, 4)),
+            ]);
+            let runs = decode(&bytes).unwrap_or_else(|e| panic!("{feature}: {e}"));
+            assert_eq!(step_ids(&runs), [("r1".to_string(), 1)], "{feature}");
+        }
     }
 
     #[test]
@@ -1441,6 +1949,67 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_live_file_replaced_by_one_no_shorter_is_read_again_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_live(dir.path(), &one_step_wal("r1"));
+        let mut cache = WalCache::default();
+        let runs = cache.session_runs(dir.path(), &identity()).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+
+        // Same length, different file: written aside and renamed over the
+        // old one, so only the file's identity says it changed.
+        let replacement = one_step_wal("r2");
+        assert_eq!(replacement.len(), one_step_wal("r1").len());
+        let aside = path.with_extension("tmp");
+        std::fs::write(&aside, &replacement).unwrap();
+        std::fs::rename(&aside, &path).unwrap();
+        let runs = cache.session_runs(dir.path(), &identity()).unwrap();
+        assert_eq!(step_ids(&runs), [("r2".to_string(), 1)]);
+    }
+
+    #[test]
+    fn the_list_note_reports_only_what_was_already_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = two_runs();
+        wal.bytes.extend(frame(4, wal.seq + 1, 0, b"future"));
+        write_live(dir.path(), &wal.bytes);
+        let mut cache = WalCache::default();
+        // Asking for the note reads nothing, so nothing is known yet.
+        assert_eq!(cache.known_note(&identity()), None);
+        assert!(cache.live.is_empty());
+        let note = cache
+            .session_snapshot(dir.path(), &identity())
+            .unwrap()
+            .activity_note;
+        assert!(note.is_some());
+        assert_eq!(cache.known_note(&identity()), note);
+    }
+
+    #[test]
+    fn compatibility_notes_and_prefix_steps_survive_live_and_archive_caches() {
+        for archived in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut wal = two_runs();
+            wal.bytes.extend(frame(4, wal.seq + 1, 0, b"future"));
+            if archived {
+                write_container(
+                    dir.path(),
+                    100,
+                    &container(&[(&identity().addr(), &wal.bytes)], true),
+                );
+            } else {
+                write_live(dir.path(), &wal.bytes);
+            }
+            for _ in 0..2 {
+                let (runs, note) = session_runs(dir.path(), &identity()).unwrap();
+                assert_eq!(step_ids(&runs).len(), 3);
+                assert!(note.as_deref().unwrap().contains("showing data up to"));
+                assert_eq!(session_activity_note(&identity()), note);
+            }
+        }
+    }
+
+    #[test]
     fn a_missing_or_corrupt_live_file_yields_no_steps() {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = WalCache::default();
@@ -1525,6 +2094,51 @@ pub(crate) mod tests {
             run_ids(WalCache::default().session_runs(dir.path(), &identity())),
             Some(vec!["r1".into()])
         );
+    }
+
+    #[test]
+    fn a_member_size_that_overflows_is_refused_without_panicking() {
+        let address = identity().addr();
+        let wal = one_step_wal("r1");
+        let huge = (u64::MAX - 10).to_le_bytes();
+
+        // In a member header, read when the index is missing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = container(&[(&address, &wal)], false);
+        bytes[24..32].copy_from_slice(&huge);
+        write_container(dir.path(), 100, &bytes);
+        assert!(WalCache::default()
+            .session_runs(dir.path(), &identity())
+            .is_none());
+
+        // In the stored index: entry = address(16) offset(8) size(8), after
+        // the 4-byte entry count that follows the members.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = container(&[(&address, &wal)], true);
+        let size_at = ARCHIVE_MEMBER_HEADER_LEN as usize + wal.len() + 4 + 24;
+        bytes[size_at..size_at + 8].copy_from_slice(&huge);
+        write_container(dir.path(), 100, &bytes);
+        // The index is rejected and the headers are walked instead.
+        assert_eq!(
+            run_ids(WalCache::default().session_runs(dir.path(), &identity())),
+            Some(vec!["r1".into()])
+        );
+    }
+
+    #[test]
+    fn decoded_archived_members_are_bounded() {
+        let mut cache = WalCache::default();
+        for i in 0..(MAX_REMEMBERED_ARCHIVED as u64 + 5) {
+            cache.remember_archived((PathBuf::from(format!("c{i}.ark")), 0, 100), Err("x".into()));
+        }
+        assert!(cache.archived.len() <= MAX_REMEMBERED_ARCHIVED);
+
+        // A rewritten container replaces what was cached for its old length.
+        let mut cache = WalCache::default();
+        let path = PathBuf::from("fold-1.ark");
+        cache.remember_archived((path.clone(), 0, 100), Err("old".into()));
+        cache.remember_archived((path.clone(), 0, 200), Err("new".into()));
+        assert_eq!(cache.archived.keys().collect::<Vec<_>>(), [&(path, 0, 200)]);
     }
 
     #[test]

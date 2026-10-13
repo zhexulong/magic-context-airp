@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 # Check the live context.db and store.db versions and source epoch constants before placement.
 set -euo pipefail
+umask 077
 
-usage() { echo "usage: $0 [--dry-run] [--require-epochs-unchanged] [--source-ref REF] STAGED_BINARY" >&2; exit 2; }
+usage() { echo "usage: $0 [--dry-run] [--no-restart] [--require-epochs-unchanged] [--source-ref REF] STAGED_BINARY" >&2; exit 2; }
 die() { echo "place-ck-mc: $*" >&2; exit 1; }
 dry_run=0
+# --no-restart places and checks the file and stops there. It is for a window in
+# which the subc daemon itself is replaced, which restarts every module anyway, so
+# ck-mc restarts once instead of twice. Nothing here waits for that restart: the
+# script prints the provenance and health commands to run once it has happened.
+no_restart=0
 require_epochs=0
 source_ref=
 staged=
+shared_staging=${CK_STAGING:-$HOME/.local/share/cortexkit/staging}
 while (($#)); do
     case "$1" in
         --dry-run) dry_run=1 ;;
+        --no-restart) no_restart=1 ;;
         --require-epochs-unchanged) require_epochs=1 ;;
         --source-ref) (($# >= 2)) || usage; source_ref=$2; shift ;;
         --*) usage ;;
@@ -36,10 +44,28 @@ require_hardened() {
     sig=$(codesign -dv --verbose=2 "$1" 2>&1) || die "cannot read signature of $1"
     [[ "$sig" =~ flags=0x[[:xdigit:]]+\(([^\)]*)\) && ",${BASH_REMATCH[1]}," == *,runtime,* ]] ||
         die "$1 is not signed with hardened runtime (re-sign with --options runtime)"
-    ! codesign -d --entitlements - "$1" 2>/dev/null | grep -q get-task-allow ||
+    # Read the entitlements first, then match: a negated `codesign | grep -q` under
+    # pipefail would pass a binary that HAS get-task-allow whenever grep exits on
+    # its match before codesign finishes writing (codesign gets SIGPIPE).
+    local entitlements
+    entitlements=$(codesign -d --entitlements - "$1" 2>/dev/null || true)
+    [[ "$entitlements" != *get-task-allow* ]] ||
         die "$1 carries the get-task-allow entitlement"
 }
 require_hardened "$staged"
+# A release build strips its debug info with rust-objcopy. When that step fails,
+# cargo only prints a warning and the build still succeeds, so a binary still
+# carrying debug-map (STABS) entries means the strip silently failed: the binary
+# works, but it's larger and carries this machine's build paths. Count before
+# matching, so an nm failure can't read as zero.
+require_stripped() {
+    local symbols debug_entries
+    symbols=$(nm -a "$1" 2>/dev/null) || die "cannot list symbols of $1"
+    debug_entries=$(awk '$2 == "-"' <<<"$symbols" | wc -l | tr -d ' ')
+    ((debug_entries == 0)) ||
+        die "$1 carries $debug_entries debug-map entries: its debug-info strip failed (rebuild without the failing rustc wrapper)"
+}
+require_stripped "$staged"
 sha_from() {
     local line sha
     line=$("$1" --version) || die "cannot read $1 --version"
@@ -48,6 +74,64 @@ sha_from() {
     printf '%s\n' "$sha"
 }
 staged_sha=$(sha_from "$staged")
+# Resolve without creating the directory: a refused or dry-run placement must not
+# leave a staging directory behind. place-module.sh reads these declarations from
+# both the staging root and the directory containing it.
+shared_staging=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$shared_staging")
+shared_stage="$shared_staging/ck-mc.${staged_sha:0:8}"
+check_shared_declarations() {
+    local candidate actual
+    local expected
+    expected=$(printf '%s\n%s' "$shared_stage" "$staged_sha")
+    for candidate in \
+        "$(dirname "$shared_staging")/magic-context.current" \
+        "$(dirname "$shared_staging")/ck-magic-context.current" \
+        "$shared_staging/ck-magic-context.current"; do
+        [[ -f "$candidate" ]] || continue
+        grep -q '^stage=' "$candidate" 2>/dev/null || continue
+        # Match the consumer: only stage and revision determine whether two
+        # declarations agree; declared_at is informational.
+        actual=$(awk -F= '$1 == "stage" || $1 == "revision" { print $2 }' "$candidate")
+        [[ "$actual" == "$expected" ]] ||
+            die "another magic-context currency declaration disagrees: $candidate (remove or reconcile it before placing)"
+    done
+}
+check_shared_declarations
+publish_shared_stage() (
+    set -euo pipefail
+    local card_name card sidecar
+    local card_tmp="" sidecar_tmp="" manifest_tmp="" card_digest declared_at
+    trap 'rm -f "$card_tmp" "$sidecar_tmp" "$manifest_tmp"' EXIT
+    card_name=$(basename "$shared_stage")
+    card="$shared_staging/$card_name"
+    sidecar="$card.sha256"
+    mkdir -p "$shared_staging"
+
+    # Copy the verified destination bytes; signing here would change the artifact
+    # after placement and invalidate the identity checked by the restart gates.
+    card_tmp=$(mktemp "$shared_staging/.ck-mc.XXXXXXXX") || die "cannot make shared staging temp"
+    cp -p "$deployed" "$card_tmp" || die "cannot copy placed binary into shared staging"
+    cmp -s "$deployed" "$card_tmp" || die "shared staging copy differs from placed binary"
+    card_digest=$(shasum -a 256 "$card_tmp" | awk '{print $1}')
+    [[ "$card_digest" == "$staged_digest" ]] || die "shared staging copy digest differs from verified placement"
+    mv -f "$card_tmp" "$card"
+    card_tmp=""
+    cmp -s "$deployed" "$card" || die "shared staging card differs from placed binary"
+
+    sidecar_tmp=$(mktemp "$shared_staging/.ck-mc.sha256.XXXXXXXX") || die "cannot make shared sidecar temp"
+    printf '%s  %s\n' "$card_digest" "$card_name" > "$sidecar_tmp"
+    mv -f "$sidecar_tmp" "$sidecar"
+    sidecar_tmp=""
+    (cd "$shared_staging" && shasum -a 256 -c "$(basename "$sidecar")" >/dev/null) ||
+        die "shared staging sidecar does not verify its card"
+
+    declared_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    manifest_tmp=$(mktemp "$shared_staging/.magic-context.current.XXXXXXXX") || die "cannot make shared declaration temp"
+    printf 'stage=%s\nrevision=%s\ndeclared_at=%s\n' \
+        "$card" "$staged_sha" "$declared_at" > "$manifest_tmp"
+    mv -f "$manifest_tmp" "$shared_staging/magic-context.current"
+    manifest_tmp=""
+)
 if [[ -n "$source_ref" ]]; then
     source_sha=$(git rev-parse --verify "${source_ref}^{commit}") || die "unknown source ref: $source_ref"
     [[ "$staged_sha" == "$source_sha" ]] || die "staged SHA $staged_sha differs from source $source_sha"
@@ -62,7 +146,13 @@ mc_dir=${MAGIC_CONTEXT_STORAGE_DIR:-$HOME/.local/share/cortexkit/magic-context}
 read_version() {
     local path=$1 sql=$2 value
     [[ -f "$path" ]] || die "missing live store: $path"
-    value=$(sqlite3 -readonly "$path" "$sql") || die "cannot read schema version from $path"
+    # A WAL-mode store closed cleanly has no -wal/-shm files, and a read-only
+    # connection cannot create them (SQLITE_CANTOPEN). With no -wal file every
+    # committed page is in the main file, so an immutable read sees the same data.
+    if ! value=$(sqlite3 -readonly "$path" "$sql" 2>/dev/null); then
+        [[ ! -e "$path-wal" ]] || die "cannot read schema version from $path"
+        value=$(sqlite3 "file:$path?immutable=1" "$sql") || die "cannot read schema version from $path"
+    fi
     [[ "$value" =~ ^[0-9]+$ ]] || die "invalid schema version from $path: $value"
     printf '%s\n' "$value"
 }
@@ -121,6 +211,15 @@ cp -p "$staged" "$tmp"
 [[ $(shasum -a 256 "$tmp" | cut -d' ' -f1) == "$staged_digest" ]] || die "staged binary changed during placement"
 mv -f "$tmp" "$deployed"
 trap 'echo "placement verification failed; rollback binary only when both stores are compatible: $rollback_cmd" >&2' ERR
+if ((no_restart)); then
+    [[ "$(sha_from "$deployed")" == "$staged_sha" ]] || false
+    [[ "$(shasum -a 256 "$deployed" | cut -d' ' -f1)" == "$staged_digest" ]] || false
+    require_hardened "$deployed"
+    trap - ERR
+    publish_shared_stage
+    echo "placed ck-mc $staged_sha on disk without restarting; the running module still uses the previous build until magic-context restarts. Verify after that restart: ck --json provenance magic-context (build $staged_sha) and ck --json health magic-context. Rollback: $rollback_cmd"
+    exit 0
+fi
 ck module restart magic-context
 # The restart returns while the old process drains, before the new one has declared its
 # build. Wait for the new process to report a build instead of reading a half-started state.
@@ -167,4 +266,5 @@ for _ in $(seq 1 30); do
 done
 [[ $health_ok -eq 1 ]] || { echo "ck health is not ok after the restart" >&2; false; }
 trap - ERR
+publish_shared_stage
 echo "placed ck-mc $staged_sha; context.db $context_live/$context_supported store.db $store_live/$store_supported; inode/version/digest/health ok"

@@ -1,8 +1,12 @@
+import { isMainThread } from "node:worker_threads";
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { splitLkgSlotPrefixes, splitReplayDecisions } from "./migration-v94-write-split";
+import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
+import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -3156,6 +3160,57 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 92,
+        description: "store-level offline single-store state and canonical compartment boundaries",
+        up(db: Database): void {
+            // A summary rebuild stages retained compartments before replacing them;
+            // its staging rows must preserve the block indices as well.
+            for (const table of ["compartments", "recomp_compartments"]) {
+                if (!tableExists(db, table)) continue;
+                ensureColumn(db, table, "start_block_index", "INTEGER");
+                ensureColumn(db, table, "end_block_index", "INTEGER");
+            }
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS single_store_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    state TEXT NOT NULL CHECK (state IN ('required', 'migrated')),
+                    migrated_at INTEGER,
+                    migrated_by TEXT,
+                    backup_dir TEXT,
+                    report_json TEXT
+                );
+                INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
+            `);
+        },
+    },
+    {
+        version: 93,
+        description: "per-session compartment history revision for shared readers",
+        up(db: Database): void {
+            installCompartmentHistoryVersions(db);
+        },
+    },
+    {
+        version: 94,
+        description:
+            "store LKG prefixes as slices and replay decisions as rows instead of growing records",
+        up(db: Database): void {
+            // The LKG slot's prefix and the replay document in session_meta grew
+            // on every pass, and SQLite rewrote each whole record every time; see
+            // migration-v94-write-split.ts.
+            splitLkgSlotPrefixes(db);
+            splitReplayDecisions(db);
+        },
+    },
+    {
+        version: 95,
+        description:
+            "cover cleanup and retention reads, index git FTS rowids and store temporal replay decisions",
+        up(db: Database): void {
+            installV95PerfSchema(db, true);
+        },
+    },
 ];
 
 /**
@@ -3258,6 +3313,36 @@ function isMigrationApplied(db: Database, version: number): boolean {
 }
 
 /**
+ * Whether `runMigrations` would apply anything to this database. Read-only: it
+ * creates no bookkeeping table and takes no write lock, so a startup that has
+ * nothing to migrate can skip the migration worker entirely.
+ */
+export function hasPendingMigrations(db: Database): boolean {
+    const bookkeeping = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+        .get();
+    if (bookkeeping == null) return true;
+    const currentVersion = getCurrentVersion(db);
+    return MIGRATIONS.some(
+        (candidate) =>
+            candidate.version > currentVersion && !isMigrationApplied(db, candidate.version),
+    );
+}
+
+// Counts migration bodies applied on the process's main thread. Startup applies
+// them on a worker thread so the host keeps answering requests; a test reads this
+// to prove a startup open never fell back to running them here.
+let mainThreadMigrationBodies = 0;
+
+export function __getMainThreadMigrationBodyCountForTests(): number {
+    return getMainThreadMigrationBodyCount();
+}
+
+export function getMainThreadMigrationBodyCount(): number {
+    return mainThreadMigrationBodies;
+}
+
+/**
  * Detect the specific case where a sibling process already committed the
  * same `schema_migrations` row we're about to insert. BEGIN IMMEDIATE now
  * prevents this race for supported adapters by serializing before the version
@@ -3337,9 +3422,10 @@ export function runMigrations(db: Database): void {
             // retryable MigrationLockBusyError classification below.
             migration = undefined;
 
-            const transactionStartedAt = performance.now();
+            let transactionStartedAt = 0;
             const applied = db
                 .transaction(() => {
+                    transactionStartedAt = performance.now();
                     currentVersion = getCurrentVersion(db);
                     // Keep the append-only version boundary for legacy databases whose
                     // bookkeeping contains only a current-version row. Within the pending
@@ -3366,6 +3452,7 @@ export function runMigrations(db: Database): void {
                         loggedPlan = true;
                     }
 
+                    if (isMainThread) mainThreadMigrationBodies += 1;
                     migration.up(db);
                     db.prepare(
                         "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
@@ -3411,8 +3498,11 @@ export function runMigrations(db: Database): void {
 
     if (touchedLegacyAuthorityBatch) {
         try {
-            const transactionStartedAt = performance.now();
-            db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+            let transactionStartedAt = 0;
+            db.transaction(() => {
+                transactionStartedAt = performance.now();
+                installLatestAuthorityTriggers(db);
+            }).immediate();
             logSlowWriteTransaction("migration-runner", transactionStartedAt);
         } catch (error) {
             throw new Error(

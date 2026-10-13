@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { MURAL_MODEL_DEPRECATION_WARNING } from "@magic-context/core/config/mural-model-deprecation";
 import { getProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
 import { REMOVED_AGENT_CONFIG_WARNING } from "@magic-context/core/config/removed-agent-config";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
+import { buildDreamTaskRuntimeConfigs } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import { resolveEpochFloorForPass } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { Database } from "@magic-context/core/shared/sqlite";
 import {
@@ -12,6 +14,7 @@ import {
 	reloadWindowOverlay,
 	setWindowOverlayPath,
 } from "@magic-context/core/shared/window-geometry";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { loadPiConfig, loadPiConfigDetailed } from "./index";
 
 const tempRoots: string[] = [];
@@ -20,7 +23,7 @@ const originalUserProfile = process.env.USERPROFILE;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 
 function makeTempRoot(prefix: string): string {
-	const path = mkdtempSync(join(tmpdir(), prefix));
+	const path = createTestTempDirFromPath(join(tmpdir(), prefix));
 	tempRoots.push(path);
 	return path;
 }
@@ -246,6 +249,37 @@ describe("loadPiConfig", () => {
 		expect(result.loadedFromPaths).toEqual([userPath]);
 	});
 
+	it("loads the retired mural.model with one deprecation warning and resolves compress-cues from dreamer.pi", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({
+				mural: { enabled: true, model: "google/antigravity-gemini-3.8-flash" },
+				dreamer: {
+					pi: { model: "google-antigravity/antigravity-gemini-3.8-flash" },
+				},
+			}),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.mural.enabled).toBe(true);
+		expect(
+			result.warnings.filter((w) =>
+				w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
+			),
+		).toHaveLength(1);
+		const compressCues = buildDreamTaskRuntimeConfigs(
+			result.config.dreamer,
+			"pi",
+		).find((task) => task.task === "compress-cues");
+		expect(compressCues?.model).toEqual({
+			model: "google-antigravity/antigravity-gemini-3.8-flash",
+		});
+	});
+
 	it("honors user storage permissions while ignoring a project-tier override", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
@@ -315,7 +349,7 @@ describe("loadPiConfig", () => {
 		);
 	});
 
-	it("warns and falls back to defaults for invalid Zod fields", () => {
+	it("warns and ignores deprecated age without converting it into a budget", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
 		withHome(home);
@@ -330,11 +364,9 @@ describe("loadPiConfig", () => {
 		const result = loadPiConfig({ cwd });
 
 		expect(result.config.enabled).toBe(false);
-		expect(result.config.clear_reasoning_age).toBe(
-			MagicContextConfigSchema.parse({}).clear_reasoning_age,
-		);
+		expect(result.config.keep_reasoning_tokens).toBeUndefined();
 		expect(result.warnings.join("\n")).toContain("clear_reasoning_age");
-		expect(result.warnings.join("\n")).toContain("using default");
+		expect(result.warnings.join("\n")).toContain("deprecated and ignored");
 	});
 
 	it("prunes only cross-harness qualifier leaves and names their full paths", () => {
@@ -897,6 +929,58 @@ describe("loadPiConfig", () => {
 			expect(warnings).toContain("deprecated");
 			expect(warnings).toContain("protected_tokens");
 			expect(result.hasDeprecatedProtectedTags).toBe(true);
+		});
+	});
+});
+
+// Parity with the OpenCode loader: an invalid project value must not displace
+// the user's value and then fall to the schema default in recovery.
+describe("loadPiConfig — project config cannot reset user settings", () => {
+	function load(user: unknown, project: unknown) {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(home, JSON.stringify(user));
+		writeProjectConfig(cwd, JSON.stringify(project));
+		return loadPiConfigDetailed({ cwd }, false);
+	}
+
+	it("keeps the user's compaction block when the project sets compaction:false", () => {
+		const result = load(
+			{ compaction: { enabled: false } },
+			{ compaction: false },
+		);
+		expect(result.config.compaction).toMatchObject({ enabled: false });
+		expect(result.recoveredTopLevelKeys).toContain("compaction");
+	});
+
+	it("keeps the user's historian model when the project sets historian:1", () => {
+		const result = load(
+			{ historian: { pi: { model: "anthropic/claude-x" } } },
+			{ historian: 1 },
+		);
+		expect(result.config.historian?.pi?.model).toBe("anthropic/claude-x");
+	});
+
+	it("does not lower a user threshold of 88 to a project value of 81", () => {
+		const result = load(
+			{ execute_threshold_percentage: 88 },
+			{ execute_threshold_percentage: 81 },
+		);
+		expect(result.config.execute_threshold_percentage).toBe(88);
+	});
+
+	it("keeps the user's threshold when the project value is invalid", () => {
+		const result = load(
+			{
+				execute_threshold_percentage: 80,
+				execute_threshold_tokens: { default: 300_000 },
+			},
+			{ execute_threshold_percentage: 10, execute_threshold_tokens: 5 },
+		);
+		expect(result.config.execute_threshold_percentage).toBe(80);
+		expect(result.config.execute_threshold_tokens).toEqual({
+			default: 300_000,
 		});
 	});
 });

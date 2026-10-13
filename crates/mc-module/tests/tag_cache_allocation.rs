@@ -86,13 +86,16 @@ fn context(dir: &str) -> ProducerContext<'_> {
         protected_tokens_provenance: "derived",
         compaction_enabled: true,
         smart_drops: false,
+        protected_tools: [("todowrite".to_string(), 1), ("ctx_reduce".to_string(), 3)].into(),
         cache_ttl: "5m".to_string(),
         cache_ttl_provenance: CacheTtlProvenance::Default,
+        cache_ttl_policy: None,
         model_key: None,
         observed_last_response_at_ms: None,
         guidance_date: None,
         historian_active: false,
         wrapup_active: false,
+        caveman_english_word_rules: true,
     }
 }
 
@@ -161,7 +164,7 @@ fn run(payload: usize) -> PassAllocations {
             .unwrap();
         }
     }
-    let store = McStore::open(&descriptor(dir.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
     let dir_text = dir.path().to_str().unwrap().to_string();
     let ctx = context(&dir_text);
     let live = request(&session, LIVE_MESSAGES);

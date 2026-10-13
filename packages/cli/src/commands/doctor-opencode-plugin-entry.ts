@@ -54,6 +54,17 @@ export interface PluginEntryCheckReporter {
     autoUpdateStall(specifier: string): void;
 }
 
+export function isOpenCodePluginRegistered(
+    config: Record<string, unknown>,
+    configDir: string,
+): boolean {
+    return readPluginEntries(config).some(
+        ({ entry }) =>
+            matchesPluginEntry(entry, OPENCODE_PLUGIN_NAME) ||
+            isDevPathPluginEntry(entry, configDir),
+    );
+}
+
 /**
  * Check the Magic Context entry in a parsed config and apply the change in
  * place. Returns true when `config` changed and must be written back.
@@ -61,13 +72,19 @@ export interface PluginEntryCheckReporter {
 export function checkOpenCodePluginEntry(
     config: Record<string, unknown>,
     configName: string,
-    options: { force?: boolean; registrationKey: OpenCodePluginConfigKey },
+    options: {
+        force?: boolean;
+        registrationKey: OpenCodePluginConfigKey;
+        /** Directory of the config file, which relative checkout paths resolve against. */
+        configDir: string;
+    },
     report: PluginEntryCheckReporter,
 ): boolean {
     const allEntries = readPluginEntries(config);
     const found = allEntries.find(
         ({ entry }) =>
-            matchesPluginEntry(entry, OPENCODE_PLUGIN_NAME) || isDevPathPluginEntry(entry),
+            matchesPluginEntry(entry, OPENCODE_PLUGIN_NAME) ||
+            isDevPathPluginEntry(entry, options.configDir),
     );
 
     if (!found) {
@@ -87,7 +104,7 @@ export function checkOpenCodePluginEntry(
         report.pass(`Plugin registered in ${configName}`);
         return false;
     }
-    if (isDevPathPluginEntry(found.entry)) {
+    if (isDevPathPluginEntry(found.entry, options.configDir)) {
         report.pass(`Plugin registered in ${configName} (dev path: ${specifier})`);
         return false;
     }

@@ -45,6 +45,8 @@ export interface ManagedRecompContext {
     client: PluginContext["client"];
     /** Optional executor for hosts that cannot issue hidden completions through the v1 SDK. */
     hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    /** Host-owned checkpoints must not use OpenCode 1's synthetic marker writer. */
+    compactionMarkerStrategy?: CompartmentRunnerDeps["compactionMarkerStrategy"];
     db: Database;
     liveSessionState: LiveSessionState;
     /** Plugin-startup directory — last-resort fallback for session-dir resolution. */
@@ -68,6 +70,7 @@ export interface ManagedRecompContext {
     userMemoriesEnabled: boolean;
     /** Two-pass historian (editor cleanup) — config `historian.two_pass`. */
     historianTwoPass?: boolean;
+    historianExpandTools?: Record<string, string | false>;
     getNotificationParams: (sessionId: string) => NotificationParams;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
 }
@@ -188,6 +191,7 @@ export function buildRecompDeps(
     return {
         client: ctx.client,
         hiddenCompletionExecutor: ctx.hiddenCompletionExecutor,
+        compactionMarkerStrategy: ctx.compactionMarkerStrategy,
         db: ctx.db,
         sessionId,
         historianChunkTokens: ctx.historianChunkTokens,
@@ -206,6 +210,7 @@ export function buildRecompDeps(
         fallbackModelId:
             ctx.fallbackModelId ?? resolveLiveModelKey(ctx.liveSessionState, sessionId),
         historianTwoPass: ctx.historianTwoPass,
+        historianExpandTools: ctx.historianExpandTools,
         ensureProjectRegistered: ctx.ensureProjectRegistered,
         getNotificationParams: () => ctx.getNotificationParams(sessionId),
         onCompartmentStatePublished: (sid: string) => {

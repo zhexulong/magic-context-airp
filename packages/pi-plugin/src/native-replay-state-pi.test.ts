@@ -10,16 +10,19 @@ import {
 import {
 	getNativeReasoningIds,
 	getNativeToolInputs,
+	saveNativeToolInputs,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 	signalPiPendingMaterialization,
 } from "./context-handler";
+import { NATIVE_TOOL_REMOVAL_MARKER } from "./native-replay-pi";
 import {
 	applyNativeReasoningReplayPi,
 	applyNativeToolInputReplayPi,
 } from "./native-replay-state-pi";
+import { observePiPublicationForTest } from "./publication-observer-fixture.test";
 import {
 	assistantMessage,
 	createFakePi,
@@ -298,13 +301,16 @@ describe("native upgrade application", () => {
 						],
 					});
 				}
-				expect(
-					f.db
-						.prepare(
-							"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
-						)
-						.get(sessionId),
-				).toEqual({ trailing_blank_decisions: stored });
+				const row = f.db
+					.prepare(
+						"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+					)
+					.get(sessionId) as { trailing_blank_decisions: string };
+				const { piServedTagNumbers, ...nativeDocument } = JSON.parse(
+					row.trailing_blank_decisions,
+				);
+				expect(nativeDocument).toEqual(JSON.parse(stored));
+				expect(piServedTagNumbers).toEqual([1, 2, 3, 4]);
 			} finally {
 				f.close();
 			}
@@ -314,6 +320,7 @@ describe("native upgrade application", () => {
 	it("does not overwrite an unsupported document version or abort local cleanup", async () => {
 		const sessionId = "ses-native-future-document";
 		const f = fixture(sessionId);
+		const publication = observePiPublicationForTest(sessionId);
 		try {
 			await f.seedLegacy();
 			const stored = JSON.stringify({
@@ -326,6 +333,7 @@ describe("native upgrade application", () => {
 					"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
 				)
 				.run(stored, sessionId);
+			publication.reset();
 			const original = nativeBytes([oldAssistant()]);
 			for (const percent of [0, 90, 0]) {
 				f.restart();
@@ -346,7 +354,9 @@ describe("native upgrade application", () => {
 					)
 					.get(sessionId),
 			).toEqual({ trailing_blank_decisions: stored });
+			publication.expect("skipped", "envelope_unreadable", 3);
 		} finally {
+			publication.restore();
 			f.close();
 		}
 	});
@@ -495,6 +505,40 @@ describe("native upgrade application", () => {
 			).toBe(0);
 			expect(run(false)).toBe(after);
 			expect(run(false)).toBe(after);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("never replaces a recorded arc removal with the arguments of a kept pair", () => {
+		const db = createTestDb();
+		const sessionId = "ses-native-removal-kept";
+		try {
+			getOrCreateSessionMeta(db, sessionId);
+			saveNativeToolInputs(
+				db,
+				sessionId,
+				new Map([[callId, NATIVE_TOOL_REMOVAL_MARKER]]),
+			);
+			// A model that keeps tool pairs beside reasoning serves the removed arc
+			// as a paired shell on a busting pass.
+			const kept = oldAssistant() as unknown as {
+				content: Array<{ arguments?: Record<string, unknown> }>;
+			};
+			kept.content[2].arguments = { dropped: "[dropped §3§]" };
+			applyNativeToolInputReplayPi(
+				{
+					db,
+					sessionId,
+					messages: [kept],
+					changes: new Map([[0, new Set([callId])]]),
+					canApply: true,
+				},
+				getNativeToolInputs(db, sessionId),
+			);
+			expect(getNativeToolInputs(db, sessionId).get(callId)).toBe(
+				NATIVE_TOOL_REMOVAL_MARKER,
+			);
 		} finally {
 			db.close();
 		}

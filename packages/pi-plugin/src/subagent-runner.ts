@@ -19,6 +19,7 @@ import {
 	sep,
 } from "node:path";
 import { createInterface } from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import {
 	createDreamTokenBudget,
@@ -525,6 +526,17 @@ const HISTORIAN_CALIBRATION_ENTRY_PATH = resolveSiblingEntryPath(
  */
 const TERMINAL_DRAIN_GRACE_MS = 2_000;
 
+/**
+ * How long (ms) the runner waits for the child's stdio to close after the
+ * child process itself has exited. Node fires `close` only once every process
+ * holding the child's stdout/stderr has let go, and Pi can start processes
+ * that inherit those pipes and outlive it (a user extension's helper, an MCP
+ * stdio server). Without this bound such a process would keep the run
+ * unsettled forever. One second is ample for the pipe to deliver the output
+ * Pi wrote before it exited.
+ */
+const EXIT_STDIO_GRACE_MS = 1_000;
+
 export const MAGIC_CONTEXT_PI_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
 
 function isOmpHostProcess(): boolean {
@@ -593,7 +605,24 @@ function resolveSubagentExtensionEntry(
 
 const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
 const PI_AFT_READ_TOOLS = ["aft_outline", "aft_zoom", "aft_search"] as const;
-const PI_HISTORIAN_TOOLS = [...PI_READ_ONLY_BUILTINS, "aft_search"] as const;
+const PI_BUILTIN_TOOL_NAMES: Readonly<Record<string, true>> = {
+	read: true,
+	grep: true,
+	find: true,
+	ls: true,
+	bash: true,
+	edit: true,
+	write: true,
+};
+let configuredHostToolNames: (() => readonly string[] | undefined) | undefined;
+const loggedUnavailableBuiltinTools = new Set<string>();
+
+/** Read the host's live tool registry when building each child invocation. */
+export function configurePiSubagentHostTools(
+	getToolNames: (() => readonly string[] | undefined) | undefined,
+): void {
+	configuredHostToolNames = getToolNames;
+}
 
 /**
  * Set of subagent agent ids that get ctx_memory in the lean child extension.
@@ -644,18 +673,11 @@ const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
 ])[] = [
 	["dreamer-retrospective", ["ctx_search"]],
 	["smart-note-compiler", []],
-	// Pi's live historian runner uses this Magic Context-specific id for first
-	// pass, repair, two-pass editor, and recomp prompts. It
-	// summarizes/offloads host-rendered input and may inspect local files, but it
-	// must not mutate source or memory. Keep only read-only Pi built-ins plus
-	// aft_search (no aft_outline/aft_zoom, no ctx_* tools).
-	["magic-context-historian", PI_HISTORIAN_TOOLS],
-	// Shared OpenCode agent ids that can be passed by tests or future Pi callers.
-	// Same historian surface as magic-context-historian: local read/search only,
-	// optional aft_search, never writes or ctx_* tools.
-	["historian", PI_HISTORIAN_TOOLS],
-	["historian-recomp", PI_HISTORIAN_TOOLS],
-	["historian-editor", PI_HISTORIAN_TOOLS],
+	// First pass, repair, recomp and editor prompts transform supplied text into XML without tools.
+	["magic-context-historian", []],
+	["historian", []],
+	["historian-recomp", []],
+	["historian-editor", []],
 	// classify-memories: a pure metadata transform (prompt in → XML out). ZERO
 	// tools — it scores from the memory text and the host applies the columns.
 	["dreamer-classifier", []],
@@ -702,7 +724,8 @@ const ZERO_TOOL_PROMPT_REQUIRED_AGENTS: ReadonlySet<string> = new Set(
 /**
  * OMP validates `--tools` against built-in names before extensions register.
  * Translate Pi-only built-ins, discard extension tool names that cannot be
- * addressed by this flag, and deduplicate aliases.
+ * addressed by this flag, and deduplicate aliases. When the host registry is
+ * available, keep only built-ins that are registered in the current session.
  *
  * This narrows OMP's built-in surface only. OMP does not set
  * `restrictToolNames`, so discovered AFT/MCP/ctx tools remain available.
@@ -724,17 +747,41 @@ const OMP_ALLOWLISTABLE_TOOLS: Readonly<Record<string, true>> = {
 function resolveHostToolAllowlist(
 	tools: readonly string[],
 	ompHost: boolean = isOmpHostProcess(),
+	hostToolNames?: readonly string[],
 ): readonly string[] {
-	if (!ompHost) return tools;
-	const resolved: string[] = [];
+	return resolveHostToolAllowlistDetails(tools, ompHost, hostToolNames).tools;
+}
+
+function resolveHostToolAllowlistDetails(
+	tools: readonly string[],
+	ompHost: boolean,
+	hostToolNames?: readonly string[],
+): { tools: readonly string[]; dropped: readonly string[] } {
+	const candidates: string[] = [];
 	const seen = new Set<string>();
 	for (const tool of tools) {
-		const mapped = OMP_TOOL_ALIASES[tool] ?? tool;
-		if (OMP_ALLOWLISTABLE_TOOLS[mapped] !== true || seen.has(mapped)) continue;
+		const mapped = ompHost ? (OMP_TOOL_ALIASES[tool] ?? tool) : tool;
+		if (ompHost && OMP_ALLOWLISTABLE_TOOLS[mapped] !== true) continue;
+		if (seen.has(mapped)) continue;
 		seen.add(mapped);
-		resolved.push(mapped);
+		candidates.push(mapped);
 	}
-	return resolved;
+	if (hostToolNames === undefined) return { tools: candidates, dropped: [] };
+
+	const registered = new Set(hostToolNames);
+	const available: string[] = [];
+	const dropped: string[] = [];
+	for (const tool of candidates) {
+		const isBuiltin = ompHost
+			? OMP_ALLOWLISTABLE_TOOLS[tool] === true
+			: PI_BUILTIN_TOOL_NAMES[tool] === true;
+		if (isBuiltin && !registered.has(tool)) {
+			dropped.push(tool);
+			continue;
+		}
+		available.push(tool);
+	}
+	return { tools: available, dropped };
 }
 
 const KNOWN_PI_SUBAGENT_AGENTS = [
@@ -878,6 +925,9 @@ export class PiSubagentRunner implements SubagentRunner {
 	private readonly extraArgs: readonly string[];
 	/** `undefined` means preserve Pi's normal extension discovery behavior. */
 	private readonly subagentExtensions: readonly string[] | undefined;
+	private readonly getHostToolNames:
+		| (() => readonly string[] | undefined)
+		| undefined;
 
 	constructor(
 		options: {
@@ -888,6 +938,8 @@ export class PiSubagentRunner implements SubagentRunner {
 			extraArgs?: readonly string[];
 			/** User-tier explicit extension allowlist; an empty list disables all discovered extensions. */
 			subagentExtensions?: readonly string[];
+			/** Test override for the built-in tools exposed by the current host session. */
+			getHostToolNames?: () => readonly string[] | undefined;
 			/** Test seam for subprocess lifecycle tests. Production uses child_process.spawn. */
 			spawnImpl?: typeof childProcess.spawn;
 		} = {},
@@ -908,6 +960,7 @@ export class PiSubagentRunner implements SubagentRunner {
 		this.extraArgs = options.extraArgs ?? [];
 		this.subagentExtensions =
 			options.subagentExtensions ?? configuredSubagentExtensions;
+		this.getHostToolNames = options.getHostToolNames;
 	}
 
 	async run(options: SubagentRunOptions): Promise<SubagentRunResult> {
@@ -1083,6 +1136,19 @@ export class PiSubagentRunner implements SubagentRunner {
 		);
 	}
 
+	private readHostToolNames(): readonly string[] | undefined {
+		// Only OMP rejects disabled built-ins in --tools. Pi must keep its normal
+		// allow-list and must not consult a possibly unbound host action API.
+		if (this.invocation.targetHarness !== "omp") return undefined;
+		try {
+			return this.getHostToolNames?.() ?? configuredHostToolNames?.();
+		} catch {
+			// SDK loaders can evaluate an extension without binding a runner. An
+			// unavailable registry is not an empty registry: retain the normal tools.
+			return undefined;
+		}
+	}
+
 	private async runOnce(
 		options: SubagentRunOptions,
 		runMode: PiRunMode,
@@ -1112,6 +1178,10 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 			if (!options.accountingSessionId || recordedAccounting) return;
 			recordedAccounting = true;
+			const modelRef =
+				typeof options.model === "string" ? options.model : undefined;
+			const providerSeparator = modelRef?.indexOf("/") ?? -1;
+			const hasProvider = providerSeparator > 0;
 			recordChildInvocation({
 				db: openDatabase(),
 				parentSessionId: options.accountingSessionId,
@@ -1131,14 +1201,12 @@ export class PiSubagentRunner implements SubagentRunner {
 								? "empty"
 								: "failed",
 				messages,
-				providerId:
-					typeof options.model === "string"
-						? options.model.split("/")[0]
-						: null,
-				modelId:
-					typeof options.model === "string"
-						? options.model.split("/").slice(1).join("/")
-						: null,
+				providerId: hasProvider
+					? modelRef?.slice(0, providerSeparator)
+					: undefined,
+				modelId: hasProvider
+					? modelRef?.slice(providerSeparator + 1)
+					: modelRef,
 				error: result.ok ? null : result.error,
 				parentInvocationId: options.accountingParentInvocationId ?? null,
 			});
@@ -1284,6 +1352,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			targetHarness: this.invocation.targetHarness,
 			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
 			subagentExtensions: this.subagentExtensions,
+			hostToolNames: this.readHostToolNames(),
 			omitPositionalMessage: deliverViaStdin || rpcBudget,
 			systemPromptPath,
 			modelRef: modelRefOverride,
@@ -1496,8 +1565,12 @@ export class PiSubagentRunner implements SubagentRunner {
 			// otherwise).
 			let stderr = "";
 			let stderrLine = "";
+			// Pipe chunks split anywhere, including inside a multibyte UTF-8
+			// character; the decoder carries the partial bytes into the next chunk.
+			const stderrDecoder = new StringDecoder("utf8");
 			child.stderr?.on("data", (chunk: Buffer) => {
-				const text = chunk.toString("utf8");
+				const text = stderrDecoder.write(chunk);
+				if (text.length === 0) return;
 				// Pi 0.87 redirects extension stdout writes to stderr to protect its
 				// protocol. Accept only our content-free provenance event there.
 				stderrLine += text;
@@ -1531,6 +1604,7 @@ export class PiSubagentRunner implements SubagentRunner {
 			let finalErrorMessage: string | null = null;
 			let finalStopReason: string | null = null;
 			let sawAgentEnd = false;
+			let preserveDrainedResult = false;
 			let parseError: string | null = null;
 			// Tool-invocation count for the grounding gate (refresh-primers:
 			// 0 tool calls = closed-book paraphrase, rejected). Derived at settle
@@ -1582,19 +1656,37 @@ export class PiSubagentRunner implements SubagentRunner {
 			// (tool-call) and terminal turns, with the final assistant
 			// message carrying stopReason="stop" and no toolCall content.
 			//
-			// Why we accumulate instead of waiting for `agent_end`:
-			// Pi's print mode does NOT emit an `agent_end` event on stdout.
-			// That event exists in Pi's internal extension event channel
-			// only — the stdout JSON stream comes from `session.subscribe`,
-			// which receives only `message_start`/`message_end`/
-			// `tool_execution_*`/`compaction_*`/`session_info_changed`/
-			// `thinking_level_changed`/`queue_update`/`auto_retry_end`.
+			// Some Pi-compatible print streams omit `agent_end`, so completion
+			// cannot depend on receiving it. Accumulate the message_end stream
+			// and accept agent_end's complete transcript when available.
 			//
 			// We detect run completion the same way Pi itself does: watch
 			// `message_end` for the final assistant turn (stopReason="stop"
 			// + no toolCall content), then drain until natural child exit.
 			const accumulatedMessages: unknown[] = [];
 			accountingMessages = accumulatedMessages;
+			const captureFinalAssistant = (messages: unknown[]) => {
+				const result = extractFinalAssistant(messages);
+				finalAssistantText = result.text;
+				finalStopReason = result.stopReason;
+				finalErrorMessage = result.errorMessage;
+				const lastAssistant = [...messages]
+					.reverse()
+					.find(
+						(message) =>
+							typeof message === "object" &&
+							message !== null &&
+							(message as { role?: unknown }).role === "assistant",
+					);
+				// Capturing terminal text starts the drain below. Its SIGTERM can
+				// produce empty aborted turns; those are shutdown noise, not a new
+				// answer. Keep length-capped text too, so it still reports truncated.
+				preserveDrainedResult =
+					(result.stopReason === "stop" || result.stopReason === "length") &&
+					!!result.text?.trim() &&
+					countToolCalls([lastAssistant]) === 0;
+				return result;
+			};
 
 			rl.on("line", (line) => {
 				if (settled || line.length === 0) return;
@@ -1666,13 +1758,26 @@ export class PiSubagentRunner implements SubagentRunner {
 										(part as { type?: string }).type === "toolCall",
 								)
 							);
-						const decision = budget.charge(
+						let decision = budget.charge(
 							usage?.input ?? 0,
 							usage?.cacheRead ?? 0,
 							usage?.cacheWrite ?? 0,
 							finished,
 							rpcBudget,
 						);
+						// Reserve two turns: one for a queued investigation/refusal and
+						// one for the manifest. Keep the 60-step runaway ceiling intact.
+						if (
+							decision === "continue" &&
+							!finished &&
+							rpcBudget &&
+							options.agent.replace(/^magic-context-/, "") ===
+								"dreamer-memory-mapper" &&
+							cap !== undefined &&
+							telemetry.steps >= cap - 2
+						) {
+							decision = budget.finalize();
+						}
 						if (
 							decision === "stop" ||
 							(decision === "finalize" && !rpcBudget)
@@ -1776,20 +1881,47 @@ export class PiSubagentRunner implements SubagentRunner {
 					ms: elapsedMs,
 				});
 
-				// Backwards-compat: if Pi (or any pi-compatible runner) ever
-				// does emit `agent_end` with the full messages array, treat
-				// it as authoritative. Older Pi versions may have done this.
-				if (e.type === "agent_end" && Array.isArray(e.messages)) {
+				// Pi retries a transient provider error (429, 529, 5xx) inside the
+				// same child: the failed attempt's message_end and agent_end (with
+				// willRetry: true) are followed by auto_retry_start, a backoff of
+				// retry.baseDelayMs (2 s by default) and a fresh attempt. The failed
+				// turn is not the run's answer, so forget it, stop the drain before
+				// it kills the retry, and restore the hard timeout for the time left.
+				// The retried attempt's own terminal turn arms the drain again.
+				if (
+					e.type === "auto_retry_start" ||
+					(e.type === "agent_end" &&
+						(event as { willRetry?: unknown }).willRetry === true)
+				) {
+					sawAgentEnd = false;
+					preserveDrainedResult = false;
+					finalAssistantText = null;
+					finalStopReason = null;
+					finalErrorMessage = null;
+					agentEndMessages = null;
+					drainTimerStarted = false;
+					if (drainTimerHandle) {
+						clearTimeout(drainTimerHandle);
+						drainTimerHandle = undefined;
+					}
+					armHardTimeout();
+					return;
+				}
+
+				// Accept a complete transcript unless a usable terminal result is
+				// already draining. Shutdown events must not replace that result.
+				if (
+					e.type === "agent_end" &&
+					Array.isArray(e.messages) &&
+					!preserveDrainedResult
+				) {
 					sawAgentEnd = true;
 					agentEndMessages = e.messages;
 					// agent_end is authoritative when a Pi-compatible child emits it;
 					// retain its complete assistant-message list so usage is accounted
 					// even when no message_end events were printed.
 					accountingMessages = e.messages;
-					const result = extractFinalAssistant(e.messages);
-					finalAssistantText = result.text;
-					finalStopReason = result.stopReason;
-					finalErrorMessage = result.errorMessage;
+					const result = captureFinalAssistant(e.messages);
 					emitProgress({
 						type: "terminal",
 						stopReason: result.stopReason ?? undefined,
@@ -1797,7 +1929,6 @@ export class PiSubagentRunner implements SubagentRunner {
 						hasToolCall: false,
 						ms: elapsedMs,
 					});
-					return;
 				}
 
 				// Live path: accumulate every assistant/tool message Pi
@@ -1807,7 +1938,7 @@ export class PiSubagentRunner implements SubagentRunner {
 				// being a non-toolUse value AND no toolCall content in the
 				// assistant message body. "length" means the model hit its
 				// max-tokens cap mid-response — still terminal, but we
-				// surface it as model_failed so callers can react.
+				// surface it as truncated so callers can react.
 				if (e.type === "message_end" && e.message) {
 					// Every assistant message_end is retained. recordChildInvocation
 					// sums message.usage here, matching OpenCode's per-assistant
@@ -1834,12 +1965,13 @@ export class PiSubagentRunner implements SubagentRunner {
 								m.stopReason === "length" ||
 								m.stopReason === "error" ||
 								m.stopReason === "aborted");
-						if (isTerminalStopReason && !hasToolCall) {
+						if (
+							isTerminalStopReason &&
+							!hasToolCall &&
+							!preserveDrainedResult
+						) {
 							sawAgentEnd = true;
-							const result = extractFinalAssistant(accumulatedMessages);
-							finalAssistantText = result.text;
-							finalStopReason = result.stopReason;
-							finalErrorMessage = result.errorMessage;
+							const result = captureFinalAssistant(accumulatedMessages);
 							emitProgress({
 								type: "terminal",
 								stopReason: m.stopReason,
@@ -1882,36 +2014,49 @@ export class PiSubagentRunner implements SubagentRunner {
 
 			// Hard timeout. We use SIGTERM first so the child can flush
 			// stdout cleanly, with SIGKILL as a backstop in case it hangs.
+			// The deadline is fixed at spawn: the drain timer replaces it once a
+			// terminal turn arrives, and a Pi auto-retry re-arms it for whatever
+			// time is left, so a retrying child stays bounded by timeoutMs.
 			let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-			if (typeof options.timeoutMs === "number" && options.timeoutMs > 0) {
-				timeoutHandle = setTimeout(() => {
-					if (settled) return;
-					terminateChild(child);
-					// Build a diagnostic suffix so callers can tell whether
-					// the subagent was hung silent (auth/network/no events)
-					// vs actively producing output but slow (model just
-					// taking too long). Without this, every timeout looks
-					// the same and operators can't distinguish them.
-					const sinceLastEvent =
-						lastEventTimestamp > 0 ? Date.now() - lastEventTimestamp : -1;
-					const progressSuffix =
-						eventCount === 0
-							? " — no events received from child (silent hang: spawn/auth/network or model never started streaming)"
-							: ` — saw ${eventCount} events; last event type=${lastEventType ?? "?"} ${sinceLastEvent}ms before timeout (model was emitting events but no terminal stopReason reached)`;
-					settle({
-						ok: false,
-						reason: "timeout",
-						error: `pi subagent timed out after ${options.timeoutMs}ms${progressSuffix}${stderr.length > 0 ? ` | stderr: ${summarizeChildStderr(stderr)}` : ""}`,
-						durationMs: Date.now() - startTime,
-						meta: {
-							stderr: stderr.length > 0 ? stderr : undefined,
-							eventCount,
-							lastEventType: lastEventType ?? undefined,
-							msSinceLastEvent: sinceLastEvent,
-						},
-					});
-				}, options.timeoutMs);
-			}
+			const hardDeadline =
+				typeof options.timeoutMs === "number" && options.timeoutMs > 0
+					? Date.now() + options.timeoutMs
+					: undefined;
+			const onHardTimeout = () => {
+				if (settled) return;
+				terminateChild(child);
+				// Build a diagnostic suffix so callers can tell whether
+				// the subagent was hung silent (auth/network/no events)
+				// vs actively producing output but slow (model just
+				// taking too long). Without this, every timeout looks
+				// the same and operators can't distinguish them.
+				const sinceLastEvent =
+					lastEventTimestamp > 0 ? Date.now() - lastEventTimestamp : -1;
+				const progressSuffix =
+					eventCount === 0
+						? " — no events received from child (silent hang: spawn/auth/network or model never started streaming)"
+						: ` — saw ${eventCount} events; last event type=${lastEventType ?? "?"} ${sinceLastEvent}ms before timeout (model was emitting events but no terminal stopReason reached)`;
+				settle({
+					ok: false,
+					reason: "timeout",
+					error: `pi subagent timed out after ${options.timeoutMs}ms${progressSuffix}${stderr.length > 0 ? ` | stderr: ${summarizeChildStderr(stderr)}` : ""}`,
+					durationMs: Date.now() - startTime,
+					meta: {
+						stderr: stderr.length > 0 ? stderr : undefined,
+						eventCount,
+						lastEventType: lastEventType ?? undefined,
+						msSinceLastEvent: sinceLastEvent,
+					},
+				});
+			};
+			const armHardTimeout = () => {
+				if (hardDeadline === undefined || timeoutHandle) return;
+				timeoutHandle = setTimeout(
+					onHardTimeout,
+					Math.max(0, hardDeadline - Date.now()),
+				);
+			};
+			armHardTimeout();
 
 			// Caller-driven abort (e.g. dreamer lease loss).
 			const onAbort = () => {
@@ -1938,9 +2083,17 @@ export class PiSubagentRunner implements SubagentRunner {
 				});
 			});
 
-			child.on("close", (code, signal) => {
+			let exitGraceHandle: ReturnType<typeof setTimeout> | undefined;
+			let childExitHandled = false;
+			const finishAfterChildExit = (
+				code: number | null,
+				signal: NodeJS.Signals | null,
+			) => {
+				if (childExitHandled) return;
+				childExitHandled = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (drainTimerHandle) clearTimeout(drainTimerHandle);
+				if (exitGraceHandle) clearTimeout(exitGraceHandle);
 				options.signal?.removeEventListener("abort", onAbort);
 				emitProgress({
 					type: "child_exit",
@@ -2109,6 +2262,25 @@ export class PiSubagentRunner implements SubagentRunner {
 						sawProtocolOutput: eventCount > 0,
 					},
 				});
+			};
+
+			child.on("close", finishAfterChildExit);
+
+			// The child has exited but its stdio may still be held open by a
+			// process it started. Give the pipes a short grace to deliver what
+			// Pi wrote, then stop reading and settle from the exit status.
+			child.on("exit", (code, signal) => {
+				if (settled || exitGraceHandle) return;
+				exitGraceHandle = setTimeout(() => {
+					if (settled) return;
+					rl.close();
+					child.stdout?.destroy();
+					child.stderr?.destroy();
+					finishAfterChildExit(code, signal);
+				}, EXIT_STDIO_GRACE_MS);
+				if (typeof exitGraceHandle.unref === "function") {
+					exitGraceHandle.unref();
+				}
 			});
 		});
 	}
@@ -2294,6 +2466,7 @@ export function buildArgs(
 		modelRef?: string;
 		rpc?: boolean;
 		historianCalibrationEntryPath?: string | null;
+		hostToolNames?: readonly string[];
 	},
 ): string[] {
 	const targetHarness = opts?.targetHarness ?? resolvePiHarnessKind();
@@ -2326,7 +2499,8 @@ export function buildArgs(
 		...(ompTarget
 			? (["--no-rules"] as const)
 			: (["--no-prompt-templates", "--no-context-files"] as const)),
-		// --no-tools is applied below only for unknown or explicitly zero-tool agents.
+		// --no-tools is applied below for unknown, explicitly zero-tool, or fully
+		// filtered allow-lists.
 		// Every known Magic Context child gets an explicit --tools allow-list so Pi's
 		// discovered extension registry cannot leak unrelated tools into subagents.
 	];
@@ -2404,7 +2578,30 @@ export function buildArgs(
 		);
 		args.push("--no-tools");
 	} else {
-		const hostTools = resolveHostToolAllowlist(strictTools, ompTarget);
+		// Only OMP refuses a child whose --tools names a built-in it has disabled.
+		// Pi accepts the list, and its registry also reflects the parent session's
+		// own --tools restriction, so filtering there would only take tools away.
+		const resolution = resolveHostToolAllowlistDetails(
+			strictTools,
+			ompTarget,
+			ompTarget ? opts?.hostToolNames : undefined,
+		);
+		const hostTools = resolution.tools;
+		for (const tool of resolution.dropped) {
+			const warningKey = `${options.agent}\u0000${tool}`;
+			if (loggedUnavailableBuiltinTools.has(warningKey)) continue;
+			loggedUnavailableBuiltinTools.add(warningKey);
+			const degradation =
+				tool === "read"
+					? "This source-inspection task cannot read local files without read."
+					: hostTools.includes("read")
+						? `The agent can still read files with read, but its ${tool} search capability is unavailable.`
+						: "The agent has no remaining built-in file-reading capability for this task.";
+			sessionLog(
+				options.accountingSessionId ?? "pi-subagent",
+				`Pi subagent "${options.agent}" is dropping unavailable built-in "${tool}". ${degradation}`,
+			);
+		}
 		if (hostTools.length > 0) {
 			args.push("--tools", hostTools.join(","));
 		} else {
@@ -2675,4 +2872,8 @@ export const __test = {
 	STRICT_TOOL_ALLOWLIST,
 	ZERO_TOOL_PROMPT_REQUIRED_AGENTS,
 	resetProviderFormCache: () => PI_PROVIDER_FORM_CACHE.clear(),
+	resetHostToolState: () => {
+		configuredHostToolNames = undefined;
+		loggedUnavailableBuiltinTools.clear();
+	},
 };

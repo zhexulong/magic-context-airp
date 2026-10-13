@@ -13,15 +13,12 @@ import {
     StaleRouteHandleError,
     SubcClient,
 } from "@cortexkit/subc-client";
-import type {
-    AuthorityDrainResponse,
-    AuthorityStatus,
-    ChangefeedPage,
-    ChangefeedRow,
-} from "../../features/magic-context/context-authority";
+
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { isRecord } from "../../shared/record-type-guard";
+import { assembleReplyPages } from "./reply-pages";
+import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
 import { storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 
 const DEFAULT_MODULE_ID = "magic-context";
@@ -224,6 +221,14 @@ export interface ModuleCallTimings {
     settle: number;
 }
 
+function moduleRequestBody(body: unknown, method: string): unknown {
+    if (!isRecord(body)) return body;
+    // Flat management requests dispatch on method; MCP facade calls dispatch on
+    // name/arguments and must remain method-free to reach the facade handler.
+    const facade = typeof body.name === "string" && isRecord(body.arguments);
+    return { ...body, ...(facade ? {} : { method }), accept_reply_pages: true };
+}
+
 export class SubcModuleTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
@@ -240,14 +245,6 @@ export class SubcModuleTransport {
     private wrapupSessions = new Map<string, number>();
     private nextProbeMs = 0;
     private connectionPromise: Promise<SubcClient> | null = null;
-    private authorityProjectRoot = "";
-    /**
-     * Filesystem root used to bind authority/mirror routes. Authority request
-     * bodies carry the MC project IDENTITY (git:<sha> / dir:<hash>), which is not
-     * a path — the daemon validates BindIdentity.project_root against the real
-     * filesystem and rejects identity strings outright.
-     */
-    private authorityBindRoot = "";
     private backoffMs = CONNECT_BACKOFF_INITIAL_MS;
     private connectionGeneration = 0;
     private stateSyncCapabilityCache: {
@@ -469,22 +466,6 @@ export class SubcModuleTransport {
             | "session.wrapup"
             | "todo_state.set"
             | "agent_drops.append"
-            | "authority.status"
-            | "authority.prepare"
-            | "authority.seed"
-            | "authority.drain.begin"
-            | "authority.drain.finish"
-            | "authority.drain_seed"
-            | "authority.drain_memories"
-            | "authority.drain_notes"
-            | "authority.drain_compartments"
-            | "authority.drain_reconcile"
-            | "authority.drain_verify"
-            | "authority.drain_flip"
-            | "authority.drain_finish"
-            | "mirror.pull"
-            | "mirror.memory"
-            | "memory.identity.ack"
             | "ctx_note"
             | "ctx_memory"
             | "note.evaluate"
@@ -594,6 +575,7 @@ export class SubcModuleTransport {
         try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
                 let ensuredRoute: EnsuredRoute | null = null;
+                let initialResponseReceived = false;
                 try {
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
@@ -618,7 +600,9 @@ export class SubcModuleTransport {
                     const body =
                         args.body instanceof Uint8Array
                             ? args.body
-                            : Buffer.from(JSON.stringify(args.body));
+                            : Buffer.from(
+                                  JSON.stringify(moduleRequestBody(args.body, args.method)),
+                              );
                     timings.encode += performance.now() - encodeStartedAt;
                     const issueStartedAt = performance.now();
                     const request = ensuredRoute.client.request(ensuredRoute.route, body, {
@@ -634,6 +618,7 @@ export class SubcModuleTransport {
                         "waiting for the module response",
                     );
                     timings.responseWait += performance.now() - waitStartedAt;
+                    initialResponseReceived = true;
                     if (
                         this.client !== ensuredRoute.client ||
                         this.connectionGeneration !== ensuredRoute.generation
@@ -642,12 +627,49 @@ export class SubcModuleTransport {
                             "subc connection changed while awaiting the module response",
                         );
                     }
-                    return response;
+                    const pageRoute = ensuredRoute;
+                    const assembled = await assembleReplyPages(response, async (id, index) => {
+                        if (args.signal?.aborted) throw args.signal.reason;
+                        const page = await this.beforeDeadline(
+                            Promise.race([
+                                pageRoute.client.request(
+                                    pageRoute.route,
+                                    Buffer.from(
+                                        JSON.stringify({
+                                            method: "reply.page",
+                                            reply_page_id: id,
+                                            reply_page_index: index,
+                                        }),
+                                    ),
+                                    {
+                                        priority: Priority.Background,
+                                        admissionClass: AdmissionClass.Normal,
+                                        timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
+                                    },
+                                ),
+                                aborted,
+                            ]),
+                            attemptDeadlineMs,
+                            "waiting for a module reply page",
+                        );
+                        if (
+                            this.client !== pageRoute.client ||
+                            this.connectionGeneration !== pageRoute.generation
+                        ) {
+                            throw this.connectionChangedError(
+                                "subc connection changed during reply paging",
+                            );
+                        }
+                        return page;
+                    });
+                    return assembled;
                 } catch (error) {
                     if (args.signal?.aborted) throw args.signal.reason ?? error;
                     // One typed error for every caller: the transform, the tools and the
                     // historian lane all have to recognize this refusal, and none of them
                     // should have to know how the subc client shapes an error frame.
+                    const migration = singleStoreMigrationRequiredFailure(error);
+                    if (migration) throw migration;
                     const storeAhead = storeAheadOfBinaryFailure(error);
                     if (storeAhead) throw storeAhead;
                     if (args.method === "state_sync" && isDeadlineFailure(error)) {
@@ -684,6 +706,34 @@ export class SubcModuleTransport {
                         } else {
                             this.invalidateConnection();
                         }
+                        // The SDK rejects a stale handle locally, before emitting any request
+                        // frame. Rebind that unsent request after a module restart. This is not
+                        // permission to resend a dispatched transform or a partial reply: their
+                        // outcome can already be committed, even when a later page is stale.
+                        // Remote error frames can reuse the code, but decode as SubcError,
+                        // not this SDK-local exception. A remote refusal is not unsent proof.
+                        const locallyUnsent =
+                            isRecord(error) &&
+                            error.name === "StaleRouteHandleError" &&
+                            error.code === "stale_route_handle";
+                        if (
+                            attempt === 0 &&
+                            ensuredRoute &&
+                            !initialResponseReceived &&
+                            locallyUnsent &&
+                            !args.generationSensitive
+                        ) {
+                            continue;
+                        }
+                        // A disconnected transform may already have committed. Never resend
+                        // its history automatically, including after a partial reply download.
+                        if (args.method === "transform") {
+                            if (!ensuredRoute) throw error;
+                            throw Object.assign(
+                                new Error("Transform transport interrupted; abandon this pass"),
+                                { code: "transform_transport_interrupted", cause: error },
+                            );
+                        }
                         if (args.generationSensitive && !args.signal?.aborted) {
                             return {
                                 transport_status: "connection_generation_changed",
@@ -715,178 +765,6 @@ export class SubcModuleTransport {
             );
             args.onTimings?.(timings);
         }
-    }
-
-    private async authorityRequest(
-        sessionId: string,
-        projectRoot: string,
-        method:
-            | "authority.status"
-            | "authority.prepare"
-            | "authority.seed"
-            | "authority.drain.begin"
-            | "authority.drain.finish"
-            | "authority.drain_seed"
-            | "authority.drain_memories"
-            | "authority.drain_notes"
-            | "authority.drain_compartments"
-            | "authority.drain_reconcile"
-            | "authority.drain_verify"
-            | "authority.drain_finish"
-            | "mirror.pull"
-            | "mirror.memory"
-            | "memory.identity.ack",
-        body: Record<string, unknown>,
-        timeoutMs?: number,
-    ): Promise<Record<string, unknown>> {
-        // The transport serializes the body verbatim; the module dispatches on the
-        // body's own method field, so it must always be present and canonical here.
-        const response = (await this.call({
-            sessionId,
-            projectRoot,
-            method,
-            body: { ...body, method, v: 1 },
-            timeoutMs,
-        })) as unknown;
-        if (isRecord(response) && isRecord(response.result)) return response.result;
-        if (isRecord(response)) return response;
-        throw new Error(`module returned an invalid ${method} response`);
-    }
-
-    setAuthorityBindRoot(root: string): void {
-        this.authorityBindRoot = root;
-    }
-
-    private bindRootForAuthority(): string {
-        return this.authorityBindRoot.length > 0 ? this.authorityBindRoot : process.cwd();
-    }
-
-    async authorityStatus(args: {
-        context_store_uuid: string;
-        project: string;
-        projectRoot?: string;
-        sessionId?: string;
-        domain: "memories" | "notes";
-    }): Promise<{ authority: AuthorityStatus | null }> {
-        this.authorityProjectRoot = args.project;
-        const { projectRoot, sessionId, ...body } = args;
-        const response = await this.authorityRequest(
-            // A tool call already has a real session route. Reusing it avoids asking the
-            // daemon to resolve the project identity as though it were an OpenCode session.
-            sessionId ?? args.project,
-            projectRoot ?? this.bindRootForAuthority(),
-            "authority.status",
-            body,
-        );
-        return { authority: (response.authority as AuthorityStatus | null) ?? null };
-    }
-
-    async authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }> {
-        this.authorityProjectRoot = String(args.project ?? "");
-        const { projectRoot, ...body } = args;
-        const response = await this.authorityRequest(
-            String(args.project ?? "authority"),
-            typeof projectRoot === "string" ? projectRoot : this.bindRootForAuthority(),
-            "authority.prepare",
-            body,
-        );
-        if (!isRecord(response.authority)) throw new Error("authority.prepare omitted authority");
-        return { authority: response.authority as unknown as AuthorityStatus };
-    }
-
-    async authoritySeed(
-        args: Record<string, unknown>,
-    ): Promise<{ seeded: number; module_row_ids?: number[] }> {
-        this.authorityProjectRoot = String(args.project ?? "");
-        const { projectRoot, ...body } = args;
-        const response = await this.authorityRequest(
-            String(args.project ?? "authority"),
-            typeof projectRoot === "string" ? projectRoot : this.bindRootForAuthority(),
-            "authority.seed",
-            body,
-        );
-        return {
-            seeded: typeof response.seeded === "number" ? response.seeded : 0,
-            module_row_ids: Array.isArray(response.module_row_ids)
-                ? response.module_row_ids.filter((id): id is number => typeof id === "number")
-                : undefined,
-        };
-    }
-
-    async authorityDrain(args: Record<string, unknown>): Promise<AuthorityDrainResponse> {
-        this.authorityProjectRoot = String(args.project ?? this.authorityProjectRoot);
-        const method = String(args.method ?? "authority.drain.step") as Parameters<
-            SubcModuleTransport["authorityRequest"]
-        >[2];
-        const { projectRoot, ...body } = args;
-        const response = await this.authorityRequest(
-            String(args.project ?? "authority"),
-            typeof projectRoot === "string" ? projectRoot : this.bindRootForAuthority(),
-            method,
-            body,
-        );
-        if (isRecord(response.authority)) {
-            return { authority: response.authority as unknown as AuthorityStatus };
-        }
-        if (typeof response.code === "string") {
-            return {
-                code: response.code,
-                retryable: response.retryable === true,
-            };
-        }
-        throw new Error("authority.drain omitted authority");
-    }
-
-    async mirrorPull(args: {
-        domain: "memories" | "notes";
-        cursor: number;
-        limit: number;
-        live_only?: boolean;
-        projectRoot?: string;
-    }): Promise<{ page: ChangefeedPage }> {
-        const { projectRoot, ...body } = args;
-        const response = await this.authorityRequest(
-            `mirror:${args.domain}`,
-            projectRoot ?? this.bindRootForAuthority(),
-            "mirror.pull",
-            body,
-        );
-        if (!isRecord(response.page)) throw new Error("mirror.pull omitted page");
-        return { page: response.page as unknown as ChangefeedPage };
-    }
-
-    async mirrorMemory(args: {
-        module_row_id: number;
-        projectRoot?: string;
-    }): Promise<{ row: ChangefeedRow | null }> {
-        const { projectRoot, ...body } = args;
-        const response = await this.authorityRequest(
-            `mirror-memory:${args.module_row_id}`,
-            projectRoot ?? this.bindRootForAuthority(),
-            "mirror.memory",
-            body,
-            1_900,
-        );
-        return {
-            row: isRecord(response.row) ? (response.row as unknown as ChangefeedRow) : null,
-        };
-    }
-
-    async memoryIdentityAck(args: {
-        project: string;
-        rows: Array<{ module_row_id: number; context_row_id: number }>;
-        projectRoot?: string;
-    }): Promise<{ acknowledged: number }> {
-        const { projectRoot, ...body } = args;
-        const response = await this.authorityRequest(
-            `memory-identity:${args.project}`,
-            projectRoot ?? this.bindRootForAuthority(),
-            "memory.identity.ack",
-            body,
-        );
-        return {
-            acknowledged: typeof response.acknowledged === "number" ? response.acknowledged : 0,
-        };
     }
 
     async deleteSession(sessionId: string, projectRoot: string): Promise<void> {

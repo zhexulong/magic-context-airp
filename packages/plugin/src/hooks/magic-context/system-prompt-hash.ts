@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "../../agents/magic-context-prompt";
+import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import {
     type ContextDatabase,
     getOrCreateSessionMeta,
@@ -7,7 +8,7 @@ import {
 } from "../../features/magic-context/storage";
 import type { PluginContext } from "../../plugin/types";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
-import { sessionLog } from "../../shared/logger";
+import { log, sessionLog } from "../../shared/logger";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import {
@@ -21,7 +22,6 @@ import {
     resolveCtxReduceAvailability,
     spawnAgentFromOpenCodeDb,
 } from "./ctx-reduce-availability";
-
 import { estimateTokens } from "./read-session-formatting";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
@@ -133,6 +133,7 @@ export function isMagicContextInternalAgent(systemPromptContent: string): boolea
 export function createSystemPromptHashHandler(deps: {
     db: ContextDatabase;
     dreamerEnabled: boolean;
+    smartNotesEnabled?: boolean;
     /** When false (`memory.enabled: false`), the `<project-memory>` block is
      *  never injected, so ctx_memory guidance is dropped from the prompt and the
      *  ctx_memory tool is not registered. ctx_search guidance stays (it still
@@ -205,6 +206,13 @@ export function createSystemPromptHashHandler(deps: {
     /** When true, inject a "BEWARE: history compression is on" warning so the
      *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
+    /**
+     * True when the messages transform for this same request already ran (the
+     * host calls the system hook after it). Consumes that per-request signal.
+     * Absent (tests, hosts without the signal): a system change is assumed to be
+     * seen before the messages transform, as on a system-first host.
+     */
+    consumeMessagesPrepared?: (sessionId: string) => boolean;
 }): {
     handler: (
         input: {
@@ -219,7 +227,7 @@ export function createSystemPromptHashHandler(deps: {
         deps.promptSurfaceRuntime ??
         createPromptSurfaceRuntime({
             userConfigDirectory: process.cwd(),
-            warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
+            warn: (message) => log(`[magic-context] config warning: ${message}`),
         });
     const guidanceEpochs = createPromptSurfaceGuidanceEpochCache(promptSurfaceRuntime);
 
@@ -320,6 +328,10 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
 
+        // Read after the skip checks above: a skipped title/summary call for this
+        // session must not consume the marker left by the main request's messages pass.
+        const requestMessagesFinal = deps.consumeMessagesPrepared?.(sessionId) ?? false;
+
         // ── Step 1: Inject magic-context guidance ──
         // Subagents with callable ctx_reduce get only the minimal drop mechanics
         // guidance. Subagents without the tool get no Magic Context guidance,
@@ -385,6 +397,7 @@ export function createSystemPromptHashHandler(deps: {
                 deps.memoryEnabled !== false,
                 promptSurface.preset,
                 promptSurface.primaryOverride,
+                deps.smartNotesEnabled,
             );
             // OpenAI-compatible serializers emit one wire message per array entry,
             // and strict chat templates reject a second system message. Keep the host
@@ -407,6 +420,28 @@ export function createSystemPromptHashHandler(deps: {
         // are the volatile resident at m[1]. Keep only guidance + sticky
         // date in system so BP1 remains stable.
         const isCacheBusting = deps.systemPromptRefreshSessions.has(sessionId);
+        // Some OpenCode 1 routes run messages.transform before this hook. An idle-expired
+        // request is already a full provider-cache rebuild, even if an aborted
+        // attempt prepared its frozen head. Adopt this request's system identity
+        // with that head instead of scheduling another rewrite on its next step.
+        // A scheduler execute alone is not proof: pressure passes can replay an
+        // unchanged, still-warm prefix, so those retain the hash-change fold.
+        const idleCacheExpired =
+            sessionMetaEarly !== undefined &&
+            computeHardCacheExpired(
+                sessionMetaEarly.cacheTtl,
+                sessionMetaEarly.lastResponseTime,
+                Date.now(),
+            );
+        // When this request's messages are already final (OpenCode 1 runs the
+        // messages transform before this hook), a changed system prompt is already
+        // a full provider-cache rewrite on this request, and Magic Context can no
+        // longer fold into it. Queuing a rebuild for the next request would make the
+        // provider rewrite its cache a second time. Adopt the new identity here, as
+        // on an idle-expired request; queued work rides the next natural bust.
+        // This must not release the sticky date: OpenCode 1 reports
+        // `requestMessagesFinal` on every request, warm or not.
+        const adoptSystemChange = idleCacheExpired || requestMessagesFinal;
 
         // ── Step 2: Coalesce content/preset and date changes into one bust ──
         const DATE_PATTERN = /Today's date: .+/;
@@ -439,7 +474,7 @@ export function createSystemPromptHashHandler(deps: {
             .update(promptSurfaceHashMaterial(stableCandidate, promptSurface.preset))
             .digest("hex");
         const contentOrPresetChanged = hasPersistedHash && stableCandidateHash !== previousHash;
-        const dateMayAdvance = isCacheBusting || contentOrPresetChanged;
+        const dateMayAdvance = isCacheBusting || idleCacheExpired || contentOrPresetChanged;
 
         if (currentDate && !stickyDate) {
             stickyDateBySession.set(sessionId, currentDate);
@@ -492,16 +527,18 @@ export function createSystemPromptHashHandler(deps: {
         if (previousHash !== "" && previousHash !== "0" && previousHash !== currentHash) {
             sessionLog(
                 sessionId,
-                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), triggering flush`,
+                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}`,
             );
-            // Real prompt-content or preset change: signal all three independent
-            // refresh lifetimes. The semantic prompt epoch changed on this turn,
-            // so history rebuild, adjunct refresh, and materialization should ride
-            // the same cycle.
-            deps.historyRefreshSessions.add(sessionId);
-            deps.systemPromptRefreshSessions.add(sessionId);
-            deps.pendingMaterializationSessions.add(sessionId);
-            deps.lastHeuristicsTurnId.delete(sessionId);
+            // When the following messages transform can still fold into this
+            // request, signal all three independent refresh lifetimes. The semantic
+            // prompt epoch changed on this turn, so history rebuild, adjunct refresh,
+            // and materialization should ride the same cycle.
+            if (!adoptSystemChange) {
+                deps.historyRefreshSessions.add(sessionId);
+                deps.systemPromptRefreshSessions.add(sessionId);
+                deps.pendingMaterializationSessions.add(sessionId);
+                deps.lastHeuristicsTurnId.delete(sessionId);
+            }
         } else if (previousHash === "" || previousHash === "0") {
             sessionLog(
                 sessionId,
@@ -534,12 +571,13 @@ export function createSystemPromptHashHandler(deps: {
                 updateSessionMeta(deps.db, sessionId, {
                     systemPromptHash: currentHash,
                     systemPromptTokens,
-                    // On OpenCode 1, messages.transform runs before system.transform.
+                    // When messages.transform has already run before this hook,
                     // After a rebase clears the previous host baseline, the first
                     // m[0] render records no system-prompt hash. Store this request's
                     // hash with that cached render so the following pass recognizes
                     // the unchanged system prompt and reuses the cache.
-                    cachedM0SystemHash: hasPersistedHash ? undefined : currentHash,
+                    cachedM0SystemHash:
+                        !hasPersistedHash || adoptSystemChange ? currentHash : undefined,
                 });
             } catch (error) {
                 sessionLog(sessionId, "system prompt meta persist failed (fail-open):", error);
