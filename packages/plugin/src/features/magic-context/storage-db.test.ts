@@ -51,6 +51,7 @@ import {
     openDatabaseAsync,
     resolveDatabasePath,
 } from "./storage-db";
+import { FORK_MIGRATIONS } from "./migrations";
 import { clearSession } from "./storage-meta-session";
 import { SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
@@ -419,14 +420,11 @@ describe("storage-db", () => {
             expect(first).not.toBeNull();
             first
                 ?.prepare(
-                    "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?), (?, ?, ?)",
+                    "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
                 )
                 .run(
                     FORK_MIGRATION_VERSION_FLOOR,
-                    "fork migration 10000",
-                    0,
-                    FORK_MIGRATION_VERSION_FLOOR + 1,
-                    "fork migration 10001",
+                    "fork migration at the floor",
                     0,
                 );
             closeDatabase();
@@ -438,7 +436,7 @@ describe("storage-db", () => {
                 reopened
                     ?.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version >= ?")
                     .get(FORK_MIGRATION_VERSION_FLOOR),
-            ).toEqual({ count: 2 });
+            ).toEqual({ count: 1 + FORK_MIGRATIONS.length });
         });
 
         it("#when called first time #then creates required tables", () => {

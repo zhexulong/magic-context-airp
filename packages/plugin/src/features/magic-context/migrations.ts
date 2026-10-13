@@ -3156,8 +3156,29 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+];
+
+/**
+ * Highest version in the MIGRATIONS array. `LATEST_SUPPORTED_VERSION` in
+ * storage-db.ts (the schema-fence ceiling) MUST equal this — a stale ceiling
+ * makes the DB refuse to open after the new migration applies (a real bug the
+ * project hit during v2 work). A unit test asserts the two stay in lockstep.
+ */
+export const LATEST_MIGRATION_VERSION: number = MIGRATIONS.reduce(
+    (max, m) => Math.max(max, m.version),
+    0,
+);
+
+/**
+ * The fork's own migrations.
+ * Upstream reserves versions at and above `FORK_MIGRATION_VERSION_FLOOR` for downstream work, and its own
+ * fence test asserts that nothing inside `MIGRATIONS` reaches that floor — so a fork migration cannot live
+ * in the upstream array however it is numbered. `getCurrentVersion` counts only versions below the floor,
+ * so upstream bookkeeping and its pending check keep working untouched.
+ */
+export const FORK_MIGRATIONS: readonly Migration[] = [
     {
-        version: 92,
+        version: 10_001,
         description: "narrative chapter rollup (immutable compartment-range summaries)",
         up(db: Database): void {
             // Chapters are sealed once inside the HARD fold transaction and are
@@ -3191,7 +3212,7 @@ export const MIGRATIONS: Migration[] = [
         },
     },
     {
-        version: 93,
+        version: 10_002,
         description: "player edits and removal for narrative chapters",
         up(db: Database): void {
             // A chapter stops being write-once the moment the player can see it: the product's own rule for
@@ -3210,16 +3231,8 @@ export const MIGRATIONS: Migration[] = [
     },
 ];
 
-/**
- * Highest version in the MIGRATIONS array. `LATEST_SUPPORTED_VERSION` in
- * storage-db.ts (the schema-fence ceiling) MUST equal this — a stale ceiling
- * makes the DB refuse to open after the new migration applies (a real bug the
- * project hit during v2 work). A unit test asserts the two stay in lockstep.
- */
-export const LATEST_MIGRATION_VERSION: number = MIGRATIONS.reduce(
-    (max, m) => Math.max(max, m.version),
-    0,
-);
+/** Everything that applies to this build: upstream's lane, then the fork's. */
+const APPLIED_MIGRATIONS: readonly Migration[] = [...MIGRATIONS, ...FORK_MIGRATIONS];
 
 function ensureMigrationsTable(db: Database): void {
     db.exec(`
@@ -3313,7 +3326,7 @@ export function runMigrations(db: Database): void {
             // that there is no migration to apply. Pending databases still re-read
             // under BEGIN IMMEDIATE below before selecting the migration.
             currentVersion = getCurrentVersion(db);
-            const pendingMigration = MIGRATIONS.find(
+            const pendingMigration = APPLIED_MIGRATIONS.find(
                 (candidate) =>
                     candidate.version > currentVersion &&
                     !isMigrationApplied(db, candidate.version),
@@ -3333,7 +3346,7 @@ export function runMigrations(db: Database): void {
                     // range, check each candidate's row directly so downstream rows at or
                     // above the reserved floor cannot make a sibling migration re-select
                     // an already-applied version.
-                    migration = MIGRATIONS.find(
+                    migration = APPLIED_MIGRATIONS.find(
                         (candidate) =>
                             candidate.version > currentVersion &&
                             !isMigrationApplied(db, candidate.version),
@@ -3342,7 +3355,7 @@ export function runMigrations(db: Database): void {
                     if (!migration) return false;
 
                     if (!loggedPlan) {
-                        const pendingCount = MIGRATIONS.filter(
+                        const pendingCount = APPLIED_MIGRATIONS.filter(
                             (candidate) =>
                                 candidate.version > currentVersion &&
                                 !isMigrationApplied(db, candidate.version),
@@ -3410,7 +3423,7 @@ export function runMigrations(db: Database): void {
 
     if (loggedPlan) {
         log(
-            `[migrations] upstream migration lane now: ${MIGRATIONS[MIGRATIONS.length - 1].version}`,
+            `[migrations] upstream migration lane now: ${APPLIED_MIGRATIONS[APPLIED_MIGRATIONS.length - 1].version}`,
         );
     }
 }
