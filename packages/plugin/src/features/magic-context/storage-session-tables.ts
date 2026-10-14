@@ -34,6 +34,14 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "session_projects", harnessScoped: true },
     { table: "compartment_chunk_embeddings", harnessScoped: true },
     { table: "compartments", harnessScoped: true },
+    // The narrative chapters are session-owned row for row (UNIQUE(session_id, sequence)), and they cover
+    // compartment ranges, so they are deleted with the compartments they summarise. The fork added this
+    // table without registering it here, which the merged suite's lockstep and clearSession tests catch:
+    // every table carrying an exact `session_id` column denotes session-owned rows.
+    //
+    // No `harnessScoped`: the table has no `harness` column, so its rows cannot be attributed to one host
+    // and it stays cleanup-only for the orphan sweep (the suite asserts that split from schema shape).
+    { table: "chapters" },
     // A harness sweep can leave another harness's compartments for the same session.
     {
         table: "compartment_history_versions",
