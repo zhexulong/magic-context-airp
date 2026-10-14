@@ -41,7 +41,36 @@ export type DeclaredProjectIdentity = Readonly<{
   identity: string;
 }>;
 
-let declaredProjectIdentity: string | undefined;
+/**
+ * The declared project identity lives on a process-wide `Symbol.for` slot, not in a module variable.
+ *
+ * The embedding Host declares it through the package's `/memory` subpath while the extension reads it from the
+ * bundled core - two evaluation paths that can end up with separate module instances. A module variable would
+ * then be written on one side and read as `undefined` on the other, and the symptom is silent: the historian
+ * seals chapters under a directory-derived identity while the panel reads the declared partition, so the
+ * player's chapters are stored somewhere the panel never looks. The same reasoning already put the embedded
+ * model registry on a shared slot; this is the second handoff of the same shape.
+ */
+const DECLARED_IDENTITY_SLOT = Symbol.for("magic-context.pi.declared-project-identity");
+
+type DeclaredIdentitySlot = { value?: string | undefined };
+
+function declaredIdentitySlot(): DeclaredIdentitySlot {
+    const host = globalThis as typeof globalThis & { [DECLARED_IDENTITY_SLOT]?: DeclaredIdentitySlot };
+    const existing = host[DECLARED_IDENTITY_SLOT];
+    if (existing !== undefined) return existing;
+    const created: DeclaredIdentitySlot = {};
+    host[DECLARED_IDENTITY_SLOT] = created;
+    return created;
+}
+
+function readDeclaredProjectIdentity(): string | undefined {
+    return declaredIdentitySlot().value;
+}
+
+function writeDeclaredProjectIdentity(value: string | undefined): void {
+    declaredIdentitySlot().value = value;
+}
 
 let currentHarness: HarnessId = "opencode";
 let harnessLocked = false;
@@ -94,7 +123,7 @@ export function harnessOwnsOpenCodeStore(harness: HarnessId = currentHarness): b
 export function _resetHarnessForTesting(): void {
     currentHarness = "opencode";
     harnessLocked = false;
-    declaredProjectIdentity = undefined;
+    writeDeclaredProjectIdentity(undefined);
 }
 
 /**
@@ -109,7 +138,7 @@ export function _resetHarnessForTesting(): void {
  */
 export function setDeclaredProjectIdentity(value: string | undefined): void {
     if (value === undefined) {
-        declaredProjectIdentity = undefined;
+        writeDeclaredProjectIdentity(undefined);
         return;
     }
     if (!isValidDeclaredProjectIdentity(value)) {
@@ -118,14 +147,14 @@ export function setDeclaredProjectIdentity(value: string | undefined): void {
         );
     }
     if (
-        declaredProjectIdentity !== undefined &&
-        declaredProjectIdentity !== value
+        readDeclaredProjectIdentity() !== undefined &&
+        readDeclaredProjectIdentity() !== value
     ) {
         throw new Error(
-            `Magic Context: project identity already declared as "${declaredProjectIdentity}"; refusing to switch to "${value}"`,
+            `Magic Context: project identity already declared as "${readDeclaredProjectIdentity()}"; refusing to switch to "${value}"`,
         );
     }
-    declaredProjectIdentity = value;
+    writeDeclaredProjectIdentity(value);
 }
 
 /**
@@ -133,7 +162,7 @@ export function setDeclaredProjectIdentity(value: string | undefined): void {
  * (OpenCode and other repository-driven hosts keep the git heuristic).
  */
 export function getDeclaredProjectIdentity(): string | undefined {
-    return declaredProjectIdentity;
+    return readDeclaredProjectIdentity();
 }
 
 /** Reject anything that could break storage keys or produce an ambiguous value. */
