@@ -168,6 +168,7 @@ export interface CompartmentRunnerDeps<
     /** Resolved fallback chain for historian-family calls (historian + compressor). */
     fallbackModels?: readonly ModelInput[];
     language?: string;
+    memoryDomain?: import("../../features/magic-context/memory/domain").MemoryDomain;
     directory: string;
     historyBudgetTokens?: number;
     fallbackModelId?: string;

@@ -118,6 +118,7 @@ import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { isStrictGapHealingMessage } from "./read-session-raw";
 import { sendStatusNotification } from "./send-session-notification";
+import { historianSystemPromptForDomain } from "../../features/magic-context/memory/domain";
 
 const inconsistentProducerWindows = new Set<string>();
 function logInconsistentProducerWindowOnce(
@@ -554,7 +555,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
             systemPrompt: withContentLanguageDirective(
-                COMPARTMENT_AGENT_SYSTEM_PROMPT,
+                historianSystemPromptForDomain(deps.memoryDomain ?? "coding-project"),
                 deps.language,
             ),
             requestedChunkTokens: historianChunkTokens,
@@ -799,6 +800,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             fallbackModels: deps.fallbackModels,
             twoPass: deps.historianTwoPass,
             language: deps.language,
+            // The pass sends its own system prompt; it has to be the same one the fit above sized, or the
+            // admission arithmetic is about a prompt the transport never sees.
+            memoryDomain: deps.memoryDomain,
         });
         // A window refusal here comes from a fallback model (the primary was fitted
         // above). Treat it like any other failed pass: count it, notify, and keep

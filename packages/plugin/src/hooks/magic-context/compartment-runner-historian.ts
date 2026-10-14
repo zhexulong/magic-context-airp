@@ -65,6 +65,8 @@ import {
     producerPromptFailureReason,
 } from "./producer-window-guard";
 import { estimateTokens } from "./read-session-formatting";
+import { historianSystemPromptForDomain } from "../../features/magic-context/memory/domain";
+import type { MemoryDomain } from "../../features/magic-context/memory/domain";
 
 // Intentionally kept: historian validation failure dumps are preserved for
 // debugging. They land in the project-local historian dir
@@ -321,6 +323,7 @@ export async function runValidatedHistorianPass(args: {
     subagentKind?: SubagentKind;
     agentId?: string;
     language?: string;
+    memoryDomain?: MemoryDomain;
 }): Promise<ValidatedHistorianPassResult> {
     const firstRun = await runHistorianPrompt({
         ...args,
@@ -513,6 +516,7 @@ async function runHistorianPrompt(args: {
     maxOutputTokens?: number;
     dumpLabel?: string;
     language?: string;
+    memoryDomain?: MemoryDomain;
     modelOverride?: ModelInput;
     /** Agent identifier to route the request to. Defaults to HISTORIAN_AGENT.
      *  Use HISTORIAN_EDITOR_AGENT for the second pass in two-pass mode. */
@@ -536,6 +540,7 @@ async function runHistorianPrompt(args: {
         fallbackModels,
         subagentKind,
         parentInvocationId,
+        memoryDomain,
     } = args;
     let agentSessionId: string | null = null;
     let handle: HiddenRunHandle | null = null;
@@ -596,7 +601,7 @@ async function runHistorianPrompt(args: {
     const system = withContentLanguageDirective(
         agentId === HISTORIAN_EDITOR_AGENT
             ? HISTORIAN_EDITOR_SYSTEM_PROMPT
-            : COMPARTMENT_AGENT_SYSTEM_PROMPT,
+            : historianSystemPromptForDomain(memoryDomain ?? "coding-project"),
         args.language,
     );
     // Admit the prompt before opening a child session. A prompt that cannot fit

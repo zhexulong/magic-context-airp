@@ -6590,6 +6590,14 @@ function spawnPiHistorianRun(args: {
 					expandTools: historian.expandTools,
 					thinkingLevel: historian.thinkingLevel,
 					memoryEnabled: historian.memoryEnabled,
+					// The domain decides which historian prompt a run uses, so it has to travel with the rest of the
+					// historian configuration. Without it the runner falls back to its coding-project default and a
+					// companion compartments get written in the coding voice - measured end to end before this line.
+					memoryDomain: historian.memoryDomain,
+					// The domain decides which historian prompt a run uses, so it has to travel with the rest of the
+					// historian configuration. Without it the runner falls back to its coding-project default and a
+					// companion's compartments get written in the coding voice - measured end to end before this line.
+
 					allowHomeProject: historian.allowHomeProject,
 					autoPromote: historian.autoPromote,
 					userMemoriesEnabled: historian.userMemoriesEnabled,
