@@ -35,6 +35,9 @@ for (const fragment of required) {
 // while the diff said otherwise. That is the failure this file exists to prevent, so it is checked
 // here with a full-text comparison: a change to the generator's own template must fail here too rather
 // than pass unnoticed.
+// Both sides of the comparison below are normalised to LF first: the generated artifact's line endings
+// belong to git, and comparing raw bytes made a CRLF checkout look like a stale prompt.
+const asComparable = (value) => value.replace(/\r\n/g, "\n");
 const promptSource = (
   await readFile(
     resolve(sourceRoot, "..", "..", "plugin", "src", "hooks", "magic-context", "ongoing-interaction-historian-prompt.source.md"),
@@ -49,7 +52,7 @@ const generatedPrompt = await readFile(
   resolve(sourceRoot, "..", "..", "plugin", "src", "hooks", "magic-context", "ongoing-interaction-historian-prompt.generated.ts"),
   "utf8",
 );
-if (generatedPrompt !== expectedGenerated) {
+if (asComparable(generatedPrompt) !== asComparable(expectedGenerated)) {
   throw new Error(
     "stale ongoing-interaction historian prompt: regenerate it with " +
       "`bun run packages/plugin/scripts/build-ongoing-interaction-historian-prompt.ts`",
@@ -74,7 +77,7 @@ const generatedReflect = await readFile(
   resolve(sourceRoot, "..", "..", "plugin", "src", "hooks", "magic-context", "reflect-prompt.generated.ts"),
   "utf8",
 );
-if (generatedReflect !== expectedReflectGenerated) {
+if (asComparable(generatedReflect) !== asComparable(expectedReflectGenerated)) {
   throw new Error(
     "stale reflection prompt: regenerate it with " +
       "`bun run packages/plugin/scripts/build-reflect-prompt.ts`",
