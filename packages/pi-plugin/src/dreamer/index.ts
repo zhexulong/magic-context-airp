@@ -921,3 +921,9 @@ export const __test = {
  */
 export { loadPiConfig } from "../config/index";
 export { dreamerRunConfig } from "@magic-context/core/config/live-run-config";
+/**
+ * Re-exported for the on-demand harness: a caller that wants to run one task has to hand the registration the
+ * same store handle the extension opens, and that opener lives in the core package, whose source the pi-plugin
+ * aliases rather than depends on.
+ */
+export { openCurrentDatabase as openRuntimeDatabase } from "@magic-context/core/features/magic-context/storage-db";
