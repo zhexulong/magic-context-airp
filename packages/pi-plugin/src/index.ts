@@ -2029,7 +2029,12 @@ async function startPiMagicContextRuntime(
 		// host registered no project at all, so the schedule timer had nothing to run and every task - including
 		// the two the product enables - did nothing, silently. Measured: with `reflect` on a one-minute clock, a
 		// full session left dream_state, dream_queue and dream_runs all empty.
-		if (hostOutlivesBackgroundRuns(ctx.hasUI)) syncDreamerProjectRegistration(current, ctx.modelRegistry);
+		// The registry the dreamer validates its task models against. `ctx.modelRegistry` is the interactive
+		// host's own field and is absent on an embedded one, which is where the Host binds the registry it
+		// hands to background runs - the same slot the historian reads. Threading it through is the second half
+		// of this gate: without it the timer starts and every task is skipped as unvalidated, silently.
+		if (hostOutlivesBackgroundRuns(ctx.hasUI))
+			syncDreamerProjectRegistration(current, ctx.modelRegistry ?? readEmbeddedModelRegistry());
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
 		const failuresToShow = claimConfigParseFailuresOnce(
