@@ -28,6 +28,11 @@ const result = await Bun.build({
     target: "node",
     format: "esm",
     external: ["onnxruntime-web", "onnxruntime-web/*"],
+    // The CJS dependencies behind this entry declare their own __dirname/__filename, and bun's bundler emits them
+    // as THIS repository's absolute path - which then ships inside the release artifact and names the build
+    // machine. Defining them out is the only lever that works (measured upstream: --target, --root, bunfig and
+    // BUN_OPTIONS all leave the declaration in place); nothing here reads either at runtime.
+    define: { __dirname: "undefined", __filename: "undefined" },
     plugins: [
         {
             name: "magic-context-transformers-node-wasm",
