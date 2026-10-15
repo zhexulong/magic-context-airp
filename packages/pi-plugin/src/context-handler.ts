@@ -1479,6 +1479,13 @@ export interface PiContextHandlerOptions {
 	 * registry before trigger scheduling; a CLI runner uses a no-op binding. */
 	bindHistorianRunner?: (ctx: ExtensionContext) => void;
 	/**
+	 * Bind the dreamer for this project from the SDK context. The dreamer's own registration lives in the
+	 * extension's session_start handler, which an embedded host never dispatches - so on that runtime no
+	 * project was ever registered and every scheduled task silently did nothing. This pass is dispatched, so
+	 * it carries the same binding for hosts whose lifecycle has no session_start.
+	 */
+	bindDreamerProject?: (ctx: ExtensionContext) => void;
+	/**
 	 * Optional auto-search hint wiring (Step 4b.4). When omitted or
 	 * disabled, no hint computation runs. Notes that auto-search shares
 	 * the cortexkit DB with OpenCode, so memories ARE cross-harness.
@@ -4117,6 +4124,7 @@ export function registerPiContextHandler(
 			// Bind the hidden embedded Historian from this actual SDK context before
 			// any trigger can schedule it. This is a no-op for CLI runners.
 			options.bindHistorianRunner?.(ctx);
+			options.bindDreamerProject?.(ctx);
 			const schedulerConfig = options.scheduler ?? DEFAULT_SCHEDULER_CONFIG;
 			const scheduler = schedulerFor(options);
 			lkgCompactionOff = options.compactionOff === true;

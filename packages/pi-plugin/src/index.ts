@@ -1410,7 +1410,10 @@ async function startPiMagicContextRuntime(
 	// cached dependencies so changed project config is visible in the next session.
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
-	const dreamerRegistrationOwner = {};
+	// Projects whose dreamer registration this process has already done: the context pass runs every turn,
+// and registering starts a timer, so it must happen once per project rather than once per pass.
+const dreamerBoundProjects = new Set();
+const dreamerRegistrationOwner = {};
 	activePiRuntimes.add(dreamerRegistrationOwner);
 	const commandLifecycleController = new AbortController();
 	registerCtxStatusLifecycleSignal(pi, commandLifecycleController.signal);
@@ -1599,6 +1602,12 @@ async function startPiMagicContextRuntime(
 			executeThresholdTokens: cfg.execute_threshold_tokens,
 		},
 		historian: hist,
+		bindDreamerProject: (ctx) => {
+			// Once per project: this pass runs on every turn, and the dreamer's registration starts a timer.
+			if (dreamerBoundProjects.has(ctx.cwd)) return;
+			dreamerBoundProjects.add(ctx.cwd);
+			syncDreamerProjectRegistration(resolveCurrentProjectDeps(ctx), ctx.modelRegistry ?? readEmbeddedModelRegistry());
+		},
 		bindHistorianRunner: embeddedRuntime
 			? (ctx) => {
 					// Prefer the live session registry; fall back to the value the
