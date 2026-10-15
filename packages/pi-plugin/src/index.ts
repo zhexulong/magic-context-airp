@@ -60,6 +60,7 @@ import {
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
+import { hostOutlivesBackgroundRuns } from "./pi-background-run-lifetime";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	getOrCreateSessionMeta,
@@ -2023,7 +2024,12 @@ async function startPiMagicContextRuntime(
 		activeModelRegistry = ctx.modelRegistry;
 		activeModelChainContext = ctx;
 		reportPiModelChains(ctx, current);
-		if (ctx.hasUI) syncDreamerProjectRegistration(current, ctx.modelRegistry);
+		// The same lifetime question the historian's spawn asks: a host that keeps a fire-and-forget run alive past
+		// `agent_end` must register the dreamer even without a UI. Gating this on `ctx.hasUI` meant an embedded
+		// host registered no project at all, so the schedule timer had nothing to run and every task - including
+		// the two the product enables - did nothing, silently. Measured: with `reflect` on a one-minute clock, a
+		// full session left dream_state, dream_queue and dream_runs all empty.
+		if (hostOutlivesBackgroundRuns(ctx.hasUI)) syncDreamerProjectRegistration(current, ctx.modelRegistry);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
 		const failuresToShow = claimConfigParseFailuresOnce(
