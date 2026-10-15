@@ -51,22 +51,25 @@ export function readReflectWindow(
     since: number,
     limit: number = REFLECT_WINDOW_LIMIT,
 ): ReflectPromptMemory[] {
+    // Owner ruling (a), 2026-10-15: read the stream this product actually keeps. GameBuddy runs with promotion
+    // off, so the historian's long-term memory is the compartment stream - the narrative the player reads as
+    // history and chapters - while `memories` stays empty by configuration. Reading that table made every
+    // reflection run a no-op with nothing to say.
     const rows = db
         .prepare(
-            `SELECT ${getMemorySelectColumns(db)}
-               FROM memories
-              WHERE project_path = ?
-                AND status IN ('active','permanent')
-                AND (expires_at IS NULL OR expires_at > ?)
-                AND updated_at > ?
-              ORDER BY updated_at DESC
+            `SELECT sequence, title, content, created_at
+               FROM compartments
+              WHERE created_at > ?
+              ORDER BY created_at DESC, sequence DESC
               LIMIT ?`,
         )
-        .all(projectIdentity, Date.now(), since, limit)
-        .filter(isMemoryRow);
-    return rows.map(toMemory).map((memory) => ({
-        category: memory.category,
-        content: memory.content,
+        .all(since, limit) as Array<{ title: string | null; content: string | null }>;
+    return rows.map((row) => ({
+        category: "INTERACTION_EPISODE",
+        content: [row.title, row.content]
+            .map((part) => (typeof part === "string" ? part.trim() : ""))
+            .filter((part) => part.length > 0)
+            .join("\n"),
     }));
 }
 

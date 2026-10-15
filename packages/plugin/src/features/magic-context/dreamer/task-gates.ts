@@ -335,6 +335,12 @@ function hasRecentProjectCompartment(db: Database, projectPath: string, since: n
  * keeps this consistent with the idle-identity pruning: an identity that pruning
  * removed is never seeded straight back by the next reconcile.
  */
+function hasCompartments(db: Database): boolean {
+    // The compartment stream is this product's long-term memory; a store with none has nothing to reflect on,
+    // which is the only condition that should keep this task unseeded.
+    return (db.prepare("SELECT COUNT(*) AS n FROM compartments").get() as { n: number }).n > 0;
+}
+
 export function taskHasSchedulableInput(
     task: DreamTaskName,
     db: Database,
@@ -354,9 +360,10 @@ export function taskHasSchedulableInput(
         case "retrospective":
             return hasRecentProjectSession(db, projectPath, now - SCHEDULE_ACTIVITY_WINDOW_MS);
         case "reflect":
-            // The reflection reads the project's own durable memory stream, so any
-            // live memory gives it something to reflect on. Never-run → the pool.
-            return countMemoriesChangedSince(db, projectPath, 0) > 0;
+            // Owner ruling (a), 2026-10-15: the reflection reads the compartment stream - the long-term narrative
+            // this product keeps - so a project is eligible once it has one. Asking for memory rows kept the
+            // task unseeded forever, because promotion is off by configuration.
+            return hasCompartments(db);
         case "maintain-docs":
             return hasRecentProjectCompartment(db, projectPath, now - SCHEDULE_ACTIVITY_WINDOW_MS);
         case "evaluate-smart-notes":

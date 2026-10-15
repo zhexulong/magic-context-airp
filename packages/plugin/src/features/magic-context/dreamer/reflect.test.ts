@@ -58,11 +58,28 @@ async function runReflect(args: {
     seed?: string;
 }) {
     db = freshDb();
+    // Two seeds, for two different reasons: the reflection's input is the project's compartment stream - the
+    // long-term narrative this product keeps - while the memory insert keeps the fixture's project visible to
+    // the promotion-side bookkeeping the assertions below read (owner ruling (a), 2026-10-15).
     insertMemory(db, {
         projectPath: PROJECT,
         category: "SEMANTIC_MEMORY",
         content: args.seed ?? "You told me you like keeping the long way round when it rains.",
     });
+    db.prepare(
+        `INSERT INTO compartments
+            (session_id, sequence, start_message, end_message, title, content, importance, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+        "reflect-seed-session",
+        0,
+        1,
+        2,
+        "A long way round in the rain",
+        args.seed ?? "You told me you like keeping the long way round when it rains.",
+        50,
+        Date.now(),
+    );
     const prompts: string[] = [];
     const executor = createDreamTaskExecutor({
         client: reflectClient(args.answer, prompts) as never,
