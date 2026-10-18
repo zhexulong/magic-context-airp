@@ -357,17 +357,51 @@ export function materializeGameBuddyAuthoredStableCatalog(
 
 // Process-local renderer state. Only the construction-private bridge publishes entries;
 // context-handler consumes them through this owner hook (never through the package root).
-const authoredRenderer = new Map<
-	string,
-	GameBuddyAuthoredContextMaterialization
->();
-const authoredVolatileTurn = new Map<
-	string,
-	Readonly<{
-		turnId: string;
-		sourceRefs: readonly GameBuddyAuthoredVolatileSourceRef[];
-	}>
->();
+//
+// The publisher and the reader are not one module instance in the shipped package. `build` runs
+// `bun build` twice into the same `dist` (once for the root entry, which carries the readers through
+// `context-handler`/`inject-compartments-pi`, and once for `src/tavern/index.ts`, which carries the
+// binder), and `--splitting` only deduplicates within one invocation - so each copy of this module
+// used to get its own `Map`, the tavern copy's binding was never visible to the root copy's renderer,
+// and no authored block (stable or keyword-gated) ever reached the provider. Pi additionally loads
+// the extension through jiti with `moduleCache: false`, which can evaluate the package again in the
+// same process. The registry therefore lives on `globalThis` under a `Symbol.for` key - the same
+// cross-entry channel this package already uses for its embedded historian binding - so whichever
+// copy performs either half sees one map. There is no second, module-local copy to diverge from.
+const AUTHORED_CONTEXT_REGISTRY_SLOT = Symbol.for(
+	"magic-context.pi.gamebuddy-authored-context-registry",
+);
+
+type GameBuddyAuthoredContextRegistry = {
+	readonly materializations: Map<
+		string,
+		GameBuddyAuthoredContextMaterialization
+	>;
+	readonly volatileTurns: Map<
+		string,
+		Readonly<{
+			turnId: string;
+			sourceRefs: readonly GameBuddyAuthoredVolatileSourceRef[];
+		}>
+	>;
+};
+
+function authoredContextRegistry(): GameBuddyAuthoredContextRegistry {
+	const global = globalThis as typeof globalThis & {
+		[AUTHORED_CONTEXT_REGISTRY_SLOT]?: GameBuddyAuthoredContextRegistry;
+	};
+	const existing = global[AUTHORED_CONTEXT_REGISTRY_SLOT];
+	if (existing !== undefined) return existing;
+	const created: GameBuddyAuthoredContextRegistry = {
+		materializations: new Map(),
+		volatileTurns: new Map(),
+	};
+	global[AUTHORED_CONTEXT_REGISTRY_SLOT] = created;
+	return created;
+}
+
+const { materializations: authoredRenderer, volatileTurns: authoredVolatileTurn } =
+	authoredContextRegistry();
 export function __gamebuddyReadAuthoredMaterialization(
 	sessionId: string,
 ): GameBuddyAuthoredContextMaterialization | undefined {
