@@ -133,15 +133,18 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 		);
 
 		// 构造预期的精准 XML 字符串（遵循属性排序、单换行符与结构规范）
+		// 块首的自然语言句子说明这段材料是什么；每个 source 只带 kind，不带 source-id /
+		// revision / canonical-hash —— 那些工程标识留在 durable record 与 materialization 里。
 		const expectedXml = [
-			`<gamebuddy-authored-context version="v2" continuity-id="cont-fixed-001" session-id="sess-fixed-002" thread-id="thread-fixed-003" canonical-hash="${catalog.canonicalHash}">`,
-			`<gamebuddy-authored-source kind="persona" source-id="persona-lyra" revision="rev-p-001" canonical-hash="${standardSources[0].canonicalHash}">`,
+			`<gamebuddy-authored-context version="v2" continuity-id="cont-fixed-001" session-id="sess-fixed-002" thread-id="thread-fixed-003">`,
+			"Everything below is the established background setting and world knowledge: treat it as canon and stay consistent with it.",
+			`<gamebuddy-authored-source kind="persona">`,
 			personaContent,
 			`</gamebuddy-authored-source>`,
-			`<gamebuddy-authored-source kind="scenario" source-id="scenario-rainy-saloon" revision="rev-s-001" canonical-hash="${standardSources[1].canonicalHash}">`,
+			`<gamebuddy-authored-source kind="scenario">`,
 			scenarioContent,
 			`</gamebuddy-authored-source>`,
-			`<gamebuddy-authored-source kind="lorebook_constant" source-id="lore-saloon-rules" revision="rev-l-001" canonical-hash="${standardSources[2].canonicalHash}">`,
+			`<gamebuddy-authored-source kind="lorebook_constant">`,
 			lorebookContent,
 			`</gamebuddy-authored-source>`,
 			`</gamebuddy-authored-context>`,
@@ -150,7 +153,7 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 		// 1. 严格逐字节比对 XML 字符串
 		expect(renderedBlock).toBe(expectedXml);
 
-		// 2. 断言 XML 顶层标签属性顺序严格为：version, continuity-id, session-id, thread-id, canonical-hash
+		// 2. 断言 XML 顶层标签属性顺序严格为：version, continuity-id, session-id, thread-id
 		const rootTagMatch = renderedBlock.match(
 			/^<gamebuddy-authored-context ([^>]+)>/,
 		);
@@ -158,34 +161,54 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 			throw new Error("gamebuddy_authored_context_root_tag_missing");
 		const rootAttrs = rootTagMatch[1];
 		const expectedRootAttrPattern =
-			/^version="v2" continuity-id="cont-fixed-001" session-id="sess-fixed-002" thread-id="thread-fixed-003" canonical-hash="[0-9a-f]{64}"$/;
+			/^version="v2" continuity-id="cont-fixed-001" session-id="sess-fixed-002" thread-id="thread-fixed-003"$/;
 		expect(expectedRootAttrPattern.test(rootAttrs)).toBe(true);
 
-		// 3. 断言子标签属性顺序严格为：kind, source-id, revision, canonical-hash
+		// 3. 断言子标签只带 kind（kind, 无 source-id / revision / canonical-hash）
 		const sourceTagMatches = Array.from(
 			renderedBlock.matchAll(/<gamebuddy-authored-source ([^>]+)>/g),
 		);
 		expect(sourceTagMatches.length).toBe(3);
 		for (const match of sourceTagMatches) {
 			const attrs = match[1];
-			expect(
-				/^kind="[^"]+" source-id="[^"]+" revision="[^"]+" canonical-hash="[0-9a-f]{64}"$/.test(
-					attrs,
-				),
-			).toBe(true);
+			expect(/^kind="[^"]+"$/.test(attrs)).toBe(true);
 		}
 
-		// 4. 断言换行符完全符合规范（纯 Unix \n，无 \r\n，换行位置确定）
-		expect(renderedBlock.includes("\r")).toBe(false);
-		expect(renderedBlock.split("\n").length).toBe(11);
+		// 4. 没有任何工程标识进入 prompt：不出现 canonical-hash、revision、source-id，
+		//    也不出现这三个 source 的 id / hash 字面值。
+		for (const forbidden of [
+			"canonical-hash",
+			"revision",
+			"source-id",
+			"persona-lyra",
+			"scenario-rainy-saloon",
+			"lore-saloon-rules",
+			catalog.canonicalHash,
+			standardSources[0].canonicalHash,
+		]) {
+			expect(renderedBlock).not.toContain(forbidden);
+		}
 
-		// 5. 录制并校验生成的 SHA-256 摘要（Bitwise Parity 固定值）
+		// 5. 说明句在材料之前：模型先读到“这是什么”，再读到内容。
+		expect(renderedBlock.indexOf("as canon")).toBeGreaterThan(
+			renderedBlock.indexOf(">\n"),
+		);
+		expect(renderedBlock.indexOf("as canon")).toBeLessThan(
+			renderedBlock.indexOf("<gamebuddy-authored-source"),
+		);
+
+		// 6. 断言换行符完全符合规范（纯 Unix \n，无 \r\n，换行位置确定）
+		expect(renderedBlock.includes("\r")).toBe(false);
+		expect(renderedBlock.split("\n").length).toBe(12);
+
+		// 7. 录制并校验生成的 SHA-256 摘要（Bitwise Parity 固定值）
 		const EXPECTED_M0_PARITY_SHA256 =
-			"b755814c3884067d64a8563386f54f698db6cc644a41e5015e5c05b5416b857f";
+			"ae0050ead7b245a30f8bcab4b5eb46f158960bdf45ab023d31be2803499f84eb";
 		const renderedSha256 = sha256(renderedBlock);
 		const expectedSha256 = sha256(expectedXml);
-		expect(renderedSha256).toBe(EXPECTED_M0_PARITY_SHA256);
+		// 两条等式互为独立证据：渲染器输出 == 手写期望（字节保真），且两者等于录制值。
 		expect(renderedSha256).toBe(expectedSha256);
+		expect(renderedSha256).toBe(EXPECTED_M0_PARITY_SHA256);
 	});
 
 	test("用例 2：全序排布字典序一致性断言", () => {
@@ -283,7 +306,7 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 		);
 		const baselineSourcesSha = sha256(baselineSourcesXml);
 
-		// 断言所有乱序输入渲染出的 XML 中 source-id 顺序与内容严格遵从全序规则
+		// 断言所有乱序输入渲染出的 XML 中的 source 顺序与内容严格遵从全序规则
 		for (const permutation of permutations) {
 			const catalog = buildCatalog(standardScope, permutation);
 			const materialized = materializeGameBuddyAuthoredStableCatalog(
@@ -292,20 +315,27 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 			);
 			const renderedXml = materialized.renderedBlock;
 
-			// 1. 提取 XML 中 gamebuddy-authored-source 的 source-id 出现序列
-			const renderedSourceIds = Array.from(
-				renderedXml.matchAll(
-					/<gamebuddy-authored-source [^>]*source-id="([^"]+)"/g,
-				),
-			).map((m) => m[1]);
+			// 1. prompt 里已不再带 source-id，所以“出现顺序”改由每个 source 自己的内容锚定：
+			//    五个 source 的内容互不相同，位置递增就等价于全序递增。
+			const renderedOptions = orderedSources.map((source) =>
+				renderedXml.indexOf(source.content),
+			);
+			expect(renderedOptions.includes(-1)).toBe(false);
+			expect([...renderedOptions].sort((left, right) => left - right)).toEqual(
+				renderedOptions,
+			);
 
-			// 2. 断言出现顺序严格等同于全序排布序列
-			expect(renderedSourceIds).toEqual([
-				"source-a",
-				"source-b",
-				"source-c",
-				"source-d",
-				"source-e",
+			// 2. 断言 kind 出现序列也等同于全序排布（persona → scenario → dialogue_examples → lorebook_constant ×2）
+			expect(
+				Array.from(
+					renderedXml.matchAll(/<gamebuddy-authored-source kind="([^"]+)">/g),
+				).map((match) => match[1]),
+			).toEqual([
+				"persona",
+				"scenario",
+				"dialogue_examples",
+				"lorebook_constant",
+				"lorebook_constant",
 			]);
 
 			// 3. 断言物化后的 sources 数组顺序也严格遵循字典序全序规则
@@ -370,8 +400,11 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 		);
 		expect(rendered).toContain('session-id="sess&lt;1&gt;&amp;2&gt;"');
 		expect(rendered).toContain('thread-id="thread&lt;sub&amp;zero&gt;"');
-		expect(rendered).toContain('source-id="source&lt;escape&gt;&amp;test&gt;"');
-		expect(rendered).toContain('revision="rev&lt;1&gt;&amp;2&gt;"');
+		// source-id / revision 不再出现在 prompt 里，连转义形式也一样：曾经的属性注入面直接消失了。
+		expect(rendered).not.toContain("source-id");
+		expect(rendered).not.toContain("revision");
+		expect(rendered).not.toContain("escape");
+		expect(rendered).not.toContain("on-error");
 
 		// 2. 断言除 XML 标签语法定界符外，内容与属性中无任何裸 &、<、> 字符
 		// 剥离合法的 XML 标签定界符后检查剩余字符
@@ -431,17 +464,20 @@ describe("M0 byte parity and deterministic regression (Lane 3)", () => {
 			selectionKeys: ["key"],
 		};
 
-		const rendered = renderGameBuddyVolatileContextBlock(
-			[volatileSource],
-			'hash" injection',
-		);
+		const rendered = renderGameBuddyVolatileContextBlock([volatileSource]);
 		// Content is properly escaped
 		expect(rendered).toContain(
 			'&lt;evil-tag&gt;alert("pwned")&lt;/evil-tag&gt;&amp;more',
 		);
 		expect(rendered).not.toContain("<evil-tag>");
-		// Attribute quotes are escaped
-		expect(rendered).toContain('revision="1&quot; on-error=&quot;inject"');
-		expect(rendered).toContain('canonical-hash="hash&quot; injection"');
+		// The per-turn marker survives; the entry's own identity does not ride the prompt.
+		expect(rendered).toContain("<gamebuddy-volatile-context>");
+		expect(rendered).toContain("<gamebuddy-volatile-source>");
+		expect(rendered).not.toContain("canonical-hash");
+		expect(rendered).not.toContain("revision");
+		expect(rendered).not.toContain("source-id");
+		// The attribute-injection vector goes with the attributes: nothing an entry carries
+		// can name an attribute, so no `on-error=` can appear at all.
+		expect(rendered).not.toContain("on-error");
 	});
 });

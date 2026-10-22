@@ -2183,7 +2183,9 @@ function renderM1PiWithMetadata(
 ): RenderM1PiResult {
 	const sections: string[] = [];
 	if (state.volatileContext?.volatileSources.length) {
-		sections.push(renderGameBuddyVolatileContextBlock(state.volatileContext));
+		sections.push(
+			renderGameBuddyVolatileContextBlock(state.volatileContext.volatileSources),
+		);
 	}
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 

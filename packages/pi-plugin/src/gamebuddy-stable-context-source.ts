@@ -143,53 +143,34 @@ export const MAX_AUTHORED_VOLATILE_BUDGET_TOKENS = 32768;
 const escapeXmlContent = (s: string): string =>
 	s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
-const escapeXmlAttr = (s: string): string =>
-	s
-		.replaceAll("&", "&amp;")
-		.replaceAll("<", "&lt;")
-		.replaceAll(">", "&gt;")
-		.replaceAll('"', "&quot;");
+/**
+ * What the authored block IS, in one sentence, before its material.
+ *
+ * The sources are prose the player authored (a card's backdrop, its entries, a
+ * scenario). Without a line saying so, a bare block of text reads to a model as data
+ * it may summarise; the point of the block is that it is canon it must keep.
+ */
+const AUTHORED_CONTEXT_PREAMBLE =
+	"Everything below is the established background setting and world knowledge: treat it as canon and stay consistent with it.";
 
 /**
  * Convenience helper rendering the volatile M1 context block with XML injection defense.
+ *
+ * The block's own marker is all that separates it from the rest of m[1]; the identity
+ * of each entry (source id, revision, content hash) stays in the durable turn plan and
+ * in the materialization, which is what the per-turn bind and the plan check compare.
  */
 export function renderGameBuddyVolatileContextBlock(
-	context:
-		| Readonly<{
-				snapshotCanonicalHash?: string;
-				canonicalHash?: string;
-				volatileSources: readonly GameBuddyAuthoredVolatileSource[];
-		  }>
-		| readonly GameBuddyAuthoredVolatileSource[],
-	canonicalHash?: string,
+	sources: readonly GameBuddyAuthoredVolatileSource[],
 ): string {
-	let sources: readonly GameBuddyAuthoredVolatileSource[];
-	let hash: string;
-
-	if (
-		typeof context === "object" &&
-		context !== null &&
-		"volatileSources" in context
-	) {
-		sources = context.volatileSources;
-		hash =
-			canonicalHash ??
-			context.snapshotCanonicalHash ??
-			context.canonicalHash ??
-			"";
-	} else {
-		sources = (context as readonly GameBuddyAuthoredVolatileSource[]) ?? [];
-		hash = canonicalHash ?? "";
-	}
-
 	if (!sources || sources.length === 0) return "";
 	const renderedSources = sources
 		.map(
 			(source: GameBuddyAuthoredVolatileSource) =>
-				`<gamebuddy-volatile-source source-id="${escapeXmlAttr(source.sourceId)}" revision="${escapeXmlAttr(source.revision)}" canonical-hash="${escapeXmlAttr(source.canonicalHash)}">\n${escapeXmlContent(source.content)}\n</gamebuddy-volatile-source>`,
+				`<gamebuddy-volatile-source>\n${escapeXmlContent(source.content)}\n</gamebuddy-volatile-source>`,
 		)
 		.join("\n");
-	return `<gamebuddy-volatile-context canonical-hash="${escapeXmlAttr(hash)}">\n${renderedSources}\n</gamebuddy-volatile-context>`;
+	return `<gamebuddy-volatile-context>\n${renderedSources}\n</gamebuddy-volatile-context>`;
 }
 
 export function validateGameBuddyAuthoredStableCatalog(
@@ -342,9 +323,23 @@ export function materializeGameBuddyAuthoredStableCatalog(
 			`${b.totalOrderKey}\0${b.sourceId}\0${b.revision}\0${b.canonicalHash}`,
 		),
 	);
-	const esc = (s: string) =>
-		s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-	const renderedBlock = `<gamebuddy-authored-context version="v2" continuity-id="${esc(scope.continuityId)}" session-id="${esc(scope.sessionId)}" thread-id="${esc(scope.threadId)}" canonical-hash="${catalog.canonicalHash}">\n${sources.map((s) => `<gamebuddy-authored-source kind="${s.kind}" source-id="${esc(s.sourceId)}" revision="${esc(s.revision)}" canonical-hash="${s.canonicalHash}">\n${esc(s.content)}\n</gamebuddy-authored-source>`).join("\n")}\n</gamebuddy-authored-context>`;
+	const esc = escapeXmlContent;
+	// The engineering identity of these bytes - catalog hash, per-source revision and
+	// source id - is what the durable record and the materialization carry; none of it is
+	// part of what the companion is told. Prefix stability does not come from printing
+	// the hash: it comes from the materialization being a deterministic function of the
+	// frozen catalog (total-order sort, then one render), and the probe's m[0] digest is
+	// taken over these rendered bytes - so the digest still proves turn-to-turn identity
+	// now that the ids no longer ride the prompt.
+	const sourceBlocks = sources.map(
+		(source) =>
+			`<gamebuddy-authored-source kind="${source.kind}">\n${esc(source.content)}\n</gamebuddy-authored-source>`,
+	);
+	const body =
+		sourceBlocks.length === 0
+			? ""
+			: `${AUTHORED_CONTEXT_PREAMBLE}\n${sourceBlocks.join("\n")}\n`;
+	const renderedBlock = `<gamebuddy-authored-context version="v2" continuity-id="${esc(scope.continuityId)}" session-id="${esc(scope.sessionId)}" thread-id="${esc(scope.threadId)}">\n${body}</gamebuddy-authored-context>`;
 	return freeze({
 		scope,
 		snapshotCanonicalHash: catalog.canonicalHash,
