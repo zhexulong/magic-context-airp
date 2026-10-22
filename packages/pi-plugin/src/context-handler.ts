@@ -331,6 +331,7 @@ import {
 	PiContextSupersededError,
 	registerPiGuardedContext,
 } from "./pi-context-refusal";
+import { isPiCtxReduceToolActive } from "./pi-ctx-reduce-tool";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import {
 	clearPiLkgSessionState,
@@ -5171,6 +5172,7 @@ export function registerPiContextHandler(
 			const result = await budget.waitMandatory(
 				runPipeline({
 					assertCurrentPass,
+					ctxReduceToolActive: isPiCtxReduceToolActive(pi),
 					db: options.db,
 					tagger,
 					sessionId,
@@ -7258,6 +7260,13 @@ interface RunPipelineArgs {
 		};
 	};
 	isSubagent?: boolean;
+	/**
+	 * Whether this session's tool set carries `ctx_reduce` (see isPiCtxReduceToolActive).
+	 * When false the pipeline still allocates tag rows so persisted drops keep replaying,
+	 * but no `§N§` prefix reaches the model. Omitted means the historical assumption that
+	 * Pi's primary process has the tool.
+	 */
+	ctxReduceToolActive?: boolean;
 	/** Additive-only transform mode: no tags, drops, history trim, markers, or nudges. */
 	compactionOff?: boolean;
 	/** ceiling = contextLimit × executeThreshold% for the tiered emergency drop. */
@@ -7876,11 +7885,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const alreadyRanHeuristicsThisTurn =
 		currentTurnId !== null &&
 		lastHeuristicsTurnIdBySession.get(args.sessionId) === currentTurnId;
-	// Pi's primary process always registers ctx_reduce. Hidden/no-session child
-	// processes do not use this context handler; if a future path marks a session
-	// as subagent here, suppress visible tags and nudges so the prompt never points
-	// at a missing session-scoped tool.
-	const ctxReduceCallable = !args.sessionMeta.isSubagent;
+	// Suppress visible tags and nudges so the prompt never points at a missing
+	// session-scoped tool: a subagent session does not have ctx_reduce, and neither does
+	// a host session whose allow-list filters it out (the caller resolves that from the
+	// live tool set).
+	const ctxReduceCallable =
+		!args.sessionMeta.isSubagent && (args.ctxReduceToolActive ?? true);
 	// Deferred publication signals may be consumed only on a pass that already
 	// has a genuine bust opportunity. Pi's historian is detached and signals via
 	// the deferred sets post-publish, so there is no inline await to special-case.
