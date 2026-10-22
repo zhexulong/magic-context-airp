@@ -100,7 +100,10 @@ import {
 	maybeChannel1ReminderForToolResult,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
-import { publishGameBuddyAuthoredStableCatalog } from "./gamebuddy-authored-context-bridge.internal";
+import {
+	publishGameBuddyAuthoredStableCatalog,
+	replaceGameBuddyAuthoredStableCatalog,
+} from "./gamebuddy-authored-context-bridge.internal";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
 import * as piHistorian from "./pi-historian-runner";
 import { observePiPublicationForTest } from "./publication-observer-fixture.test";
@@ -2019,6 +2022,142 @@ describe("registerPiContextHandler", () => {
 			expect(clearedWire).not.toContain("gamebuddy-authored-context");
 		} finally {
 			await initial.clear();
+			clearContextHandlerSession(sessionId, db);
+			closeQuietly(db);
+		}
+	});
+
+	it("appends the card's closing direction as the last block, per turn, outside the cached prefix", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-post-history-instructions";
+		const scope = {
+			continuityId: "continuity-post-history-instructions",
+			sessionId,
+			surface: "tavern" as const,
+			threadId: "thread-post-history-instructions",
+			profile: {
+				profileId: "profile-post-history-instructions",
+				revision: 1,
+				canonicalHash: "a".repeat(64),
+			},
+		};
+		const canonical = (value: unknown): string =>
+			Array.isArray(value)
+				? `[${value.map(canonical).join(",")}]`
+				: value && typeof value === "object"
+					? `{${Object.keys(value as object)
+							.sort()
+							.map(
+								(key) =>
+									`${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`,
+							)
+							.join(",")}}`
+					: JSON.stringify(value);
+		// The Host publishes the closing direction beside the hashed catalogue body, exactly
+		// as the fork's validator reads it; the field never enters the canonical hash.
+		const catalog = (closingDirection?: string) => {
+			const content = "A quiet tavern.";
+			const body = {
+				version: "gamebuddy-authored-context-catalog/v2" as const,
+				scope,
+				stableSources: [
+					{
+						sourceId: "scenario",
+						kind: "scenario" as const,
+						revision: "1",
+						content,
+						canonicalHash: createHash("sha256").update(content).digest("hex"),
+						budgetTokens: 5,
+						totalOrderKey: "0001",
+						provenance: "test/context-handler",
+					},
+				],
+			};
+			return {
+				...body,
+				canonicalHash: createHash("sha256")
+					.update(canonical(body))
+					.digest("hex"),
+				...(closingDirection === undefined ? {} : { postHistoryInstructions: closingDirection }),
+			};
+		};
+		const CLOSING = "收束时只说一句家常话，别把镜头拉到旁白。";
+		const REVISED = "收束时先道一声晚安，再停笔。";
+		const published = publishGameBuddyAuthoredStableCatalog(scope, catalog());
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				injection: { injectionBudgetTokens: 10_000 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			const run = async () => {
+				// Identical input on every pass: the only variable across these passes is the
+				// published closing direction, so any byte difference in the assembled array is
+				// attributable to the field and to nothing else.
+				const messages = [userMessage("first", 1)];
+				return handler(
+					{ messages: messages as never[] },
+					fakeContext(sessionId, process.cwd(), ["entry-1"], messages) as never,
+				);
+			};
+
+			// 1. A card that declares no field: the assembled array is today's array, and the
+			//    two synthetic history messages are m[0] and m[1] verbatim.
+			const absent = await run();
+			const absentBytes = JSON.stringify(absent.messages);
+			const absentHead = textOf(absent.messages[0] as never);
+			const absentDelta = textOf(absent.messages[1] as never);
+			expect(absentBytes).not.toContain("<character-closing-direction>");
+			// The two head messages ARE the m[0] baseline and the m[1] delta on the wire.
+			expect(absentHead).toContain("<gamebuddy-authored-context");
+
+			// 2. The field appears: it is the LAST message, its prose verbatim, and the rest of
+			//    the array is byte-for-byte the array from step 1.
+			const withClosing = publishGameBuddyAuthoredStableCatalog(
+				scope,
+				catalog(CLOSING),
+			);
+			const present = await run();
+			const presentMessages = present.messages as unknown[];
+			const tail = textOf(presentMessages.at(-1) as never);
+			expect(tail).toContain(CLOSING);
+			expect(tail).toStartWith("<character-closing-direction>");
+			expect(tail.split(CLOSING)).toHaveLength(2);
+			expect(JSON.stringify(presentMessages.slice(0, -1))).toBe(absentBytes);
+			expect(textOf(presentMessages[0] as never)).toBe(absentHead);
+			expect(textOf(presentMessages[1] as never)).toBe(absentDelta);
+
+			// 3. Editing the field changes the NEXT assembled array, and only its tail: m[0] and
+			//    m[1] stay byte-identical, so the block is provably outside the cached prefix
+			//    rather than riding a cache bust.
+			const revised = replaceGameBuddyAuthoredStableCatalog(
+				withClosing,
+				scope,
+				catalog(REVISED),
+			);
+			const changed = await run();
+			const changedMessages = changed.messages as unknown[];
+			expect(textOf(changedMessages.at(-1) as never)).toContain(REVISED);
+			expect(textOf(changedMessages.at(-1) as never)).not.toContain(CLOSING);
+			expect(JSON.stringify(changedMessages.slice(0, -1))).toBe(absentBytes);
+			// m[0] and m[1] are still the byte-identical pair from step 1, so the block is
+			// outside the cached prefix rather than riding a cache bust.
+			expect(textOf(changedMessages[0] as never)).toBe(absentHead);
+			expect(textOf(changedMessages[1] as never)).toBe(absentDelta);
+
+			// 4. Clearing the publication removes the block again: the tail is publication state,
+			//    not transcript state.
+			await revised.clear();
+			const cleared = await run();
+			expect(JSON.stringify(cleared.messages)).not.toContain(
+				"<character-closing-direction>",
+			);
+		} finally {
+			await published.clear();
 			clearContextHandlerSession(sessionId, db);
 			closeQuietly(db);
 		}

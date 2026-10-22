@@ -41,6 +41,31 @@ recall engine, handoff summary, JSONL copier, experience ledger, or custom
 promotion logic. Host only writes the selected domain and feature gates into
 its opaque runtime directory.
 
+## GameBuddy delta: the card's closing direction
+
+An imported card's `post_history_instructions` is the one piece of author prose
+that belongs AFTER the transcript, the way SillyTavern injects it at depth 0.
+The Host carries it verbatim (bounded to 4096 UTF-8 bytes) and publishes it on
+the authored-context catalogue as `postHistoryInstructions`, beside the hashed
+catalogue body rather than inside it.
+
+The fork renders it in `src/post-history-instructions-pi.ts` and appends it at
+`context-handler.ts`'s single success exit — after every reader of the served
+array, and therefore outside m[0]/m[1], the fold, the tail-hygiene baseline, the
+LKG snapshot, the token accounting and every cache key:
+
+* outside the catalogue hash, so editing a card's closing direction can never
+  bust the cached prefix — otherwise a stale tail could ride a fresh prefix, or
+  the new prose would only take effect once the cache turned over;
+* `role: "user"`, because `pi-ai`'s `resolveTranscript` collapses later `system`
+  entries into the LEADING system message on transports without
+  mid-conversation system messages, which would hoist the block to the head;
+* framed as the character's own closing direction with an explicit floor line,
+  because it is the last block and a card may not talk over the Host's language
+  binding or safety rules by position;
+* absent for a card that declares nothing: the served array is byte-identical to
+  the array without this feature.
+
 ## Deliberate rollout state
 
 GameBuddy currently selects `ongoing-interaction`, enables same-scope read-only

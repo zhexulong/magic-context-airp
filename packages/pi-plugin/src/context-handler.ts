@@ -395,6 +395,7 @@ import {
 	piCachedToolSurvivor,
 } from "./pi-tool-identity";
 import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
+import { appendPostHistoryInstructions } from "./post-history-instructions-pi";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
@@ -6055,6 +6056,25 @@ export function registerPiContextHandler(
 			}
 			budget.assertOutcome();
 			publishTransformDecision?.();
+			// The card's `post_history_instructions` is the ONE block that goes after the
+			// transcript (SillyTavern's depth-0 shape). It is read here, at the last exit, so
+			// it cannot reach m[0]/m[1], the fold, any cache key, the tail-hygiene baseline,
+			// the LKG snapshot or the token accounting: those all measured the transcript as
+			// it stood, and the closing direction is not transcript. A session with no
+			// authored publication, or a card with no field, appends nothing and returns the
+			// identical array.
+			const authoredClosingDirection =
+				__gamebuddyReadAuthoredMaterialization(sessionId);
+			if (
+				appendPostHistoryInstructions(
+					outputMessages,
+					authoredClosingDirection?.postHistoryInstructions,
+				)
+			)
+				sessionLog(
+					sessionId,
+					`appended the card's closing direction as the last message (${authoredClosingDirection?.postHistoryInstructions?.length ?? 0} bytes)`,
+				);
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};
