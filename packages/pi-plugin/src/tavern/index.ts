@@ -20,6 +20,12 @@ export {
 } from "../gamebuddy-stable-context-source";
 
 export {
+	appendPostHistoryInstructions,
+	MAX_POST_HISTORY_INSTRUCTIONS_BYTES,
+	renderPostHistoryInstructions,
+} from "../post-history-instructions-pi";
+
+export {
 	clearTavernNarrativeGateMarker,
 	GAME_OPERATIONAL_GATE_MARKER_SCHEMA,
 	registerGameOperationalGateMarker,
