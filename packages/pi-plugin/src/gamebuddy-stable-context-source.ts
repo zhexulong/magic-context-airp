@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { MAX_POST_HISTORY_INSTRUCTIONS_BYTES } from "./post-history-instructions-pi";
 
 export type GameBuddyAuthoredSourceKind =
 	| "persona"
@@ -43,6 +44,12 @@ export type GameBuddyAuthoredStableCatalog = Readonly<{
 	canonicalHash: string;
 	stableSources: readonly GameBuddyAuthoredStableSource[];
 	volatileSources: readonly GameBuddyAuthoredVolatileSource[];
+	/**
+	 * The card's own closing direction (`post_history_instructions`), rendered after the
+	 * transcript rather than with the authored context, and deliberately OUTSIDE the
+	 * catalogue body that `canonicalHash` covers (see `validateGameBuddyAuthoredStableCatalog`).
+	 */
+	postHistoryInstructions?: string;
 }>;
 export type GameBuddyAuthoredStableSourceRef = Readonly<{
 	sourceId: string;
@@ -78,6 +85,11 @@ export type GameBuddyAuthoredContextMaterialization = Readonly<{
 	sources: readonly GameBuddyAuthoredStableSource[];
 	volatileSources: readonly GameBuddyAuthoredVolatileSource[];
 	renderedBlock: string;
+	/**
+	 * The card's closing direction as the tail seam appends it (`post-history-instructions-pi`).
+	 * Never part of `renderedBlock`: that block is the cached m[0] head.
+	 */
+	postHistoryInstructions?: string;
 	/** Present only while an exact durable turn owns the volatile m[1] projection. */
 	durableTurnId?: string;
 }>;
@@ -129,6 +141,19 @@ const hash = (v: unknown, field: string) =>
 	/^[a-f0-9]{64}$/.test(text(v, field))
 		? (v as string)
 		: fail("invalid_catalog", `${field} must be sha256`);
+/**
+ * The carried closing direction: non-empty author prose within the one shared byte bound.
+ */
+const closingDirection = (v: unknown): string => {
+	if (typeof v !== "string" || v.trim().length === 0)
+		return fail("invalid_catalog", "postHistoryInstructions must be non-empty");
+	if (Buffer.byteLength(v, "utf8") > MAX_POST_HISTORY_INSTRUCTIONS_BYTES)
+		return fail(
+			"invalid_catalog",
+			`postHistoryInstructions exceeds ${MAX_POST_HISTORY_INSTRUCTIONS_BYTES} bytes`,
+		);
+	return v;
+};
 const freeze = <T>(v: T): T => {
 	if (v && typeof v === "object") {
 		Object.freeze(v);
@@ -302,10 +327,20 @@ export function validateGameBuddyAuthoredStableCatalog(
 		hash(input.canonicalHash, "catalog.canonicalHash") !== sha(canonical(body))
 	)
 		return fail("hash_mismatch", "catalog hash mismatch");
+	// Carried BESIDE the hashed body on purpose. `snapshotCanonicalHash` is what the context
+	// handler compares to decide whether a publication replaced the rendered m[0] head. A
+	// field that renders after the transcript must not be able to bust that cache: if it were
+	// in the hashed body, editing the closing direction would re-fold the prefix, and the new
+	// prose would ride a cache bust instead of being the per-turn tail it has to be.
+	const postHistoryInstructions =
+		input.postHistoryInstructions === undefined
+			? undefined
+			: closingDirection(input.postHistoryInstructions);
 	return freeze({
 		...body,
 		canonicalHash: input.canonicalHash as string,
 		volatileSources,
+		...(postHistoryInstructions === undefined ? {} : { postHistoryInstructions }),
 	});
 }
 export function materializeGameBuddyAuthoredStableCatalog(
@@ -347,6 +382,9 @@ export function materializeGameBuddyAuthoredStableCatalog(
 		sources,
 		volatileSources,
 		renderedBlock,
+		...(catalog.postHistoryInstructions === undefined
+			? {}
+			: { postHistoryInstructions: catalog.postHistoryInstructions }),
 	});
 }
 

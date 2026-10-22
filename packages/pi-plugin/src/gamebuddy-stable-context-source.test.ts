@@ -8,6 +8,7 @@ import {
 	materializeGameBuddyAuthoredStableCatalog,
 	validateGameBuddyAuthoredStableCatalog,
 } from "./gamebuddy-stable-context-source";
+import { MAX_POST_HISTORY_INSTRUCTIONS_BYTES } from "./post-history-instructions-pi";
 
 const scope = {
 	continuityId: "continuity-opaque",
@@ -47,13 +48,22 @@ function catalog(
 			provenance: "fixture",
 		},
 	],
+	postHistoryInstructions?: string,
 ) {
 	const body = {
 		version: GAMEBUDDY_AUTHORED_CONTEXT_CATALOG_VERSION,
 		scope,
 		stableSources: sources,
 	};
-	return { ...body, canonicalHash: hash(canonical(body)) };
+	// The closing direction rides BESIDE the hashed body, exactly as the Host publishes it:
+	// it renders after the transcript, so it must not be able to bust the m[0] cache.
+	return {
+		...body,
+		canonicalHash: hash(canonical(body)),
+		...(postHistoryInstructions === undefined
+			? {}
+			: { postHistoryInstructions }),
+	};
 }
 
 describe("GameBuddy authored stable catalog", () => {
@@ -246,5 +256,59 @@ describe("GameBuddy authored stable catalog", () => {
 		expect(() => validateGameBuddyAuthoredStableCatalog(c, scope)).toThrow(
 			"volatile candidates exceed total budgetTokens limit",
 		);
+	});
+});
+
+describe("GameBuddy card closing direction (post_history_instructions)", () => {
+	const CLOSING = "收束时只说一句家常话，不要把镜头拉到旁白。";
+
+	it("carries the field to the tail seam and leaves the rendered m[0] head byte-identical", () => {
+		const without = materializeGameBuddyAuthoredStableCatalog(catalog(), scope);
+		const withClosing = materializeGameBuddyAuthoredStableCatalog(
+			catalog(undefined, CLOSING),
+			scope,
+		);
+		expect(withClosing.postHistoryInstructions).toBe(CLOSING);
+		// The m[0] contribution and the publication hash the context handler compares are
+		// unchanged by the field: the tail cannot enter the cached prefix or its cache key.
+		expect(withClosing.renderedBlock).toBe(without.renderedBlock);
+		expect(withClosing.snapshotCanonicalHash).toBe(without.snapshotCanonicalHash);
+		expect(withClosing.sources).toEqual(without.sources);
+		expect(withClosing.budgetTokens).toBe(without.budgetTokens);
+	});
+
+	it("leaves a card without the field exactly as it was: absence stays absence", () => {
+		const materialized = materializeGameBuddyAuthoredStableCatalog(
+			catalog(),
+			scope,
+		);
+		expect(Object.hasOwn(materialized, "postHistoryInstructions")).toBe(false);
+		expect(Object.hasOwn(catalog(), "postHistoryInstructions")).toBe(false);
+	});
+
+	it("keeps one 4 KB bound and refuses an over-long card instead of truncating it", () => {
+		const atBound = "x".repeat(MAX_POST_HISTORY_INSTRUCTIONS_BYTES);
+		expect(
+			materializeGameBuddyAuthoredStableCatalog(catalog(undefined, atBound), scope)
+				.postHistoryInstructions,
+		).toBe(atBound);
+		// UTF-8 bytes, not UTF-16 units: 2049 two-byte characters are already over.
+		const multiByteOver = "收".repeat(
+			Math.floor(MAX_POST_HISTORY_INSTRUCTIONS_BYTES / 3) + 1,
+		);
+		expect(() =>
+			materializeGameBuddyAuthoredStableCatalog(
+				catalog(undefined, multiByteOver),
+				scope,
+			),
+		).toThrow(`exceeds ${MAX_POST_HISTORY_INSTRUCTIONS_BYTES} bytes`);
+		for (const invalid of ["", "   ", 42]) {
+			expect(() =>
+				materializeGameBuddyAuthoredStableCatalog(
+					catalog(undefined, invalid as never),
+					scope,
+				),
+			).toThrow("postHistoryInstructions must be non-empty");
+		}
 	});
 });
