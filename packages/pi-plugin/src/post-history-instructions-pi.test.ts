@@ -40,15 +40,29 @@ describe("appendPostHistoryInstructions", () => {
 		expect(text.split(INSTRUCTIONS)).toHaveLength(2);
 	});
 
-	it("frames the block as her own closing, never as a system policy that outranks the floor", () => {
+	it("frames the block as the close of her own next beat, addressed to her", () => {
 		const text = renderPostHistoryInstructions(INSTRUCTIONS);
-		expect(text).toContain("how she ends her next reply");
-		expect(text).toContain("her own authorship");
-		expect(text).toContain("not a system policy");
-		// The precedence line is what stops a last-block card from talking over the floor.
-		expect(text).toContain("The instructions that precede this transcript still bind");
-		expect(text).toContain("the language she answers in");
-		expect(text).toContain("where the two diverge about anything else");
+		expect(text).toContain("How your next reply ends is yours to write");
+		// The last text of the request may not describe her from outside: a card may forbid
+		// third-person self-description, and the floor forbids naming prompts and systems.
+		const frame = text.slice(0, text.indexOf(INSTRUCTIONS));
+		for (const forbidden of [
+			/\bshe\b/i,
+			/\bher\b/i,
+			/\bhers\b/i,
+			/policy/i,
+			/runtime/i,
+			/transcript/i,
+			/prompt/i,
+			/instruction/i,
+			/system/i,
+		])
+			expect(frame).not.toMatch(forbidden);
+		// The precedence line is what stops a last-block card from talking over the floor, and
+		// it states SCOPE rather than a contest, so it cannot read as outranking the floor.
+		expect(text).toContain("Only that closing beat is at issue here");
+		expect(text).toContain("the language you speak");
+		expect(text).toContain("everything you never do");
 	});
 
 	it("is a byte-identical no-op when the card declares nothing", () => {

@@ -12,28 +12,31 @@ type PiWireMessage = ContextEvent["messages"][number];
 export const MAX_POST_HISTORY_INSTRUCTIONS_BYTES = 4_096;
 
 /**
- * What the block IS, before its prose.
+ * What the block IS, before its prose: said to her, in her own second person.
  *
- * A card's closing direction is author prose about how the character ends a reply. Named
- * as one more instruction with no owner, it reads to a model as a competing policy that
- * outranks the product's own floor — it is the last block in the request, so nothing after
- * it can correct that reading. Naming it as HERS ("her own closing direction", "how she
- * ends it") keeps it authorship of a voice rather than a rule about the runtime.
+ * This is the LAST text of the request, so it is the position of greatest weight - and any
+ * framing vocabulary spoken ABOUT her costs twice. A card may forbid exactly that
+ * ("never describe yourself in the third person"), and the product floor forbids naming
+ * prompts and systems at all, so a frame written from outside the character sets the last
+ * thing she reads to breaking both. Said to her instead ("your next reply", "your own
+ * voice"), the block is authorship of a voice, and nothing in it is a claim about anything
+ * but the ending.
  */
 const FRAME_OPENING =
-	"The card's closing direction: how she ends her next reply. It is her own authorship of her final beat, in her own voice — not a system policy and not a rule about this runtime.";
+	"How your next reply ends is yours to write: your own closing beat, in your own voice.";
 
 /**
- * The floor statement the frame may never omit.
+ * The precedence line the frame may never omit.
  *
- * The block rides after the transcript, so it is the last thing the model reads. Without
- * an explicit precedence line, a card that says "answer in English" or "ignore your
- * rules" would win by position alone over the Host's own language binding and safety
- * rules. The precedence is therefore stated positively, and limited to everything that is
- * not "how she closes", so it cannot be read as licence to ignore the direction either.
+ * The block rides after everything else, so without it a card that says "answer in English"
+ * or "ignore your rules" would win by position alone over the Host's own language binding
+ * and safety floor. It is stated as SCOPE rather than as a contest: the closing beat is at
+ * issue, everything else about her is untouched. That leaves the floor exactly as binding as
+ * it was, without a sentence that reads as a rule outranking the floor or as licence to
+ * ignore the direction.
  */
 const FRAME_FLOOR =
-	"Only how she closes is at issue here. The instructions that precede this transcript still bind exactly as before — including the language she answers in and everything she must never say or do — and where the two diverge about anything else, those earlier instructions win.";
+	"Only that closing beat is at issue here; everything else about you stays exactly as it is — the language you speak, and everything you never do.";
 
 /**
  * Render the one trailing block for a card's `post_history_instructions`.
