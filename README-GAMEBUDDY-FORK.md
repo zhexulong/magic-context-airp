@@ -60,9 +60,15 @@ LKG snapshot, the token accounting and every cache key:
 * `role: "user"`, because `pi-ai`'s `resolveTranscript` collapses later `system`
   entries into the LEADING system message on transports without
   mid-conversation system messages, which would hoist the block to the head;
-* framed as the character's own closing direction with an explicit floor line,
-  because it is the last block and a card may not talk over the Host's language
-  binding or safety rules by position;
+* framed as the closing beat of her own next reply, said TO her — "How your next
+  reply ends is yours to write: your own closing beat, in your own voice." — with a
+  scope line ("Only that closing beat is at issue here; everything else about you
+  stays exactly as it is — the language you speak, and everything you never do.")
+  rather than a precedence contest. The block is the last text of the request, so
+  it may not describe her in the third person (a card may forbid exactly that) and
+  may not name prompts, systems or a runtime (the product floor forbids it); stated
+  as scope, a card still cannot talk over the Host's language binding or safety
+  rules by position;
 * absent for a card that declares nothing: the served array is byte-identical to
   the array without this feature.
 
