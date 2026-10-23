@@ -14,6 +14,14 @@ import {
 
 const INSTRUCTIONS = "收束时只说一句家常话，别把镜头拉到旁白。";
 
+/** A directive of the shape cards actually carry: each line binds a different behaviour. */
+const AUTHOR_DIRECTIVE = [
+	"日常相处保持松弛的生活烟火气；",
+	"动作采用第一人称具身体感，严禁第三人称小说旁白与摄影机视角的自我描摹；",
+	"短促寒暄就短促地答，不要堆成长段；",
+	"称谓用“你”；以自然的生活行动或环境细节收束。",
+].join("\n");
+
 function wire(): PiMessage[] {
 	return [
 		{ role: "system", content: "system prompt" } as PiMessage,
@@ -40,9 +48,9 @@ describe("appendPostHistoryInstructions", () => {
 		expect(text.split(INSTRUCTIONS)).toHaveLength(2);
 	});
 
-	it("frames the block as the close of her own next beat, addressed to her", () => {
+	it("frames the block as her own authorship of how she answers, addressed to her", () => {
 		const text = renderPostHistoryInstructions(INSTRUCTIONS);
-		expect(text).toContain("How your next reply ends is yours to write");
+		expect(text).toContain("How you answer is yours to write");
 		// The last text of the request may not describe her from outside: a card may forbid
 		// third-person self-description, and the floor forbids naming prompts and systems.
 		const frame = text.slice(0, text.indexOf(INSTRUCTIONS));
@@ -58,11 +66,28 @@ describe("appendPostHistoryInstructions", () => {
 			/system/i,
 		])
 			expect(frame).not.toMatch(forbidden);
-		// The precedence line is what stops a last-block card from talking over the floor, and
-		// it states SCOPE rather than a contest, so it cannot read as outranking the floor.
-		expect(text).toContain("Only that closing beat is at issue here");
+	});
+
+	it("does not narrow a multi-line author directive to its last line", () => {
+		// A card's `post_history_instructions` is a performance contract: narration in first
+		// person, embodied action prose, pacing, the word for the player, and only then how a
+		// reply lands. A frame scoped to "the ending" would demote every earlier line to
+		// advice she may drop, so the opening must speak to how she answers as a whole.
+		const text = renderPostHistoryInstructions(AUTHOR_DIRECTIVE);
+		expect(AUTHOR_DIRECTIVE.split("\n")).toHaveLength(4);
+		expect(text).toContain(AUTHOR_DIRECTIVE);
+		// The envelope tag is not prose; the assertion is about the words the frame speaks.
+		const frame = text.slice(text.indexOf("\n"), text.indexOf(AUTHOR_DIRECTIVE));
+		expect(frame).not.toMatch(/\bend(s|ing)?\b/i);
+		expect(frame).not.toMatch(/\bclos(e|es|ing)\b/i);
+	});
+
+	it("keeps the precedence line stated as scope, with the floor still binding", () => {
+		const text = renderPostHistoryInstructions(INSTRUCTIONS);
+		expect(text).toContain("None of this changes who you are");
 		expect(text).toContain("the language you speak");
-		expect(text).toContain("everything you never do");
+		expect(text).toContain("anything you never do");
+		expect(text).toContain("those hold");
 	});
 
 	it("is a byte-identical no-op when the card declares nothing", () => {

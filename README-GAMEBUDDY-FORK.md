@@ -60,15 +60,18 @@ LKG snapshot, the token accounting and every cache key:
 * `role: "user"`, because `pi-ai`'s `resolveTranscript` collapses later `system`
   entries into the LEADING system message on transports without
   mid-conversation system messages, which would hoist the block to the head;
-* framed as the closing beat of her own next reply, said TO her — "How your next
-  reply ends is yours to write: your own closing beat, in your own voice." — with a
-  scope line ("Only that closing beat is at issue here; everything else about you
-  stays exactly as it is — the language you speak, and everything you never do.")
-  rather than a precedence contest. The block is the last text of the request, so
-  it may not describe her in the third person (a card may forbid exactly that) and
-  may not name prompts, systems or a runtime (the product floor forbids it); stated
-  as scope, a card still cannot talk over the Host's language binding or safety
-  rules by position;
+* framed as her own authorship of how she answers, said TO her — "How you answer
+  is yours to write: your voice, your bearing, your pace, in your own words." —
+  with a scope line ("None of this changes who you are, the language you speak, or
+  anything you never do; where it disagrees with those, those hold.") rather than
+  a precedence contest. The opening names the whole of how she answers and never
+  "the ending": an imported directive is a performance contract, and a frame scoped
+  to the last clause would demote its narration, embodiment, pacing and address rules
+  to advice she may drop. The block is the last text of the request, so it may not
+  describe her in the third person (a card may forbid exactly that) and may not name
+  prompts, systems or a runtime (the product floor forbids it); stated as scope, the
+  line stays in the floor's favour without reading as a rule outranking it or as
+  licence to ignore the direction;
 * absent for a card that declares nothing: the served array is byte-identical to
   the array without this feature.
 
