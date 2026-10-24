@@ -22,6 +22,16 @@ const AUTHOR_DIRECTIVE = [
 	"称谓用“你”；以自然的生活行动或环境细节收束。",
 ].join("\n");
 
+/**
+ * The frame's own characters: the block minus its two tags, its four newlines, and the
+ * author's prose. Derived rather than counted by hand, so a frame that grew shows up as a
+ * number this suite compares against the direction it wraps.
+ */
+function frameSize(block: string, instructions: string): number {
+	const tags = "<character-closing-direction>".length + "</character-closing-direction>".length;
+	return block.length - instructions.length - tags - 4;
+}
+
 function wire(): PiMessage[] {
 	return [
 		{ role: "system", content: "system prompt" } as PiMessage,
@@ -48,9 +58,14 @@ describe("appendPostHistoryInstructions", () => {
 		expect(text.split(INSTRUCTIONS)).toHaveLength(2);
 	});
 
-	it("frames the block as her own authorship of how she answers, addressed to her", () => {
+	it("names the direction as her author's, addressed to her, and licenses nothing", () => {
 		const text = renderPostHistoryInstructions(INSTRUCTIONS);
-		expect(text).toContain("How you answer is yours to write");
+		expect(text).toContain("Your author's direction for how you answer.");
+		// The shipped card fixes pronouns, sentence length and what may not appear. A frame
+		// that called the words hers to choose would contradict that card from the strongest
+		// position in the request, so the frame offers no permission at all.
+		const opening = text.slice(text.indexOf("\n") + 1, text.indexOf(`\n${INSTRUCTIONS}\n`));
+		expect(opening).toBe("Your author's direction for how you answer.");
 		// The last text of the request may not describe her from outside: a card may forbid
 		// third-person self-description, and the floor forbids naming prompts and systems.
 		const frame = text.slice(0, text.indexOf(INSTRUCTIONS));
@@ -82,12 +97,22 @@ describe("appendPostHistoryInstructions", () => {
 		expect(frame).not.toMatch(/\bclos(e|es|ing)\b/i);
 	});
 
-	it("keeps the precedence line stated as scope, with the floor still binding", () => {
+	it("keeps the floor binding in one clause, with no tie-break to weigh the two sides", () => {
 		const text = renderPostHistoryInstructions(INSTRUCTIONS);
-		expect(text).toContain("None of this changes who you are");
-		expect(text).toContain("the language you speak");
-		expect(text).toContain("anything you never do");
-		expect(text).toContain("those hold");
+		// One clause: a second clause would have to say which side wins, and the point of the
+		// scope line is that the question never arises.
+		expect(text).toContain(
+			`\n${INSTRUCTIONS}\nNothing here overrides what already holds.\n</character-closing-direction>`,
+		);
+	});
+
+	it("spends fewer characters on the frame than the author spent on the direction", () => {
+		// The block's last position is the strongest in the request, so every character the
+		// frame takes there is a character the author did not write.
+		const block = renderPostHistoryInstructions(AUTHOR_DIRECTIVE);
+		const frame = frameSize(block, AUTHOR_DIRECTIVE);
+		expect(frame).toBeLessThanOrEqual(110);
+		expect(frame).toBeLessThan(AUTHOR_DIRECTIVE.length);
 	});
 
 	it("is a byte-identical no-op when the card declares nothing", () => {

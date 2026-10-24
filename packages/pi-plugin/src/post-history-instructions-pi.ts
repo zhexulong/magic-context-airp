@@ -12,37 +12,33 @@ type PiWireMessage = ContextEvent["messages"][number];
 export const MAX_POST_HISTORY_INSTRUCTIONS_BYTES = 4_096;
 
 /**
- * What the block IS, before its prose: said to her, in her own second person.
+ * What the block IS: her author's direction for how she answers, said to her.
  *
- * This is the LAST text of the request, so it is the position of greatest weight - and any
- * framing vocabulary spoken ABOUT her costs twice. A card may forbid exactly that
- * ("never describe yourself in the third person"), and the product floor forbids naming
- * prompts and systems at all, so a frame written from outside the character sets the last
- * thing she reads to breaking both. Said to her instead ("your own words", "your voice"),
- * the block is authorship of a voice.
+ * This is the LAST text of the request, so it is the position of greatest weight — and
+ * every character spent there is a character the author did not write. The frame is
+ * therefore SHORTER than the direction it introduces, and all it does is name whose the
+ * direction is. It carries no permission: a shipped card fixes the pronouns, the sentence
+ * length and what may not appear, so a frame that told her the words were hers to choose
+ * would contradict the card from the strongest position in the request.
  *
- * The opening names the WHOLE of how she answers, never one clause of it. An imported
- * `post_history_instructions` is a performance contract - narration kept in first person,
+ * What it points at is the WHOLE of how she answers, never one clause of it. An imported
+ * `post_history_instructions` is a performance contract — narration kept in first person,
  * action prose embodied, pacing for short exchanges, the word she uses for the player, and
- * only then how a reply lands. A frame that scopes itself to "the ending" demotes every
- * line before the last one to advice she may drop, and hands her a licence the card is
- * written to withhold; naming how she answers keeps each line binding.
+ * only then how a reply lands. A frame that scoped itself to "the ending" would demote every
+ * line before the last one to advice she may drop.
  */
-const FRAME_OPENING =
-	"How you answer is yours to write: your voice, your bearing, your pace, in your own words.";
+const FRAME_OPENING = "Your author's direction for how you answer.";
 
 /**
- * The precedence line the frame may never omit.
+ * The floor the frame may never omit, stated in ONE clause.
  *
  * The block rides after everything else, so without it a card that says "answer in English"
  * or "ignore your rules" would win by position alone over the Host's own language binding
- * and safety floor. It is stated as SCOPE rather than as a contest: nothing about her changes
- * what already holds, so the floor is exactly as binding as it was and no sentence reads as a
- * rule outranking it. The tie-break is named once, in the floor's favour, only so the scope
- * line cannot itself be read as licence to ignore the direction above it.
+ * and safety floor. It is stated as scope — nothing above the block moves — rather than as a
+ * contest, and it names no tie-break: a second clause weighing the two sides would itself
+ * have to say which one wins, and the point is that the question never arises.
  */
-const FRAME_FLOOR =
-	"None of this changes who you are, the language you speak, or anything you never do; where it disagrees with those, those hold.";
+const FRAME_FLOOR = "Nothing here overrides what already holds.";
 
 /**
  * Render the one trailing block for a card's `post_history_instructions`.
