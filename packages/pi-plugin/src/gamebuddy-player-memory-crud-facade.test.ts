@@ -112,6 +112,45 @@ describe("GameBuddy player Memory CRUD facade", () => {
 		).rejects.toThrow("gamebuddy_memory_continuity_mismatch");
 	});
 
+	test("tells the player's own writing apart from what the companion remembers", async () => {
+		root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-authorship-"));
+		// The panel's create: the player types a memory of their own. The durable row cannot say so in
+		// `sourceType` (the store reserves "user" and `insertMemory` refuses it from every path that is
+		// not the unimplemented dashboard entry), so the store's player-authority stamp is what answers.
+		const facade = createGameBuddyPlayerMemoryCrudFacade({
+			continuityId,
+			runtimeCwd: root,
+			...defaultProfile,
+		});
+		const written = await facade.create({
+			continuityId,
+			content: "I told her: the farmer likes blueberries.",
+			...defaultProfile,
+		});
+		expect(written.playerAuthored).toBe(true);
+		// The companion's own write path: an ordinary historian row with no player authority behind it.
+		const db = await openDatabaseAsync(
+			join(root, "data", "cortexkit", "magic-context", "context.db"),
+		);
+		expect(db).toBeTruthy();
+		new MemoryCommandFacade(db!).create({
+			projectPath: resolveGameBuddyMemoryProjectPath(root, continuityId),
+			category: "SEMANTIC_MEMORY",
+			content: "She remembers: the mill opens at nine.",
+			sourceType: "historian",
+			actor: { principal: "companion_agent", delegated: false },
+		});
+		const rows = await facade.listMemories({ continuityId, ...defaultProfile });
+		expect(
+			rows.find((row) => row.content === "I told her: the farmer likes blueberries.")
+				?.playerAuthored,
+		).toBe(true);
+		expect(
+			rows.find((row) => row.content === "She remembers: the mill opens at nine.")
+				?.playerAuthored,
+		).toBe(false);
+	});
+
 	test("isolates continuities and omits unrelated vendor categories from the player projection", async () => {
 		root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-isolation-"));
 		const databasePath = join(

@@ -60,14 +60,21 @@ export type GameBuddyPlayerMemoryReadView = Readonly<{
   category: "semantic" | "interaction";
   status: "active" | "permanent" | "archived";
   /**
-   * Who wrote the row, in the store's own vocabulary (`historian` | `agent` | `dreamer` | `user`).
+   * Whether the player's own writing is what stands in this row.
    *
    * The management surface has always allowed a player to edit and archive ANY row, but it could not
    * say which rows the player wrote themselves and which the companion's own machinery produced - so
-   * the two were indistinguishable exactly where a player decides what to trust. The value is carried
-   * verbatim: the store owns the vocabulary, and the display wording belongs to the surface.
+   * the two were indistinguishable exactly where a player decides what to trust.
+   *
+   * `sourceType` cannot answer this. It is provenance of the WRITE PATH (`historian` | `agent` |
+   * `dreamer`, plus a `user` value the store reserves for a dashboard entry that does not exist and
+   * `insertMemory` refuses from every implemented path), and a player typing in the panel is stored as
+   * `agent` because it does arrive through the command facade. The fact this asks for is authority,
+   * and the command facade already stamps it: `metadata.governance.authority === "player"` on every
+   * player-directed create or update, and it is what the store itself uses to refuse a companion
+   * mutation of the player's words. That stamp is the one authority read here.
    */
-  sourceType: string;
+  playerAuthored: boolean;
   sourceRefs?: readonly string[];
 }>;
 
@@ -152,23 +159,37 @@ export function assertMemoryProfileMatch(
 		throw new Error("gamebuddy_memory_profile_mismatch");
 }
 
-function sourceRefs(memory: Memory): readonly string[] | undefined {
+function metadataObject(memory: Memory): Record<string, unknown> {
+	if (memory.metadataJson === null) return {};
 	try {
-		const metadata: unknown =
-			memory.metadataJson === null
-				? undefined
-				: JSON.parse(memory.metadataJson);
-		const values =
-			metadata && typeof metadata === "object" && !Array.isArray(metadata)
-				? (metadata as Record<string, unknown>).source_refs
-				: undefined;
-		return Array.isArray(values) &&
-			values.every((value) => typeof value === "string")
-			? Object.freeze([...values])
-			: undefined;
+		const parsed: unknown = JSON.parse(memory.metadataJson);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: {};
 	} catch {
-		return undefined;
+		// Malformed metadata belongs to no authority, so it answers nothing rather than
+		// failing a bounded read of every other row beside it.
+		return {};
 	}
+}
+
+function sourceRefs(metadata: Record<string, unknown>): readonly string[] | undefined {
+	const values = metadata.source_refs;
+	return Array.isArray(values) &&
+		values.every((value) => typeof value === "string")
+		? Object.freeze([...values])
+		: undefined;
+}
+
+/** The one authority: the command facade's player stamp, never the write path's `sourceType`. */
+function playerAuthored(metadata: Record<string, unknown>): boolean {
+	const governance = metadata.governance;
+	return (
+		governance !== null &&
+		typeof governance === "object" &&
+		!Array.isArray(governance) &&
+		(governance as Record<string, unknown>).authority === "player"
+	);
 }
 
 function view(
@@ -183,16 +204,16 @@ function view(
 		memory.category !== "INTERACTION_EPISODE"
 	)
 		return undefined;
+  const metadata = metadataObject(memory);
+  const refs = sourceRefs(metadata);
   return Object.freeze({
     stateToken,
     content: memory.content,
     category:
       memory.category === "SEMANTIC_MEMORY" ? "semantic" : "interaction",
     status: memory.status,
-    sourceType: memory.sourceType,
-    ...(sourceRefs(memory) === undefined
-      ? {}
-      : { sourceRefs: sourceRefs(memory) }),
+    playerAuthored: playerAuthored(metadata),
+    ...(refs === undefined ? {} : { sourceRefs: refs }),
   });
 }
 
