@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { log } from "../../shared/logger";
-import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
+import { isHostSynthesizedDeliveryText, isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
 import { countTokensExactly } from "./token-count-exact";
 
 export interface SessionChunkLine {
@@ -46,6 +46,10 @@ export function hasMeaningfulUserText(parts: unknown[]): boolean {
 
         if (!cleaned) continue;
         if (isSystemDirective(cleaned)) continue;
+        // A host that delivers runtime facts through a user turn is not a player speaking. Counted as one, it
+        // inflated every boundary sized in "user turns" - the protected tail protected five of them rather than
+        // five utterances, and the historian's chunk pinned to the newest batch instead of the newest thing said.
+        if (isHostSynthesizedDeliveryText(cleaned)) continue;
         return true;
     }
 
