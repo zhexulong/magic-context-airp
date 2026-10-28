@@ -40,14 +40,24 @@ const ENVIRONMENT_BLOCK_PATTERN =
  * message's text. Returns the number of messages modified (0 or 1).
  * Idempotent by marker: an identical block is left untouched; a changed
  * block replaces the old one; a removed provider strips it.
+ *
+ * `resolveId` identifies messages that belong to the session's real transcript.
+ * Magic Context's own synthetic m[0]/m[1] prepends carry no SessionEntry id
+ * (the same contract the temporal markers rely on), so passing it keeps the
+ * block off the rendered history prefix and on the first surviving player turn.
  */
-export function injectPiRuntimeEnvironmentFacts(messages: unknown[]): number {
+export function injectPiRuntimeEnvironmentFacts(
+	messages: unknown[],
+	resolveId?: (message: unknown, index: number) => string | undefined,
+): number {
 	const block = renderRuntimeEnvironmentBlock();
 	let modified = 0;
-	for (const raw of messages) {
+	for (let index = 0; index < messages.length; index++) {
+		const raw = messages[index];
 		if (!raw || typeof raw !== "object") continue;
 		const msg = raw as PiUserMessage;
 		if (msg.role !== "user") continue;
+		if (resolveId && resolveId(raw, index) === undefined) continue;
 		const content = msg.content;
 		if (typeof content === "string") {
 			if (block === undefined) {

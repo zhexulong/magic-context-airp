@@ -7786,33 +7786,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		logTransformTiming(args.sessionId, "injectTemporalMarkers", tTemporal);
 	}
 
-	// 0b. Non-durable runtime environment facts (GameBuddy companion surfaces):
-	// the host registers a boot-time provider; this pass injects its CURRENT
-	// snapshot (game hour/season/weather/location) as an idempotent
-	// <runtime-environment> block next to the temporal markers. Same timing
-	// rule (every pass) and same idempotency rule (replace, never stack);
-	// the block is stripped when the provider is removed. Unlike temporal
-	// markers the VALUE changes between passes by design — freshness is the
-	// point; idempotency means one pass never stacks two blocks.
-	if (hasRuntimeEnvironmentFactsProvider()) {
-		const tEnv = performance.now();
-		try {
-			const envInjected = injectPiRuntimeEnvironmentFacts(args.messages);
-			if (envInjected > 0) {
-				sessionLog(
-					args.sessionId,
-					`environment-facts: injected current facts block`,
-				);
-			}
-		} catch (err) {
-			sessionLog(
-				args.sessionId,
-				`environment-facts failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
-		logTransformTiming(args.sessionId, "injectPiRuntimeEnvironmentFacts", tEnv);
-	}
-
+	// 0b. Non-durable runtime environment facts (GameBuddy companion surfaces) are
+	// written at the END of this pass, once the compartment prefix trim has decided
+	// which player turn survives; see the injection site below.
 	// Pass entryIds so the transcript tags each message under its real SessionEntry
 	// id (position-independent) instead of the index-based pi-msg-* id that drifts
 	// when the visible array shifts (compaction trim / custom_message inserts),
@@ -9719,6 +9695,36 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				? postCommitStableIdByRef.get(message)
 				: undefined,
 		);
+	}
+
+	// The served prefix is final here, so the CURRENT runtime facts snapshot can be
+	// written into the first surviving player turn as an idempotent
+	// <runtime-environment> block. Every pass refreshes it from the host provider
+	// (a weather change or hour advance is visible on the next turn without a
+	// memory write); a removed provider strips it. One pass never stacks two blocks.
+	if (hasRuntimeEnvironmentFactsProvider()) {
+		const tEnv = performance.now();
+		try {
+			const envInjected = injectPiRuntimeEnvironmentFacts(
+				args.messages,
+				(message) =>
+					message && typeof message === "object"
+						? postCommitStableIdByRef.get(message)
+						: undefined,
+			);
+			if (envInjected > 0) {
+				sessionLog(
+					args.sessionId,
+					`environment-facts: injected current facts block`,
+				);
+			}
+		} catch (err) {
+			sessionLog(
+				args.sessionId,
+				`environment-facts failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		logTransformTiming(args.sessionId, "injectPiRuntimeEnvironmentFacts", tEnv);
 	}
 
 	const outputMessages = transcript.getOutputMessages();
