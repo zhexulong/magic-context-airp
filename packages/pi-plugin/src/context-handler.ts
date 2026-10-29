@@ -5169,10 +5169,13 @@ export function registerPiContextHandler(
 			if (beforePipelineForTests)
 				await budget.waitMandatory(beforePipelineForTests());
 			assertCurrentPass();
+			// One verdict per pass: the pipeline gates its `§N§` prefixes on it, and the
+			// channel accounting below must gate the nudge channels on the same value.
+			const ctxReduceToolActive = isPiCtxReduceToolActive(pi);
 			const result = await budget.waitMandatory(
 				runPipeline({
 					assertCurrentPass,
-					ctxReduceToolActive: isPiCtxReduceToolActive(pi),
+					ctxReduceToolActive,
 					db: options.db,
 					tagger,
 					sessionId,
@@ -5643,7 +5646,17 @@ export function registerPiContextHandler(
 			const tChannelAccounting = performance.now();
 			try {
 				const sessionMetaForCh1 = sessionMeta;
-				if (!options.compactionOff && !sessionMetaForCh1.isSubagent) {
+				// Both channels are instructions to call `ctx_reduce`, so a session whose tool
+				// list filters it out must arm neither: Channel 1 would return a reminder block
+				// from the tool_result hook and Channel 2 would steer one into the run. The
+				// baseline is still the only signal the delivery path has for "this session
+				// manages its own context", so skipping it here is what turns a delivery site
+				// with no baseline into the off state.
+				if (
+					ctxReduceToolActive &&
+					!options.compactionOff &&
+					!sessionMetaForCh1.isSubagent
+				) {
 					const { tags, protectedTagNumbers, pendingDropTagNumbers } =
 						result.channelBaselineSnapshot;
 					const stableId = (message: unknown): string | undefined =>
