@@ -12,7 +12,6 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import type { MemoryDomain } from "../memory/domain";
-import { getMemorySelectColumns, isMemoryRow, toMemory } from "../memory/storage-memory";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";

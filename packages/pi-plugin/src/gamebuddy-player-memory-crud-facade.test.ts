@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
 import { createGameBuddyPlayerMemoryCrudFacade } from "./gamebuddy-player-memory-crud-facade";
-import { resolveGameBuddyMemoryProjectPath, validateMemoryProfileBinding } from "./gamebuddy-player-memory-read-projection";
+import { resolveGameBuddyMemoryProjectPath } from "./gamebuddy-player-memory-read-projection";
 import { setDeclaredProjectIdentity, _resetHarnessForTesting } from "@magic-context/core/shared/harness";
 
 const continuityId = "continuity_01";

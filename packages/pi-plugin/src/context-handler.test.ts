@@ -7,12 +7,10 @@ import {
 	appendCompartments,
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
-import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import * as embeddingModule from "@magic-context/core/features/magic-context/memory/embedding";
 import {
 	__resetProjectIdentityForTests,
 	__setProjectIdentityTestHooks,
-	resolveProjectIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	__resetMessageIndexAsyncForTests,

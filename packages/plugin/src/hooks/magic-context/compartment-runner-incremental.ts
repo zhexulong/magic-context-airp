@@ -61,7 +61,7 @@ import { toModelEntry } from "../../shared/resolve-fallbacks";
 import { beginSqliteWriterAsync } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
-import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
+import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import {
     prepareCompartmentDrops,
     queuePreparedCompartmentDrops,

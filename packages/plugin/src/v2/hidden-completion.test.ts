@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { inspectCurateMemoryOperations } from "../features/magic-context/dreamer/task-executor";
-import { runValidatedHistorianPass } from "../hooks/magic-context/compartment-runner-historian";
 import {
     HiddenCompletionRefusal,
     type HiddenRunIdentity,

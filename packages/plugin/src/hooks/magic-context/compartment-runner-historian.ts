@@ -40,7 +40,6 @@ import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
 import {
     buildHistorianEditorPrompt,
-    COMPARTMENT_AGENT_SYSTEM_PROMPT,
     HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "./compartment-prompt";
 import type {
