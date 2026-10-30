@@ -2706,6 +2706,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
         };
         let lastSystem = "";
         const client = {
+            backgroundSessionsAreHidden: true,
             session: {
                 list: mock(async () => ({ data: [] })),
                 create: mock(async () => ({ data: { id: "retro-module-child" } })),

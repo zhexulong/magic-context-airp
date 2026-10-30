@@ -1,7 +1,4 @@
-import {
-    projectNeedsSingleStoreMigration,
-    SingleStoreMigrationRequiredError,
-} from "../../../hooks/magic-context/single-store-refusal";
+import { SingleStoreMigrationRequiredError } from "../../../hooks/magic-context/single-store-refusal";
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import type { MemoryCategory } from "../memory/types";
@@ -44,9 +41,6 @@ export async function resolveDreamerModuleRoute(args: {
     moduleClient?: DreamerModuleClient;
     commandId: string;
 }): Promise<DreamerModuleRoute | undefined> {
-    if (projectNeedsSingleStoreMigration(args.db, args.projectIdentity)) {
-        throw new SingleStoreMigrationRequiredError();
-    }
     if (args.transformMode === "ts" || !args.moduleClient) return undefined;
     return {
         moduleClient: args.moduleClient,

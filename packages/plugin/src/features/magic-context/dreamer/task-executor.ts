@@ -80,7 +80,6 @@ import { mapMemories } from "./map-memories";
 import {
     DreamerModuleFailureError,
     type DreamerModuleRoute,
-    logDreamerNotOwnerOnce,
     resolveDreamerModuleRoute,
     writeMemoryLearningsThroughModule,
 } from "./module-apply";
@@ -556,7 +555,6 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
         const migrationRequired = projectNeedsSingleStoreMigration(db, projectIdentity);
         let moduleRoute: Awaited<ReturnType<typeof resolveDreamerModuleRoute>>;
         if (
-            !migrationRequired &&
             !config.modelChainUnavailable &&
             (config.task === "curate" ||
                 config.task === "map-memories" ||
@@ -580,27 +578,12 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 throw new DreamerModuleFailureError("store admission", error);
             }
         }
-        if (
-            !moduleRoute &&
-            migrationRequired &&
-            (
-                [
-                    "curate",
-                    "map-memories",
-                    "compress-cues",
-                    "classify-memories",
-                    "verify",
-                    "verify-broad",
-                    "retrospective",
-                    "reflect",
-                ] as DreamTaskName[]
-            ).includes(config.task)
-        ) {
-            logDreamerNotOwnerOnce(projectIdentity);
-            return { status: "completed", detail: "skipped: module-managed memory; not owner" };
-        }
+        // A project the module still owns must route to the module, never to the
+        // TypeScript store. Refuse only when no module route resolved: routing is
+        // the handling, and the refusal is the fallback.
+        const migrationRefusal = migrationRequired && !moduleRoute;
         const parent =
-            migrationRequired || config.modelChainUnavailable
+            migrationRefusal || config.modelChainUnavailable
                 ? deps.parentSessionId
                 : await resolveParentSessionId(deadline);
         if (!leaseOwnershipMatches(db, holderId, leaseAcquisition.generation, leaseKey)) {
@@ -761,7 +744,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             };
             if (config.modelChainUnavailable)
                 return skip("Pi model chain is empty (no configured model resolves in Pi)");
-            if (migrationRequired) return skip(renderSingleStoreMigrationRequiredRefusal());
+            if (migrationRefusal) return skip(renderSingleStoreMigrationRequiredRefusal());
             // A visible host must not create a background root. Skip the whole
             // scheduled task before opening batches or advancing task cursors;
             // the scheduler moves skipped work to its next cron without retries.
