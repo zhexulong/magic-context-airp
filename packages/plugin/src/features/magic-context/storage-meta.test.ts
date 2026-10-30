@@ -97,8 +97,10 @@ describe("storage-meta", () => {
             // legacy FTS rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
             // The indexed temporal choices are session-owned too; adding their
-            // deletion must not split cleanup across separate transactions.
-            expect(db.prepare).toHaveBeenCalledTimes(40);
+            // deletion must not split cleanup across separate transactions. The
+            // count is one statement per SESSION_SCOPED_TABLES entry plus the
+            // fixed backoff/activity/FTS sweep statements around them.
+            expect(db.prepare).toHaveBeenCalledTimes(41);
         });
     });
 });

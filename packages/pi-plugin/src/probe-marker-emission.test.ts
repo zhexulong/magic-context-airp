@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -87,7 +87,7 @@ const baseHard = {
 describe("Class B memory-probe marker emission", () => {
 	it("emits no fold marker for a first render that certifies no new compartment", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-first-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-marker-first-"));
 		try {
 			const state = {
 				...piState("ses-marker-first", cwd),
@@ -108,7 +108,7 @@ describe("Class B memory-probe marker emission", () => {
 
 	it("emits a fold marker when a compartment is certified into the m[0] baseline", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-fold-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-marker-fold-"));
 		try {
 			const state = {
 				...piState("ses-marker-fold", cwd),
@@ -127,7 +127,7 @@ describe("Class B memory-probe marker emission", () => {
 
 	it("does NOT emit a fold marker for a HARD re-render that folds no compartment", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-modelchange-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-marker-modelchange-"));
 		try {
 			const state = {
 				...piState("ses-marker-modelchange", cwd),
@@ -162,7 +162,7 @@ describe("Class B memory-probe marker emission", () => {
 
 	it("keeps the digest stable across a pure replay of the same materialization", () => {
 		const db = createTestDb();
-		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-stable-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-marker-stable-"));
 		try {
 			const state = {
 				...piState("ses-marker-stable", cwd),
