@@ -110,7 +110,7 @@ macro_rules! table {
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
     // BEGIN FRESH-MIGRATION CENSUS
-    // context.db: 106 tables observed after fresh migration.
+    // context.db: 108 tables observed after fresh migration.
     table!(
         Context,
         "authority_capture_bounds",
@@ -149,6 +149,34 @@ pub const TABLES: &[TableInventory] = &[
         &["project_path", "started_at"],
         &[],
         None,
+        None
+    ),
+    table!(
+        Context,
+        "chapters",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["id"],
+        &[
+            "id",
+            "session_id",
+            "project_path",
+            "span_start_sequence",
+            "span_end_sequence",
+            "start_date",
+            "end_date",
+            "title",
+            "content",
+            "source_compartment_ids",
+            "importance",
+            "sealed_at",
+            "revision",
+            "created_at",
+            "status",
+            "edited_at"
+        ],
+        &[],
+        Some(KeyPolicy::PreserveOrRefuseCollision),
         None
     ),
     table!(
@@ -800,6 +828,17 @@ pub const TABLES: &[TableInventory] = &[
         &[],
         None,
         Some(RenderInput::MemoryMutations)
+    ),
+    table!(
+        Context,
+        "memory_source_exclusions",
+        NotSession,
+        RowSelector::None,
+        &["project_path", "source_ref"],
+        &["project_path", "source_ref", "created_at"],
+        &[],
+        None,
+        None
     ),
     table!(
         Context,
@@ -1550,6 +1589,8 @@ pub const TABLES: &[TableInventory] = &[
             "cached_m0_max_memory_mutation_id",
             "cached_m0_project_docs_hash",
             "cached_m1_bytes",
+            "cached_m1_max_memory_id",
+            "cached_m1_max_memory_mutation_id",
             "last_observed_model_key",
             "last_usage_context_limit",
             "prior_boundary_ordinal",
@@ -2902,7 +2943,11 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 34);
+        // The fork's narrative `chapters` table carries an exact `session_id`
+        // and is registered in SESSION_SCOPED_TABLES, so the census this list
+        // must cover is 35 wide. The count stays a literal canary: a shrink or
+        // growth of the TypeScript list has to be reviewed here too.
+        assert_eq!(session_tables.len(), 35);
         for table in session_tables {
             assert!(matches!(
                 entry(Store::Context, &table).unwrap().class,
