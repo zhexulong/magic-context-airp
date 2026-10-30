@@ -221,6 +221,7 @@ describe("GameBuddy stable source m[0] lifecycle", () => {
 			db.close();
 		}
 	});
+});
 
 describe("Pi render-to-commit concurrency", () => {
 	for (const change of ["memory", "compartment"] as const) {
