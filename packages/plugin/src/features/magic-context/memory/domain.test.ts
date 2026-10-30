@@ -21,28 +21,30 @@ const interactionOutput = `<output>
 describe("ongoing-interaction memory domain", () => {
     test("uses a dedicated historian prompt that keeps completed activity episodic", () => {
         const prompt = historianSystemPromptForDomain("ongoing-interaction");
-    expect(prompt).toContain("Episodic Memory");
-    expect(prompt).toContain("Semantic Memory gate");
-    expect(prompt).toContain("We finished organizing our tools that afternoon.");
-    expect(prompt).toContain("must not be promoted");
-    expect(prompt).toContain("IdentityProfile");
-    expect(prompt).toContain("Live World");
-    // The companion's voice is part of this domain's contract, not a stylistic detail: the
-    // compartments are read back into the companion's own context, where the player is "you".
-    expect(prompt).toContain("## Voice");
-    expect(prompt).toContain('write "I" for the companion and "you" for the player');
-    // The voice must never read as licence to drop the ordinals the contract requires.
-    expect(prompt).toContain("The ordinals are still REQUIRED");
-    expect(prompt).toContain('No role labels ("the player", "the user", "the assistant", "the agent")');
-    // The Voice rule is not compartment-only: the durable entry bodies render on the player's
-    // Memory panel, so they must read in the same voice and drop the same role labels.
-    expect(prompt).toContain(
-        "The `<SEMANTIC_MEMORY>` and `<INTERACTION_EPISODE>` entry bodies",
-    );
-    expect(prompt).toContain(
-        'they follow the same rule: first person for the companion ("I"), second person for the player ("you"), and no role labels in those entry bodies',
-    );
-    expect(historianSystemPromptForDomain("coding-project")).not.toBe(prompt);
+        expect(prompt).toContain("Episodic Memory");
+        expect(prompt).toContain("Semantic Memory gate");
+        expect(prompt).toContain("We finished organizing our tools that afternoon.");
+        expect(prompt).toContain("must not be promoted");
+        expect(prompt).toContain("IdentityProfile");
+        expect(prompt).toContain("Live World");
+        // The companion's voice is part of this domain's contract, not a stylistic detail: the
+        // compartments are read back into the companion's own context, where the player is "you".
+        expect(prompt).toContain("## Voice");
+        expect(prompt).toContain('write "I" for the companion and "you" for the player');
+        // The voice must never read as licence to drop the ordinals the contract requires.
+        expect(prompt).toContain("The ordinals are still REQUIRED");
+        expect(prompt).toContain(
+            'No role labels ("the player", "the user", "the assistant", "the agent")',
+        );
+        // The Voice rule is not compartment-only: the durable entry bodies render on the player's
+        // Memory panel, so they must read in the same voice and drop the same role labels.
+        expect(prompt).toContain(
+            "The `<SEMANTIC_MEMORY>` and `<INTERACTION_EPISODE>` entry bodies",
+        );
+        expect(prompt).toContain(
+            'they follow the same rule: first person for the companion ("I"), second person for the player ("you"), and no role labels in those entry bodies',
+        );
+        expect(historianSystemPromptForDomain("coding-project")).not.toBe(prompt);
     });
 
     test("accepts only the ongoing-interaction fact taxonomy", () => {

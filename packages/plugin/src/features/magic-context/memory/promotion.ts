@@ -45,7 +45,10 @@ function isPromotableCategory(
     // coding side too rather than falling through to that list.
     const ongoingOnly = category === "SEMANTIC_MEMORY" || category === "INTERACTION_EPISODE";
     if (domain === "ongoing-interaction") return ongoingOnly;
-    return !ongoingOnly && PROMOTABLE_CATEGORIES.some((promotableCategory) => promotableCategory === category);
+    return (
+        !ongoingOnly &&
+        PROMOTABLE_CATEGORIES.some((promotableCategory) => promotableCategory === category)
+    );
 }
 
 function resolveExpiresAt(category: MemoryCategory): number | null {

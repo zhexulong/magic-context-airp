@@ -421,7 +421,10 @@ describe("promotion", () => {
                 "ses-1",
                 "/repo/project",
                 [
-                    { category: "ARCHITECTURE_DECISIONS", content: "Use SQLite for cross-session memory" },
+                    {
+                        category: "ARCHITECTURE_DECISIONS",
+                        content: "Use SQLite for cross-session memory",
+                    },
                     { category: "NAMING", content: "Name the extractor extractFacts" },
                     {
                         category: "SEMANTIC_MEMORY",
@@ -431,9 +434,9 @@ describe("promotion", () => {
                 "ongoing-interaction",
             );
             expect(result.factsPromoted).toBe(1);
-            expect(getMemoriesByProject(db, "/repo/project").map((memory) => memory.category)).toEqual([
-                "SEMANTIC_MEMORY",
-            ]);
+            expect(
+                getMemoriesByProject(db, "/repo/project").map((memory) => memory.category),
+            ).toEqual(["SEMANTIC_MEMORY"]);
         });
     });
 

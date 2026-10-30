@@ -6,7 +6,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { log } from "../../shared/logger";
-import { isHostSynthesizedDeliveryText, isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
+import {
+    isHostSynthesizedDeliveryText,
+    isSystemDirective,
+    removeSystemReminders,
+} from "../../shared/system-directive";
 import { countTokensExactly } from "./token-count-exact";
 
 export interface SessionChunkLine {

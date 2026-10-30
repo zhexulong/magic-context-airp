@@ -14,21 +14,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { initializeDatabase } from "./storage-db";
-import { runMigrations } from "./migrations";
 import {
     buildChapter,
+    type Chapter,
     deleteChapter,
+    estimateChaptersTokens,
     getChapters,
     getChaptersForProject,
     getLastSealedChapterSpanEnd,
     renderChaptersBlock,
-    estimateChaptersTokens,
     sealChaptersForCompartments,
     updateChapterContent,
-    type Chapter,
 } from "./chapter-storage";
 import type { Compartment } from "./compartment-storage";
+import { runMigrations } from "./migrations";
+import { initializeDatabase } from "./storage-db";
 
 let db: Database;
 
@@ -82,7 +82,9 @@ describe("migration v92 creates the chapters table", () => {
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .all() as Array<{ name: string }>;
         expect(tables.map((t) => t.name)).toContain("chapters");
-        db.prepare("INSERT INTO chapters (session_id, project_path, span_start_sequence, span_end_sequence, start_date, end_date, title, content, source_compartment_ids, importance, sealed_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+        db.prepare(
+            "INSERT INTO chapters (session_id, project_path, span_start_sequence, span_end_sequence, start_date, end_date, title, content, source_compartment_ids, importance, sealed_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ).run(
             "session-01",
             "/test",
             1,
@@ -141,15 +143,11 @@ describe("sealChaptersForCompartments", () => {
     });
 
     test("a later fold becomes its own chapter, never folded into the previous one", () => {
-        const first = Array.from({ length: 28 }, (_, i) =>
-            compartment(i + 1, `A${i + 1}`),
-        );
+        const first = Array.from({ length: 28 }, (_, i) => compartment(i + 1, `A${i + 1}`));
         sealChaptersForCompartments(db, "session-01", first, "/test");
         // A second fold of 5 is a second chapter. It must NOT extend the sealed first chapter:
         // a sealed chapter's bytes are fixed, so extending it would rewrite the m[0] prefix.
-        const second = Array.from({ length: 5 }, (_, i) =>
-            compartment(29 + i, `B${i + 1}`),
-        );
+        const second = Array.from({ length: 5 }, (_, i) => compartment(29 + i, `B${i + 1}`));
         expect(sealChaptersForCompartments(db, "session-01", second, "/test")).toBe(1);
         const chapters = chaptersList();
         expect(chapters).toHaveLength(2);
@@ -166,17 +164,13 @@ describe("sealChaptersForCompartments", () => {
             "/test",
         );
         // A caller passes only the NEW tail (5 compartments); last sealed is 28.
-        const tail = Array.from({ length: 5 }, (_, i) =>
-            compartment(29 + i, `B${i + 1}`),
-        );
+        const tail = Array.from({ length: 5 }, (_, i) => compartment(29 + i, `B${i + 1}`));
         expect(sealChaptersForCompartments(db, "session-01", tail, "/test")).toBe(1);
         expect(getLastSealedChapterSpanEnd(db, "session-01")).toBe(33);
     });
 
     test("is scoped by session_id", () => {
-        const compartments = Array.from({ length: 28 }, (_, i) =>
-            compartment(i + 1, `A${i + 1}`),
-        );
+        const compartments = Array.from({ length: 28 }, (_, i) => compartment(i + 1, `A${i + 1}`));
         sealChaptersForCompartments(db, "session-01", compartments, "/test");
         sealChaptersForCompartments(db, "session-02", compartments, "/test");
         expect(getChapters(db, "session-01")).toHaveLength(1);
@@ -206,11 +200,10 @@ describe("buildChapter determinism", () => {
     });
 
     test("body holds only highlights; heading assembled at render", () => {
-        const chapter = buildChapter(
-            "session-01",
-            "/test",
-            [compartment(1, "Alpha"), compartment(2, "Beta", 90)],
-        );
+        const chapter = buildChapter("session-01", "/test", [
+            compartment(1, "Alpha"),
+            compartment(2, "Beta", 90),
+        ]);
         // content has no heading markers, no span duplication.
         expect(chapter.content).toBe("Beta; Alpha");
         expect(chapter.title).toBe("Alpha");
@@ -220,17 +213,15 @@ describe("buildChapter determinism", () => {
     });
 
     test("importance is the mean clamped to 1..100", () => {
-        const chapter = buildChapter(
-            "session-01",
-            "/test",
-            [compartment(1, "A", 100), compartment(2, "B", 80)],
-        );
+        const chapter = buildChapter("session-01", "/test", [
+            compartment(1, "A", 100),
+            compartment(2, "B", 80),
+        ]);
         expect(chapter.importance).toBe(90);
-        const low = buildChapter(
-            "session-01",
-            "/test",
-            [compartment(1, "A", 0), compartment(2, "B", 0)],
-        );
+        const low = buildChapter("session-01", "/test", [
+            compartment(1, "A", 0),
+            compartment(2, "B", 0),
+        ]);
         expect(low.importance).toBe(1);
     });
 
@@ -294,7 +285,10 @@ describe("player edits and removal (v93)", () => {
         sealChaptersForCompartments(db, "session-01", [compartment(1, "first")], "/p");
         sealChaptersForCompartments(db, "session-02", [compartment(2, "second")], "/p");
         sealChaptersForCompartments(db, "session-03", [compartment(3, "elsewhere")], "/other");
-        expect(getChaptersForProject(db, "/p").map((chapter) => chapter.sessionId)).toEqual(["session-01", "session-02"]);
+        expect(getChaptersForProject(db, "/p").map((chapter) => chapter.sessionId)).toEqual([
+            "session-01",
+            "session-02",
+        ]);
         expect(getChaptersForProject(db, "/other")).toHaveLength(1);
     });
 
@@ -306,7 +300,14 @@ describe("player edits and removal (v93)", () => {
 
     test("the player's text replaces the body and is recorded as the player's", () => {
         const chapter = sealOne();
-        expect(updateChapterContent(db, { projectPath: "/p", chapterId: chapter.id, content: "what I remember", now: 111 })).toBe(true);
+        expect(
+            updateChapterContent(db, {
+                projectPath: "/p",
+                chapterId: chapter.id,
+                content: "what I remember",
+                now: 111,
+            }),
+        ).toBe(true);
 
         const [updated] = getChapters(db, "session-01");
         expect(updated?.content).toBe("what I remember");
@@ -323,7 +324,9 @@ describe("player edits and removal (v93)", () => {
         const before = renderChaptersBlock(getChapters(db, "session-01"));
         expect(before).toContain("## CHAPTERS:");
 
-        expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 222 })).toBe(true);
+        expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 222 })).toBe(
+            true,
+        );
 
         const after = getChapters(db, "session-01");
         expect(after).toHaveLength(1);
@@ -332,20 +335,37 @@ describe("player edits and removal (v93)", () => {
         // Rendering drops it, and the span stays covered so a later fold cannot re-derive it.
         expect(renderChaptersBlock(after)).toBe("");
         expect(getLastSealedChapterSpanEnd(db, "session-01")).toBe(chapter.spanEndSequence);
-        expect(sealChaptersForCompartments(db, "session-01", [compartment(1, "first")], "/p")).toBe(0);
+        expect(sealChaptersForCompartments(db, "session-01", [compartment(1, "first")], "/p")).toBe(
+            0,
+        );
     });
 
     test("a second removal changes nothing, and another session cannot touch the row", () => {
         const chapter = sealOne();
-        expect(deleteChapter(db, { projectPath: "/other", chapterId: chapter.id, now: 1 })).toBe(false);
-        expect(updateChapterContent(db, { projectPath: "/other", chapterId: chapter.id, content: "x", now: 1 })).toBe(false);
+        expect(deleteChapter(db, { projectPath: "/other", chapterId: chapter.id, now: 1 })).toBe(
+            false,
+        );
+        expect(
+            updateChapterContent(db, {
+                projectPath: "/other",
+                chapterId: chapter.id,
+                content: "x",
+                now: 1,
+            }),
+        ).toBe(false);
         expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 2 })).toBe(true);
         expect(deleteChapter(db, { projectPath: "/p", chapterId: chapter.id, now: 3 })).toBe(false);
         expect(getChapters(db, "session-01")[0]?.editedAt).toBe(2);
     });
 
     test("the estimate counts what renders, not what the player removed", () => {
-        sealChaptersForCompartments(db, "session-01", [compartment(1, "first"), compartment(2, "second")], "/p", 1);
+        sealChaptersForCompartments(
+            db,
+            "session-01",
+            [compartment(1, "first"), compartment(2, "second")],
+            "/p",
+            1,
+        );
         const all = getChapters(db, "session-01");
         expect(all).toHaveLength(2);
         const full = estimateChaptersTokens(all);

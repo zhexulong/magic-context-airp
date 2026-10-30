@@ -27,6 +27,7 @@ import {
     setStoragePrivatePermissionEnforcement,
 } from "../../shared/storage-permissions";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { FORK_MIGRATIONS } from "./migrations";
 import {
     __resetRpcDiscoveryFsForTests,
     __resetSchemaFenceStateForTests,
@@ -52,7 +53,6 @@ import {
     removeRpcDiscoveryRecords,
     resolveDatabasePath,
 } from "./storage-db";
-import { FORK_MIGRATIONS } from "./migrations";
 import { clearSession } from "./storage-meta-session";
 import { SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
@@ -410,11 +410,7 @@ describe("storage-db", () => {
                 ?.prepare(
                     "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?)",
                 )
-                .run(
-                    FORK_MIGRATION_VERSION_FLOOR,
-                    "fork migration at the floor",
-                    0,
-                );
+                .run(FORK_MIGRATION_VERSION_FLOOR, "fork migration at the floor", 0);
             closeDatabase();
 
             const reopened = openDatabase();

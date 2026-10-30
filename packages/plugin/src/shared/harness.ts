@@ -38,7 +38,7 @@ export type HarnessId = "opencode" | "opencode2" | "pi" | "omp";
  * which partition they are reading.
  */
 export type DeclaredProjectIdentity = Readonly<{
-  identity: string;
+    identity: string;
 }>;
 
 /**
@@ -56,7 +56,9 @@ const DECLARED_IDENTITY_SLOT = Symbol.for("magic-context.pi.declared-project-ide
 type DeclaredIdentitySlot = { value?: string | undefined };
 
 function declaredIdentitySlot(): DeclaredIdentitySlot {
-    const host = globalThis as typeof globalThis & { [DECLARED_IDENTITY_SLOT]?: DeclaredIdentitySlot };
+    const host = globalThis as typeof globalThis & {
+        [DECLARED_IDENTITY_SLOT]?: DeclaredIdentitySlot;
+    };
     const existing = host[DECLARED_IDENTITY_SLOT];
     if (existing !== undefined) return existing;
     const created: DeclaredIdentitySlot = {};
@@ -146,10 +148,7 @@ export function setDeclaredProjectIdentity(value: string | undefined): void {
             "Magic Context: declared project identity must be a non-empty, whitespace-free, bounded string",
         );
     }
-    if (
-        readDeclaredProjectIdentity() !== undefined &&
-        readDeclaredProjectIdentity() !== value
-    ) {
+    if (readDeclaredProjectIdentity() !== undefined && readDeclaredProjectIdentity() !== value) {
         throw new Error(
             `Magic Context: project identity already declared as "${readDeclaredProjectIdentity()}"; refusing to switch to "${value}"`,
         );

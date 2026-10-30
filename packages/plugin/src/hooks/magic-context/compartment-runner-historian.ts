@@ -7,6 +7,8 @@ import {
     rememberHistorianOutputCap,
 } from "../../config/live-child-output-cap";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
+import type { MemoryDomain } from "../../features/magic-context/memory/domain";
+import { historianSystemPromptForDomain } from "../../features/magic-context/memory/domain";
 import { openDatabase } from "../../features/magic-context/storage";
 import type {
     SubagentInvocationStatus,
@@ -38,10 +40,7 @@ import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
 import { formatRunTokenLog, type RunTokenLog, runTokenLog } from "../../shared/run-token-log";
 import type { Database } from "../../shared/sqlite";
 import { createChildSessionWithFence } from "./child-session-spawn";
-import {
-    buildHistorianEditorPrompt,
-    HISTORIAN_EDITOR_SYSTEM_PROMPT,
-} from "./compartment-prompt";
+import { buildHistorianEditorPrompt, HISTORIAN_EDITOR_SYSTEM_PROMPT } from "./compartment-prompt";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -64,8 +63,6 @@ import {
     producerPromptFailureReason,
 } from "./producer-window-guard";
 import { estimateTokens } from "./read-session-formatting";
-import { historianSystemPromptForDomain } from "../../features/magic-context/memory/domain";
-import type { MemoryDomain } from "../../features/magic-context/memory/domain";
 
 // Intentionally kept: historian validation failure dumps are preserved for
 // debugging. They land in the project-local historian dir

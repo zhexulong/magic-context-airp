@@ -17,8 +17,8 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { log } from "../../../shared/logger";
 import { getDeclaredProjectIdentity } from "../../../shared/harness";
+import { log } from "../../../shared/logger";
 import {
     projectDirectoryKey,
     readRememberedGitIdentity,

@@ -140,10 +140,7 @@ function toChapter(row: ChapterRow): Chapter {
     let sourceCompartmentIds: number[] = [];
     try {
         const parsed: unknown = JSON.parse(row.source_compartment_ids);
-        if (
-            Array.isArray(parsed) &&
-            parsed.every((entry) => typeof entry === "number")
-        )
+        if (Array.isArray(parsed) && parsed.every((entry) => typeof entry === "number"))
             sourceCompartmentIds = parsed;
     } catch {
         // Malformed legacy row: keep empty list; the chapter body is what renders.
@@ -180,14 +177,9 @@ export function getChapters(db: Database, sessionId: string): Chapter[] {
 }
 
 /** Highest span_end_sequence any chapter covers for this session (0 when none). */
-export function getLastSealedChapterSpanEnd(
-    db: Database,
-    sessionId: string,
-): number {
+export function getLastSealedChapterSpanEnd(db: Database, sessionId: string): number {
     const row = db
-        .prepare(
-            "SELECT MAX(span_end_sequence) AS max_end FROM chapters WHERE session_id = ?",
-        )
+        .prepare("SELECT MAX(span_end_sequence) AS max_end FROM chapters WHERE session_id = ?")
         .get(sessionId) as { max_end: number | null } | null;
     return row?.max_end ?? 0;
 }
@@ -224,7 +216,10 @@ export function sealChaptersForCompartments(
     chapterCompartmentCap: number = DEFAULT_CHAPTER_COMPARTMENT_CAP,
 ): number {
     if (compartments.length === 0) return 0;
-    const cap = Number.isFinite(chapterCompartmentCap) && chapterCompartmentCap >= 1 ? Math.floor(chapterCompartmentCap) : DEFAULT_CHAPTER_COMPARTMENT_CAP;
+    const cap =
+        Number.isFinite(chapterCompartmentCap) && chapterCompartmentCap >= 1
+            ? Math.floor(chapterCompartmentCap)
+            : DEFAULT_CHAPTER_COMPARTMENT_CAP;
     const lastSealed = getLastSealedChapterSpanEnd(db, sessionId);
     // Only the interval (lastSealed, max sequence] is new.
     const candidateMax = compartments[compartments.length - 1]?.sequence ?? 0;
@@ -304,10 +299,8 @@ export function buildChapter(
             Math.min(
                 100,
                 Math.round(
-                    compartments.reduce(
-                        (sum, c) => sum + (c.importance ?? 50),
-                        0,
-                    ) / compartments.length,
+                    compartments.reduce((sum, c) => sum + (c.importance ?? 50), 0) /
+                        compartments.length,
                 ),
             ),
         ),

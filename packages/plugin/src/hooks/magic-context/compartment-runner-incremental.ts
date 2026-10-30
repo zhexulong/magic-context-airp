@@ -10,6 +10,7 @@ import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
+import { historianSystemPromptForDomain } from "../../features/magic-context/memory/domain";
 import {
     resolveProjectIdentity,
     shouldSkipHomeProjectMemory,
@@ -118,7 +119,6 @@ import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { isStrictGapHealingMessage } from "./read-session-raw";
 import { sendStatusNotification } from "./send-session-notification";
-import { historianSystemPromptForDomain } from "../../features/magic-context/memory/domain";
 
 const inconsistentProducerWindows = new Set<string>();
 function logInconsistentProducerWindowOnce(

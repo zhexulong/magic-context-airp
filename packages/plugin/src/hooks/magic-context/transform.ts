@@ -158,6 +158,10 @@ import {
     projectOpencodeReasoningBudgetCutoff,
     resolveKeepReasoningTokens,
 } from "./reasoning-budget";
+import {
+    hasRuntimeEnvironmentFactsProvider,
+    injectRuntimeEnvironmentFacts,
+} from "./runtime-environment-facts";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
@@ -167,10 +171,6 @@ import {
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
-import {
-    hasRuntimeEnvironmentFactsProvider,
-    injectRuntimeEnvironmentFacts,
-} from "./runtime-environment-facts";
 import { prewarmTagOwners, waitForTagOwners } from "./tag-owner-warmup";
 import { collectTemporalCandidates, injectTemporalMarkers } from "./temporal-awareness";
 import { readServedTemporalDecisions } from "./temporal-served-projection";
