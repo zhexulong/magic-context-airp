@@ -39,6 +39,11 @@ const PROJECT = "/repo/reflect";
 
 function reflectClient(answer: string, prompts: string[]) {
     return {
+        // The dreamer needs a parent session on a host whose background sessions are
+        // visible, and skips the task without one. This fake is the hidden carrier (the
+        // same premise task-executor.test.ts uses for its process-local sessions), so it
+        // declares that shape instead of standing in for a visible host.
+        backgroundSessionsAreHidden: true,
         session: {
             list: mock(async () => ({ data: [] })),
             create: mock(async () => ({ data: { id: "reflect-child" } })),
