@@ -247,6 +247,7 @@ import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provid
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
+import { isHostSynthesizedDeliveryText } from "@magic-context/core/shared/system-directive";
 import {
 	guardSqliteTransformPass,
 	type Statement as PreparedStatement,
@@ -10276,14 +10277,23 @@ function applyNoteNudges(args: {
 function hasMeaningfulUserTextPi(message: PiAgentMessage): boolean {
 	if (message.role !== "user") return false;
 	const content = (message as { content: unknown }).content;
-	if (typeof content === "string") return content.trim().length > 0;
+	if (typeof content === "string") {
+		return content.trim().length > 0 && !isHostSynthesizedDeliveryText(content);
+	}
 	if (!Array.isArray(content)) return false;
 	for (const part of content as Array<{ type?: unknown; text?: unknown }>) {
 		if (
 			part &&
 			part.type === "text" &&
 			typeof part.text === "string" &&
-			part.text.trim().length > 0
+			part.text.trim().length > 0 &&
+			// A host that delivers runtime facts through a user turn is not a player speaking. OpenCode's
+			// `hasMeaningfulUserText` has skipped these since the fact-batch work; this Pi twin did not, so every
+			// boundary measured in "user turns" counted a machine delivery as an utterance. A Game surface delivers
+			// every fact batch this way, so the protected tail was pinned to the newest batch and the historian's
+			// chunk could never span a day. Measured 2026-10-29 (`round7`): three `gamebuddy_fact_batch` messages,
+			// 104,972 of 123,130 input tokens (85%), none of them foldable.
+			!isHostSynthesizedDeliveryText(part.text)
 		) {
 			return true;
 		}
