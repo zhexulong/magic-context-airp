@@ -25,10 +25,14 @@ function externalsOfExtensionBundle(buildScript: string): string[] {
 	const step = buildScript
 		.split("&&")
 		.map((part) => part.trim())
-		.find((part) => part.startsWith("bun build src/index.ts"));
+		.find(
+			(part) =>
+				part.startsWith("bun build ") &&
+				part.split(/\s+/).includes("src/index.ts"),
+		);
 	if (!step) {
 		throw new Error(
-			"build script no longer contains the `bun build src/index.ts` step this test inspects",
+			"build script no longer contains a `bun build` step whose entry list includes src/index.ts",
 		);
 	}
 	return [...step.matchAll(/--external\s+(\S+)/g)].map((match) => match[1]);
