@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { sealChaptersForCompartments } from "@magic-context/core/features/magic-context/chapter-storage";
+import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -3815,12 +3815,12 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 	}
 
 	function stateFor(dir: string) {
-	return {
-		sessionId,
-		projectIdentity: "pi-chapters",
-		projectDirectory: dir,
-	};
-}
+		return {
+			sessionId,
+			projectIdentity: "pi-chapters",
+			projectDirectory: dir,
+		};
+	}
 
 	it("renders sealed chapters at the HEAD of <session-history>, chronological, append-only bytes", () => {
 		const db = createTestDb();
@@ -3860,7 +3860,10 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 			// chapter lines: the chapter block is the leading "## CHAPTERS:" run
 			// inside <session-history>, split from base compartments by \n\n.
 			const ch1Line = m0First
-				.slice(m0First.indexOf("## CHAPTERS:"), m0First.indexOf("</session-history>"))
+				.slice(
+					m0First.indexOf("## CHAPTERS:"),
+					m0First.indexOf("</session-history>"),
+				)
 				.split("\n\n")[0];
 			const chapters2 = m0Second.slice(
 				m0Second.indexOf("## CHAPTERS:"),
