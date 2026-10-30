@@ -31,25 +31,30 @@ afterEach(async () => {
 });
 
 describe("resolveGameBuddyMemoryProjectPath with a declared partition", () => {
-	test("is idempotent: the declared full path is returned verbatim", () => {
+	test("is idempotent: the declared full path is returned verbatim", async () => {
 		// The render side declares the full path (setDeclaredProjectIdentity). The
 		// management CRUD side runs in the same process and must write under that
 		// SAME path, not re-wrap it. Before the fix this returned
 		// `gamebuddy:gamebuddy:<identity>:continuity:<id>:continuity:<id>` and the
 		// render session could never meet the written rows.
-		const declared = resolveGameBuddyMemoryProjectPath(
-			"C:/tmp/runtime",
-			"continuity_x",
-		);
+		//
+		// The runtime root must be a directory that exists on THIS platform. The
+		// first call (there is no declaration yet) resolves the base identity from
+		// it, and `C:/tmp/runtime` is absolute only on Windows: on POSIX it is a
+		// bare relative name that resolves inside the checked-out repository, so
+		// the identity resolver finds an ancestor `.git` and rethrows instead of
+		// falling back to a directory identity.
+		root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-declared-"));
+		const declared = resolveGameBuddyMemoryProjectPath(root, "continuity_x");
 		setDeclaredProjectIdentity(declared);
-		expect(
-			resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_x"),
-		).toBe(declared);
+		expect(resolveGameBuddyMemoryProjectPath(root, "continuity_x")).toBe(
+			declared,
+		);
 		// Even a different continuity id cannot change the already-declared path;
 		// the declaration is boot-time locked.
-		expect(
-			resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_y"),
-		).toBe(declared);
+		expect(resolveGameBuddyMemoryProjectPath(root, "continuity_y")).toBe(
+			declared,
+		);
 	});
 	test("writes land under the declared path, not a doubled one", async () => {
 		root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-declared-"));
