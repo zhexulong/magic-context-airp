@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { getPersistedSchemaVersion, initializeDatabase } from "./storage-db";
 
 function columnNames(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
@@ -22,11 +22,7 @@ describe("migration v29 — notes.anchor_ordinal", () => {
             runMigrations(db);
 
             expect(columnNames(db, "notes")).toContain("anchor_ordinal");
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }

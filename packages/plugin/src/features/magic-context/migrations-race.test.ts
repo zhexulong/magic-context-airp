@@ -10,6 +10,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
+    FORK_MIGRATIONS,
     isSiblingMigrationConflict,
     LATEST_MIGRATION_VERSION,
     MIGRATIONS,
@@ -182,16 +183,13 @@ describe("migration race tolerance", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);
         runMigrations(db);
+        // The fork lane records real rows above the floor, so a synthetic
+        // "another writer's downstream row" must sit above them: FLOOR and
+        // FLOOR+1 now collide with the fork's own v10001/v10002.
+        const otherFork = Math.max(...FORK_MIGRATIONS.map((migration) => migration.version)) + 1;
         db.prepare(
             "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?), (?, ?, ?)",
-        ).run(
-            FORK_MIGRATION_VERSION_FLOOR,
-            "fork migration 10000",
-            0,
-            FORK_MIGRATION_VERSION_FLOOR + 1,
-            "fork migration 10001",
-            0,
-        );
+        ).run(otherFork, "other fork migration", 0, otherFork + 1, "other fork migration", 0);
         db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_MIGRATION_VERSION);
 
         expect(() => runMigrations(db)).not.toThrow();
@@ -211,8 +209,12 @@ describe("migration race tolerance", () => {
                 )
                 .all(FORK_MIGRATION_VERSION_FLOOR),
         ).toEqual([
-            { version: FORK_MIGRATION_VERSION_FLOOR, description: "fork migration 10000" },
-            { version: FORK_MIGRATION_VERSION_FLOOR + 1, description: "fork migration 10001" },
+            ...FORK_MIGRATIONS.map((migration) => ({
+                version: migration.version,
+                description: migration.description,
+            })),
+            { version: otherFork, description: "other fork migration" },
+            { version: otherFork + 1, description: "other fork migration" },
         ]);
         closeQuietly(db);
     });

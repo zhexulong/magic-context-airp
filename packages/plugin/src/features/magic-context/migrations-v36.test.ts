@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import {
+    getPersistedSchemaVersion,
+    initializeDatabase,
+    LATEST_SUPPORTED_VERSION,
+} from "./storage-db";
 
 function tableColumns(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
@@ -33,11 +37,7 @@ describe("migration v36 — session project ownership", () => {
             // it's the latest (the schema-version-fence test owns the latest pin).
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(LATEST_MIGRATION_VERSION).toBeGreaterThanOrEqual(36);
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }
@@ -56,11 +56,7 @@ describe("migration v36 — session project ownership", () => {
             expect(tableColumns(db, "session_projects")).toEqual(
                 expect.arrayContaining(["session_id", "harness", "project_path", "updated_at"]),
             );
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }

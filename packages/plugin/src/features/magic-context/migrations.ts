@@ -3278,10 +3278,12 @@ export const FORK_MIGRATIONS: readonly Migration[] = [
             // cannot re-derive the interval and resurrect what the player removed, and the exclusion stays
             // auditable. `status` also lets rendering skip a removed chapter while the read projection still
             // reports it as removed instead of silently vanishing.
-            db.exec(`
-                ALTER TABLE chapters ADD COLUMN status TEXT NOT NULL DEFAULT 'sealed';
-                ALTER TABLE chapters ADD COLUMN edited_at INTEGER;
-            `);
+            //
+            // ensureColumn, not a bare ALTER: the runner supports replay (a lost
+            // ledger, a recovered race), and v10002 re-executing must be a no-op
+            // rather than "duplicate column name: status" failing the DB closed.
+            ensureColumn(db, "chapters", "status", "TEXT NOT NULL DEFAULT 'sealed'");
+            ensureColumn(db, "chapters", "edited_at", "INTEGER");
         },
     },
 ];

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { getPersistedSchemaVersion, initializeDatabase } from "./storage-db";
 
 function tableInfo(
     db: Database,
@@ -127,11 +127,10 @@ describe("migration v49 — per-model embedding coexistence", () => {
 
             expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
             runMigrations(db);
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            // The upstream-lane max, not the raw table max: the fork lane records
+            // its own rows at/above the reserved floor, so a bare MAX() reads the
+            // fork's version, not the upstream migration this assertion is about.
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }
@@ -163,11 +162,7 @@ describe("migration v49 — per-model embedding coexistence", () => {
             expect(() => runMigrations(db)).not.toThrow();
             expect(countRows(db, "compartment_chunk_embeddings")).toBe(0);
             expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }

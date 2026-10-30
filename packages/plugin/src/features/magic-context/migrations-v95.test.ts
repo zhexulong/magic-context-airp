@@ -9,7 +9,11 @@ import {
     V95_REDUNDANT_INDEXES,
 } from "./migration-v95-perf-indexes";
 import { MIGRATIONS, runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import {
+    getPersistedSchemaVersion,
+    initializeDatabase,
+    LATEST_SUPPORTED_VERSION,
+} from "./storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 import { insertTag, markTagsCompactedByMessageIds, updateTagStatus } from "./storage-tags";
 import { getTemporalDecisions } from "./temporal-decisions";
@@ -96,9 +100,7 @@ describe("migration 95", () => {
                 "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id='legacy'",
             ).run(blob);
             expect(() => runMigrations(db)).not.toThrow();
-            expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
-                v: 95,
-            });
+            expect(getPersistedSchemaVersion(db)).toBe(95);
             expect(
                 db
                     .prepare(
@@ -239,9 +241,7 @@ describe("migration 95", () => {
             expect(MIGRATIONS.filter((migration) => migration.version === 95)).toHaveLength(1);
             runMigrations(db);
             expect(LATEST_SUPPORTED_VERSION).toBe(95);
-            expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
-                v: 95,
-            });
+            expect(getPersistedSchemaVersion(db)).toBe(95);
             expect(db.prepare("SELECT * FROM session_meta").all()).toEqual(expectedMeta);
             expect(db.prepare("SELECT * FROM tags").all()).toEqual(tags);
             expect(fts(db)).toEqual(before);
@@ -444,9 +444,7 @@ describe("migration 95", () => {
             expect(() => runMigrations(db)).toThrow(
                 /git FTS rowid inventory differs.*magic-context doctor git-fts-map --repair/,
             );
-            expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
-                v: 94,
-            });
+            expect(getPersistedSchemaVersion(db)).toBe(94);
         } finally {
             db.close();
         }

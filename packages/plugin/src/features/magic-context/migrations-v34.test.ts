@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import {
+    getPersistedSchemaVersion,
+    initializeDatabase,
+    LATEST_SUPPORTED_VERSION,
+} from "./storage-db";
 
 function tableColumns(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
@@ -80,11 +84,7 @@ describe("migration v34/v35 — workspaces", () => {
             ).toEqual({ share_categories: '["CONSTRAINTS"]' });
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(LATEST_MIGRATION_VERSION).toBeGreaterThanOrEqual(35);
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }
@@ -211,11 +211,7 @@ describe("migration v34/v35 — workspaces", () => {
                 { project_path: "git:a", project_memory_epoch: 8 },
                 { project_path: "git:b", project_memory_epoch: 1 },
             ]);
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }

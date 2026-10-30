@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { getPersistedSchemaVersion, initializeDatabase } from "./storage-db";
 import { getOrCreateSessionMeta } from "./storage-meta";
 
 const V32_COLUMNS = [
@@ -40,11 +40,7 @@ describe("migration v32 — protected-tail metadata", () => {
             expect(meta.forceEmergencyBypassWindowStart).toBe(0);
             expect(meta.forceEmergencyBypassUsed).toBe(0);
             expect(meta.lastUsageContextLimit).toBe(0);
-            expect(
-                db
-                    .prepare("SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1")
-                    .get(),
-            ).toEqual({ version: LATEST_MIGRATION_VERSION });
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
         }
