@@ -8,6 +8,16 @@
 # including the dashboard's icons, and normalising a PNG rewrites the 0D 0A bytes inside it.
 * text=auto eol=lf
 
+# The rule above governs what git WRITES. It does not rewrite a working tree that already holds CRLF
+# from before the rule existed: with `text=auto`, git considers those bytes equal to the LF blob, so
+# `git status` reports the tree clean and nothing normalises them. A test that hashes the bytes on
+# disk therefore reads CRLF and fails against its LF baseline - that is how
+# `issue-485-replay-gate.test.ts` broke locally after this rule landed while passing on a fresh
+# checkout. `git ls-files --eol` lists them as `i/lf w/crlf`; refresh with
+#   git rm -r --cached . >/dev/null && git reset --hard
+# or, per file, delete it and `git checkout -- <path>` (a plain `git checkout -- .` is a no-op because
+# the stat cache says the file is unchanged).
+
 # Assets git must never normalise. Kept to what this repository actually tracks, plus the two formats
 # the dashboard toolchain is expected to add.
 *.png binary
