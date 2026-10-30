@@ -41,12 +41,6 @@ export const CATEGORY_PRIORITY: MemoryCategory[] = [
     // when a partition intentionally uses that domain.
     "SEMANTIC_MEMORY",
     "INTERACTION_EPISODE",
-    // v2 world taxonomy (these dominate coding-project sessions)
-    "PROJECT_RULES",
-    "ARCHITECTURE",
-    "CONSTRAINTS",
-    "CONFIG_VALUES",
-    "NAMING",
     // v2 world taxonomy first (these dominate new sessions)
     ...V2_MEMORY_CATEGORIES,
     // legacy 9-cat ordering preserved below for pre-v2 rows
