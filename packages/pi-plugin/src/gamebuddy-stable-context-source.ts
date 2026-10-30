@@ -340,7 +340,9 @@ export function validateGameBuddyAuthoredStableCatalog(
 		...body,
 		canonicalHash: input.canonicalHash as string,
 		volatileSources,
-		...(postHistoryInstructions === undefined ? {} : { postHistoryInstructions }),
+		...(postHistoryInstructions === undefined
+			? {}
+			: { postHistoryInstructions }),
 	});
 }
 export function materializeGameBuddyAuthoredStableCatalog(
@@ -433,8 +435,10 @@ function authoredContextRegistry(): GameBuddyAuthoredContextRegistry {
 	return created;
 }
 
-const { materializations: authoredRenderer, volatileTurns: authoredVolatileTurn } =
-	authoredContextRegistry();
+const {
+	materializations: authoredRenderer,
+	volatileTurns: authoredVolatileTurn,
+} = authoredContextRegistry();
 export function __gamebuddyReadAuthoredMaterialization(
 	sessionId: string,
 ): GameBuddyAuthoredContextMaterialization | undefined {

@@ -60,7 +60,6 @@ import {
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
-import { hostOutlivesBackgroundRuns } from "./pi-background-run-lifetime";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	getOrCreateSessionMeta,
@@ -199,11 +198,13 @@ import {
 	type PiModelRegistryLike,
 	waitForPiModelRegistryRefresh,
 } from "./model-chain-health";
+import { hostOutlivesBackgroundRuns } from "./pi-background-run-lifetime";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
 import {
 	resolvePiUsableContextLimit,
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
+import { isPiCtxReduceToolActive } from "./pi-ctx-reduce-tool";
 import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
@@ -229,7 +230,10 @@ import {
 	resolvePiProvenInputFloor,
 } from "./pi-proven-floor";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
-import { isPiCtxReduceToolActive } from "./pi-ctx-reduce-tool";
+import {
+	emitProbeFoldCommittedMarker,
+	emitProbeM0DigestMarker,
+} from "./probe-materialization-marker";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { bindStaleBuildNotice } from "./stale-build-notice";
 import { registerStatusLine, updateStatusLine } from "./status-line";
@@ -247,10 +251,6 @@ import {
 	processSystemPromptForCache,
 } from "./system-prompt";
 import { registerTavernNarrativeGateMarkerHook } from "./tavern-narrative-gate-marker";
-import {
-	emitProbeFoldCommittedMarker,
-	emitProbeM0DigestMarker,
-} from "./probe-materialization-marker";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
@@ -1142,6 +1142,7 @@ export function resolveDreamerFromConfig(
  * All driven by the user's `magic-context.jsonc` (Pi convention paths).
  */
 const embeddedRuntime = process.env.GAMEBUDDY_EMBEDDED_RUNTIME === "1";
+
 // One process, one registry: see `pi-embedded-model-registry.ts` for why this cannot be module state
 // (jiti evaluates an extension repeatedly with `moduleCache: false`, and the runner is rebuilt per
 // pass, so a module local would be written by one evaluation and ignored by the one that runs).
@@ -1173,10 +1174,13 @@ type EmbeddedHistorianBindingGlobal = typeof globalThis & {
 	[EMBEDDED_HISTORIAN_BINDING_SLOT]?: EmbeddedHistorianRuntimeBinding;
 };
 
-export function getEmbeddedHistorianRuntimeBinding(): EmbeddedHistorianRuntimeBinding | undefined {
+export function getEmbeddedHistorianRuntimeBinding():
+	| EmbeddedHistorianRuntimeBinding
+	| undefined {
 	return (
-		(globalThis as EmbeddedHistorianBindingGlobal)[EMBEDDED_HISTORIAN_BINDING_SLOT] ??
-		activeEmbeddedHistorianRuntimeBinding
+		(globalThis as EmbeddedHistorianBindingGlobal)[
+			EMBEDDED_HISTORIAN_BINDING_SLOT
+		] ?? activeEmbeddedHistorianRuntimeBinding
 	);
 }
 
@@ -1192,8 +1196,9 @@ const activeEmbeddedHistorianRuntimeBinding:
 	: undefined;
 
 if (activeEmbeddedHistorianRuntimeBinding !== undefined) {
-	(globalThis as EmbeddedHistorianBindingGlobal)[EMBEDDED_HISTORIAN_BINDING_SLOT] =
-		activeEmbeddedHistorianRuntimeBinding;
+	(globalThis as EmbeddedHistorianBindingGlobal)[
+		EMBEDDED_HISTORIAN_BINDING_SLOT
+	] = activeEmbeddedHistorianRuntimeBinding;
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
@@ -1412,9 +1417,9 @@ async function startPiMagicContextRuntime(
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
 	// Projects whose dreamer registration this process has already done: the context pass runs every turn,
-// and registering starts a timer, so it must happen once per project rather than once per pass.
-const dreamerBoundProjects = new Set();
-const dreamerRegistrationOwner = {};
+	// and registering starts a timer, so it must happen once per project rather than once per pass.
+	const dreamerBoundProjects = new Set();
+	const dreamerRegistrationOwner = {};
 	activePiRuntimes.add(dreamerRegistrationOwner);
 	const commandLifecycleController = new AbortController();
 	registerCtxStatusLifecycleSignal(pi, commandLifecycleController.signal);
@@ -1607,7 +1612,10 @@ const dreamerRegistrationOwner = {};
 			// Once per project: this pass runs on every turn, and the dreamer's registration starts a timer.
 			if (dreamerBoundProjects.has(ctx.cwd)) return;
 			dreamerBoundProjects.add(ctx.cwd);
-			syncDreamerProjectRegistration(resolveCurrentProjectDeps(ctx), ctx.modelRegistry ?? readEmbeddedModelRegistry());
+			syncDreamerProjectRegistration(
+				resolveCurrentProjectDeps(ctx),
+				ctx.modelRegistry ?? readEmbeddedModelRegistry(),
+			);
 		},
 		bindHistorianRunner: embeddedRuntime
 			? (ctx) => {
@@ -1615,7 +1623,10 @@ const dreamerRegistrationOwner = {};
 					// embedding Host injected through the runtime binding seam
 					// (both are the same SDK registry in production).
 					const registry = ctx.modelRegistry ?? readEmbeddedModelRegistry();
-					if (registry !== undefined && hist?.runner instanceof EmbeddedPiHistorianRunner) {
+					if (
+						registry !== undefined &&
+						hist?.runner instanceof EmbeddedPiHistorianRunner
+					) {
 						hist.runner.bindModelRegistry(registry);
 					}
 				}
@@ -2044,7 +2055,10 @@ const dreamerRegistrationOwner = {};
 		// hands to background runs - the same slot the historian reads. Threading it through is the second half
 		// of this gate: without it the timer starts and every task is skipped as unvalidated, silently.
 		if (hostOutlivesBackgroundRuns(ctx.hasUI))
-			syncDreamerProjectRegistration(current, ctx.modelRegistry ?? readEmbeddedModelRegistry());
+			syncDreamerProjectRegistration(
+				current,
+				ctx.modelRegistry ?? readEmbeddedModelRegistry(),
+			);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
 		const failuresToShow = claimConfigParseFailuresOnce(
@@ -2419,7 +2433,8 @@ const dreamerRegistrationOwner = {};
 					userMemoriesEnabled: userMemoryCollectionEnabled(
 						current.config.dreamer,
 					),
-					executeThresholdPercentage: current.config.execute_threshold_percentage,
+					executeThresholdPercentage:
+						current.config.execute_threshold_percentage,
 					executeThresholdTokens: current.config.execute_threshold_tokens,
 				};
 			},

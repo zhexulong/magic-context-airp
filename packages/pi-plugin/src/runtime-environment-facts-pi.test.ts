@@ -1,8 +1,8 @@
-import { describe, expect, it, beforeEach } from "vitest";
 import {
 	__resetRuntimeEnvironmentFactsForTesting,
 	setRuntimeEnvironmentFacts,
 } from "@magic-context/core/hooks/magic-context/runtime-environment-facts";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
 	hasRuntimeEnvironmentFactsProvider,
 	injectPiRuntimeEnvironmentFacts,
@@ -50,9 +50,15 @@ describe("pi runtime environment facts", () => {
 
 	it("injects into the first text part of an array content", () => {
 		setRuntimeEnvironmentFacts(() => "hour=1800 season=spring");
-		const messages = [userParts([{ type: "image", data: "x", mimeType: "png" }, { type: "text", text: "go" }])];
+		const messages = [
+			userParts([
+				{ type: "image", data: "x", mimeType: "png" },
+				{ type: "text", text: "go" },
+			]),
+		];
 		expect(injectPiRuntimeEnvironmentFacts(messages)).toBe(1);
-		const parts = (messages[0] as { content: Record<string, unknown>[] }).content;
+		const parts = (messages[0] as { content: Record<string, unknown>[] })
+			.content;
 		const text = parts.find((p) => p.type === "text") as { text: string };
 		expect(text.text).toMatch(/<runtime-environment>/);
 		expect(text.text).toContain("hour=1800");

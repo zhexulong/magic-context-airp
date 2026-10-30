@@ -46,13 +46,20 @@ it("a session whose tool set has no ctx_reduce gets no §N§ prefixes but keeps 
 				assistantMessage("She nods.", 2),
 				userMessage("Did the kettle boil?", 3),
 			];
-			return { messages, entryIds: messages.map((_, index) => `entry-${index}`) };
+			return {
+				messages,
+				entryIds: messages.map((_, index) => `entry-${index}`),
+			};
 		};
 
 		const { messages, entryIds } = build();
 		const served = await handler({ messages: messages as never[] }, {
 			...fakeContext(sessionId, process.cwd(), entryIds, messages as never),
-			getContextUsage: () => ({ tokens: 4000, percent: 4, contextWindow: 100000 }),
+			getContextUsage: () => ({
+				tokens: 4000,
+				percent: 4,
+				contextWindow: 100000,
+			}),
 		} as never);
 
 		const conversation = served.messages.filter(
@@ -81,11 +88,18 @@ it("a session that can call ctx_reduce still gets its §N§ prefixes", async () 
 			event: { messages: never[] },
 			ctx: never,
 		) => Promise<{ messages: unknown[] }>;
-		const messages = [userMessage("Good morning.", 1), assistantMessage("She nods.", 2)];
+		const messages = [
+			userMessage("Good morning.", 1),
+			assistantMessage("She nods.", 2),
+		];
 		const entryIds = messages.map((_, index) => `entry-${index}`);
 		const served = await handler({ messages: messages as never[] }, {
 			...fakeContext(sessionId, process.cwd(), entryIds, messages as never),
-			getContextUsage: () => ({ tokens: 4000, percent: 4, contextWindow: 100000 }),
+			getContextUsage: () => ({
+				tokens: 4000,
+				percent: 4,
+				contextWindow: 100000,
+			}),
 		} as never);
 
 		const conversation = served.messages
@@ -123,18 +137,19 @@ const runToolHeavyPass = async (input: {
 			event: { messages: never[] },
 			ctx: never,
 		) => Promise<{ messages: unknown[] }>
-	)(
-		{ messages: messages as never[] },
-		{
-			...fakeContext(
-				input.sessionId,
-				process.cwd(),
-				messages.map((_, index) => `entry-${index}`),
-				messages as never,
-			),
-			getContextUsage: () => ({ tokens: 10_000, percent: 5, contextWindow: 200_000 }),
-		} as never,
-	);
+	)({ messages: messages as never[] }, {
+		...fakeContext(
+			input.sessionId,
+			process.cwd(),
+			messages.map((_, index) => `entry-${index}`),
+			messages as never,
+		),
+		getContextUsage: () => ({
+			tokens: 10_000,
+			percent: 5,
+			contextWindow: 200_000,
+		}),
+	} as never);
 };
 
 it("a session whose tool set has no ctx_reduce arms no ctx_reduce nudge channel", async () => {

@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
+import {
+	_resetHarnessForTesting,
+	setDeclaredProjectIdentity,
+} from "@magic-context/core/shared/harness";
 import { createGameBuddyPlayerMemoryCrudFacade } from "./gamebuddy-player-memory-crud-facade";
 import { resolveGameBuddyMemoryProjectPath } from "./gamebuddy-player-memory-read-projection";
-import { setDeclaredProjectIdentity, _resetHarnessForTesting } from "@magic-context/core/shared/harness";
 
 const continuityId = "continuity_01";
 const defaultProfile = {
@@ -34,12 +37,19 @@ describe("resolveGameBuddyMemoryProjectPath with a declared partition", () => {
 		// SAME path, not re-wrap it. Before the fix this returned
 		// `gamebuddy:gamebuddy:<identity>:continuity:<id>:continuity:<id>` and the
 		// render session could never meet the written rows.
-		const declared = resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_x");
+		const declared = resolveGameBuddyMemoryProjectPath(
+			"C:/tmp/runtime",
+			"continuity_x",
+		);
 		setDeclaredProjectIdentity(declared);
-		expect(resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_x")).toBe(declared);
+		expect(
+			resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_x"),
+		).toBe(declared);
 		// Even a different continuity id cannot change the already-declared path;
 		// the declaration is boot-time locked.
-		expect(resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_y")).toBe(declared);
+		expect(
+			resolveGameBuddyMemoryProjectPath("C:/tmp/runtime", "continuity_y"),
+		).toBe(declared);
 	});
 	test("writes land under the declared path, not a doubled one", async () => {
 		root = await mkdtemp(join(tmpdir(), "gamebuddy-memory-crud-declared-"));
@@ -57,8 +67,12 @@ describe("resolveGameBuddyMemoryProjectPath with a declared partition", () => {
 		});
 		expect(created.content).toBe("declared partition row");
 		// The durable store row must be scoped to the single-wrapped declared path.
-		const { openDatabaseAsync: open } = await import("@magic-context/core/features/magic-context/storage-db");
-		const db = await open(join(root, "data", "cortexkit", "magic-context", "context.db"));
+		const { openDatabaseAsync: open } = await import(
+			"@magic-context/core/features/magic-context/storage-db"
+		);
+		const db = await open(
+			join(root, "data", "cortexkit", "magic-context", "context.db"),
+		);
 		const row = db
 			.prepare("SELECT project_path FROM memories WHERE content = ?")
 			.get("declared partition row") as { project_path: string } | undefined;
@@ -142,12 +156,14 @@ describe("GameBuddy player Memory CRUD facade", () => {
 		});
 		const rows = await facade.listMemories({ continuityId, ...defaultProfile });
 		expect(
-			rows.find((row) => row.content === "I told her: the farmer likes blueberries.")
-				?.playerAuthored,
+			rows.find(
+				(row) => row.content === "I told her: the farmer likes blueberries.",
+			)?.playerAuthored,
 		).toBe(true);
 		expect(
-			rows.find((row) => row.content === "She remembers: the mill opens at nine.")
-				?.playerAuthored,
+			rows.find(
+				(row) => row.content === "She remembers: the mill opens at nine.",
+			)?.playerAuthored,
 		).toBe(false);
 	});
 
@@ -259,16 +275,16 @@ describe("GameBuddy player Memory CRUD facade", () => {
 			}),
 		).rejects.toThrow("gamebuddy_memory_profile_mismatch");
 
-  		// The D-02 owner decision removed profileCanonicalHash from ordinary
-  		// Memory CRUD binding: the facade no longer requires or matches it.
-  		await expect(
-  			facade.create({
-  				continuityId,
-  				content: "Test",
-  				profileId: "profile_01",
-  				profileRevision: 2,
-  			}),
-  		).resolves.toBeTruthy();
+		// The D-02 owner decision removed profileCanonicalHash from ordinary
+		// Memory CRUD binding: the facade no longer requires or matches it.
+		await expect(
+			facade.create({
+				continuityId,
+				content: "Test",
+				profileId: "profile_01",
+				profileRevision: 2,
+			}),
+		).resolves.toBeTruthy();
 
 		// Matching profile succeeds
 		const created = await facade.create({

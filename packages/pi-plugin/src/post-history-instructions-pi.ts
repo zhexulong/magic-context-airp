@@ -83,10 +83,13 @@ export function appendPostHistoryInstructions(
 	messages: PiWireMessage[],
 	instructions: string | undefined,
 ): boolean {
-	if (instructions === undefined || instructions.trim().length === 0) return false;
+	if (instructions === undefined || instructions.trim().length === 0)
+		return false;
 	messages.push({
 		role: "user",
-		content: [{ type: "text", text: renderPostHistoryInstructions(instructions) }],
+		content: [
+			{ type: "text", text: renderPostHistoryInstructions(instructions) },
+		],
 	} as PiWireMessage);
 	return true;
 }

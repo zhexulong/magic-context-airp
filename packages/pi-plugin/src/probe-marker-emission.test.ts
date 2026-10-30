@@ -44,11 +44,15 @@ function captureStderr(fn) {
 }
 
 function foldMarkers(payload) {
-	return payload.split("\n").filter((line) => line.startsWith(PROBE_FOLD_COMMITTED_PREFIX));
+	return payload
+		.split("\n")
+		.filter((line) => line.startsWith(PROBE_FOLD_COMMITTED_PREFIX));
 }
 
 function digestMarkers(payload) {
-	return payload.split("\n").filter((line) => line.startsWith(PROBE_M0_DIGEST_PREFIX));
+	return payload
+		.split("\n")
+		.filter((line) => line.startsWith(PROBE_M0_DIGEST_PREFIX));
 }
 
 function piState(sessionId, cwd) {
@@ -85,7 +89,10 @@ describe("Class B memory-probe marker emission", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-first-"));
 		try {
-			const state = { ...piState("ses-marker-first", cwd), hardSignals: baseHard };
+			const state = {
+				...piState("ses-marker-first", cwd),
+				hardSignals: baseHard,
+			};
 			const messages = [userMessage("hi", 10)];
 			const payload = captureStderr(() => {
 				injectM0M1Pi(state, db, messages as never, ["entry-0"]);
@@ -103,7 +110,10 @@ describe("Class B memory-probe marker emission", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-fold-"));
 		try {
-			const state = { ...piState("ses-marker-fold", cwd), hardSignals: baseHard };
+			const state = {
+				...piState("ses-marker-fold", cwd),
+				hardSignals: baseHard,
+			};
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha body")]);
 			const payload = captureStderr(() => {
 				injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);
@@ -119,7 +129,10 @@ describe("Class B memory-probe marker emission", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-modelchange-"));
 		try {
-			const state = { ...piState("ses-marker-modelchange", cwd), hardSignals: baseHard };
+			const state = {
+				...piState("ses-marker-modelchange", cwd),
+				hardSignals: baseHard,
+			};
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha body")]);
 			// Baseline pass folds the compartment once.
 			const baseline = captureStderr(() => {
@@ -134,7 +147,9 @@ describe("Class B memory-probe marker emission", () => {
 				hardSignals: { ...baseHard, modelKey: "anthropic/sonnet" },
 			};
 			const payload = captureStderr(() => {
-				injectM0M1Pi(switched, db, [userMessage("again", 11)] as never, ["entry-0"]);
+				injectM0M1Pi(switched, db, [userMessage("again", 11)] as never, [
+					"entry-0",
+				]);
 			});
 			// The digest still fires (m[0] was re-presented and must be comparable),
 			// but the fold claim must not.
@@ -149,7 +164,10 @@ describe("Class B memory-probe marker emission", () => {
 		const db = createTestDb();
 		const cwd = mkdtempSync(join(tmpdir(), "pi-marker-stable-"));
 		try {
-			const state = { ...piState("ses-marker-stable", cwd), hardSignals: baseHard };
+			const state = {
+				...piState("ses-marker-stable", cwd),
+				hardSignals: baseHard,
+			};
 			appendCompartments(db, state.sessionId, [compartment(0, "Alpha body")]);
 			const first = captureStderr(() => {
 				injectM0M1Pi(state, db, [userMessage("hi", 10)] as never, ["entry-0"]);

@@ -24,7 +24,14 @@ export {
 	MAX_POST_HISTORY_INSTRUCTIONS_BYTES,
 	renderPostHistoryInstructions,
 } from "../post-history-instructions-pi";
-
+export {
+	emitProbeFoldCommittedMarker,
+	emitProbeM0DigestMarker,
+	emitProbeM0MemoryIdsMarker,
+	PROBE_FOLD_COMMITTED_PREFIX,
+	PROBE_M0_DIGEST_PREFIX,
+	PROBE_M0_MEMORY_IDS_PREFIX,
+} from "../probe-materialization-marker";
 export {
 	clearTavernNarrativeGateMarker,
 	GAME_OPERATIONAL_GATE_MARKER_SCHEMA,
@@ -37,12 +44,3 @@ export {
 	validateGameOperationalGateMarkerConfig,
 	validateTavernNarrativeGateMarkerConfig,
 } from "../tavern-narrative-gate-marker";
-
-export {
-	emitProbeFoldCommittedMarker,
-	emitProbeM0DigestMarker,
-	emitProbeM0MemoryIdsMarker,
-	PROBE_FOLD_COMMITTED_PREFIX,
-	PROBE_M0_DIGEST_PREFIX,
-	PROBE_M0_MEMORY_IDS_PREFIX,
-} from "../probe-materialization-marker";

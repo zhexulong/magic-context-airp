@@ -62,7 +62,10 @@ export function injectPiRuntimeEnvironmentFacts(
 		if (typeof content === "string") {
 			if (block === undefined) {
 				if (ENVIRONMENT_BLOCK_PATTERN.test(content)) {
-					msg.content = content.replace(ENVIRONMENT_BLOCK_PATTERN, "").replace(/^\s+/, "").replace(/\s+$/, "");
+					msg.content = content
+						.replace(ENVIRONMENT_BLOCK_PATTERN, "")
+						.replace(/^\s+/, "")
+						.replace(/\s+$/, "");
 					modified += 1;
 				}
 			} else if (!ENVIRONMENT_BLOCK_PATTERN.test(content)) {
@@ -83,7 +86,10 @@ export function injectPiRuntimeEnvironmentFacts(
 			if (part.type !== "text") continue;
 			if (block === undefined) {
 				if (ENVIRONMENT_BLOCK_PATTERN.test(part.text)) {
-					part.text = part.text.replace(ENVIRONMENT_BLOCK_PATTERN, "").replace(/^\s+/, "").replace(/\s+$/, "");
+					part.text = part.text
+						.replace(ENVIRONMENT_BLOCK_PATTERN, "")
+						.replace(/^\s+/, "")
+						.replace(/\s+$/, "");
 					modified += 1;
 				}
 			} else if (!ENVIRONMENT_BLOCK_PATTERN.test(part.text)) {
@@ -102,6 +108,4 @@ export function injectPiRuntimeEnvironmentFacts(
 	return modified;
 }
 
-export {
-	hasRuntimeEnvironmentFactsProvider,
-} from "@magic-context/core/hooks/magic-context/runtime-environment-facts";
+export { hasRuntimeEnvironmentFactsProvider } from "@magic-context/core/hooks/magic-context/runtime-environment-facts";

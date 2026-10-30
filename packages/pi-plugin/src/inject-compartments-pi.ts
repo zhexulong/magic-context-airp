@@ -26,19 +26,18 @@
  */
 
 import { createHash } from "node:crypto";
+import { MEMORY_MURAL_BLOCK } from "@magic-context/core/agents/magic-context-prompt";
 import {
-		emitProbeFoldCommittedMarker,
-		emitProbeM0DigestMarker,
-		emitProbeM0MemoryIdsMarker,
-		emitProbeM0ChaptersMarker,
-		emitProbeM0SourcesMarker,
-} from "./probe-materialization-marker";
+	DEFAULT_CHAPTER_BUDGET_TOKENS,
+	estimateChaptersTokens,
+	getChaptersForProject,
+	renderChaptersBlock,
+} from "@magic-context/core/features/magic-context/chapter-storage";
+import { isPartialCompartmentEnd } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
 	factCategoriesForDomain,
 	type MemoryDomain,
 } from "@magic-context/core/features/magic-context/memory/domain";
-import { MEMORY_MURAL_BLOCK } from "@magic-context/core/agents/magic-context-prompt";
-import { isPartialCompartmentEnd } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
@@ -111,12 +110,6 @@ import {
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { renderUserProfileContent } from "@magic-context/core/hooks/magic-context/user-profile-render";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
-import {
-	getChaptersForProject,
-	renderChaptersBlock,
-	estimateChaptersTokens,
-	DEFAULT_CHAPTER_BUDGET_TOKENS,
-} from "@magic-context/core/features/magic-context/chapter-storage";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
 import {
 	logSlowWriteTransaction,
@@ -127,6 +120,13 @@ import {
 	type GameBuddyStableContextSourceRecord,
 	renderGameBuddyVolatileContextBlock,
 } from "./gamebuddy-stable-context-source";
+import {
+	emitProbeFoldCommittedMarker,
+	emitProbeM0ChaptersMarker,
+	emitProbeM0DigestMarker,
+	emitProbeM0MemoryIdsMarker,
+	emitProbeM0SourcesMarker,
+} from "./probe-materialization-marker";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 import {
 	isPiSystemEntry,
@@ -2184,7 +2184,9 @@ function renderM1PiWithMetadata(
 	const sections: string[] = [];
 	if (state.volatileContext?.volatileSources.length) {
 		sections.push(
-			renderGameBuddyVolatileContextBlock(state.volatileContext.volatileSources),
+			renderGameBuddyVolatileContextBlock(
+				state.volatileContext.volatileSources,
+			),
 		);
 	}
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
@@ -2317,10 +2319,10 @@ function renderM1PiWithMetadata(
 			? `<knowledge-updates>\n${sections.join("\n")}\n</knowledge-updates>`
 			: `<session-history-since>\n${sections.join("\n")}\n</session-history-since>`,
 		memoryUpdateCount: memoryUpdates.count,
-			materializedMemoryIds,
-			renderedMemoryIds: newMemoriesBlock
-				? deltaMemories.map((memory) => memory.id)
-				: [],
+		materializedMemoryIds,
+		renderedMemoryIds: newMemoriesBlock
+			? deltaMemories.map((memory) => memory.id)
+			: [],
 	};
 }
 
@@ -3313,14 +3315,18 @@ export function injectM0M1Pi(
 		// marker describe the bytes a provider actually received.
 		emitProbeM0MemoryIdsMarker(
 			materializationRevision(markers),
-			parseMemoryBlockIds(readCachedPiM0M1Row(db, state.sessionId)?.memory_block_ids ?? null),
+			parseMemoryBlockIds(
+				readCachedPiM0M1Row(db, state.sessionId)?.memory_block_ids ?? null,
+			),
 		);
 		// Chapter rollup (AIRP fork v1): count + block digest of the CHAPTERS
 		// lines actually present in the provider-bound m[0]. Count lets the
 		// harness verify chapters reach m[0] after a fold; digest lets it verify
 		// the chapter block is byte-identical across unrelated passes (prefix
 		// stability) and that a new chapter only appends. Never chapter text.
-		const chapterLines = m0.split("\n").filter((line) => line.startsWith("## CHAPTERS:"));
+		const chapterLines = m0
+			.split("\n")
+			.filter((line) => line.startsWith("## CHAPTERS:"));
 		emitProbeM0ChaptersMarker(
 			materializationRevision(markers),
 			chapterLines.length,

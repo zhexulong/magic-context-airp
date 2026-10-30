@@ -173,7 +173,12 @@ describe("authored context private bridge", () => {
 		// the contract only requires that every installed ref is backed by this materialization.
 		const first = "The moon festival is tonight.";
 		const second = "The lantern market opens at dusk.";
-		const entry = (sourceId: string, content: string, totalOrderKey: string, keys: readonly string[]) => ({
+		const entry = (
+			sourceId: string,
+			content: string,
+			totalOrderKey: string,
+			keys: readonly string[],
+		) => ({
 			sourceId,
 			kind: "lorebook_entry" as const,
 			revision: "1",
@@ -201,11 +206,18 @@ describe("authored context private bridge", () => {
 		// The SECOND entry only, as the caller's keyword selection would produce.
 		const selected = plan.volatileSourceCandidates[1];
 		if (selected === undefined) throw new Error("fixture_missing_candidate");
-		const { selectionKeys: _selectionKeys, content: _content, budgetTokens: _budgetTokens, ...ref } = selected;
+		const {
+			selectionKeys: _selectionKeys,
+			content: _content,
+			budgetTokens: _budgetTokens,
+			...ref
+		} = selected;
 		expect(() =>
 			capability.assertInstall("turn_volatile", plan.sourceRefs, [ref]),
 		).not.toThrow();
-		const materialized = __gamebuddyReadAuthoredVolatileMaterialization(scope.sessionId);
+		const materialized = __gamebuddyReadAuthoredVolatileMaterialization(
+			scope.sessionId,
+		);
 		expect(materialized?.volatileSources.map((item) => item.sourceId)).toEqual([
 			"second",
 		]);

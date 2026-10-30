@@ -853,12 +853,12 @@ describe("runPiHistorian", () => {
 					mock: { calls: Array<[{ systemPrompt: string }]> };
 				}
 			).mock.calls[0][0].systemPrompt;
-            expect(prompt).toContain("Ongoing Interaction Memory Domain");
-            // The second assertion here used to look for a line of `ongoingInteractionSuccessXml()` inside the
-            // SYSTEM prompt. That fixture is the model's mocked OUTPUT, so it was never in a request; the check
-            // could only ever have been true by accident. What this test actually needs to pin - the ongoing
-            // prompt is the one used, one compartment is written, and a one-off interaction promotes nothing -
-            // is asserted on the following lines.
+			expect(prompt).toContain("Ongoing Interaction Memory Domain");
+			// The second assertion here used to look for a line of `ongoingInteractionSuccessXml()` inside the
+			// SYSTEM prompt. That fixture is the model's mocked OUTPUT, so it was never in a request; the check
+			// could only ever have been true by accident. What this test actually needs to pin - the ongoing
+			// prompt is the one used, one compartment is written, and a one-off interaction promotes nothing -
+			// is asserted on the following lines.
 			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
 			const projectPath = resolveProjectIdentity(process.cwd());
 			expect(getMemoriesByProject(db, projectPath)).toEqual([]);

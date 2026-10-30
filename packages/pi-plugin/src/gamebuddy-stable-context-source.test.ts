@@ -272,7 +272,9 @@ describe("GameBuddy card closing direction (post_history_instructions)", () => {
 		// The m[0] contribution and the publication hash the context handler compares are
 		// unchanged by the field: the tail cannot enter the cached prefix or its cache key.
 		expect(withClosing.renderedBlock).toBe(without.renderedBlock);
-		expect(withClosing.snapshotCanonicalHash).toBe(without.snapshotCanonicalHash);
+		expect(withClosing.snapshotCanonicalHash).toBe(
+			without.snapshotCanonicalHash,
+		);
 		expect(withClosing.sources).toEqual(without.sources);
 		expect(withClosing.budgetTokens).toBe(without.budgetTokens);
 	});
@@ -289,8 +291,10 @@ describe("GameBuddy card closing direction (post_history_instructions)", () => {
 	it("keeps one 4 KB bound and refuses an over-long card instead of truncating it", () => {
 		const atBound = "x".repeat(MAX_POST_HISTORY_INSTRUCTIONS_BYTES);
 		expect(
-			materializeGameBuddyAuthoredStableCatalog(catalog(undefined, atBound), scope)
-				.postHistoryInstructions,
+			materializeGameBuddyAuthoredStableCatalog(
+				catalog(undefined, atBound),
+				scope,
+			).postHistoryInstructions,
 		).toBe(atBound);
 		// UTF-8 bytes, not UTF-16 units: 2049 two-byte characters are already over.
 		const multiByteOver = "收".repeat(

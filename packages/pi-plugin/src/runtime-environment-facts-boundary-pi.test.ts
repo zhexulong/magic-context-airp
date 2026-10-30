@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
 	__resetRuntimeEnvironmentFactsForTesting,
@@ -78,9 +78,9 @@ describe("pi runtime environment facts across a compartment boundary", () => {
 				},
 			]);
 			// First pass folds the compartment; the trim removes the covered prefix.
-			expect(environmentText(await pass()) ?? "<no environment block>").toContain(
-				"weather=rain",
-			);
+			expect(
+				environmentText(await pass()) ?? "<no environment block>",
+			).toContain("weather=rain");
 
 			// A published compartment advances the boundary, so the trim fires again
 			// in the same pass that injected the block.

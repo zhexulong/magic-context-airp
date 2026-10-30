@@ -1,15 +1,15 @@
 import { join } from "node:path";
 import {
+	type ChapterStatus,
+	getChaptersForProject,
+} from "@magic-context/core/features/magic-context/chapter-storage";
+import {
 	type Memory,
 	MemoryCommandFacade,
 } from "@magic-context/core/features/magic-context/memory";
-import { getDeclaredProjectIdentity } from "@magic-context/core/shared/harness";
 import { resolveProjectIdentityOrFallback } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
-import {
-	getChaptersForProject,
-	type ChapterStatus,
-} from "@magic-context/core/features/magic-context/chapter-storage";
+import { getDeclaredProjectIdentity } from "@magic-context/core/shared/harness";
 
 /**
  * The vendor store is project-scoped.  A GameBuddy continuity gets a stable,
@@ -55,27 +55,27 @@ export type GameBuddyPlayerMemoryReadInput = Readonly<{
 }>;
 
 export type GameBuddyPlayerMemoryReadView = Readonly<{
-  stateToken: string;
-  content: string;
-  category: "semantic" | "interaction";
-  status: "active" | "permanent" | "archived";
-  /**
-   * Whether the player's own writing is what stands in this row.
-   *
-   * The management surface has always allowed a player to edit and archive ANY row, but it could not
-   * say which rows the player wrote themselves and which the companion's own machinery produced - so
-   * the two were indistinguishable exactly where a player decides what to trust.
-   *
-   * `sourceType` cannot answer this. It is provenance of the WRITE PATH (`historian` | `agent` |
-   * `dreamer`, plus a `user` value the store reserves for a dashboard entry that does not exist and
-   * `insertMemory` refuses from every implemented path), and a player typing in the panel is stored as
-   * `agent` because it does arrive through the command facade. The fact this asks for is authority,
-   * and the command facade already stamps it: `metadata.governance.authority === "player"` on every
-   * player-directed create or update, and it is what the store itself uses to refuse a companion
-   * mutation of the player's words. That stamp is the one authority read here.
-   */
-  playerAuthored: boolean;
-  sourceRefs?: readonly string[];
+	stateToken: string;
+	content: string;
+	category: "semantic" | "interaction";
+	status: "active" | "permanent" | "archived";
+	/**
+	 * Whether the player's own writing is what stands in this row.
+	 *
+	 * The management surface has always allowed a player to edit and archive ANY row, but it could not
+	 * say which rows the player wrote themselves and which the companion's own machinery produced - so
+	 * the two were indistinguishable exactly where a player decides what to trust.
+	 *
+	 * `sourceType` cannot answer this. It is provenance of the WRITE PATH (`historian` | `agent` |
+	 * `dreamer`, plus a `user` value the store reserves for a dashboard entry that does not exist and
+	 * `insertMemory` refuses from every implemented path), and a player typing in the panel is stored as
+	 * `agent` because it does arrive through the command facade. The fact this asks for is authority,
+	 * and the command facade already stamps it: `metadata.governance.authority === "player"` on every
+	 * player-directed create or update, and it is what the store itself uses to refuse a companion
+	 * mutation of the player's words. That stamp is the one authority read here.
+	 */
+	playerAuthored: boolean;
+	sourceRefs?: readonly string[];
 }>;
 
 /**
@@ -173,7 +173,9 @@ function metadataObject(memory: Memory): Record<string, unknown> {
 	}
 }
 
-function sourceRefs(metadata: Record<string, unknown>): readonly string[] | undefined {
+function sourceRefs(
+	metadata: Record<string, unknown>,
+): readonly string[] | undefined {
 	const values = metadata.source_refs;
 	return Array.isArray(values) &&
 		values.every((value) => typeof value === "string")
@@ -204,17 +206,17 @@ function view(
 		memory.category !== "INTERACTION_EPISODE"
 	)
 		return undefined;
-  const metadata = metadataObject(memory);
-  const refs = sourceRefs(metadata);
-  return Object.freeze({
-    stateToken,
-    content: memory.content,
-    category:
-      memory.category === "SEMANTIC_MEMORY" ? "semantic" : "interaction",
-    status: memory.status,
-    playerAuthored: playerAuthored(metadata),
-    ...(refs === undefined ? {} : { sourceRefs: refs }),
-  });
+	const metadata = metadataObject(memory);
+	const refs = sourceRefs(metadata);
+	return Object.freeze({
+		stateToken,
+		content: memory.content,
+		category:
+			memory.category === "SEMANTIC_MEMORY" ? "semantic" : "interaction",
+		status: memory.status,
+		playerAuthored: playerAuthored(metadata),
+		...(refs === undefined ? {} : { sourceRefs: refs }),
+	});
 }
 
 /** Bound read-only projection. It deliberately exposes no Memory mutation method. */
@@ -234,28 +236,34 @@ export function createGameBuddyPlayerMemoryReadProjection(
 		return new MemoryCommandFacade(db);
 	};
 	return Object.freeze({
-async listChapters(input) {
-	assertMemoryProfileMatch(args, input);
-	const db = await openDatabaseAsync(
-		join(args.runtimeCwd, "data", "cortexkit", "magic-context", "context.db"),
-	);
-	if (!db) throw new Error("gamebuddy_memory_storage_unavailable");
-	// Continuity-scoped, like every other panel read: the runtime root and its memory partition are
-	// shared, and a Pi session only partitions one run's own compartments.
-	return getChaptersForProject(db, projectPath).map((chapter) =>
-		Object.freeze({
-			chapterId: chapter.id,
-			title: chapter.title,
-			spanStartSequence: chapter.spanStartSequence,
-			spanEndSequence: chapter.spanEndSequence,
-			startDate: chapter.startDate,
-			endDate: chapter.endDate,
-			content: chapter.content,
-			status: chapter.status,
-			editedAt: chapter.editedAt,
-		}),
-	);
-},
+		async listChapters(input) {
+			assertMemoryProfileMatch(args, input);
+			const db = await openDatabaseAsync(
+				join(
+					args.runtimeCwd,
+					"data",
+					"cortexkit",
+					"magic-context",
+					"context.db",
+				),
+			);
+			if (!db) throw new Error("gamebuddy_memory_storage_unavailable");
+			// Continuity-scoped, like every other panel read: the runtime root and its memory partition are
+			// shared, and a Pi session only partitions one run's own compartments.
+			return getChaptersForProject(db, projectPath).map((chapter) =>
+				Object.freeze({
+					chapterId: chapter.id,
+					title: chapter.title,
+					spanStartSequence: chapter.spanStartSequence,
+					spanEndSequence: chapter.spanEndSequence,
+					startDate: chapter.startDate,
+					endDate: chapter.endDate,
+					content: chapter.content,
+					status: chapter.status,
+					editedAt: chapter.editedAt,
+				}),
+			);
+		},
 
 		async listMemories(input) {
 			assertMemoryProfileMatch(args, input);

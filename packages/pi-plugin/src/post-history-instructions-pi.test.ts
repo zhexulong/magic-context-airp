@@ -6,10 +6,10 @@ import {
 } from "./post-history-instructions-pi";
 import {
 	assistantMessage,
+	type PiMessage,
 	textOf,
 	toolResultMessage,
 	userMessage,
-	type PiMessage,
 } from "./test-utils.test";
 
 const INSTRUCTIONS = "收束时只说一句家常话，别把镜头拉到旁白。";
@@ -28,7 +28,9 @@ const AUTHOR_DIRECTIVE = [
  * number this suite compares against the direction it wraps.
  */
 function frameSize(block: string, instructions: string): number {
-	const tags = "<character-closing-direction>".length + "</character-closing-direction>".length;
+	const tags =
+		"<character-closing-direction>".length +
+		"</character-closing-direction>".length;
 	return block.length - instructions.length - tags - 4;
 }
 
@@ -64,7 +66,10 @@ describe("appendPostHistoryInstructions", () => {
 		// The shipped card fixes pronouns, sentence length and what may not appear. A frame
 		// that called the words hers to choose would contradict that card from the strongest
 		// position in the request, so the frame offers no permission at all.
-		const opening = text.slice(text.indexOf("\n") + 1, text.indexOf(`\n${INSTRUCTIONS}\n`));
+		const opening = text.slice(
+			text.indexOf("\n") + 1,
+			text.indexOf(`\n${INSTRUCTIONS}\n`),
+		);
 		expect(opening).toBe("Your author's direction for how you answer.");
 		// The last text of the request may not describe her from outside: a card may forbid
 		// third-person self-description, and the floor forbids naming prompts and systems.
@@ -92,7 +97,10 @@ describe("appendPostHistoryInstructions", () => {
 		expect(AUTHOR_DIRECTIVE.split("\n")).toHaveLength(4);
 		expect(text).toContain(AUTHOR_DIRECTIVE);
 		// The envelope tag is not prose; the assertion is about the words the frame speaks.
-		const frame = text.slice(text.indexOf("\n"), text.indexOf(AUTHOR_DIRECTIVE));
+		const frame = text.slice(
+			text.indexOf("\n"),
+			text.indexOf(AUTHOR_DIRECTIVE),
+		);
 		expect(frame).not.toMatch(/\bend(s|ing)?\b/i);
 		expect(frame).not.toMatch(/\bclos(e|es|ing)\b/i);
 	});

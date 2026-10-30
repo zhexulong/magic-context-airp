@@ -79,7 +79,10 @@ export function emitProbeFoldCommittedMarker(revision: unknown): void {
  * "same materialization revision, same digest"; a digest without its revision
  * cannot distinguish a stable baseline from an expected re-render, so the
  * comparison would report a defect for every legitimate fold. */
-export function emitProbeM0DigestMarker(digestHex: unknown, revision: unknown): void {
+export function emitProbeM0DigestMarker(
+	digestHex: unknown,
+	revision: unknown,
+): void {
 	if (typeof digestHex !== "string" || !SHA256_HEX.test(digestHex)) return;
 	if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
 	writeStderr(`${PROBE_M0_DIGEST_PREFIX} ${digestHex} ${revision}`);
@@ -95,61 +98,70 @@ export function emitProbeM0DigestMarker(digestHex: unknown, revision: unknown): 
  * render cannot produce an unbounded stderr line.
  */
 export function emitProbeM0MemoryIdsMarker(
-		revision: unknown,
-		renderedMemoryIds: unknown,
-	): void {
-		if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
-		if (!Array.isArray(renderedMemoryIds)) return;
-		const ids: number[] = [];
-		for (const value of renderedMemoryIds) {
-			if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) continue;
-			ids.push(value);
-			if (ids.length >= MAX_RENDERED_MEMORY_IDS) break;
-		}
-		// A sorted, de-duplicated list makes the marker deterministic for a given set,
-		// so a harness can compare two passes without depending on render order.
-		const unique = [...new Set(ids)].sort((left, right) => left - right);
-		const list = unique.length > 0 ? unique.join(",") : "-";
-		writeStderr(`${PROBE_M0_MEMORY_IDS_PREFIX} ${revision} ${list}`);
+	revision: unknown,
+	renderedMemoryIds: unknown,
+): void {
+	if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
+	if (!Array.isArray(renderedMemoryIds)) return;
+	const ids: number[] = [];
+	for (const value of renderedMemoryIds) {
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+			continue;
+		ids.push(value);
+		if (ids.length >= MAX_RENDERED_MEMORY_IDS) break;
 	}
+	// A sorted, de-duplicated list makes the marker deterministic for a given set,
+	// so a harness can compare two passes without depending on render order.
+	const unique = [...new Set(ids)].sort((left, right) => left - right);
+	const list = unique.length > 0 ? unique.join(",") : "-";
+	writeStderr(`${PROBE_M0_MEMORY_IDS_PREFIX} ${revision} ${list}`);
+}
 
-	/** Authored-source marker: which kinds of stable/volatile context rendered into
-	 * this pass's m[0]. Never carries source content or identifiers. */
+/** Authored-source marker: which kinds of stable/volatile context rendered into
+ * this pass's m[0]. Never carries source content or identifiers. */
 export function emitProbeM0SourcesMarker(
-		revision: unknown,
-		stableKinds: unknown,
-		volatileKinds: unknown,
-	): void {
-		if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
-		// A sorted, de-duplicated list makes the marker deterministic for a given set,
-		// so a harness can compare two passes without depending on render order.
-		const list = (value: unknown): string => {
-			if (!Array.isArray(value)) return "-";
-			const kinds: string[] = [];
-			for (const kind of value) {
-				if (typeof kind !== "string" || !SOURCE_KIND.test(kind)) continue;
-				if (!kinds.includes(kind)) kinds.push(kind);
-				if (kinds.length >= MAX_SOURCE_KINDS) break;
-			}
-			return kinds.length > 0 ? kinds.sort().join(",") : "-";
-		};
-		writeStderr(
-			`${PROBE_M0_SOURCES_PREFIX} ${revision} stable=${list(stableKinds)} volatile=${list(volatileKinds)}`,
-		);
-	}
+	revision: unknown,
+	stableKinds: unknown,
+	volatileKinds: unknown,
+): void {
+	if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
+	// A sorted, de-duplicated list makes the marker deterministic for a given set,
+	// so a harness can compare two passes without depending on render order.
+	const list = (value: unknown): string => {
+		if (!Array.isArray(value)) return "-";
+		const kinds: string[] = [];
+		for (const kind of value) {
+			if (typeof kind !== "string" || !SOURCE_KIND.test(kind)) continue;
+			if (!kinds.includes(kind)) kinds.push(kind);
+			if (kinds.length >= MAX_SOURCE_KINDS) break;
+		}
+		return kinds.length > 0 ? kinds.sort().join(",") : "-";
+	};
+	writeStderr(
+		`${PROBE_M0_SOURCES_PREFIX} ${revision} stable=${list(stableKinds)} volatile=${list(volatileKinds)}`,
+	);
+}
 
-	/** Chapter rollup marker: count + block digest, emitted at the same materialization
-	 * boundary as the memory-ids marker. Never carries chapter text. */
+/** Chapter rollup marker: count + block digest, emitted at the same materialization
+ * boundary as the memory-ids marker. Never carries chapter text. */
 export function emitProbeM0ChaptersMarker(
-		revision: unknown,
-		chapterCount: unknown,
-		chaptersBlockDigest: unknown,
-	): void {
-		if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
-		if (typeof chapterCount !== "number" || !Number.isSafeInteger(chapterCount) || chapterCount < 0) return;
-		const digest =
-			typeof chaptersBlockDigest === "string" && SHA256_HEX.test(chaptersBlockDigest)
-				? chaptersBlockDigest
-				: "-";
-		writeStderr(`${PROBE_M0_CHAPTERS_PREFIX} ${revision} ${chapterCount} ${digest}`);
-	}
+	revision: unknown,
+	chapterCount: unknown,
+	chaptersBlockDigest: unknown,
+): void {
+	if (typeof revision !== "string" || !OPAQUE_REVISION.test(revision)) return;
+	if (
+		typeof chapterCount !== "number" ||
+		!Number.isSafeInteger(chapterCount) ||
+		chapterCount < 0
+	)
+		return;
+	const digest =
+		typeof chaptersBlockDigest === "string" &&
+		SHA256_HEX.test(chaptersBlockDigest)
+			? chaptersBlockDigest
+			: "-";
+	writeStderr(
+		`${PROBE_M0_CHAPTERS_PREFIX} ${revision} ${chapterCount} ${digest}`,
+	);
+}

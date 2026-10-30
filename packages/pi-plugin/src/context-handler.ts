@@ -247,7 +247,6 @@ import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provid
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
-import { isHostSynthesizedDeliveryText } from "@magic-context/core/shared/system-directive";
 import {
 	guardSqliteTransformPass,
 	type Statement as PreparedStatement,
@@ -256,6 +255,7 @@ import {
 	withSqliteBackgroundWriter,
 } from "@magic-context/core/shared/sqlite";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import { isHostSynthesizedDeliveryText } from "@magic-context/core/shared/system-directive";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
@@ -429,6 +429,10 @@ import {
 } from "./reasoning-replay-pi";
 import { replayPiReminderStrips } from "./reminder-strip-pi";
 import {
+	hasRuntimeEnvironmentFactsProvider,
+	injectPiRuntimeEnvironmentFacts,
+} from "./runtime-environment-facts-pi";
+import {
 	capturePiServedArray,
 	clearPiServedArraySession,
 	getPiServedTagNumbers,
@@ -459,8 +463,6 @@ import {
 	stripPiLeadingTemporalMarker,
 	withoutPiLeadingTemporalMarker,
 } from "./temporal-awareness-pi";
-import { injectPiRuntimeEnvironmentFacts } from "./runtime-environment-facts-pi";
-import { hasRuntimeEnvironmentFactsProvider } from "./runtime-environment-facts-pi";
 import {
 	type PiMessageTokenCacheEntry,
 	tokenizePiMessages,
@@ -6562,17 +6564,17 @@ function spawnPiHistorianRun(args: {
 	const holderId = crypto.randomUUID();
 	const controller = new AbortController();
 	historianAbortControllers.set(sessionId, controller);
-		const runPromise = withoutSqliteTransformPass(() =>
-			(async () => {
-				// Defer the runner's synchronous prefix until the context handler has returned.
-				await new Promise<void>((resolve) => setTimeout(resolve, 0));
-				if (controller.signal.aborted) return;
-				// Do not start a historian after the pass's 21s optional cutoff.
-				// Once started, its lease protects history-summary publication without
-				// borrowing the foreground context deadline.
-				args.startGuard?.();
-				const lease = acquireCompartmentLease(db, sessionId, holderId);
-				if (!lease) {
+	const runPromise = withoutSqliteTransformPass(() =>
+		(async () => {
+			// Defer the runner's synchronous prefix until the context handler has returned.
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			if (controller.signal.aborted) return;
+			// Do not start a historian after the pass's 21s optional cutoff.
+			// Once started, its lease protects history-summary publication without
+			// borrowing the foreground context deadline.
+			args.startGuard?.();
+			const lease = acquireCompartmentLease(db, sessionId, holderId);
+			if (!lease) {
 				sessionLog(
 					sessionId,
 					"historian skipped: compartment lease held by another process",

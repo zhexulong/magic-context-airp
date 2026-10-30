@@ -24,9 +24,12 @@ type EmbeddedModelRegistryGlobal = typeof globalThis & {
 };
 
 export function readEmbeddedModelRegistry(): ModelRegistry | undefined {
-	return (globalThis as EmbeddedModelRegistryGlobal)[EMBEDDED_MODEL_REGISTRY_SLOT];
+	return (globalThis as EmbeddedModelRegistryGlobal)[
+		EMBEDDED_MODEL_REGISTRY_SLOT
+	];
 }
 
 export function writeEmbeddedModelRegistry(registry: ModelRegistry): void {
-	(globalThis as EmbeddedModelRegistryGlobal)[EMBEDDED_MODEL_REGISTRY_SLOT] = registry;
+	(globalThis as EmbeddedModelRegistryGlobal)[EMBEDDED_MODEL_REGISTRY_SLOT] =
+		registry;
 }

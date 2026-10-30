@@ -17,24 +17,36 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const REPO_ROOT = join(__dirname, "..", "..", "..");
-const CONTEXT_HANDLER = join(REPO_ROOT, "packages", "pi-plugin", "src", "context-handler.ts");
-const RUNNER = join(REPO_ROOT, "packages", "pi-plugin", "src", "pi-historian-runner.ts");
+const CONTEXT_HANDLER = join(
+	REPO_ROOT,
+	"packages",
+	"pi-plugin",
+	"src",
+	"context-handler.ts",
+);
+const RUNNER = join(
+	REPO_ROOT,
+	"packages",
+	"pi-plugin",
+	"src",
+	"pi-historian-runner.ts",
+);
 
 describe("the Pi historian call site forwards the memory domain", () => {
-    it("passes memoryDomain into runPiHistorian", () => {
-        const source = readFileSync(CONTEXT_HANDLER, "utf8");
-        const callAt = source.indexOf("await runPiHistorian({");
-        expect(callAt).toBeGreaterThan(-1);
-        // The call's argument object ends at the next `});` — plenty of room for the fields we assert on.
-        const call = source.slice(callAt, source.indexOf("\n\t\t\t\t});", callAt));
-        expect(call).toContain("memoryEnabled: historian.memoryEnabled");
-        expect(call).toContain("memoryDomain: historian.memoryDomain");
-    });
+	it("passes memoryDomain into runPiHistorian", () => {
+		const source = readFileSync(CONTEXT_HANDLER, "utf8");
+		const callAt = source.indexOf("await runPiHistorian({");
+		expect(callAt).toBeGreaterThan(-1);
+		// The call's argument object ends at the next `});` — plenty of room for the fields we assert on.
+		const call = source.slice(callAt, source.indexOf("\n\t\t\t\t});", callAt));
+		expect(call).toContain("memoryEnabled: historian.memoryEnabled");
+		expect(call).toContain("memoryDomain: historian.memoryDomain");
+	});
 
-    it("keeps the runner's fallback a coding-project default, not an ongoing one", () => {
-        const source = readFileSync(RUNNER, "utf8");
-        // If this default ever became "ongoing-interaction", a missing dependency would silently write
-        // companion memory for a coding project and the fence above would stop meaning what it says.
-        expect(source).toContain('memoryDomain = "coding-project"');
-    });
+	it("keeps the runner's fallback a coding-project default, not an ongoing one", () => {
+		const source = readFileSync(RUNNER, "utf8");
+		// If this default ever became "ongoing-interaction", a missing dependency would silently write
+		// companion memory for a coding project and the fence above would stop meaning what it says.
+		expect(source).toContain('memoryDomain = "coding-project"');
+	});
 });

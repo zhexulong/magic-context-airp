@@ -1,5 +1,9 @@
 import { join } from "node:path";
 import {
+	deleteChapter,
+	updateChapterContent,
+} from "@magic-context/core/features/magic-context/chapter-storage";
+import {
 	type MemoryCommandFacade,
 	MemoryCommandFacade as MemoryFacade,
 } from "@magic-context/core/features/magic-context/memory";
@@ -7,18 +11,14 @@ import { openDatabaseAsync } from "@magic-context/core/features/magic-context/st
 import {
 	assertMemoryProfileMatch,
 	createGameBuddyPlayerMemoryReadProjection,
+	type GameBuddyPlayerChapterView,
 	type GameBuddyPlayerMemoryProfileBinding,
 	type GameBuddyPlayerMemoryReadInput,
-	GameBuddyPlayerChapterView,
 	type GameBuddyPlayerMemoryReadProjection,
 	type GameBuddyPlayerMemoryReadView,
 	resolveGameBuddyMemoryProjectPath,
 	validateMemoryProfileBinding,
 } from "./gamebuddy-player-memory-read-projection";
-import {
-	deleteChapter,
-	updateChapterContent,
-} from "@magic-context/core/features/magic-context/chapter-storage";
 
 export type {
 	GameBuddyPlayerMemoryProfileBinding,

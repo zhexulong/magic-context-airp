@@ -39,6 +39,7 @@
 
 import * as crypto from "node:crypto";
 import { withContentLanguageDirective } from "@magic-context/core/agents/language-directive";
+import { sealChaptersForCompartments } from "@magic-context/core/features/magic-context/chapter-storage";
 import { embedAndStoreCompartmentChunks } from "@magic-context/core/features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "@magic-context/core/features/magic-context/compartment-events";
 import { isCompartmentLeaseHeld } from "@magic-context/core/features/magic-context/compartment-lease";
@@ -154,7 +155,6 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
-
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
 import {
@@ -166,9 +166,6 @@ import {
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
 import { isPiSystemEntry } from "./system-entry-pi";
-import {
-	sealChaptersForCompartments,
-} from "@magic-context/core/features/magic-context/chapter-storage";
 
 const HISTORIAN_AGENT_NAME = "magic-context-historian";
 const DEFAULT_HISTORIAN_TIMEOUT_MS = 600_000;
@@ -654,13 +651,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			if (existingValidationError) {
 				sessionLog(
 					sessionId,
-						`historian failure: source=existing-validation reason="${existingValidationError}"`,
-					);
-					// The row must name the reason the run failed: this path already knows it (the line above),
-					// and leaving it out produced `historian_runs` rows of status 'failed' with a NULL reason,
-					// which are indistinguishable from an unattributed crash.
-					telemetry.status = "failed";
-					telemetry.failureReason = `existing-validation: ${existingValidationError}`;
+					`historian failure: source=existing-validation reason="${existingValidationError}"`,
+				);
+				// The row must name the reason the run failed: this path already knows it (the line above),
+				// and leaving it out produced `historian_runs` rows of status 'failed' with a NULL reason,
+				// which are indistinguishable from an unattributed crash.
+				telemetry.status = "failed";
+				telemetry.failureReason = `existing-validation: ${existingValidationError}`;
 				{
 					const failCount = incrementHistorianFailure(
 						db,
@@ -686,16 +683,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					? createDefaultBoundarySnapshotForTests(sessionId)
 					: null);
 			if (!boundarySnapshot) {
-			sessionLog(
-				sessionId,
-				"historian no-op: missing protected-tail boundary snapshot from Pi trigger decision",
-			);
-			// A no-op, not a failure - and the row has to say which, or the pacing of the historian is
-			// read as a broken historian.
-			telemetry.status = "noop";
-			telemetry.failureReason = "missing protected-tail boundary snapshot";
-			return;
-		}
+				sessionLog(
+					sessionId,
+					"historian no-op: missing protected-tail boundary snapshot from Pi trigger decision",
+				);
+				// A no-op, not a failure - and the row has to say which, or the pacing of the historian is
+				// read as a broken historian.
+				telemetry.status = "noop";
+				telemetry.failureReason = "missing protected-tail boundary snapshot";
+				return;
+			}
 			let validation =
 				boundarySnapshot.rawRangeFingerprint.length > 0
 					? validateBoundarySnapshot({
@@ -760,11 +757,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					recordHighPressureNoEligibleHead(db, boundarySnapshot);
 				}
 				// Tail exhausted — clear the emergency catch-up latch (see OpenCode).
-			clearEmergencyDrainLatch(db, sessionId);
-			telemetry.status = "noop";
-			telemetry.failureReason = "no eligible head above the protected tail";
-			return;
-		}
+				clearEmergencyDrainLatch(db, sessionId);
+				telemetry.status = "noop";
+				telemetry.failureReason = "no eligible head above the protected tail";
+				return;
+			}
 
 			// Size the prompt to the producer model before reserving drain budget or
 			// reading the chunk: the fixed prompt parts and the output reserve come
@@ -1269,8 +1266,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					return;
 				}
 				sessionLog(sessionId, `historian failure: ${errorMsg}`);
-			telemetry.status = "failed";
-			telemetry.failureReason = errorMsg;
+				telemetry.status = "failed";
+				telemetry.failureReason = errorMsg;
 				{
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));
@@ -1385,9 +1382,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				sessionLog(
 					sessionId,
 					`historian failure: source=no-progress newCompartmentCount=${newCompartments.length} lastNewEnd=${lastNewEnd} priorEnd=${offset - 1}`,
-		);
-		telemetry.status = "failed";
-		telemetry.failureReason = `no progress: ${errorMsg}`;
+				);
+				telemetry.status = "failed";
+				telemetry.failureReason = `no progress: ${errorMsg}`;
 				{
 					const failCount = incrementHistorianFailure(db, sessionId, errorMsg);
 					await notify(buildHistorianFailureNotice(failCount, errorMsg));
@@ -1508,13 +1505,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// holder check and writes on one fresh write-locked snapshot.
 			if (!compartmentLeaseHolderId) {
 				sessionLog(
-				sessionId,
-				"historian publish skipped: missing compartment lease holder",
-			);
-			rollbackDrainReservation();
-			telemetry.status = "noop";
-			telemetry.failureReason = "publish skipped: missing compartment lease holder";
-			return;
+					sessionId,
+					"historian publish skipped: missing compartment lease holder",
+				);
+				rollbackDrainReservation();
+				telemetry.status = "noop";
+				telemetry.failureReason =
+					"publish skipped: missing compartment lease holder";
+				return;
 			}
 			const compartmentTagKeys = await getRawSessionTagKeysThrough(
 				sessionId,
@@ -1534,13 +1532,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				if (!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)) {
 					db.exec("ROLLBACK");
 					sessionLog(
-					sessionId,
-					"historian publish skipped: compartment lease no longer held",
-				);
-				rollbackDrainReservation();
-				telemetry.status = "noop";
-				telemetry.failureReason = "publish skipped: compartment lease no longer held";
-				return;
+						sessionId,
+						"historian publish skipped: compartment lease no longer held",
+					);
+					rollbackDrainReservation();
+					telemetry.status = "noop";
+					telemetry.failureReason =
+						"publish skipped: compartment lease no longer held";
+					return;
 				}
 				appendCompartments(db, sessionId, newCompartments);
 				// Resolve durable ids for the just-appended compartments (last N rows by
@@ -1565,18 +1564,18 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						sessionLog(
 							sessionId,
 							`chapter rollup: sealed ${sealed} chapter(s) over sequences ${appendedCompartments[0]?.sequence ?? 0}-${appendedCompartments[appendedCompartments.length - 1]?.sequence ?? 0}`,
+						);
+					}
+				} catch (error) {
+					// A rollup failure must never fail historian publication: chapters
+					// are a rendering enhancement, and the publish transaction already
+					// clears failure state. Log and continue — the next fold re-derives
+					// the same interval (idempotent).
+					sessionLog(
+						sessionId,
+						`chapter rollup failed (non-fatal): ${error instanceof Error ? error.message : String(error)}`,
 					);
 				}
-			} catch (error) {
-				// A rollup failure must never fail historian publication: chapters
-				// are a rendering enhancement, and the publish transaction already
-				// clears failure state. Log and continue — the next fold re-derives
-				// the same interval (idempotent).
-				sessionLog(
-					sessionId,
-					`chapter rollup failed (non-fatal): ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
 				// v2 faithful fact lifecycle (E6 parity): facts are no longer a
 				// REPLACE-the-whole-list store. The historian emits only THIS
 				// chunk's facts (deduped against <project-memory> in the prompt);
@@ -1889,16 +1888,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				harness: resolvePiHarnessKind(),
 				subagentInvocationId: invocationId,
 				runKind: telemetry.runKind ?? "incremental",
-					status: telemetry.status ?? "failed",
-					// Safety net. The default telemetry is `status: "failed"` with no reason, so any exit that
-					// does not fill in `failureReason` writes a failed row that cannot be diagnosed - which is
-					// exactly what happened on the embedded host (2 of 62 rows, reason NULL). Every exit that
-					// knows its reason now records it; this line covers the ones added later.
-					failureReason:
-						telemetry.failureReason ??
-						((telemetry.status ?? "failed") === "failed"
-							? "unattributed failure (this exit path does not record a reason)"
-							: null),
+				status: telemetry.status ?? "failed",
+				// Safety net. The default telemetry is `status: "failed"` with no reason, so any exit that
+				// does not fill in `failureReason` writes a failed row that cannot be diagnosed - which is
+				// exactly what happened on the embedded host (2 of 62 rows, reason NULL). Every exit that
+				// knows its reason now records it; this line covers the ones added later.
+				failureReason:
+					telemetry.failureReason ??
+					((telemetry.status ?? "failed") === "failed"
+						? "unattributed failure (this exit path does not record a reason)"
+						: null),
 				chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
 				chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
 				unprocessedFrom: telemetry.unprocessedFrom ?? null,

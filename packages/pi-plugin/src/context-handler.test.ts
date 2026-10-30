@@ -1327,8 +1327,8 @@ describe("Pi fallback tag adoption", () => {
 			expect(textOf(messages[0])).toBe("§7§ raced message");
 		} finally {
 			closeQuietly(siblingDb);
-		closeQuietly(db);
-	}
+			closeQuietly(db);
+		}
 	});
 
 	it("migrates dropped sentinelized tool-only owners without allocating a fresh tag", () => {
@@ -2076,7 +2076,9 @@ describe("registerPiContextHandler", () => {
 				canonicalHash: createHash("sha256")
 					.update(canonical(body))
 					.digest("hex"),
-				...(closingDirection === undefined ? {} : { postHistoryInstructions: closingDirection }),
+				...(closingDirection === undefined
+					? {}
+					: { postHistoryInstructions: closingDirection }),
 			};
 		};
 		const CLOSING = "收束时只说一句家常话，别把镜头拉到旁白。";
