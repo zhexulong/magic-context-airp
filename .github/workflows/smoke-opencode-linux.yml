@@ -30,6 +30,9 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # package.json's packageManager pin. The opencode version below floats on
+  # purpose; the Bun that runs it does not.
+  BUN_VERSION: 1.4.4
 
 jobs:
   smoke:
@@ -47,7 +50,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install opencode (latest — matches host e2e)
         # Float to latest: this smoke job exists to catch a Linux serve-startup

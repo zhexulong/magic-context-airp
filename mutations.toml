@@ -22,7 +22,7 @@
 # cargo rebuilds the mutant inside the same command. Small targets (mc-store's
 # lib, one integration test binary) are ordinary `cargo` rows with `only = true`.
 #
-# Replay with the Bun version package.json pins (packageManager, bun 1.4.2).
+# Replay with the Bun version package.json pins (packageManager, bun 1.4.4).
 # Never `git checkout` a file while a replay runs: it removes the mutation and
 # fakes a survivor.
 

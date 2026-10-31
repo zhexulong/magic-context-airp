@@ -22,19 +22,25 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # The one Bun every job installs: the setup-bun steps below read this value
   # instead of each naming a version. It is package.json's `packageManager` pin
-  # (`bun@1.4.2`), the repository's declared toolchain - mutations.yml and
+  # (`bun@1.4.4`), the repository's declared toolchain - mutations.yml,
+  # release.yml, dashboard-release.yml, smoke-opencode-linux.yml and
   # tests/docker/Dockerfile.e2e-host read the same pin, for the same reason -
   # so move them together.
   #
-  # It pinned nothing before: every job asked for `latest`, which moved 1.4.2 to
-  # 1.4.4 between two consecutive runs and changed behaviour with no commit to
-  # point at. Bun 1.4.4 provides `createFunction`, that lit a capability branch
-  # in migration 55, and the migration then emitted a trigger calling an
-  # unregistered UDF - "no such function: mc_privileged_writer" - on every
-  # connection that did not register it. The same suite passed on one run and
-  # failed on the next, and nothing in the repository said which version it was
-  # meant to run.
-  BUN_VERSION: 1.4.2
+  # The pin exists because it pinned nothing before: every job asked for
+  # `latest`, which moved 1.4.2 to 1.4.4 between two consecutive runs and
+  # changed behaviour with no commit to point at. Bun 1.4.4 provides
+  # `createFunction`, that lit a capability branch in migration 55, and the
+  # migration then emitted a trigger calling an unregistered UDF - "no such
+  # function: mc_privileged_writer" - on every connection that did not register
+  # it. The same suite passed on one run and failed on the next, and nothing in
+  # the repository said which version it was meant to run.
+  #
+  # So the pin names 1.4.4, not 1.4.2. 1.4.2 is the release that hid the defect;
+  # retreating to it would keep the suite green and lose the observation that
+  # found it. The migration is fixed on its merits and the toolchain stays on
+  # the release where the defect became visible.
+  BUN_VERSION: 1.4.4
 
 # Pipeline shape on every push to master/main:
 #

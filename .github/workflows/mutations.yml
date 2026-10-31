@@ -36,7 +36,7 @@ env:
   CK_MUTATE_REV: 7d08e73722fa3e79bbcc2607753978ab768f1c6b
   # package.json's packageManager pin. Replays must use one Bun version so a
   # row's catch never depends on which release a runner happened to install.
-  BUN_VERSION: 1.4.2
+  BUN_VERSION: 1.4.4
 
 jobs:
   check:

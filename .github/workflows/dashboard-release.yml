@@ -11,6 +11,9 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # package.json's packageManager pin; see ci.yml for why the repository names
+  # the toolchain instead of taking whatever `latest` resolves to.
+  BUN_VERSION: 1.4.4
 
 jobs:
   # Create the draft release ONCE, up front, and hand its id to every build leg.
@@ -120,7 +123,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
