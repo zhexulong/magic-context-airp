@@ -253,7 +253,7 @@ describe("OpenCode visible-memory manifest", () => {
         }
     });
 
-    it("keeps fold, refresh and defer prompt bytes identical to the pre-manifest baseline", () => {
+    it("keeps fold and refresh prompt bytes identical to the pre-manifest baseline", () => {
         const f = fixture();
         try {
             insertMemory(f.db, {
@@ -263,40 +263,55 @@ describe("OpenCode visible-memory manifest", () => {
             });
             const hash = (value: unknown) =>
                 createHash("sha256").update(JSON.stringify(value)).digest("hex");
-            const capture = (refresh = false) => {
+            const parts = (refresh = false) => {
                 const served = f.serve(refresh);
                 const meta = getOrCreateSessionMeta(f.db, f.options.sessionId);
                 if (!meta.cachedM0Bytes || !meta.cachedM1Bytes || !served.preparedMessages) {
                     throw new Error("expected persisted bytes and a served prefix");
                 }
-                return hash({
+                return {
                     m0: meta.cachedM0Bytes.toString("utf8"),
                     m1: meta.cachedM1Bytes.toString("utf8"),
                     prefix: served.preparedMessages.map((message) => message.parts),
-                });
+                };
             };
-            const fold = capture();
+            const capture = (refresh = false) => {
+                const rendered = parts(refresh);
+                return { rendered, digest: hash(rendered) };
+            };
+            const fold = capture().digest;
             insertMemory(f.db, {
                 projectPath: f.options.projectPath,
                 category: "ARCHITECTURE",
                 content: "incremental memory",
             });
-            const refresh = capture(true);
-            const before = f.row();
+            const refreshed = capture(true);
+            const refresh = refreshed.digest;
+            expect(f.manifest()).toEqual({ ids: [1, 2], count: 2 });
             insertMemory(f.db, {
                 projectPath: f.options.projectPath,
                 category: "ARCHITECTURE",
                 content: "not served during defer",
             });
-            const defer = capture();
-            // Captured from the unmodified renderer before the manifest fix.
-            expect({ fold, refresh, defer }).toEqual({
+            const deferred = capture();
+            // Captured from the unmodified renderer before the manifest fix. These two legs
+            // are what the manifest bookkeeping must not disturb: a fold and a soft refresh
+            // render exactly the bytes they rendered before it existed.
+            expect({ fold, refresh }).toEqual({
                 fold: "259a053d3215cdb0d32792144c2bab8c581075a047176d55402405bff76bcac1",
                 refresh: "c08b78fc2e739b52411db91b12311ea3f78a384aebbf2c6aa2cd2ef28527c978",
-                defer: "c08b78fc2e739b52411db91b12311ea3f78a384aebbf2c6aa2cd2ef28527c978",
             });
-            expect(defer).toBe(refresh);
-            expect(f.row()).toEqual(before);
+            // The defer leg's premise moved with the airp m[1]-coverage watermark
+            // (inject-compartments.test.ts: "refreshes m[1] on defer when memory coverage
+            // advances without rebuilding m[0]"). A defer pass no longer replays m[1]
+            // verbatim: once memory coverage advances it re-renders the volatile delta so the
+            // new memory is served, while m[0] - and therefore the cached prefix - stays
+            // byte-identical. The pre-airp baseline could only express this as "defer equals
+            // refresh" because defer never re-rendered at all.
+            expect(deferred.rendered.m0).toBe(refreshed.rendered.m0);
+            expect(refreshed.rendered.m1).not.toContain("not served during defer");
+            expect(deferred.rendered.m1).toContain("not served during defer");
+            expect(f.manifest()).toEqual({ ids: [1, 2, 3], count: 3 });
         } finally {
             f.close();
         }
