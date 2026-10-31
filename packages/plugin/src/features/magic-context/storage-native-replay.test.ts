@@ -7,7 +7,11 @@ import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import {
+    getPersistedSchemaVersion,
+    initializeDatabase,
+    LATEST_SUPPORTED_VERSION,
+} from "./storage-db";
 import {
     addTrailingBlankDecisions,
     demoteTrailingBlankKeepDecisions,
@@ -159,10 +163,9 @@ describe("native replay storage", () => {
             try {
                 initializeDatabase(seed);
                 runMigrations(seed);
-                const version = seed
-                    .prepare("SELECT MAX(version) AS version FROM schema_migrations")
-                    .get() as { version: number };
-                expect(version.version).toBe(LATEST_SUPPORTED_VERSION);
+                // Read the upstream lane, not MAX(version): the fork's own v10001/v10002
+                // rows sit above the floor and would otherwise be the maximum.
+                expect(getPersistedSchemaVersion(seed)).toBe(LATEST_SUPPORTED_VERSION);
             } finally {
                 seed.close();
             }

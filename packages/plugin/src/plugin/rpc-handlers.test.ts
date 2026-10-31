@@ -16,7 +16,7 @@ import {
     resolveProjectIdentity,
     setHomeProjectPermission,
 } from "../features/magic-context/memory/project-identity";
-import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
+import { FORK_MIGRATIONS, runMigrations } from "../features/magic-context/migrations";
 import { upsertMural } from "../features/magic-context/mural/storage-mural";
 import {
     getPersistedSchemaVersion,
@@ -584,19 +584,26 @@ describe("buildStatusDetail — storage version probe", () => {
     test("reports the upstream lane when fork rows share context.db", () => {
         const db = createTestDb();
         try {
+            // The fork's own migrations occupy the floor and above, so a synthetic
+            // "another writer's downstream row" must sit above them; planting at
+            // FLOOR/FLOOR+1 collides with the real v10001/v10002 rows.
+            const firstSyntheticForkVersion =
+                Math.max(...FORK_MIGRATIONS.map((migration) => migration.version)) + 1;
             db.prepare(
                 "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?, ?, ?), (?, ?, ?)",
             ).run(
-                FORK_MIGRATION_VERSION_FLOOR,
-                "fork migration 10000",
+                firstSyntheticForkVersion,
+                "synthetic fork row",
                 0,
-                FORK_MIGRATION_VERSION_FLOOR + 1,
-                "fork migration 10001",
+                firstSyntheticForkVersion + 1,
+                "synthetic fork row",
                 0,
             );
 
             const detail = buildStatusDetail(db, "ses-storage-version", process.cwd());
 
+            // The probe reports the upstream lane, so the fork rows above the floor
+            // must not raise it.
             expect(detail.storage_versions).toEqual({
                 context_db_schema_version: LATEST_SUPPORTED_VERSION,
                 plugin_supported_version: LATEST_SUPPORTED_VERSION,

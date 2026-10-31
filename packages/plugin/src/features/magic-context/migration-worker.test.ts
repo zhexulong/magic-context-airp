@@ -7,18 +7,26 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { __setMigrationWorkerEntryForTests } from "./migration-worker-client";
-import { __getMainThreadMigrationBodyCountForTests, MIGRATIONS } from "./migrations";
-import { closeDatabase, openDatabase, openDatabaseAsync } from "./storage-db";
+import {
+    __getMainThreadMigrationBodyCountForTests,
+    FORK_MIGRATIONS,
+    LATEST_MIGRATION_VERSION,
+    MIGRATIONS,
+} from "./migrations";
+import {
+    closeDatabase,
+    getPersistedSchemaVersion,
+    openDatabase,
+    openDatabaseAsync,
+} from "./storage-db";
 
-const LATEST = MIGRATIONS[MIGRATIONS.length - 1].version;
+const LATEST = LATEST_MIGRATION_VERSION;
 
+/** The upstream lane version a store on disk holds, ignoring the fork's rows above the floor. */
 function persistedVersion(dbPath: string): number {
     const db = new Database(dbPath);
     try {
-        const row = db
-            .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations")
-            .get() as { version: number };
-        return row.version;
+        return getPersistedSchemaVersion(db);
     } finally {
         closeQuietly(db);
     }
@@ -57,7 +65,11 @@ describe("startup migrations run on a worker thread", () => {
 
         expect(openDatabase(dbPath)).not.toBeNull();
 
-        expect(__getMainThreadMigrationBodyCountForTests() - before).toBe(MIGRATIONS.length);
+        // The runner walks the upstream lane and then the fork's, so the body count is
+        // both lengths: the fork's v10001/v10002 run here too.
+        expect(__getMainThreadMigrationBodyCountForTests() - before).toBe(
+            MIGRATIONS.length + FORK_MIGRATIONS.length,
+        );
     });
 
     test("a current database starts no worker", async () => {

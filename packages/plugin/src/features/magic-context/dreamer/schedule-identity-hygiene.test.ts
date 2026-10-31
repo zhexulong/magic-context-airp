@@ -186,11 +186,16 @@ describe("schedule rows are seeded only for tasks with input", () => {
         addCompartment(db, "ses-old", NOW - 60 * DAY_MS);
         addSession(db, project, "ses-new", NOW - DAY_MS);
         planDueTasks(db, project, ALL_TASKS, NOW);
-        expect(scheduledTasks(db, project)).toEqual(["retrospective"]);
+        // Owner ruling (a), 2026-10-15 moved the reflect gate from memory rows to the
+        // compartment stream, which `readReflectWindow` reads store-wide. The older
+        // compartment above therefore seeds reflect on this pass; the assertion's
+        // subject is maintain-docs, which needs a compartment from a recent session
+        // and correctly has no row yet.
+        expect(scheduledTasks(db, project)).toEqual(["reflect", "retrospective"]);
 
         addCompartment(db, "ses-new", NOW - 60_000);
         planDueTasks(db, project, ALL_TASKS, NOW + 60_000);
-        expect(scheduledTasks(db, project)).toEqual(["maintain-docs", "retrospective"]);
+        expect(scheduledTasks(db, project)).toEqual(["maintain-docs", "reflect", "retrospective"]);
     });
 
     it("seeds the global user-memory review only for an identity with input of its own", () => {

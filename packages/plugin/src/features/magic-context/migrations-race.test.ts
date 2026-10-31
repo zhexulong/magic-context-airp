@@ -18,7 +18,7 @@ import {
     runMigrations,
     runMigrationsWithRetry,
 } from "./migrations";
-import { initializeDatabase } from "./storage-db";
+import { getPersistedSchemaVersion, initializeDatabase } from "./storage-db";
 
 /**
  * Multi-instance migration race tolerance.
@@ -408,13 +408,9 @@ describe("migration race tolerance", () => {
             const db = new Database(path);
             db.exec("PRAGMA busy_timeout=10");
             await runMigrationsWithRetry(db, { retryDelaysMs: [100, 150] });
-            expect(
-                (
-                    db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as {
-                        version: number;
-                    }
-                ).version,
-            ).toBe(LATEST_MIGRATION_VERSION);
+            // Read the upstream lane: the fork's own v10001/v10002 rows sit above
+            // the floor, so a bare MAX(version) is no longer the upstream version.
+            expect(getPersistedSchemaVersion(db)).toBe(LATEST_MIGRATION_VERSION);
             closeQuietly(db);
             await holder.exited;
         } finally {
