@@ -21,6 +21,34 @@ const RETRY_MESSAGE =
 
 export class PiContextSupersededError extends Error {}
 
+/**
+ * A refusal cause that can tell the player what to DO, in its own words.
+ *
+ * <p>
+ * The generic retry advice ("send your message again") is right for a transient failure and wrong
+ * for a condition the player has to change — an authored context that is too large is the same size
+ * on every retry, so telling them to resend sends them in a circle. Rather than special-case any
+ * one cause here, the seam is a property: a cause that knows the answer exposes `playerMessage`, and
+ * this module leads with it. That keeps the refusal path free of knowledge about which causes
+ * exist, and lets a new actionable refusal become actionable without touching this file.
+ * </p>
+ *
+ * <p>
+ * The cause is read through its `cause` chain because the failure may arrive wrapped.
+ * </p>
+ */
+function playerFacingRefusalMessage(reason: unknown): string | undefined {
+	const seen = new Set<unknown>();
+	let current: unknown = reason;
+	while (current && typeof current === "object" && !seen.has(current)) {
+		seen.add(current);
+		const message = (current as { playerMessage?: unknown }).playerMessage;
+		if (typeof message === "string" && message.trim().length > 0) return message;
+		current = (current as { cause?: unknown }).cause;
+	}
+	return undefined;
+}
+
 interface Operation {
 	pass?: PiContextBudget;
 	started: boolean;
@@ -98,9 +126,16 @@ export function registerPiGuardedContext(
 				? "no managed result; refused"
 				: budget.recovery;
 		const identityConflict = findPiTagIdentityConflict(reason);
+		// A refusal whose cause is something the player can FIX leads with that, not with the retry
+		// advice. "Send your message again" is wrong for an over-budget authored context: resending
+		// changes nothing, because the card is the same size every turn. The cause's own sentence
+		// already names the numbers and the actions, so it becomes the message.
+		const playerFacingCause = playerFacingRefusalMessage(reason);
 		const message = identityConflict
 			? `${identityConflict.message}. ${budget.diagnostic()}`
-			: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
+			: playerFacingCause !== undefined
+				? `${playerFacingCause} ${budget.diagnostic()}`
+				: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
 		try {
 			ctx.ui?.notify(message, "error");
 		} catch (error) {

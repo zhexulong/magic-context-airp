@@ -71,6 +71,31 @@ export type GameBuddyAuthoredContextBudgetRefusal = Readonly<{
 }>;
 
 /**
+ * The error this module throws, carrying a message meant for the PLAYER.
+ *
+ * <p>
+ * The distinction matters: Magic Context's ordinary refusal path leads with "could not safely
+ * prepare this turn; send your message again", which is exactly the wrong advice here — resending
+ * changes nothing, because the authored context is the same size every turn. So this error carries
+ * `playerMessage`, and the refusal path leads with THAT when it is present. `code` keeps it
+ * classifiable for a caller that wants to react (a Host problem code, a test), and `budget` carries
+ * the numbers as data so no consumer has to parse English to get them.
+ * </p>
+ */
+export class GameBuddyAuthoredContextOverBudgetError extends Error {
+	readonly code = "gamebuddy_authored_context_over_budget";
+	readonly playerMessage: string;
+	readonly budget: GameBuddyAuthoredContextBudget;
+
+	constructor(refusal: GameBuddyAuthoredContextBudgetRefusal) {
+		super(refusal.message);
+		this.name = "GameBuddyAuthoredContextOverBudgetError";
+		this.playerMessage = refusal.message;
+		this.budget = refusal.budget;
+	}
+}
+
+/**
 	* `Math.ceil(content.length / 4)`, the unit every authored `budgetTokens` already speaks.
 	*
 	* Exported so the caller that materializes sources and this module cannot disagree about it.

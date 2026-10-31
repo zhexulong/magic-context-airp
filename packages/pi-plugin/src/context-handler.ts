@@ -289,6 +289,11 @@ import { detectRecentCommit } from "./detect-recent-commit";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { hasPiFallbackMessageTags } from "./fallback-tag-probes-pi";
 import {
+	GameBuddyAuthoredContextOverBudgetError,
+	authoredTokensForContent,
+	refuseAuthoredContextOverBudget,
+} from "./gamebuddy-authored-context-budget";
+import {
 	__gamebuddyClearAuthoredMaterialization,
 	__gamebuddyReadAuthoredMaterialization,
 	__gamebuddyReadAuthoredVolatileMaterialization,
@@ -5175,6 +5180,40 @@ export function registerPiContextHandler(
 			// One verdict per pass: the pipeline gates its `§N§` prefixes on it, and the
 			// channel accounting below must gate the nudge channels on the same value.
 			const ctxReduceToolActive = isPiCtxReduceToolActive(pi);
+			// Resolve the history budget ONCE, here: it is both an input to the pipeline and one of the
+			// three fixed terms the authored-context guard compares against. Computing it twice would let
+			// the guard reason about a different number than the one the fold actually spends.
+			const historyBudgetTokensForPass = options.injection
+				? resolveHistoryBudgetTokensForPi({
+						historyBudgetPercentage:
+							options.historian?.historyBudgetPercentage,
+					usagePercentage,
+					usageInputTokens,
+					usageContextLimit,
+					executeThresholdPercentage:
+						options.historian?.executeThresholdPercentage,
+					executeThresholdTokens:
+						options.historian?.executeThresholdTokens,
+					modelKey: liveModelBySession.get(sessionId),
+				})
+				: undefined;
+			// The authored half's total bound. This is the seam that has all four terms at once: the
+			// window (`usableSoft`) and the floor from the live envelope, and the history budget just
+			// resolved above. Refusing HERE — before the pipeline, before any storage work, and with a
+			// message that names the authored budget — is what keeps an over-size card from arriving as
+			// `PiStorageBusyError` / `raw_fallback_over_context_limit`, which is indistinguishable from a
+			// disk that would not open.
+			//
+			// Nothing is truncated. The whole authored block is refused; dropping entries to fit would
+			// change what the companion knows without telling anyone.
+			assertAuthoredContextFits({
+				sessionId,
+				db: options.db,
+				ctx,
+				pi,
+				usableSoft: windowGeometry?.usableSoft,
+				historyBudgetTokens: historyBudgetTokensForPass,
+			});
 			const result = await budget.waitMandatory(
 				runPipeline({
 					assertCurrentPass,
@@ -5211,18 +5250,7 @@ export function registerPiContextHandler(
 									liveModelBySession.get(sessionId),
 									options.historian?.executeThresholdTokens,
 								),
-								historyBudgetTokens: resolveHistoryBudgetTokensForPi({
-									historyBudgetPercentage:
-										options.historian?.historyBudgetPercentage,
-									usagePercentage,
-									usageInputTokens,
-									usageContextLimit,
-									executeThresholdPercentage:
-										options.historian?.executeThresholdPercentage,
-									executeThresholdTokens:
-										options.historian?.executeThresholdTokens,
-									modelKey: liveModelBySession.get(sessionId),
-								}),
+								historyBudgetTokens: historyBudgetTokensForPass,
 							}
 						: undefined,
 					entryIds,
@@ -6122,7 +6150,8 @@ export function registerPiContextHandler(
 			// swallow into native-compaction fallthrough.
 			if (
 				(isFailClosedBlockingError(err) ||
-					err instanceof EmergencyFailClosedError) &&
+					err instanceof EmergencyFailClosedError ||
+					err instanceof GameBuddyAuthoredContextOverBudgetError) &&
 				!baseOptions.compactionOff
 			)
 				throw err;
@@ -6385,6 +6414,83 @@ export function selectPiHistorianRunBoundarySnapshot(args: {
 	// consume the exact boundary the fire decision evaluated, falling back only
 	// for recovery paths that did not go through the trigger.
 	return args.triggerBoundarySnapshot ?? args.resolvedBoundarySnapshot;
+}
+
+/**
+ * Refuse the turn when the player's authored context does not fit, naming the authored budget.
+ *
+ * <p>
+ * **Why here, and not only at import.** This runs at prompt-build time, which is the one place all
+ * four terms exist together: the window this request actually has (`usableSoft`, already corrected
+ * for a detected overflow cap and a proven input floor), the floor measured off the live envelope
+ * (`readPiLkgFitEnvelope`, so it is the tools and system prompt THIS turn sends), and the history
+ * budget the fold will spend in the same head. The Host can measure the authored catalogue at
+ * publish time, but it cannot know which model the player will select, what window that model
+ * reports, or what the history budget will be — so a Host-side refusal would have to guess, and
+ * guessing here means refusing cards that fit. Prompt-build time covers every path into a turn,
+ * including ones the Host never sees (a model switched mid-session, an overflow-corrected window).
+ * </p>
+ *
+ * <p>
+ * **What it costs when it cannot answer.** If the envelope is unreadable or the window is unknown,
+ * the comparison is skipped and the turn proceeds exactly as before. That is deliberate: an unknown
+ * window is not evidence the prompt is too large, and refusing on it would reintroduce the same
+ * disguised failure this guard removes — only with a different disguise.
+ * </p>
+ *
+ * <p>
+ * **Nothing is truncated.** The authored block is refused whole. Dropping entries to fit would
+ * change what the companion knows without telling anyone.
+ * </p>
+ */
+function assertAuthoredContextFits(args: {
+	sessionId: string;
+	db: ContextDatabase;
+	ctx: ExtensionContext;
+	pi: ExtensionAPI;
+	usableSoft: number | undefined;
+	historyBudgetTokens: number | undefined;
+}): void {
+	const materialization = __gamebuddyReadAuthoredMaterialization(args.sessionId);
+	if (materialization === undefined) return;
+	let floorTokens: number;
+	try {
+		const envelope = readPiLkgFitEnvelope(
+			args.ctx,
+			args.pi,
+			resolvePiContextModelKey(args.ctx),
+			sessionDecisionCalibration(args.db, args.sessionId),
+		);
+		if (envelope === undefined) return;
+		floorTokens = envelope.systemTokens + envelope.toolDefinitionTokens;
+	} catch {
+		// An unreadable envelope cannot prove the prompt is too large.
+		return;
+	}
+	const authoredTokens =
+		materialization.sources.reduce(
+			(total, source) => total + authoredTokensForContent(source.content),
+			0,
+		) +
+		materialization.volatileSources.reduce(
+			(total, source) => total + authoredTokensForContent(source.content),
+			0,
+		);
+	const refusal = refuseAuthoredContextOverBudget(
+		{
+			usableSoft: args.usableSoft ?? 0,
+			floorTokens,
+			historyBudgetTokens: args.historyBudgetTokens ?? 0,
+		},
+		authoredTokens,
+	);
+	if (refusal === undefined) return;
+	sessionLog(
+		args.sessionId,
+		`authored context refused: authored=${refusal.budget.authoredTokens} budget=${refusal.budget.authoredBudgetTokens} ` +
+			`floor=${refusal.budget.floorTokens} history=${refusal.budget.historyBudgetTokens} window=${refusal.budget.usableSoft}`,
+	);
+	throw new GameBuddyAuthoredContextOverBudgetError(refusal);
 }
 
 export function resolveHistoryBudgetTokensForPi(args: {
