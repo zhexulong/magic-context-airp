@@ -105,6 +105,12 @@ describe("Pi context handler LKG replay", () => {
 				const handler = handlerFor(db, host);
 				// A separate process can release the lock while the main thread waits
 				// synchronously in SQLite. A timer on this thread could not do that.
+				//
+				// The child reports its own failures: COMMIT failing is a real failure (the
+				// lock was never released, so the parent's admission proves nothing), while
+				// a close() that loses a WAL checkpoint race is cleanup noise. Both go to
+				// stderr, which the parent reads and quotes - a bare "writer exit 1" sends
+				// the next reader to the wrong layer.
 				const writer = spawn(
 					process.execPath,
 					[
@@ -112,20 +118,40 @@ describe("Pi context handler LKG replay", () => {
 						`import { Database } from 'bun:sqlite';
 					const db = new Database(${JSON.stringify(path)});
 					db.exec('BEGIN IMMEDIATE'); console.log('locked');
-					setTimeout(() => { db.exec('COMMIT'); db.close(); }, 80);`,
+					setTimeout(() => {
+						try { db.exec('COMMIT'); }
+						catch (error) { console.error('release failed:', error); process.exitCode = 1; }
+						finally { try { db.close(); } catch (error) { console.error('close failed:', error); } }
+					}, 80);`,
 					],
 					{ stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
 				);
+				let writerStderr = "";
+				writer.stderr.setEncoding("utf8");
+				writer.stderr.on("data", (chunk: string) => {
+					writerStderr += chunk;
+				});
+				const writerFailure = (detail: string): Error =>
+					new Error(`${detail}${writerStderr.trim() ? `: ${writerStderr.trim()}` : " (no stderr output)"}`);
 				const exited = new Promise<void>((resolve, reject) => {
 					writer.once("error", reject);
-					writer.once("exit", (code) =>
-						code === 0 ? resolve() : reject(new Error(`writer exit ${code}`)),
+					writer.once("exit", (code, signal) =>
+						code === 0
+							? resolve()
+							: reject(
+									writerFailure(
+										`writer exited with code ${code}${signal ? ` (signal ${signal})` : ""}`,
+									),
+								),
 					);
 				});
 				try {
+					// A child that dies before printing "locked" must fail here with its
+					// stderr, not park the test until the harness timeout.
 					await new Promise<void>((resolve, reject) => {
 						writer.stdout.once("data", () => resolve());
 						writer.once("error", reject);
+						void exited.catch(reject);
 					});
 					const raw = [userMessage(`first turn ${trial}`, 1)];
 					const ctx = fakeContext(sessionId, dir, ["entry-1"], raw);
