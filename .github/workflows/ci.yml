@@ -83,6 +83,7 @@ jobs:
           bun run --cwd packages/retina-local-fs lint
 
       - name: Build
+        id: build
         run: |
           bun run --cwd packages/plugin build
           bun run --cwd packages/cli build
@@ -101,6 +102,15 @@ jobs:
         run: bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
 
       - name: Test
+        id: test
+        # A failing gate above must not make this suite disappear. Across four
+        # consecutive runs the job stopped three times at the golden-drift step
+        # and once at Lint, so the job reported "failure" while not one
+        # assertion of packages/plugin ran, and "no test failures reported"
+        # read as "tests pass". `!cancelled()` (not `always()`) keeps the suite
+        # running after any earlier failure without spending a runner on a run
+        # that is being cancelled.
+        if: ${{ !cancelled() }}
         # Keep CLI and retina coverage here, but let check-pi-plugin own Pi's
         # normal/assertion pair rather than fanning out through the root script.
         run: |
@@ -109,6 +119,9 @@ jobs:
           bun run --cwd packages/retina-local-fs test
 
       - name: Test (debug assertions)
+        id: test_assertions
+        # A red normal lane must not suppress the assertion lane's own verdict.
+        if: ${{ !cancelled() }}
         env:
           MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
         # Keep each package's existing assertion-lane timeout; the root command
@@ -152,6 +165,39 @@ jobs:
       - name: Smoke (tokenizer packaged install estimate)
         run: bun packages/plugin/scripts/smoke-tokenizer-pack-install.ts --skip-build
 
+      # The two suites above are immune to a failing gate; this makes their
+      # outcome readable from the run summary itself, because "the job said
+      # failure" is what let a never-run suite read as a passing one for four
+      # consecutive runs. `steps.<id>.outcome` is empty for a step that never
+      # started, so an absent suite prints "did not run" rather than a blank
+      # cell, and a skipped one prints "skipped".
+      - name: Record suite outcomes
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          ASSERTIONS_OUTCOME: ${{ steps.test_assertions.outcome }}
+        run: |
+          {
+            echo "### Check (plugin) - suite outcomes"
+            echo
+            echo "| step | outcome |"
+            echo "| --- | --- |"
+            echo "| Build | ${BUILD_OUTCOME:-did not run} |"
+            echo "| Test | ${TEST_OUTCOME:-did not run} |"
+            echo "| Test (debug assertions) | ${ASSERTIONS_OUTCOME:-did not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Enforces the property the two suites rely on: a suite that did not run is
+      # not a pass. Unreachable while they carry `!cancelled()`; if a later edit
+      # re-gates a suite behind an earlier step, this fails with a named cause
+      # instead of leaving the job to say "failure" with no suite result at all.
+      - name: A suite that did not run is not a pass
+        if: ${{ !cancelled() && (steps.test.outcome == '' || steps.test.outcome == 'skipped' || steps.test_assertions.outcome == '' || steps.test_assertions.outcome == 'skipped') }}
+        run: |
+          echo "::error::a Test step did not run in this job; 'failure' with no suite result must never read as 'the suite passed'"
+          exit 1
+
   check-pi-plugin:
     name: Check (pi-plugin)
     runs-on: ubuntu-latest
@@ -172,17 +218,51 @@ jobs:
         run: bun run --cwd packages/pi-plugin lint
 
       - name: Build
+        id: build
         run: bun run --cwd packages/pi-plugin build
 
       - name: Test
+        id: test
+        # A failing typecheck, lint or build above must not make the suite
+        # disappear; see Check (plugin) for how that read for four runs.
+        if: ${{ !cancelled() }}
         run: bun run --cwd packages/pi-plugin test
 
       - name: Test (debug assertions)
+        id: test_assertions
+        # A red normal lane must not suppress the assertion lane's own verdict.
+        if: ${{ !cancelled() }}
         env:
           MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
         # Run serially so full-content assertion walks do not compete with Pi's
         # full-runtime tests, whose existing per-test budgets remain 15 seconds.
         run: bun run --cwd packages/pi-plugin test --parallel=1 --timeout=60000
+
+      # Visible suite outcome, for the reason given in Check (plugin).
+      - name: Record suite outcomes
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          ASSERTIONS_OUTCOME: ${{ steps.test_assertions.outcome }}
+        run: |
+          {
+            echo "### Check (pi-plugin) - suite outcomes"
+            echo
+            echo "| step | outcome |"
+            echo "| --- | --- |"
+            echo "| Build | ${BUILD_OUTCOME:-did not run} |"
+            echo "| Test | ${TEST_OUTCOME:-did not run} |"
+            echo "| Test (debug assertions) | ${ASSERTIONS_OUTCOME:-did not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Enforces the property the two suites rely on: unreachable while they
+      # carry `!cancelled()`, loud if a later edit re-gates one of them.
+      - name: A suite that did not run is not a pass
+        if: ${{ !cancelled() && (steps.test.outcome == '' || steps.test.outcome == 'skipped' || steps.test_assertions.outcome == '' || steps.test_assertions.outcome == 'skipped') }}
+        run: |
+          echo "::error::a Test step did not run in this job; 'failure' with no suite result must never read as 'the suite passed'"
+          exit 1
 
   check-dashboard:
     name: Check (dashboard)
@@ -203,16 +283,49 @@ jobs:
       # ConfigEditor coverage manifest doesn't account for, so the form can't
       # silently drift out of sync with the schema again.
       - name: TypeScript typecheck
+        id: typecheck
         run: bun run --cwd packages/dashboard typecheck
 
       - name: Lint
+        id: lint
         run: bun run --cwd packages/dashboard lint
 
       - name: Test
+        id: test
+        # The schema-parity gate below is this job's point, and a typecheck or
+        # lint failure above used to skip it: the job then said "failure" and
+        # nothing in the run named whether config-parity ran at all.
+        if: ${{ !cancelled() }}
         run: bun run --cwd packages/dashboard test
 
       - name: Build (frontend)
         run: bun run --cwd packages/dashboard build
+
+      # Visible suite outcome, for the reason given in Check (plugin).
+      - name: Record suite outcomes
+        if: always()
+        env:
+          TYPECHECK_OUTCOME: ${{ steps.typecheck.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          {
+            echo "### Check (dashboard) - suite outcomes"
+            echo
+            echo "| step | outcome |"
+            echo "| --- | --- |"
+            echo "| TypeScript typecheck | ${TYPECHECK_OUTCOME:-did not run} |"
+            echo "| Lint | ${LINT_OUTCOME:-did not run} |"
+            echo "| Test | ${TEST_OUTCOME:-did not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Enforces the property the suite relies on: unreachable while it carries
+      # `!cancelled()`, loud if a later edit re-gates it.
+      - name: A suite that did not run is not a pass
+        if: ${{ !cancelled() && (steps.test.outcome == '' || steps.test.outcome == 'skipped') }}
+        run: |
+          echo "::error::the dashboard test suite did not run in this job; 'failure' with no suite result must never read as 'the suite passed'"
+          exit 1
 
   e2e-opencode:
     name: E2E (OpenCode, Docker)
@@ -500,6 +613,7 @@ jobs:
         run: bun run --cwd packages/plugin build
 
       - name: Run host e2e suite (OpenCode 2 tests from mode manifest)
+        id: suite_manifest
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
@@ -516,6 +630,11 @@ jobs:
       # These long-lived dual-host fixtures manipulate separate throwaway stores,
       # but run sequentially to avoid contending with one another's live hosts.
       - name: Run OC2 conversion and marker regressions
+        id: suite_conversion
+        # The manifest suite above is not a prerequisite of these fixtures (both
+        # drive the plugin build and GA host already prepared above), so its
+        # failure must not decide whether this lane reports at all.
+        if: ${{ !cancelled() }}
         env:
           NODE_ENV: ""
           MC_E2E_MODE: ts
@@ -524,6 +643,23 @@ jobs:
           cd packages/e2e-tests
           bun test --timeout 600000 tests/opencode2/store-generation-conversion.test.ts
           bun test --timeout 600000 tests/opencode2/marker-s3-runtime.test.ts
+
+      # This job holds two suites, so a red one must still say what the other
+      # did; same reason and same shape as Check (plugin)'s table.
+      - name: Record suite outcomes
+        if: always()
+        env:
+          MANIFEST_OUTCOME: ${{ steps.suite_manifest.outcome }}
+          CONVERSION_OUTCOME: ${{ steps.suite_conversion.outcome }}
+        run: |
+          {
+            echo "### E2E (OpenCode 2.0.22, host behavior) - suite outcomes"
+            echo
+            echo "| step | outcome |"
+            echo "| --- | --- |"
+            echo "| Run host e2e suite (OpenCode 2 tests from mode manifest) | ${MANIFEST_OUTCOME:-did not run} |"
+            echo "| Run OC2 conversion and marker regressions | ${CONVERSION_OUTCOME:-did not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   e2e-host-omp:
     name: E2E (Oh My Pi, host behavior)
@@ -634,11 +770,13 @@ jobs:
           timeout 180s python3 scripts/check-cargo-path-dependencies.py --self-test
 
       - name: Format check
+        id: format_check
         run: cargo fmt --check
 
       # --all-targets puts the integration tests under crates/*/tests through clippy
       # too; a lib-only lint cannot see them.
       - name: Clippy
+        id: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # `cargo test -p mc-module` runs the lib unit tests AND every integration test
@@ -646,10 +784,45 @@ jobs:
       # the other cross-crate behaviour proofs live. Naming the package (not --lib)
       # is the whole point of this step.
       - name: Test mc-module (lib + integration targets)
+        id: test_mc_module
+        # A format or clippy finding above must not stand in for the test result:
+        # both are quality gates over code `cargo test` builds for itself.
+        if: ${{ !cancelled() }}
         run: cargo test -p mc-module
 
       - name: Test the remaining workspace crates
+        id: test_workspace
+        # One red crate package must not hide the other's verdict.
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --exclude mc-module
+
+      # Visible suite outcome, for the reason given in Check (plugin).
+      - name: Record suite outcomes
+        if: always()
+        env:
+          FORMAT_OUTCOME: ${{ steps.format_check.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
+          TEST_MC_MODULE_OUTCOME: ${{ steps.test_mc_module.outcome }}
+          TEST_WORKSPACE_OUTCOME: ${{ steps.test_workspace.outcome }}
+        run: |
+          {
+            echo "### Rust (crates) - suite outcomes"
+            echo
+            echo "| step | outcome |"
+            echo "| --- | --- |"
+            echo "| Format check | ${FORMAT_OUTCOME:-did not run} |"
+            echo "| Clippy | ${CLIPPY_OUTCOME:-did not run} |"
+            echo "| Test mc-module (lib + integration targets) | ${TEST_MC_MODULE_OUTCOME:-did not run} |"
+            echo "| Test the remaining workspace crates | ${TEST_WORKSPACE_OUTCOME:-did not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Enforces the property both suites rely on: unreachable while they carry
+      # `!cancelled()`, loud if a later edit re-gates one of them.
+      - name: A suite that did not run is not a pass
+        if: ${{ !cancelled() && (steps.test_mc_module.outcome == '' || steps.test_mc_module.outcome == 'skipped' || steps.test_workspace.outcome == '' || steps.test_workspace.outcome == 'skipped') }}
+        run: |
+          echo "::error::a cargo test step did not run in this job; 'failure' with no suite result must never read as 'the suite passed'"
+          exit 1
 
   e2e-rust-hermetic-build:
     name: E2E (Rust hermetic build)
