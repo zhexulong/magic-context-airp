@@ -1,10 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { injectM0M1Pi } from "./inject-compartments-pi";
 import {
 	PROBE_FOLD_COMMITTED_PREFIX,
@@ -127,7 +127,9 @@ describe("Class B memory-probe marker emission", () => {
 
 	it("does NOT emit a fold marker for a HARD re-render that folds no compartment", () => {
 		const db = createTestDb();
-		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-marker-modelchange-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-marker-modelchange-"),
+		);
 		try {
 			const state = {
 				...piState("ses-marker-modelchange", cwd),

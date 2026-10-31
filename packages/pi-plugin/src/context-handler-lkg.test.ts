@@ -132,7 +132,9 @@ describe("Pi context handler LKG replay", () => {
 					writerStderr += chunk;
 				});
 				const writerFailure = (detail: string): Error =>
-					new Error(`${detail}${writerStderr.trim() ? `: ${writerStderr.trim()}` : " (no stderr output)"}`);
+					new Error(
+						`${detail}${writerStderr.trim() ? `: ${writerStderr.trim()}` : " (no stderr output)"}`,
+					);
 				const exited = new Promise<void>((resolve, reject) => {
 					writer.once("error", reject);
 					writer.once("exit", (code, signal) =>

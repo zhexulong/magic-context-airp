@@ -2,13 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { MemoryCommandFacade } from "@magic-context/core/features/magic-context/memory/command-facade";
 import { openDatabaseAsync } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	_resetHarnessForTesting,
 	setDeclaredProjectIdentity,
 } from "@magic-context/core/shared/harness";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { createGameBuddyPlayerMemoryCrudFacade } from "./gamebuddy-player-memory-crud-facade";
 import { resolveGameBuddyMemoryProjectPath } from "./gamebuddy-player-memory-read-projection";
 
@@ -45,7 +45,9 @@ describe("resolveGameBuddyMemoryProjectPath with a declared partition", () => {
 		// bare relative name that resolves inside the checked-out repository, so
 		// the identity resolver finds an ancestor `.git` and rethrows instead of
 		// falling back to a directory identity.
-		root = createTestTempDirFromPath(join(tmpdir(), "gamebuddy-memory-declared-"));
+		root = createTestTempDirFromPath(
+			join(tmpdir(), "gamebuddy-memory-declared-"),
+		);
 		const declared = resolveGameBuddyMemoryProjectPath(root, "continuity_x");
 		setDeclaredProjectIdentity(declared);
 		expect(resolveGameBuddyMemoryProjectPath(root, "continuity_x")).toBe(
@@ -58,7 +60,9 @@ describe("resolveGameBuddyMemoryProjectPath with a declared partition", () => {
 		);
 	});
 	test("writes land under the declared path, not a doubled one", async () => {
-		root = createTestTempDirFromPath(join(tmpdir(), "gamebuddy-memory-crud-declared-"));
+		root = createTestTempDirFromPath(
+			join(tmpdir(), "gamebuddy-memory-crud-declared-"),
+		);
 		const before = resolveGameBuddyMemoryProjectPath(root, continuityId);
 		setDeclaredProjectIdentity(before);
 		const facade = createGameBuddyPlayerMemoryCrudFacade({
@@ -133,7 +137,9 @@ describe("GameBuddy player Memory CRUD facade", () => {
 	});
 
 	test("tells the player's own writing apart from what the companion remembers", async () => {
-		root = createTestTempDirFromPath(join(tmpdir(), "gamebuddy-memory-crud-authorship-"));
+		root = createTestTempDirFromPath(
+			join(tmpdir(), "gamebuddy-memory-crud-authorship-"),
+		);
 		// The panel's create: the player types a memory of their own. The durable row cannot say so in
 		// `sourceType` (the store reserves "user" and `insertMemory` refuses it from every path that is
 		// not the unimplemented dashboard entry), so the store's player-authority stamp is what answers.
@@ -174,7 +180,9 @@ describe("GameBuddy player Memory CRUD facade", () => {
 	});
 
 	test("isolates continuities and omits unrelated vendor categories from the player projection", async () => {
-		root = createTestTempDirFromPath(join(tmpdir(), "gamebuddy-memory-crud-isolation-"));
+		root = createTestTempDirFromPath(
+			join(tmpdir(), "gamebuddy-memory-crud-isolation-"),
+		);
 		const databasePath = join(
 			root,
 			"data",
@@ -222,7 +230,9 @@ describe("GameBuddy player Memory CRUD facade", () => {
 	});
 
 	test("rejects a second write using the stale vendor state token", async () => {
-		root = createTestTempDirFromPath(join(tmpdir(), "gamebuddy-memory-crud-cas-"));
+		root = createTestTempDirFromPath(
+			join(tmpdir(), "gamebuddy-memory-crud-cas-"),
+		);
 		const facade = createGameBuddyPlayerMemoryCrudFacade({
 			continuityId,
 			runtimeCwd: root,
@@ -252,7 +262,9 @@ describe("GameBuddy player Memory CRUD facade", () => {
 	});
 
 	test("validates profile binding and rejects mismatched profile operations", async () => {
-		root = createTestTempDirFromPath(join(tmpdir(), "gamebuddy-memory-crud-profile-"));
+		root = createTestTempDirFromPath(
+			join(tmpdir(), "gamebuddy-memory-crud-profile-"),
+		);
 		const validProfile = {
 			continuityId,
 			runtimeCwd: root,

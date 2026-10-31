@@ -1032,7 +1032,9 @@ describe("ongoing-interaction read-only injection", () => {
 	it("renders same-project Semantic Memory and Interaction Episode rows, never unrelated or coding rows", () => {
 		const db = createTestDb();
 		const ownCwd = createTestTempDirFromPath(join(tmpdir(), "pi-ongoing-own-"));
-		const otherCwd = createTestTempDirFromPath(join(tmpdir(), "pi-ongoing-other-"));
+		const otherCwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-ongoing-other-"),
+		);
 		try {
 			const own = piState("ses-ongoing-own", ownCwd);
 			const other = piState("ses-ongoing-other", otherCwd);
@@ -2025,7 +2027,9 @@ describe("injectM0M1Pi", () => {
 
 	it("refreshes externally committed Memory before a provider invocation without folding m[0]", () => {
 		const db = createTestDb();
-		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-m1-external-memory-"));
+		const cwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-m1-external-memory-"),
+		);
 		try {
 			const state = piState("ses-pi-m1-external-memory", cwd);
 			const first = [userMessage("hello", 10)];
@@ -2053,7 +2057,9 @@ describe("injectM0M1Pi", () => {
 
 	it("refreshes a player mutation across separate Chat and Game sessions on their next provider invocations", () => {
 		const db = createTestDb();
-		const sharedCwd = createTestTempDirFromPath(join(tmpdir(), "pi-cross-surface-memory-"));
+		const sharedCwd = createTestTempDirFromPath(
+			join(tmpdir(), "pi-cross-surface-memory-"),
+		);
 		const foreignCwd = createTestTempDirFromPath(
 			join(tmpdir(), "pi-cross-surface-memory-foreign-"),
 		);
@@ -3886,7 +3892,9 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 
 	it("chapter block never decays or truncates under budget pressure", () => {
 		const db = createTestDb();
-		const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-chapters-budget-"));
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-chapters-budget-"),
+		);
 		try {
 			const state = {
 				...stateFor(dir),
@@ -3916,7 +3924,9 @@ describe("chapter rollup m[0] rendering (AIRP fork v1)", () => {
 
 	it("reads chapters by continuity, not by session: a new session under the same continuity sees the history, another continuity never does", () => {
 		const db = createTestDb();
-		const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-chapters-scope-"));
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-chapters-scope-"),
+		);
 		// The chapter-only lines of a rendered m[0] (compartment headings never
 		// start with this prefix), so a marker cannot pass on decayed bytes.
 		const chapterLines = (m0: string) =>
