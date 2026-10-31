@@ -2341,17 +2341,11 @@ export const MIGRATIONS: Migration[] = [
         description: "make managed-write privilege connection-local",
         up(db: Database): void {
             // Guard triggers must never consult a persistent flag: a crashed or second
-            // connection must not inherit permission to write module-owned rows.
+            // connection must not inherit permission to write module-owned rows. The predicate
+            // is the durable state-table form unconditionally — see authorityPrivilegeCheck.
             const memoriesPresent = tableExists(db, "memories");
             const notesPresent = tableExists(db, "notes");
-            const native = db as unknown as {
-                function?: unknown;
-                createFunction?: unknown;
-            };
-            const privilegeCheck =
-                typeof native.function === "function" || typeof native.createFunction === "function"
-                    ? "mc_privileged_writer() = 0"
-                    : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
+            const privilegeCheck = authorityPrivilegeCheck();
             if (memoriesPresent) {
                 db.exec(`
                     DROP TRIGGER IF EXISTS memories_authority_guard_insert;
