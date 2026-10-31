@@ -27,6 +27,7 @@ import {
     setStoragePrivatePermissionEnforcement,
 } from "../../shared/storage-permissions";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { V95_REDUNDANT_INDEXES } from "./migration-v95-perf-indexes";
 import { FORK_MIGRATIONS } from "./migrations";
 import {
     __resetRpcDiscoveryFsForTests,
@@ -1624,5 +1625,41 @@ describe("RPC discovery records whose PIDs were reused", () => {
         expect(result.failed).toEqual([{ file: outside, error: "not an RPC discovery record" }]);
         expect(existsSync(outside)).toBe(true);
         expect(existsSync(record)).toBe(false);
+    });
+});
+
+describe("context.db base DDL", () => {
+    it("creates no index that the v95 installer drops in the same open", () => {
+        // The v95 cut retires seven prefix indexes and the installer drops them at
+        // the end of the same open. Writing any of them into the base DDL buys a
+        // CREATE INDEX over a populated table on every database open, only for the
+        // next statement to drop it - the exact cost v95 shipped to remove. The
+        // final schema is identical either way, so only the executed statements
+        // show it.
+        const db = new Database(":memory:");
+        const executed: string[] = [];
+        const nativeExec = db.exec.bind(db);
+        Object.defineProperty(db, "exec", {
+            configurable: true,
+            writable: true,
+            value: (sql: string) => {
+                executed.push(sql);
+                return nativeExec(sql);
+            },
+        });
+        try {
+            initializeDatabase(db);
+            // An empty capture would satisfy the assertion below without watching
+            // anything, so prove this open did execute index DDL.
+            expect(executed.some((sql) => /CREATE\s+(?:UNIQUE\s+)?INDEX/i.test(sql))).toBe(true);
+            const created = V95_REDUNDANT_INDEXES.filter((name) =>
+                executed.some((sql) =>
+                    new RegExp(`CREATE\\s+(?:UNIQUE\\s+)?INDEX[^;]*\\b${name}\\b`, "i").test(sql),
+                ),
+            );
+            expect(created).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
     });
 });

@@ -2000,7 +2000,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
     END;
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session_tag_id ON pending_ops(session_id, tag_id);
-    CREATE INDEX IF NOT EXISTS idx_source_contents_session ON source_contents(session_id);
     CREATE TABLE IF NOT EXISTS recomp_compartments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       session_id TEXT NOT NULL,
