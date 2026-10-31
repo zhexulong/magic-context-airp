@@ -20,6 +20,21 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The one Bun every job installs: the setup-bun steps below read this value
+  # instead of each naming a version. It is package.json's `packageManager` pin
+  # (`bun@1.4.2`), the repository's declared toolchain - mutations.yml and
+  # tests/docker/Dockerfile.e2e-host read the same pin, for the same reason -
+  # so move them together.
+  #
+  # It pinned nothing before: every job asked for `latest`, which moved 1.4.2 to
+  # 1.4.4 between two consecutive runs and changed behaviour with no commit to
+  # point at. Bun 1.4.4 provides `createFunction`, that lit a capability branch
+  # in migration 55, and the migration then emitted a trigger calling an
+  # unregistered UDF - "no such function: mc_privileged_writer" - on every
+  # connection that did not register it. The same suite passed on one run and
+  # failed on the next, and nothing in the repository said which version it was
+  # meant to run.
+  BUN_VERSION: 1.4.2
 
 # Pipeline shape on every push to master/main:
 #
@@ -59,7 +74,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       # node:sqlite (the Pi / OpenCode-Desktop SQLite backend) is only reachable
       # under Node, not Bun. Node 24 also strips the smoke script's inline TS.
@@ -206,7 +221,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -272,7 +287,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -336,7 +351,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -369,7 +384,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile
@@ -389,7 +404,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -426,7 +441,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -462,7 +477,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install workspace deps
         run: bun install --frozen-lockfile
@@ -529,7 +544,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       # Pi tests resolve the Pi binary via createRequire against
       # @earendil-works/pi-coding-agent, which is a workspace dep of
@@ -588,7 +603,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       # The OpenCode 2 harness spawns the real GA host from @opencode/cli, a
       # workspace dev dependency whose postinstall unpacks the platform binary
@@ -671,7 +686,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       # OMP runs the same Pi plugin through Pi's extension API; the harness
       # resolves @oh-my-pi/pi-coding-agent (a workspace dev dependency) when
@@ -729,7 +744,7 @@ jobs:
       # The hostless-store integration test provisions context.db through the CLI.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install CLI dependencies
         run: bun install --frozen-lockfile
@@ -839,7 +854,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Resolve Cargo.lock crate pins
         id: cargo-pins
@@ -942,7 +957,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: ${{ env.BUN_VERSION }}
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
