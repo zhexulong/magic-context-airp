@@ -1239,33 +1239,21 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						: validatedPass.kind === "spawn-failed"
 							? `subagent run failed (${validatedPass.reason}): ${validatedPass.error}`
 							: "historian returned no usable text";
-				// A window refusal here comes from a fallback model (the primary was
-				// fitted above). Treat it like any other failed pass: count it, notify,
-				// and keep the reserved drain budget spent even though nothing was
-				// dispatched, so the next trigger does not retry at once.
+				// A window refusal can still arrive here after the primary prompt was
+				// fitted above: the dispatch guard resolves the window again, and a
+				// fallback model is never fitted at all. Such a refusal is an ordinary
+				// counted failure - counted, surfaced, and keeping the reserved drain
+				// budget as a throttle, so the next trigger does not retry at once.
 				if (
 					!producerDispatched &&
 					!PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(errorMsg)
 				)
 					retainDrainReservationForRetryThrottle = false;
-				if (
-					!producerDispatched &&
-					PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(errorMsg)
-				) {
-					retainDrainReservationForRetryThrottle = false;
-					rollbackDrainReservation();
-					sessionLog(
-						sessionId,
-						`historian producer admission refused: ${errorMsg}`,
-					);
-					// The run failed for a known reason, so the row must carry it: this path logs the reason and
-					// then left the telemetry at its default, which recorded `failed` with a NULL reason and made
-					// the embedded historian's real failure undiagnosable (measured 2026-10-08).
-					telemetry.status = "failed";
-					telemetry.failureReason = `producer admission refused: ${errorMsg}`;
-					return;
-				}
 				sessionLog(sessionId, `historian failure: ${errorMsg}`);
+				// The run failed for a known reason, so the row must carry it: this path
+				// logged the reason and then left the telemetry at its default, which
+				// recorded `failed` with a NULL reason and made the embedded historian's
+				// real failure undiagnosable (measured 2026-10-08).
 				telemetry.status = "failed";
 				telemetry.failureReason = errorMsg;
 				{

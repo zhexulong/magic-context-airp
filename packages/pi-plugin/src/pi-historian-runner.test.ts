@@ -1707,4 +1707,59 @@ describe("Pi historian prompt sized to the producer window", () => {
 			closeQuietly(db);
 		}
 	});
+
+	it("counts a window refusal the dispatch guard makes after the prompt fitted", async () => {
+		// The host registry can report a narrower window at dispatch than the one
+		// the prompt was fitted to. Nothing is dispatched in that case, and the
+		// refusal is still a historian failure: it is counted, surfaced, and keeps
+		// the reserved drain budget as a throttle, so the next trigger backs off
+		// instead of retrying at once.
+		const db = createTestDb();
+		const holderId = "dispatch-refusal-holder";
+		expect(
+			acquireCompartmentLease(db, "ses-historian", holderId),
+		).not.toBeNull();
+		const notices: string[] = [];
+		const runner = runnerReturning([successXml()]);
+		let windowReads = 0;
+		clearPiHistorianAlertState("ses-historian");
+		await runPiHistorian({
+			db,
+			sessionId: "ses-historian",
+			directory: process.cwd(),
+			provider: { readMessages: () => rawMessages() },
+			runner,
+			historianModel: "test/model",
+			historianChunkTokens: 20_000,
+			producerContextLimits: new Map([["test/model", 200_000]]),
+			// The first read sizes the historian budget and the second fits the
+			// prompt; both see the wide window. The dispatch guard then resolves a
+			// narrow one, where the fitted prompt no longer fits.
+			resolveHostContextLimit: () => {
+				windowReads += 1;
+				return windowReads <= 2 ? 200_000 : 40_000;
+			},
+			maxOutputTokens: 8_000,
+			retryBackoffMs: () => 0,
+			notifyIssue: async (message) => {
+				notices.push(message);
+			},
+			compartmentLeaseHolderId: holderId,
+		});
+		try {
+			expect(runner.run).not.toHaveBeenCalled();
+			const failure = getHistorianFailureState(db, "ses-historian");
+			expect(failure.failureCount).toBe(1);
+			expect(failure.lastError).toContain("producer_prompt_exceeds_window");
+			expect(notices).toHaveLength(1);
+			expect(
+				loadProtectedTailMeta(db, "ses-historian").protectedTailDrainTokens,
+			).toBeGreaterThan(0);
+			expect(
+				loadProtectedTailMeta(db, "ses-historian").historianDrainFailureAt,
+			).toBeGreaterThan(0);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 });
