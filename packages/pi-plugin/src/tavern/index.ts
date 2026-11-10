@@ -20,6 +20,12 @@ export {
 } from "../gamebuddy-stable-context-source";
 
 export {
+	clearGameBuddyPresetSegments,
+	type GameBuddyPresetAssembly,
+	type GameBuddyPresetSegmentsPublication,
+	publishGameBuddyPresetSegments,
+} from "../gamebuddy-preset-segments-source";
+export {
 	appendPostHistoryInstructions,
 	MAX_POST_HISTORY_INSTRUCTIONS_BYTES,
 	renderPostHistoryInstructions,

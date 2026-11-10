@@ -188,6 +188,7 @@ import {
 	unregisterPiProjectEmbeddings,
 } from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
+import { __gamebuddyReadPresetSegments } from "./gamebuddy-preset-segments-source";
 import { schedulePiAssistantIndexOnMessageEnd } from "./message-end-index-pi";
 import {
 	describeInertEmergencyDrainLatch,
@@ -1904,11 +1905,21 @@ async function startPiMagicContextRuntime(
 			PI_HARNESS_KIND,
 			activeModelRegistry,
 		);
+		// The Host's rendered preset segments, read per pass rather than memoized with the project's
+		// config: the Host republishes when the player binds, unbinds or edits the preset in force, and
+		// the seam's call site requires BOTH fields, so an absent publication assembles nothing.
+		const presetSegments = __gamebuddyReadPresetSegments(dir);
 		return {
 			...project.contextOptions,
 			historian,
 			cacheTtlConfig: sampled.cache_ttl,
 			cacheTtlConfigured: sampled.cacheTtlConfigured,
+			...(presetSegments === undefined
+				? {}
+				: {
+						presetSegments: presetSegments.segments,
+						assemblePresetSegments: presetSegments.assemble,
+					}),
 		};
 	}
 
