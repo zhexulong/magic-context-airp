@@ -24,6 +24,7 @@ export {
 	type GameBuddyPresetAssembly,
 	type GameBuddyPresetSegmentsPublication,
 	publishGameBuddyPresetSegments,
+	__gamebuddyReadPresetSegments,
 } from "../gamebuddy-preset-segments-source";
 export {
 	appendPostHistoryInstructions,
