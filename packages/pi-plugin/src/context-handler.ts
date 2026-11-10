@@ -1435,6 +1435,19 @@ export interface PiSchedulerOptions {
 	};
 }
 
+/**
+ * Host-owned SillyTavern preset segments for ONE pass, and the shape the assembly seam is called with.
+ *
+ * The preset is read-only Host data and every preset semantic lives there (marker order, macro
+ * evaluation, depth placement); this type carries only the RENDERED result across the seam, so the
+ * vendor never learns what a preset is, and a Host that renders nothing passes nothing.
+ */
+export type PiPresetSegments = {
+	before: readonly string[];
+	after: readonly string[];
+	depth: readonly { depth: number; content: string }[];
+};
+
 export interface PiContextHandlerOptions {
 	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
 	cacheTtlConfigured?: boolean;
@@ -1525,6 +1538,24 @@ export interface PiContextHandlerOptions {
 		projectDir: string,
 		projectIdentity: string,
 	) => void;
+	/**
+	 * THIS pass's preset segments. Omitted, or omitted alongside `assemblePresetSegments`, the seam is
+	 * not called at all and the served array is byte-identical to a build without it.
+	 */
+	presetSegments?: PiPresetSegments;
+	/**
+	 * The one Host-owned preset-assembly seam. Called once, at the last exit, beside
+	 * `appendPostHistoryInstructions` and for the reason recorded there: m[0]/m[1], the fold, every
+	 * cache key, the tail-hygiene baseline, the LKG snapshot and the token accounting have all
+	 * measured the transcript by then, so preset bytes reach only the array Pi is handed. It runs
+	 * BEFORE the card's closing direction, which must stay the last text of the request.
+	 *
+	 * `prefixHash` is the Host's own statement about the before-block it placed; the vendor never
+	 * reads it.
+	 */
+	assemblePresetSegments?: (
+		input: PiPresetSegments & { messages: readonly unknown[] },
+	) => { messages: unknown[]; prefixHash: string };
 }
 
 /**
@@ -6102,6 +6133,20 @@ export function registerPiContextHandler(
 			}
 			budget.assertOutcome();
 			publishTransformDecision?.();
+			// The Host assembles its preset segments here, at the last exit and for the reason the
+			// closing direction below records: the prefix, the fold, the cache keys, the tail-hygiene
+			// baseline, the LKG snapshot and the token accounting have all measured the transcript by
+			// now, so preset bytes reach only the array Pi is handed. Both fields absent ⇒ nothing runs
+			// and `outputMessages` is the same reference, byte-identical to a build without this seam.
+			const presetAssembly =
+				options.presetSegments && options.assemblePresetSegments
+					? options.assemblePresetSegments({
+							messages: outputMessages,
+							...options.presetSegments,
+						})
+					: undefined;
+			if (presetAssembly)
+				outputMessages = presetAssembly.messages as PiAgentMessage[];
 			// The card's `post_history_instructions` is the ONE block that goes after the
 			// transcript (SillyTavern's depth-0 shape). It is read here, at the last exit, so
 			// it cannot reach m[0]/m[1], the fold, any cache key, the tail-hygiene baseline,
