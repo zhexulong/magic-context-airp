@@ -12,14 +12,17 @@ type PiWireMessage = ContextEvent["messages"][number];
 export const MAX_POST_HISTORY_INSTRUCTIONS_BYTES = 4_096;
 
 /**
- * What the block IS: her author's direction for how she answers, said to her.
+ * The condition the block opens with: WHEN the direction applies, never what it must say.
  *
- * This is the LAST text of the request, so it is the position of greatest weight — and
- * every character spent there is a character the author did not write. The frame is
- * therefore SHORTER than the direction it introduces, and all it does is name whose the
- * direction is. It carries no permission: a shipped card fixes the pronouns, the sentence
- * length and what may not appear, so a frame that told her the words were hers to choose
- * would contradict the card from the strongest position in the request.
+ * This is the LAST text of the request, so it is the position of greatest weight — and every
+ * character spent there is a character the author did not write. The frame is therefore
+ * SHORTER than the direction it introduces, and all it does is name the OCCASION: the turns
+ * in which she answers her partner. It carried no permission before this line and it carries
+ * no CONDUCT after it. "During chores, stay focused on work without commentary" is a rule
+ * about how she behaves, and a wrapper that wrote it there would be the product speaking
+ * behaviour at the strongest position in the request - the preset's job and the card's, never
+ * a frame's. What the frame states is a CONDITION ON SPEAKING (guidance for the turns that
+ * are answers); the author's prose, carried verbatim below it, is what governs the answering.
  *
  * What it points at is the WHOLE of how she answers, never one clause of it. An imported
  * `post_history_instructions` is a performance contract — narration kept in first person,
@@ -27,7 +30,7 @@ export const MAX_POST_HISTORY_INSTRUCTIONS_BYTES = 4_096;
  * only then how a reply lands. A frame that scoped itself to "the ending" would demote every
  * line before the last one to advice she may drop.
  */
-const FRAME_OPENING = "Your author's direction for how you answer.";
+const FRAME_OPENING = "Guidelines when speaking to your partner:";
 
 /**
  * The floor the frame may never omit, stated in ONE clause.

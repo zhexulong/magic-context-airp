@@ -60,21 +60,27 @@ LKG snapshot, the token accounting and every cache key:
 * `role: "user"`, because `pi-ai`'s `resolveTranscript` collapses later `system`
   entries into the LEADING system message on transports without
   mid-conversation system messages, which would hoist the block to the head;
-* framed as her author's direction, said TO her and licensing nothing: "Your
-  author's direction for how you answer." — with a one-clause floor ("Nothing
-  here overrides what already holds.") rather than a precedence contest. The
-  frame is 85 characters against the shipped card's 112-character direction, so
-  the author's words dominate the block they are wrapped in; every character the
-  frame took there would be one the author did not write. It offers no
-  permission: the shipped card fixes pronouns, sentence length and what may not
-  appear, so a frame calling the words hers to choose would contradict the card
-  from the strongest position in the request. The opening names the whole of how
-  she answers and never "the ending": an imported directive is a performance
-  contract, and a frame scoped to the last clause would demote its narration,
-  embodiment, pacing and address rules to advice she may drop. The block is the
-  last text of the request, so it may not describe her in the third person (a
-  card may forbid exactly that) and may not name prompts, systems or a runtime
-  (the product floor forbids it);
+* framed as the CONDITION the direction applies to, never as a disposition and
+  never as conduct: "Guidelines when speaking to your partner:" — with a
+  one-clause floor ("Nothing here overrides what already holds.") rather than a
+  precedence contest. The frame may now carry a *condition on speaking*; it
+  still carries no conduct. "There is a direction about answering, so answer" is
+  what a disposition says to a model, and it is why the opening was reworded; a
+  rule about how she behaves ("during chores stay focused on work") would be the
+  product writing behaviour at the last position of the request, which belongs
+  to the preset and to the card, not to a wrapper. The frame is one line of 43
+  characters plus a 43-character floor, and it does not grow with the direction:
+  the author's prose is carried verbatim and is what governs the answering, so
+  every character the frame took there would be one the author did not write.
+  It offers no permission: the shipped card fixes pronouns, sentence length and
+  what may not appear, so a frame calling the words hers to choose would
+  contradict the card from the strongest position in the request. The opening
+  names the whole of how she answers and never "the ending": an imported
+  directive is a performance contract, and a frame scoped to the last clause
+  would demote its narration, embodiment, pacing and address rules to advice she
+  may drop. The block is the last text of the request, so it may not describe her
+  in the third person (a card may forbid exactly that) and may not name prompts,
+  systems or a runtime (the product floor forbids it);
 * absent for a card that declares nothing: the served array is byte-identical to
   the array without this feature.
 

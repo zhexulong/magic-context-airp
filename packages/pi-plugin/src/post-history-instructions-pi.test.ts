@@ -60,9 +60,9 @@ describe("appendPostHistoryInstructions", () => {
 		expect(text.split(INSTRUCTIONS)).toHaveLength(2);
 	});
 
-	it("names the direction as her author's, addressed to her, and licenses nothing", () => {
+	it("states the condition the direction applies to, and carries no conduct", () => {
 		const text = renderPostHistoryInstructions(INSTRUCTIONS);
-		expect(text).toContain("Your author's direction for how you answer.");
+		expect(text).toContain("Guidelines when speaking to your partner:");
 		// The shipped card fixes pronouns, sentence length and what may not appear. A frame
 		// that called the words hers to choose would contradict that card from the strongest
 		// position in the request, so the frame offers no permission at all.
@@ -70,7 +70,14 @@ describe("appendPostHistoryInstructions", () => {
 			text.indexOf("\n") + 1,
 			text.indexOf(`\n${INSTRUCTIONS}\n`),
 		);
-		expect(opening).toBe("Your author's direction for how you answer.");
+		expect(opening).toBe("Guidelines when speaking to your partner:");
+		// A CONDITION ON SPEAKING, not a disposition ("there is a direction about answering,
+		// so answer") and not behaviour: every word of conduct a wrapper put here would be
+		// the product speaking rules at the last position of the request, which is the
+		// preset's job and the card's. This assertion is what refuses that.
+		expect(opening).toMatch(/\bwhen speaking\b/);
+		expect(opening).not.toMatch(/\b(chore|chores|narration|narrate|focused?|focus)\b/i);
+		expect(opening).not.toMatch(/\b(always|never|must|should)\b/i);
 		// The last text of the request may not describe her from outside: a card may forbid
 		// third-person self-description, and the floor forbids naming prompts and systems.
 		const frame = text.slice(0, text.indexOf(INSTRUCTIONS));
